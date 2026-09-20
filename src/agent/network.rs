@@ -1,0 +1,856 @@
+//! The per-network runtime.
+//!
+//! One of these runs for every locally active network. It owns that network's
+//! sessions, its dial loop and its counters. Everything it touches carries an
+//! explicit [`NetworkId`], so deactivating or breaking one network cannot
+//! disturb another and cannot stop the agent.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use iroh::EndpointId;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
+
+use crate::config::{Limits, ReconnectPolicy};
+use crate::dataplane::{PluginCapability, SharedPlugin};
+use crate::discovery::{Candidate, CandidateSource, NetworkDiscovery};
+use crate::error::{Error, Result};
+use crate::identity::{NetworkId, NetworkKeys};
+use crate::net::{EndpointAdapter, PathAddr, snapshot_connection};
+use crate::proto::handshake::{self, HandshakeOutcome, Role};
+use crate::proto::message::{Announcement, ControlMessage, Envelope, encode, kind};
+use crate::storage::Storage;
+
+use super::events::Event;
+use super::session::{self, Session, SessionEvent};
+use super::shutdown::Shutdown;
+use super::status::{CandidateStatus, NetworkMetrics, NetworkState, NetworkStatus, PeerStatus};
+
+/// An inbound connection that already passed the handshake.
+#[derive(Debug)]
+pub(crate) struct InboundSession {
+    pub(crate) conn: Connection,
+    pub(crate) send: SendStream,
+    pub(crate) recv: RecvStream,
+    pub(crate) outcome: HandshakeOutcome,
+}
+
+/// Commands accepted by a network runtime.
+pub(crate) enum NetCommand {
+    Inbound(Box<InboundSession>),
+    Send {
+        peer: EndpointId,
+        message: ControlMessage,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Broadcast {
+        message: ControlMessage,
+        reply: oneshot::Sender<usize>,
+    },
+    Status {
+        reply: oneshot::Sender<Box<NetworkStatus>>,
+    },
+    Recheck,
+}
+
+impl std::fmt::Debug for NetCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetCommand::Inbound(_) => f.write_str("Inbound"),
+            NetCommand::Send { peer, message, .. } => {
+                write!(f, "Send({}, {})", peer.fmt_short(), kind(message))
+            }
+            NetCommand::Broadcast { message, .. } => write!(f, "Broadcast({})", kind(message)),
+            NetCommand::Status { .. } => f.write_str("Status"),
+            NetCommand::Recheck => f.write_str("Recheck"),
+        }
+    }
+}
+
+/// Handle to a running network runtime.
+#[derive(Debug)]
+pub(crate) struct NetworkHandle {
+    pub(crate) keys: NetworkKeys,
+    pub(crate) commands: mpsc::Sender<NetCommand>,
+    shutdown: Shutdown,
+    task: JoinHandle<()>,
+}
+
+impl NetworkHandle {
+    /// Stops the runtime and waits for its task to finish.
+    pub(crate) async fn stop(self) {
+        self.shutdown.trigger();
+        let _ = self.task.await;
+    }
+}
+
+/// Everything a network runtime needs to run.
+pub(crate) struct RuntimeParams {
+    pub(crate) keys: NetworkKeys,
+    pub(crate) adapter: EndpointAdapter,
+    pub(crate) storage: Storage,
+    pub(crate) events: broadcast::Sender<Event>,
+    pub(crate) limits: Arc<Limits>,
+    pub(crate) reconnect: ReconnectPolicy,
+    pub(crate) discovery: Option<Arc<dyn NetworkDiscovery>>,
+    pub(crate) discovery_interval: Duration,
+    pub(crate) plugins: Vec<SharedPlugin>,
+    pub(crate) hostname: String,
+}
+
+/// Outcome of one outbound dial.
+enum DialOutcome {
+    Established(Box<InboundSession>),
+    Failed {
+        peer: EndpointId,
+        reason: String,
+        during_handshake: bool,
+    },
+}
+
+/// Backoff bookkeeping for one candidate.
+#[derive(Debug)]
+struct DialState {
+    consecutive_failures: u32,
+    next_attempt: Instant,
+    in_flight: bool,
+    source: CandidateSource,
+}
+
+impl DialState {
+    fn new(source: CandidateSource) -> Self {
+        Self {
+            consecutive_failures: 0,
+            next_attempt: Instant::now(),
+            in_flight: false,
+            source,
+        }
+    }
+}
+
+/// Starts a network runtime.
+pub(crate) fn spawn(params: RuntimeParams) -> NetworkHandle {
+    let keys = params.keys.clone();
+    let shutdown = Shutdown::new();
+    let (commands_tx, commands_rx) = mpsc::channel(64);
+
+    let runtime_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        let mut runtime = Runtime::new(params, runtime_shutdown);
+        runtime.run(commands_rx).await;
+    });
+
+    NetworkHandle {
+        keys,
+        commands: commands_tx,
+        shutdown,
+        task,
+    }
+}
+
+struct Runtime {
+    params: RuntimeParams,
+    network_id: NetworkId,
+    local_id: EndpointId,
+    shutdown: Shutdown,
+    sessions: HashMap<EndpointId, Session>,
+    dial_states: HashMap<EndpointId, DialState>,
+    candidate_addrs: HashMap<EndpointId, iroh::EndpointAddr>,
+    metrics: NetworkMetrics,
+    session_events_tx: mpsc::Sender<SessionEvent>,
+    session_events_rx: mpsc::Receiver<SessionEvent>,
+    dial_results_tx: mpsc::Sender<DialOutcome>,
+    dial_results_rx: mpsc::Receiver<DialOutcome>,
+}
+
+impl Runtime {
+    fn new(params: RuntimeParams, shutdown: Shutdown) -> Self {
+        let network_id = params.keys.network_id();
+        let local_id = params.adapter.endpoint_id();
+        let (session_events_tx, session_events_rx) = mpsc::channel(256);
+        let (dial_results_tx, dial_results_rx) = mpsc::channel(64);
+        Self {
+            params,
+            network_id,
+            local_id,
+            shutdown,
+            sessions: HashMap::new(),
+            dial_states: HashMap::new(),
+            candidate_addrs: HashMap::new(),
+            metrics: NetworkMetrics::default(),
+            session_events_tx,
+            session_events_rx,
+            dial_results_tx,
+            dial_results_rx,
+        }
+    }
+
+    fn emit(&self, event: Event) {
+        // A broadcast with no subscribers is not an error.
+        let _ = self.params.events.send(event);
+    }
+
+    async fn run(&mut self, mut commands: mpsc::Receiver<NetCommand>) {
+        let mut ticker = tokio::time::interval(self.params.discovery_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.shutdown.wait() => break,
+                command = commands.recv() => match command {
+                    Some(command) => self.handle_command(command).await,
+                    None => break,
+                },
+                event = self.session_events_rx.recv() => {
+                    if let Some(event) = event {
+                        self.handle_session_event(event).await;
+                    }
+                }
+                result = self.dial_results_rx.recv() => {
+                    if let Some(result) = result {
+                        self.handle_dial_result(result).await;
+                    }
+                }
+                _ = ticker.tick() => self.discovery_round().await,
+            }
+        }
+
+        self.teardown().await;
+    }
+
+    async fn teardown(&mut self) {
+        // Stop accepting session events first: nothing is going to act on them
+        // any more, and a sender blocked on a full queue would stall shutdown.
+        self.session_events_rx.close();
+        if let Some(discovery) = &self.params.discovery {
+            let _ = discovery
+                .unpublish(self.params.keys.discovery_key(), self.local_id)
+                .await;
+        }
+        let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
+        for peer in peers {
+            if let Some(session) = self.sessions.remove(&peer) {
+                session.stop().await;
+            }
+        }
+        self.emit(Event::NetworkDeactivated {
+            network: self.network_id,
+        });
+    }
+
+    // ---------------------------------------------------------------- commands
+
+    async fn handle_command(&mut self, command: NetCommand) {
+        match command {
+            NetCommand::Inbound(inbound) => {
+                self.install_session(*inbound).await;
+            }
+            NetCommand::Send {
+                peer,
+                message,
+                reply,
+            } => {
+                let _ = reply.send(self.send_to(peer, message));
+            }
+            NetCommand::Broadcast { message, reply } => {
+                let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
+                let mut delivered = 0;
+                for peer in peers {
+                    if self.send_to(peer, message.clone()).is_ok() {
+                        delivered += 1;
+                    }
+                }
+                let _ = reply.send(delivered);
+            }
+            NetCommand::Status { reply } => {
+                let _ = reply.send(Box::new(self.status()));
+            }
+            NetCommand::Recheck => self.discovery_round().await,
+        }
+    }
+
+    /// Queues a message without blocking the runtime loop.
+    ///
+    /// The envelope is encoded here so that the exact number of control bytes
+    /// handed to the transport is known and can be reported honestly.
+    ///
+    /// A full queue is backpressure: the send fails rather than stalling every
+    /// other peer in this network.
+    fn send_to(&mut self, peer: EndpointId, message: ControlMessage) -> Result<()> {
+        let network = self.network_id;
+        let envelope = Envelope {
+            network_id: *network.as_bytes(),
+            message,
+        };
+        let encoded = encode(&envelope)?;
+        let bytes = encoded.len() as u64;
+
+        let session = self.sessions.get_mut(&peer).ok_or(Error::NoSuchPeer {
+            network,
+            peer: peer.fmt_short().to_string(),
+        })?;
+
+        match session.outbound.try_send(encoded) {
+            Ok(()) => {
+                session.messages_sent += 1;
+                session.bytes_sent += bytes;
+                self.metrics.control_messages_sent += 1;
+                self.metrics.control_bytes_sent += bytes;
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(Error::Storage(format!(
+                "outbound queue for peer {} is full",
+                peer.fmt_short()
+            ))),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::NoSuchPeer {
+                network,
+                peer: peer.fmt_short().to_string(),
+            }),
+        }
+    }
+
+    // ------------------------------------------------------------- discovery
+
+    async fn discovery_round(&mut self) {
+        if self.shutdown.is_triggered() {
+            return;
+        }
+
+        let mut candidates: Vec<Candidate> = Vec::new();
+
+        if let Some(discovery) = self.params.discovery.clone() {
+            let key = self.params.keys.discovery_key();
+            // Publishing every round keeps a restarted agent reachable at its
+            // new local port without any special case.
+            if let Err(err) = discovery.publish(key, self.params.adapter.addr()).await {
+                tracing::debug!(%err, "discovery publish failed");
+            }
+            if let Err(err) = discovery
+                .publish(key, self.params.adapter.loopback_addr())
+                .await
+            {
+                tracing::debug!(%err, "discovery publish of bound sockets failed");
+            }
+            match discovery.resolve(key).await {
+                Ok(found) => candidates.extend(found),
+                Err(err) => tracing::debug!(%err, "discovery resolve failed"),
+            }
+        }
+
+        // A stale or missing cache only changes which candidates we try first.
+        // It never bypasses authentication.
+        for hint in self.params.storage.hints_for_network(self.network_id).await {
+            let Ok(endpoint_id) = EndpointId::from_bytes(&hint.endpoint_id) else {
+                continue;
+            };
+            let Some(addr) = decode_hint(endpoint_id, &hint.addr) else {
+                continue;
+            };
+            candidates.push(Candidate::new(addr, CandidateSource::Cache));
+        }
+
+        for candidate in candidates {
+            let peer = candidate.endpoint_id();
+            if peer == self.local_id {
+                continue;
+            }
+            self.candidate_addrs
+                .entry(peer)
+                .and_modify(|existing| merge_addr(existing, &candidate.addr))
+                .or_insert_with(|| candidate.addr.clone());
+            self.dial_states
+                .entry(peer)
+                .or_insert_with(|| DialState::new(candidate.source));
+        }
+
+        self.start_dials();
+    }
+
+    fn start_dials(&mut self) {
+        let now = Instant::now();
+        let in_flight = self
+            .dial_states
+            .values()
+            .filter(|state| state.in_flight)
+            .count();
+        let mut budget = self
+            .params
+            .limits
+            .max_concurrent_dials
+            .saturating_sub(in_flight);
+        if budget == 0 || self.sessions.len() >= self.params.limits.max_sessions_per_network {
+            return;
+        }
+
+        let ready: Vec<EndpointId> = self
+            .dial_states
+            .iter()
+            .filter(|(peer, state)| {
+                !state.in_flight && state.next_attempt <= now && !self.sessions.contains_key(*peer)
+            })
+            .map(|(peer, _)| *peer)
+            .collect();
+
+        for peer in ready {
+            if budget == 0 {
+                break;
+            }
+            let Some(addr) = self.candidate_addrs.get(&peer).cloned() else {
+                continue;
+            };
+            if let Some(state) = self.dial_states.get_mut(&peer) {
+                state.in_flight = true;
+            }
+            budget -= 1;
+            self.metrics.dial_attempts += 1;
+
+            let adapter = self.params.adapter.clone();
+            let keys = self.params.keys.clone();
+            let limits = Arc::clone(&self.params.limits);
+            let results = self.dial_results_tx.clone();
+            let local_id = self.local_id;
+            let shutdown = self.shutdown.clone();
+
+            tokio::spawn(async move {
+                let outcome = tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => DialOutcome::Failed {
+                        peer,
+                        reason: "network deactivated".into(),
+                        during_handshake: false,
+                    },
+                    outcome = dial(adapter, addr, keys, limits, local_id, peer) => outcome,
+                };
+                let _ = results.send(outcome).await;
+            });
+        }
+    }
+
+    async fn handle_dial_result(&mut self, result: DialOutcome) {
+        match result {
+            DialOutcome::Established(inbound) => {
+                let peer = inbound.outcome.peer;
+                if let Some(state) = self.dial_states.get_mut(&peer) {
+                    state.in_flight = false;
+                    state.consecutive_failures = 0;
+                    state.next_attempt = Instant::now();
+                }
+                self.install_session(*inbound).await;
+            }
+            DialOutcome::Failed {
+                peer,
+                reason,
+                during_handshake,
+            } => {
+                self.metrics.dial_failures += 1;
+                if during_handshake {
+                    self.metrics.handshake_failures += 1;
+                }
+                let give_up = {
+                    let policy = &self.params.reconnect;
+                    let state = self
+                        .dial_states
+                        .entry(peer)
+                        .or_insert_with(|| DialState::new(CandidateSource::Discovery));
+                    state.in_flight = false;
+                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                    let delay = policy.delay_for(state.consecutive_failures);
+                    state.next_attempt = Instant::now() + delay;
+                    policy
+                        .max_consecutive_failures
+                        .is_some_and(|max| state.consecutive_failures >= max)
+                };
+                if give_up {
+                    // Keep the backoff entry but push it far out; discovery
+                    // seeing the peer again resets it.
+                    if let Some(state) = self.dial_states.get_mut(&peer) {
+                        state.next_attempt = Instant::now() + self.params.reconnect.max_delay;
+                    }
+                }
+                self.emit(Event::DialFailed {
+                    network: self.network_id,
+                    peer,
+                    reason,
+                });
+            }
+        }
+    }
+
+    // --------------------------------------------------------------- sessions
+
+    async fn install_session(&mut self, inbound: InboundSession) {
+        let InboundSession {
+            conn,
+            send,
+            recv,
+            outcome,
+        } = inbound;
+        let peer = outcome.peer;
+
+        if self.sessions.len() >= self.params.limits.max_sessions_per_network
+            && !self.sessions.contains_key(&peer)
+        {
+            conn.close(1u32.into(), b"session limit reached");
+            self.emit(Event::ProtocolViolation {
+                network: Some(self.network_id),
+                peer: Some(peer),
+                reason: "session limit for this network reached".into(),
+            });
+            return;
+        }
+
+        // Two agents may dial each other at the same time. Both sides apply the
+        // same deterministic rule, so they converge on the same session.
+        if let Some(existing) = self.sessions.get(&peer) {
+            let existing_initiator = initiator_of(existing.role, self.local_id, peer);
+            let new_initiator = initiator_of(outcome.role, self.local_id, peer);
+            if existing_initiator.as_bytes() <= new_initiator.as_bytes() {
+                conn.close(0u32.into(), b"duplicate session");
+                return;
+            }
+            if let Some(old) = self.sessions.remove(&peer) {
+                old.abort();
+                old.conn
+                    .close(0u32.into(), b"replaced by preferred session");
+            }
+        }
+
+        self.record_hints(&conn).await;
+
+        let session = session::spawn(
+            self.network_id,
+            peer,
+            outcome.role,
+            conn.clone(),
+            send,
+            recv,
+            Arc::clone(&self.params.limits),
+            self.session_events_tx.clone(),
+            self.shutdown.clone(),
+        );
+
+        let snapshot = snapshot_connection(&conn);
+        self.sessions.insert(peer, session);
+        self.metrics.sessions_established += 1;
+
+        // Announce ourselves straight away so the peer learns our hostname and
+        // capabilities without another round of discovery.
+        let announcement = ControlMessage::Announce(self.local_announcement());
+        if let Err(err) = self.send_to(peer, announcement) {
+            tracing::debug!(%err, "could not queue initial announcement");
+        }
+
+        self.emit(Event::PeerConnected {
+            network: self.network_id,
+            peer,
+            role: outcome.role,
+            transport: snapshot.transport,
+            rtt: snapshot.rtt,
+        });
+    }
+
+    fn local_announcement(&mut self) -> Announcement {
+        let mut capabilities = Vec::new();
+        let mut errors = Vec::new();
+        for plugin in &self.params.plugins {
+            match plugin.local_capability(self.network_id) {
+                Ok(Some(capability)) => capabilities.push(capability),
+                Ok(None) => {}
+                Err(err) => errors.push((plugin.protocol_id().to_string(), err.to_string())),
+            }
+        }
+        for (protocol, reason) in errors {
+            self.metrics.plugin_errors += 1;
+            self.emit(Event::PluginError {
+                network: self.network_id,
+                protocol,
+                reason,
+            });
+        }
+        capabilities.truncate(self.params.limits.max_capabilities);
+        Announcement {
+            hostname: self.params.hostname.clone(),
+            capabilities,
+        }
+    }
+
+    async fn record_hints(&self, conn: &Connection) {
+        let snapshot = snapshot_connection(conn);
+        let peer_bytes = *snapshot.remote_id.as_bytes();
+        for path in &snapshot.paths {
+            if let Some(encoded) = encode_hint(&path.remote) {
+                self.params
+                    .storage
+                    .record_hint(
+                        self.network_id,
+                        peer_bytes,
+                        encoded,
+                        self.params.limits.max_hints_per_peer,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    async fn handle_session_event(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::Message {
+                session_id,
+                peer,
+                message,
+                bytes,
+            } => {
+                let current = self.sessions.get(&peer).map(|session| session.id);
+                if current != Some(session_id) {
+                    return;
+                }
+                self.metrics.control_messages_received += 1;
+                self.metrics.control_bytes_received += bytes as u64;
+                if let Some(session) = self.sessions.get_mut(&peer) {
+                    session.messages_received += 1;
+                    session.bytes_received += bytes as u64;
+                }
+                self.dispatch_message(peer, message);
+            }
+            SessionEvent::Violation {
+                session_id,
+                peer,
+                error,
+            } => {
+                let current = self.sessions.get(&peer).map(|session| session.id);
+                if current != Some(session_id) {
+                    return;
+                }
+                self.metrics.protocol_violations += 1;
+                self.emit(Event::ProtocolViolation {
+                    network: Some(self.network_id),
+                    peer: Some(peer),
+                    reason: error.to_string(),
+                });
+            }
+            SessionEvent::Closed {
+                session_id,
+                peer,
+                reason,
+            } => {
+                let current = self.sessions.get(&peer).map(|session| session.id);
+                if current != Some(session_id) {
+                    return;
+                }
+                if let Some(session) = self.sessions.remove(&peer) {
+                    session.abort();
+                    session.conn.close(0u32.into(), b"session ended");
+                }
+                self.metrics.disconnects += 1;
+                for plugin in &self.params.plugins {
+                    plugin.on_peer_gone(self.network_id, peer);
+                }
+                // Retry promptly, then back off if it keeps failing.
+                let policy = &self.params.reconnect;
+                let state = self
+                    .dial_states
+                    .entry(peer)
+                    .or_insert_with(|| DialState::new(CandidateSource::Discovery));
+                state.in_flight = false;
+                state.next_attempt = Instant::now() + policy.initial_delay;
+                self.emit(Event::PeerDisconnected {
+                    network: self.network_id,
+                    peer,
+                    reason,
+                });
+            }
+        }
+    }
+
+    fn dispatch_message(&mut self, peer: EndpointId, message: ControlMessage) {
+        match &message {
+            ControlMessage::Announce(announcement) => {
+                let capabilities = announcement.capabilities.clone();
+                if let Some(session) = self.sessions.get_mut(&peer) {
+                    session.hostname = Some(announcement.hostname.clone());
+                    session.capabilities = capabilities.clone();
+                }
+                self.dispatch_capabilities(peer, &capabilities);
+            }
+            ControlMessage::Ping { seq, payload } => {
+                let pong = ControlMessage::Pong {
+                    seq: *seq,
+                    payload: payload.clone(),
+                };
+                if let Err(err) = self.send_to(peer, pong) {
+                    tracing::debug!(%err, "could not queue pong");
+                }
+            }
+            ControlMessage::Pong { .. } | ControlMessage::Bye { .. } => {}
+        }
+
+        self.emit(Event::MessageReceived {
+            network: self.network_id,
+            peer,
+            message,
+        });
+    }
+
+    fn dispatch_capabilities(&mut self, peer: EndpointId, capabilities: &[PluginCapability]) {
+        let mut errors = Vec::new();
+        for capability in capabilities {
+            for plugin in &self.params.plugins {
+                if plugin.protocol_id() != capability.protocol {
+                    continue;
+                }
+                // The core hands the opaque payload over without interpreting it.
+                if let Err(err) = plugin.on_peer_capability(self.network_id, peer, capability) {
+                    errors.push((plugin.protocol_id().to_string(), err.to_string()));
+                }
+            }
+        }
+        for (protocol, reason) in errors {
+            self.metrics.plugin_errors += 1;
+            self.emit(Event::PluginError {
+                network: self.network_id,
+                protocol,
+                reason,
+            });
+        }
+    }
+
+    // ----------------------------------------------------------------- status
+
+    fn status(&self) -> NetworkStatus {
+        let mut peers: Vec<PeerStatus> = self
+            .sessions
+            .values()
+            .map(|session| {
+                let snapshot = snapshot_connection(&session.conn);
+                PeerStatus {
+                    endpoint_id: session.peer,
+                    role: session.role,
+                    hostname: session.hostname.clone(),
+                    capabilities: session.capabilities.clone(),
+                    connected_for: session.established.elapsed(),
+                    paths: snapshot.paths,
+                    transport: snapshot.transport,
+                    rtt: snapshot.rtt,
+                    connection: snapshot.counters,
+                    control_messages_sent: session.messages_sent,
+                    control_messages_received: session.messages_received,
+                    control_bytes_sent: session.bytes_sent,
+                    control_bytes_received: session.bytes_received,
+                }
+            })
+            .collect();
+        peers.sort_by(|a, b| a.endpoint_id.as_bytes().cmp(b.endpoint_id.as_bytes()));
+
+        let mut candidates: Vec<CandidateStatus> = self
+            .dial_states
+            .iter()
+            .map(|(peer, state)| CandidateStatus {
+                endpoint_id: *peer,
+                source: state.source,
+                consecutive_failures: state.consecutive_failures,
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.endpoint_id.as_bytes().cmp(b.endpoint_id.as_bytes()));
+
+        NetworkStatus {
+            descriptor: self.params.keys.descriptor(),
+            name: self.params.keys.name().clone(),
+            network_id: self.network_id,
+            state: NetworkState::Active,
+            peers,
+            candidates,
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
+/// Which side dialled, given a role and the two identities.
+fn initiator_of(role: Role, local: EndpointId, peer: EndpointId) -> EndpointId {
+    match role {
+        Role::Initiator => local,
+        Role::Responder => peer,
+    }
+}
+
+/// Performs one dial and handshake.
+async fn dial(
+    adapter: EndpointAdapter,
+    addr: iroh::EndpointAddr,
+    keys: NetworkKeys,
+    limits: Arc<Limits>,
+    local_id: EndpointId,
+    peer: EndpointId,
+) -> DialOutcome {
+    let connect = tokio::time::timeout(limits.dial_timeout, adapter.connect(addr)).await;
+    let (conn, mut send, mut recv) = match connect {
+        Ok(Ok(parts)) => parts,
+        Ok(Err(err)) => {
+            return DialOutcome::Failed {
+                peer,
+                reason: err.to_string(),
+                during_handshake: false,
+            };
+        }
+        Err(_) => {
+            return DialOutcome::Failed {
+                peer,
+                reason: "dial timed out".into(),
+                during_handshake: false,
+            };
+        }
+    };
+
+    match handshake::initiate(&conn, &mut send, &mut recv, local_id, &keys, &limits).await {
+        Ok(outcome) => DialOutcome::Established(Box::new(InboundSession {
+            conn,
+            send,
+            recv,
+            outcome,
+        })),
+        Err(err) => {
+            conn.close(2u32.into(), b"handshake failed");
+            DialOutcome::Failed {
+                peer,
+                reason: err.to_string(),
+                during_handshake: true,
+            }
+        }
+    }
+}
+
+/// Encodes a path address as a cache hint.
+fn encode_hint(addr: &PathAddr) -> Option<String> {
+    match addr {
+        PathAddr::Ip(socket) => Some(format!("ip:{socket}")),
+        PathAddr::Relay(url) => Some(format!("relay:{url}")),
+        PathAddr::Other(_) => None,
+    }
+}
+
+/// Decodes a cache hint back into an address. Malformed hints are ignored.
+fn decode_hint(endpoint_id: EndpointId, hint: &str) -> Option<iroh::EndpointAddr> {
+    if let Some(rest) = hint.strip_prefix("ip:") {
+        let socket: std::net::SocketAddr = rest.parse().ok()?;
+        return Some(iroh::EndpointAddr::new(endpoint_id).with_ip_addr(socket));
+    }
+    if let Some(rest) = hint.strip_prefix("relay:") {
+        let url: iroh::RelayUrl = rest.parse().ok()?;
+        return Some(iroh::EndpointAddr::new(endpoint_id).with_relay_url(url));
+    }
+    None
+}
+
+/// Folds newly learned addresses into a known candidate address.
+fn merge_addr(existing: &mut iroh::EndpointAddr, incoming: &iroh::EndpointAddr) {
+    if existing.id != incoming.id {
+        *existing = incoming.clone();
+        return;
+    }
+    for addr in &incoming.addrs {
+        existing.addrs.insert(addr.clone());
+    }
+}

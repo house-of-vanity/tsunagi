@@ -1,0 +1,44 @@
+[package]
+name = "tsunagi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+description = "Proof-of-concept library for small private mesh networks: persistent agent identity, deterministic network spaces, iroh-based control plane."
+repository = "https://github.com/tsunagi-net/tsunagi"
+readme = "README.md"
+keywords = ["mesh", "p2p", "iroh", "networking"]
+categories = ["network-programming"]
+
+[dependencies]
+iroh = { version = "1.2", default-features = false, features = ["tls-ring"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+hkdf = "0.13"
+hmac = "0.13"
+sha2 = "0.11"
+subtle = "2.6"
+zeroize = { version = "1.9", features = ["derive"] }
+rand = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+data-encoding = "2.11"
+hex = "0.4"
+thiserror = "2.0"
+tracing = "0.1"
+fs4 = { version = "1.1", features = ["sync"] }
+directories = "6.0"
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
+tempfile = "3.24"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
