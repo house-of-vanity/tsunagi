@@ -47,13 +47,28 @@ and the agent stays manageable.
 | `storage` | mandatory state and the separately recoverable cache |
 | `state` | signed records that outlive a session, merged between replicas |
 | `dataplane::transport` | authenticated datagram links to peers; where reachability lives |
-| `dataplane` | the contract IP plugins implement, plus the WireGuard plugin |
+| `dataplane` | the contract a protocol implements, and nothing else |
+| `overlay` | the one interface an agent owns: provisioning, the TUN, whose packet is whose |
+| `dns` | the DNS view of a network, and telling the system resolver about it |
+
+And in crates of their own:
+
+| crate | responsibility |
+|---|---|
+| `tsunagi-wg-quic` | the `wg-quic` protocol: its keys, its announcement, its tunnels |
+| `tsunagi-cli` | the command line agent: the only place that owns a runtime, a logger and signals |
+
+A protocol is a separate crate so the boundary is the compiler's to enforce,
+and so it can carry its own version. That version is not what peers compare:
+they compare the *wire* version, which moves only when the bytes do, so two
+peers on different releases keep working.
 
 Abstractions exist only where something is really substituted or really needs
 isolating for tests: `NetworkDiscovery`, `IpPlugin`, `PacketTransport` /
-`PacketLink` (so the data plane's carrier can change), and `TunFactory` (which
-is what lets the whole data plane be tested without privileges). Everything
-else is a concrete type.
+`PacketLink` (so a protocol's carrier can change), `TunFactory` (which is what
+lets the whole data plane be tested without privileges), `InterfaceProvisioner`
+and `DnsPublisher` (which are where the platforms differ). Everything else is a
+concrete type.
 
 ## Runtime shape
 

@@ -72,7 +72,7 @@ Unit tests in `crates/tsunagi/src/proto/handshake.rs` cover the transcript const
 itself: role separation, channel binding, identity and network binding,
 unambiguous encoding, and rejection under the wrong key.
 
-Unit tests in `crates/tsunagi/src/dataplane/wireguard/` cover key clamping against the RFC
+Unit tests in `crates/tsunagi-wg-quic/src/` cover key clamping against the RFC
 7748 vector, overlay derivation, announcement validation including the
 address-hijack attempt, interface naming, and IP header parsing against
 truncated and nonsense input.
