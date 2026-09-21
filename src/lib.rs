@@ -14,7 +14,10 @@
 //! * [`proto`] — the control protocol: framing, messages, handshake.
 //! * [`net`] — the iroh connectivity adapter and its observability surface.
 //! * [`agent`] — the runtime: agent lifecycle, per-network runtimes, reconnect.
-//! * [`dataplane`] — the minimal contract future IP plugins must satisfy.
+//! * [`dataplane`] — the contract IP plugins satisfy, the packet transport,
+//!   and the WireGuard data plane.
+//! * [`ipc`] — the local control interface a command line tool talks to. An
+//!   adapter over the public API; the core does not know it exists.
 //!
 //! # What this library deliberately does not do
 //!
@@ -36,6 +39,7 @@ pub mod dataplane;
 pub mod discovery;
 pub mod error;
 pub mod identity;
+pub mod ipc;
 pub mod net;
 pub mod proto;
 pub mod storage;

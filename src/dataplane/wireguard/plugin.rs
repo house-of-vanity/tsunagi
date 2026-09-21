@@ -152,8 +152,10 @@ pub struct NetworkOverview {
     pub overlay_prefix_len: u8,
     /// Peers this agent knows about.
     pub peers: Vec<PeerOverview>,
-    /// Packets the operating system sent to an address no peer owns.
+    /// Unicast packets the operating system sent to an address no peer owns.
     pub unroutable_packets: u64,
+    /// Multicast packets dropped. Expected, not a fault.
+    pub multicast_packets: u64,
 }
 
 impl NetworkOverview {
@@ -326,6 +328,11 @@ impl WireguardPlugin {
                 .device
                 .as_ref()
                 .map(|device| device.unroutable_packets())
+                .unwrap_or(0),
+            multicast_packets: state
+                .device
+                .as_ref()
+                .map(|device| device.multicast_packets())
                 .unwrap_or(0),
         })
     }

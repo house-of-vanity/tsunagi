@@ -186,6 +186,7 @@ struct Inner {
     routes: RwLock<HashMap<Ipv6Addr, WgPublicKey>>,
     next_index: AtomicU32,
     unroutable: AtomicU64,
+    multicast: AtomicU64,
 }
 
 impl std::fmt::Debug for Inner {
@@ -215,6 +216,7 @@ impl WireguardDevice {
             routes: RwLock::new(HashMap::new()),
             next_index: AtomicU32::new(1),
             unroutable: AtomicU64::new(0),
+            multicast: AtomicU64::new(0),
         });
 
         let reader = tokio::spawn(read_from_os(Arc::clone(&inner)));
@@ -327,9 +329,21 @@ impl WireguardDevice {
         peers
     }
 
-    /// Packets the operating system sent that no peer owns the address for.
+    /// Unicast packets the operating system sent to an address no peer owns.
+    ///
+    /// A non-zero value means something tried to reach a host that is not in
+    /// the overlay.
     pub fn unroutable_packets(&self) -> u64 {
         self.inner.unroutable.load(Ordering::Relaxed)
+    }
+
+    /// Multicast packets dropped.
+    ///
+    /// Expected and harmless: Linux emits multicast listener and router
+    /// solicitation traffic on any IPv6 interface, and this overlay is
+    /// unicast only. Counted separately so it does not look like a fault.
+    pub fn multicast_packets(&self) -> u64 {
+        self.inner.multicast.load(Ordering::Relaxed)
     }
 }
 
@@ -407,6 +421,12 @@ async fn read_from_os(inner: Arc<Inner>) {
             inner.unroutable.fetch_add(1, Ordering::Relaxed);
             continue;
         };
+        // The kernel emits multicast on every IPv6 interface. The overlay is
+        // unicast only, so this is dropped, but it is not a fault.
+        if destination.is_multicast() {
+            inner.multicast.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         let target = read_lock(&inner.routes).get(&destination).copied();
         let Some(target) = target else {
             inner.unroutable.fetch_add(1, Ordering::Relaxed);

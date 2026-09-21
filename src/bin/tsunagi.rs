@@ -45,12 +45,24 @@ enum Command {
     Id(PathArgs),
     /// Joins a network and runs until interrupted.
     Up(UpArgs),
+    /// Asks a running agent what it is doing.
+    Status(StatusArgs),
     /// Prints the one-time privileged setup for the overlay interface.
     ///
     /// Run its output once as root, then run `tsunagi up` as an ordinary
     /// user: the agent attaches to the prepared interface and needs no
     /// privileges of its own.
     TunSetup(TunSetupArgs),
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[command(flatten)]
+    paths: PathArgs,
+
+    /// Control socket to talk to. Derived from the state directory by default.
+    #[arg(long)]
+    control_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -203,6 +215,10 @@ struct UpArgs {
     /// How often to print a status summary, in seconds. Zero disables it.
     #[arg(long, default_value_t = 15)]
     status_interval: u64,
+
+    /// Control socket to serve. Derived from the state directory by default.
+    #[arg(long)]
+    control_socket: Option<PathBuf>,
 }
 
 /// Reads the shared secret from an argument or a file.
@@ -292,7 +308,34 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Id(paths) => show_id(paths).await,
         Command::Up(args) => up(args).await,
         Command::TunSetup(args) => tun_setup(args).await,
+        Command::Status(args) => status(args).await,
     }
+}
+
+/// Path of the local control socket for a state directory.
+fn control_socket(paths: &StoragePaths, override_path: Option<&PathBuf>) -> PathBuf {
+    match override_path {
+        Some(path) => path.clone(),
+        None => tsunagi::ipc::control_socket_path(&paths.state_dir),
+    }
+}
+
+async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = args.paths.resolve()?;
+    let socket = control_socket(&paths, args.control_socket.as_ref());
+    if !socket.exists() {
+        return Err(format!(
+            "no agent is running for {} (no control socket at {})",
+            paths.state_dir.display(),
+            socket.display()
+        )
+        .into());
+    }
+    let report = tsunagi::ipc::unix::request_status(&socket)
+        .await
+        .map_err(|err| format!("cannot reach the agent at {}: {err}", socket.display()))?;
+    print!("{}", report.render());
+    Ok(())
 }
 
 /// Works out the interface name and overlay address, then prints the
@@ -508,6 +551,31 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             agent.endpoint_id()
         );
     }
+    // Serve `tsunagi status` for as long as this agent runs. Failing to bind
+    // is not fatal: the agent itself works fine without it.
+    let control = {
+        let agent = agent.clone();
+        let plugin = wireguard.clone();
+        let source: Arc<dyn tsunagi::ipc::unix::ReportSource> = Arc::new(
+            move || -> tsunagi::BoxFuture<'static, tsunagi::ipc::StatusReport> {
+                let agent = agent.clone();
+                let plugin = plugin.clone();
+                Box::pin(async move { build_report(&agent, plugin.as_deref()).await })
+            },
+        );
+        let path = control_socket(&paths, args.control_socket.as_ref());
+        match tsunagi::ipc::unix::ControlSocket::bind(path, source).await {
+            Ok(socket) => {
+                println!("  control      {}", socket.path().display());
+                Some(socket)
+            }
+            Err(err) => {
+                eprintln!("warning: `tsunagi status` will not work: {err}");
+                None
+            }
+        }
+    };
+
     println!("Press Ctrl-C to stop.\n");
 
     let status_every =
@@ -538,9 +606,112 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if let Some(control) = control {
+        control.shutdown().await;
+    }
     agent.shutdown().await;
     println!("stopped.");
     Ok(())
+}
+
+/// Collects a status report from the agent and, when present, the WireGuard
+/// plugin. The two are combined here because only this binary knows about
+/// both.
+async fn build_report(
+    agent: &Agent,
+    wireguard: Option<&WireguardPlugin>,
+) -> tsunagi::ipc::StatusReport {
+    use tsunagi::ipc::{NetworkReport, OverlayPeerReport, OverlayReport, PeerReport, StatusReport};
+
+    let Ok(status) = agent.status().await else {
+        return StatusReport::default();
+    };
+
+    let networks = status
+        .networks
+        .iter()
+        .map(|network| {
+            let overlay = wireguard
+                .and_then(|plugin| plugin.overview(network.network_id))
+                .map(|view| OverlayReport {
+                    interface: view.interface.clone(),
+                    mtu: view.mtu,
+                    address: view.overlay_address.to_string(),
+                    prefix: view.overlay_prefix.to_string(),
+                    prefix_len: view.overlay_prefix_len,
+                    peers: view
+                        .peers
+                        .iter()
+                        .map(|peer| OverlayPeerReport {
+                            public_key: peer.public_key.to_string(),
+                            address: peer.overlay_address.to_string(),
+                            handshake_secs_ago: peer
+                                .tunnel
+                                .as_ref()
+                                .and_then(|tunnel| tunnel.health.since_handshake)
+                                .map(|since| since.as_secs()),
+                            tx_packets: peer
+                                .tunnel
+                                .as_ref()
+                                .map_or(0, |tunnel| tunnel.stats.tx_packets),
+                            rx_packets: peer
+                                .tunnel
+                                .as_ref()
+                                .map_or(0, |tunnel| tunnel.stats.rx_packets),
+                            dropped: peer.tunnel.as_ref().map_or(0, |tunnel| {
+                                tunnel.stats.dropped_wrong_source + tunnel.stats.dropped_oversize
+                            }),
+                            protocol_errors: peer
+                                .tunnel
+                                .as_ref()
+                                .map_or(0, |tunnel| tunnel.stats.protocol_errors),
+                            path: peer
+                                .tunnel
+                                .as_ref()
+                                .map(|tunnel| tunnel.path.clone())
+                                .unwrap_or_else(|| "no data link".into()),
+                        })
+                        .collect(),
+                    unroutable_packets: view.unroutable_packets,
+                    multicast_packets: view.multicast_packets,
+                });
+
+            NetworkReport {
+                name: network.name.to_string(),
+                network_id: network.network_id.to_string(),
+                active: matches!(network.state, tsunagi::agent::NetworkState::Active),
+                peers: network
+                    .peers
+                    .iter()
+                    .map(|peer| PeerReport {
+                        endpoint_id: peer.endpoint_id.to_string(),
+                        hostname: peer.hostname.clone(),
+                        transport: format!("{:?}", peer.transport),
+                        rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
+                    })
+                    .collect(),
+                dial_failures: network.metrics.dial_failures,
+                handshake_failures: network.metrics.handshake_failures,
+                control_messages: (
+                    network.metrics.control_messages_sent,
+                    network.metrics.control_messages_received,
+                ),
+                overlay,
+            }
+        })
+        .collect();
+
+    StatusReport {
+        endpoint_id: status.endpoint_id.to_string(),
+        hostname: status.hostname.clone(),
+        bound_sockets: status
+            .bound_sockets
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        cache_healthy: status.cache_healthy,
+        networks,
+    }
 }
 
 /// Resolves when the process is asked to stop.
