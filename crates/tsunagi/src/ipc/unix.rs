@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use crate::BoxFuture;
 use crate::error::{Error, Result};
 
-use super::{LeftReport, MAX_MESSAGE_LEN, Request, Response, StatusReport};
+use super::{JoinedReport, LeftReport, MAX_MESSAGE_LEN, Request, Response, StatusReport};
 
 /// Builds the report that answers a status request.
 ///
@@ -45,6 +45,18 @@ pub trait ReportSource: Send + Sync + 'static {
     /// that only reports says so plainly rather than appearing to do it.
     fn leave(&self, _network_id: String) -> BoxFuture<'_, std::result::Result<LeftReport, String>> {
         Box::pin(async move { Err("this agent cannot leave a network".to_string()) })
+    }
+
+    /// Joins a network, or starts one that is configured and not running.
+    ///
+    /// Defaulted to a refusal, like the others: a source that only reports
+    /// says so rather than appearing to have done it.
+    fn join(
+        &self,
+        _name: String,
+        _secret: String,
+    ) -> BoxFuture<'_, std::result::Result<JoinedReport, String>> {
+        Box::pin(async move { Err("this agent cannot join a network".to_string()) })
     }
 }
 
@@ -178,6 +190,10 @@ async fn handle(mut stream: UnixStream, source: Arc<dyn ReportSource>) -> Result
             Ok(report) => Response::Left(report),
             Err(reason) => Response::Error(reason),
         },
+        Request::Join { name, secret } => match source.join(name, secret).await {
+            Ok(report) => Response::Joined(report),
+            Err(reason) => Response::Error(reason),
+        },
     };
     write_message(&mut stream, &response).await
 }
@@ -252,6 +268,27 @@ pub async fn leave_network(path: impl AsRef<Path>, network_id: &str) -> Result<L
     }
 }
 
+/// Asks a running agent to join a network.
+///
+/// The one way to add a network to an agent that is already up: the state
+/// directory belongs to one live agent, so a second `up` cannot.
+pub async fn join_network(
+    path: impl AsRef<Path>,
+    name: &str,
+    secret: &str,
+) -> Result<JoinedReport> {
+    let path = path.as_ref();
+    let request = Request::Join {
+        name: name.to_string(),
+        secret: secret.to_string(),
+    };
+    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
+        Response::Joined(report) => Ok(report),
+        Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
 /// Marks the wire format of the local control socket.
 ///
 /// `b"TSN"` followed by the version, so a mismatch is recognised as one
@@ -263,7 +300,7 @@ pub async fn leave_network(path: impl AsRef<Path>, network_id: &str) -> Result<L
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 8]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 9]);
 
 async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let encoded = postcard::to_stdvec(value)

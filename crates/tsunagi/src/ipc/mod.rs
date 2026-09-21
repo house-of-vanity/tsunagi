@@ -61,7 +61,11 @@ pub fn control_socket_path(state_dir: &Path) -> PathBuf {
 }
 
 /// What a client asks for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand rather than derived: one of these carries a
+/// network secret, and a derived one would put it in any log line that
+/// printed a request.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Request {
     /// Report what the agent is doing.
@@ -78,6 +82,32 @@ pub enum Request {
     /// only it can publish the release, and only while its sessions are up.
     /// The network is named by its id, in the text form `status` prints.
     Leave(String),
+    /// Join a network, or start one that is configured and not running.
+    ///
+    /// Asked of the running agent because that is the only way to add a
+    /// network to an agent that is already up: the state directory belongs
+    /// to one live agent, so a second `tsunagi up` cannot.
+    Join {
+        /// The network name.
+        name: String,
+        /// The shared secret in its `tsn1…` text form.
+        ///
+        /// It travels over a socket only its owner can open, to the agent
+        /// that stores it anyway, and never appears in `Debug`.
+        secret: String,
+    },
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Request::Status => f.write_str("Status"),
+            Request::SetHostname(name) => write!(f, "SetHostname({name})"),
+            Request::Leave(network) => write!(f, "Leave({network})"),
+            // The name is not a secret; the secret is.
+            Request::Join { name, .. } => write!(f, "Join {{ name: {name}, secret: <redacted> }}"),
+        }
+    }
 }
 
 /// What the agent answers.
@@ -90,8 +120,31 @@ pub enum Response {
     Hostname(String),
     /// A network was left.
     Left(LeftReport),
+    /// A network was joined, or was already there and is now running.
+    Joined(JoinedReport),
     /// The request could not be served.
     Error(String),
+}
+
+/// What happened when a network was joined.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinedReport {
+    /// The network's name, as given.
+    pub name: String,
+    /// The derived network id, which is what tells two same-named networks
+    /// apart.
+    pub network_id: String,
+    /// Whether this device was already configured for exactly this network.
+    ///
+    /// Joining is idempotent, so this is the difference between "added" and
+    /// "it was already there and is now running".
+    pub already_configured: bool,
+    /// Another configured network with the same name but a different
+    /// secret, if there is one.
+    ///
+    /// Almost always a mistyped secret, and the one thing that makes two
+    /// sections of a report look like one network.
+    pub name_shared_with: Option<String>,
 }
 
 /// What happened when a network was left.

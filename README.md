@@ -70,7 +70,7 @@ On the first machine:
 
 ```bash
 cargo build --release
-./target/release/tsunagi id secret generate   # prints tsn1...; share it privately
+./target/release/tsunagi network secret generate   # prints tsn1...; share it privately
 ./target/release/tsunagi status          # this device, the agent, and this host
 ./target/release/tsunagi network         # the networks this device belongs to
 
@@ -291,10 +291,14 @@ sayable — it remembers who belongs while they are gone, so the report can say
 dial-failure counter to imply it. Counters are history and are never graded:
 a peer that left and came back should not leave the report looking broken.
 
-`id` is the other half: it shows what this device is — its signing key, the
-name it answers to, and the secret of every network it has joined — and
-changes those. Every item takes the same shape, so there is nothing to
-remember: name it to see it, name it with a value to change it.
+The other two commands split along the line the system itself draws. `id` is
+this **device**: the key it signs with and the name it answers to. `network`
+is what it **belongs to**: which networks, their secrets, joining and
+leaving. A device outlives every network it is in, and a network outlives
+any device in it, so a command that mixed them had to be read twice.
+
+Every item takes the same shape, so there is nothing to remember: name it to
+see it, name it with a value to change it.
 
 ```
 tsunagi id                      everything about this device
@@ -302,12 +306,24 @@ tsunagi id hostname             the name it answers to
 tsunagi id hostname mango       change it
 tsunagi id key                  the key it signs with
 tsunagi id key rotate           replace that key
-tsunagi id secret               the secret of each joined network
-tsunagi id secret generate      a fresh secret for a network that does not exist yet
+
+tsunagi network                 the networks this device belongs to
+tsunagi network join -n lab -s tsn1…   join one; adds it to a running agent
+tsunagi network leave <id>      give up the address and name, then forget it
+tsunagi network secret          the secret of each joined network
+tsunagi network secret <id>     just that one, for copying
+tsunagi network secret generate a fresh secret for a network that does not exist yet
 ```
 
-Secrets appear in `id`, which is where you go to ask for one, and never in
-`status`, in a log, in a `Debug` rendering or in anything sent to a peer.
+A secret is printed by `network secret` and nowhere else — not by `id`, not
+by `status`, not in a log, a `Debug` rendering or anything sent to a peer.
+Asking for it is deliberate, because these reports get pasted into chats.
+
+`network join` is also the answer to a question `up` cannot: a state
+directory belongs to one live agent, so a second `tsunagi up` cannot add a
+network to the one already running. This adds it over the control socket and
+it starts at once. With no agent running it is written to the configuration
+and starts with the next `up`.
 
 The name is part of the signed state, so changing it revokes the previous
 one: there is one record per author, a new version replaces the whole claim,
@@ -494,7 +510,14 @@ The command line agent puts everything under the platform's per-user
 directories by default; `--state-dir` and `--cache-dir` override them.
 
 One state directory belongs to one live agent, enforced with a real OS file
-lock rather than an existence check.
+lock rather than an existence check. That directory *is* the identity: one
+agent, one device key, one interface, and as many networks as you like on it
+— `tsunagi network join` adds them to the agent that is already running,
+which is why a second `tsunagi up` on the same directory is refused rather
+than made to work. A second agent on the same host is a second identity, and
+needs everything of its own: its own state and cache directories, its own
+interface name and its own overlay range. The library owns no globals, so
+several of them run side by side in one process as readily as in one host.
 
 ### Leaving, and starting over
 

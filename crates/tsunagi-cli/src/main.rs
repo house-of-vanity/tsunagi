@@ -72,6 +72,25 @@ struct NetworkArgs {
 
 #[derive(Debug, Subcommand)]
 enum NetworkAction {
+    /// Joins a network, adding it to the agent that is already running.
+    ///
+    /// The state directory belongs to one live agent, so a second `up`
+    /// cannot add a network to it — this can, and takes effect at once.
+    /// With no agent running it is configured and starts with the next
+    /// `tsunagi up`.
+    Join {
+        /// Network name. Must be identical on every participant.
+        #[arg(long, short = 'n')]
+        network: String,
+
+        /// The shared secret, as printed by `tsunagi network secret generate`.
+        #[arg(long, short = 's', env = "TSUNAGI_SECRET")]
+        secret: Option<String>,
+
+        /// Read the shared secret from a file instead of the command line.
+        #[arg(long, conflicts_with = "secret")]
+        secret_file: Option<PathBuf>,
+    },
     /// Gives up this device's address and name in a network, and forgets it.
     ///
     /// A signed release goes out first, so the address and name are freed
@@ -89,6 +108,24 @@ enum NetworkAction {
         #[arg(long)]
         offline: bool,
     },
+    /// Shows the secret of a network, which is half of its identity.
+    ///
+    /// Printed only when asked for, never as part of an overview: these
+    /// reports get pasted into chats and issue trackers.
+    Secret {
+        /// Which network, by id; a unique prefix is enough. All of them if
+        /// omitted.
+        network: Option<String>,
+
+        #[command(subcommand)]
+        action: Option<SecretAction>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretAction {
+    /// Prints a fresh random secret, for a network that does not exist yet.
+    Generate,
 }
 
 #[derive(Debug, Args)]
@@ -130,11 +167,6 @@ enum IdAction {
         #[command(subcommand)]
         action: Option<KeyAction>,
     },
-    /// Shows the secret of every network this device has joined.
-    Secret {
-        #[command(subcommand)]
-        action: Option<SecretAction>,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -145,12 +177,6 @@ enum KeyAction {
     /// addresses and names it held on the way out, so they are freed rather
     /// than reserved to a key nobody has. Requires the agent to be stopped.
     Rotate,
-}
-
-#[derive(Debug, Subcommand)]
-enum SecretAction {
-    /// Prints a fresh random secret, for a network that does not exist yet.
-    Generate,
 }
 
 #[derive(Debug, Args)]
@@ -546,7 +572,7 @@ fn device_section(paths: &StoragePaths, observed: &Observed) -> report::Section 
 /// The networks this device belongs to, named but not described.
 ///
 /// No secrets: this is part of `status`, and a status report is somewhere a
-/// secret must never appear. `tsunagi id secret` is the place that shows one,
+/// secret must never appear. `tsunagi network secret` is the place that shows one,
 /// because asking for it there is deliberate.
 fn configured_networks_section(paths: &StoragePaths) -> report::Section {
     use report::{Health, Row, Section};
@@ -963,6 +989,45 @@ impl tsunagi::ipc::unix::ReportSource for AgentControl {
         })
     }
 
+    fn join(
+        &self,
+        name: String,
+        secret: String,
+    ) -> tsunagi::BoxFuture<'_, Result<tsunagi::ipc::JoinedReport, String>> {
+        Box::pin(async move {
+            let name = NetworkName::new(&name).map_err(|err| err.to_string())?;
+            let secret = NetworkSecret::decode(&secret).map_err(|err| err.to_string())?;
+            let keys = tsunagi::identity::NetworkKeys::derive(&name, &secret);
+
+            // Read before joining: afterwards "already configured" is true
+            // of everything, and the difference is what the user is told.
+            let before = self
+                .agent
+                .list_networks()
+                .await
+                .map_err(|err| err.to_string())?;
+            let already = before
+                .iter()
+                .any(|other| other.network_id == keys.network_id());
+            let shared = before
+                .iter()
+                .find(|other| other.name == name && other.network_id != keys.network_id())
+                .map(|other| other.network_id.to_string());
+
+            let network_id = self
+                .agent
+                .join_network(&name, &secret)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(tsunagi::ipc::JoinedReport {
+                name: name.as_str().to_string(),
+                network_id: network_id.to_string(),
+                already_configured: already,
+                name_shared_with: shared,
+            })
+        })
+    }
+
     fn leave(
         &self,
         network_id: String,
@@ -1054,10 +1119,102 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
     let socket = control_socket(&paths, args.control_socket.as_ref());
     match args.action {
         None => show_networks(&paths, &socket).await,
+        Some(NetworkAction::Join {
+            network,
+            secret,
+            secret_file,
+        }) => {
+            let secret = load_secret(secret.as_deref(), secret_file.as_deref())?;
+            join_network(&paths, &socket, &network, secret).await
+        }
         Some(NetworkAction::Leave { network, offline }) => {
             leave_network(&paths, &socket, &network, offline).await
         }
+        Some(NetworkAction::Secret {
+            network,
+            action: None,
+        }) => show_secrets(&paths, network.as_deref()),
+        Some(NetworkAction::Secret {
+            action: Some(SecretAction::Generate),
+            ..
+        }) => {
+            let secret = NetworkSecret::generate();
+            println!("{}", secret.encode().as_str());
+            eprintln!(
+                "\nShare this with every participant, over a channel you trust.\n\
+                 Anyone who has it can join the network."
+            );
+            Ok(())
+        }
     }
+}
+
+/// Joins a network: into the running agent if there is one.
+async fn join_network(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+    name: &str,
+    secret: NetworkSecret,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The running agent, because a second `up` cannot have the directory
+    // and because this way the network starts at once instead of at the
+    // next restart.
+    if socket.exists() {
+        let report =
+            tsunagi::ipc::unix::join_network(socket, name, secret.encode().as_str()).await?;
+        if report.already_configured {
+            println!(
+                "`{}` ({}) was already configured; it is running",
+                report.name,
+                short(&report.network_id, 10)
+            );
+        } else {
+            println!("joined `{}` ({})", report.name, report.network_id);
+        }
+        if let Some(other) = &report.name_shared_with {
+            eprintln!(
+                "\nwarning: `{}` is also configured with a different secret, as {}.\n\
+                 A network is its name *and* its secret, so these two share nothing.\n\
+                 If that was a mistyped secret, `tsunagi network leave` removes one.",
+                report.name,
+                short(other, 10)
+            );
+        }
+        return Ok(());
+    }
+
+    // No agent: configure it, and say when it will take effect rather than
+    // leaving the impression that it is running.
+    let name = NetworkName::new(name)?;
+    let keys = tsunagi::identity::NetworkKeys::derive(&name, &secret);
+    let storage = tsunagi::storage::Storage::open(paths)?;
+    let existing = storage.list_networks().await.unwrap_or_default();
+    let already = existing
+        .iter()
+        .any(|other| other.network_id == keys.network_id());
+    let shared = existing
+        .iter()
+        .find(|other| other.name == name && other.network_id != keys.network_id())
+        .map(|other| other.network_id.to_string());
+    storage
+        .upsert_network(keys.network_id(), name.clone(), secret, true)
+        .await?;
+    storage.release_ownership_lock();
+
+    if already {
+        println!("`{name}` ({}) was already configured", keys.network_id());
+    } else {
+        println!("joined `{name}` ({})", keys.network_id());
+    }
+    if let Some(other) = shared {
+        eprintln!(
+            "\nwarning: `{name}` is also configured with a different secret, as {}.\n\
+             A network is its name *and* its secret, so these two share nothing.",
+            short(&other, 10)
+        );
+    }
+    eprintln!("\nNo agent is running here, so it starts with the next `tsunagi up`.");
+    Ok(())
 }
 
 /// Every configured network, live where an agent can say so.
@@ -1261,18 +1418,6 @@ async fn id(args: IdArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(IdAction::Key {
             action: Some(KeyAction::Rotate),
         }) => rotate_key(&paths, &socket).await,
-        Some(IdAction::Secret { action: None }) => show_secrets(&paths),
-        Some(IdAction::Secret {
-            action: Some(SecretAction::Generate),
-        }) => {
-            let secret = NetworkSecret::generate();
-            println!("{}", secret.encode().as_str());
-            eprintln!(
-                "\nShare this with every participant, over a channel you trust.\n\
-                 Anyone who has it can join the network."
-            );
-            Ok(())
-        }
     }
 }
 
@@ -1294,21 +1439,28 @@ async fn show_identity(
     ));
     out.push(device);
 
+    // What this device *is*, not what it belongs to. The networks are
+    // `tsunagi network`, and their secrets are asked for by name there:
+    // printing them in an overview put them in every pasted report.
     let networks = stored_networks(paths);
     let mut section = Section::new("networks");
-    if networks.is_empty() {
-        section.push(Row::new(Health::Info, "none", "no network has been joined"));
-    }
-    for network in &networks {
-        section.push(
-            Row::new(
-                Health::Info,
-                network.name.as_str(),
-                network.network_id.to_string(),
-            )
-            .with_note(format!("secret  {}", network.secret.encode().as_str())),
-        );
-    }
+    section.push(match networks.len() {
+        0 => Row::new(Health::Info, "none", "no network has been joined")
+            .with_note("`tsunagi network join --network <name> --secret <secret>` joins one"),
+        count => Row::new(
+            Health::Info,
+            "joined",
+            format!(
+                "{count} network(s): {}",
+                networks
+                    .iter()
+                    .map(|network| network.name.as_str().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .with_note("`tsunagi network` lists them with their ids and addresses"),
+    });
     out.push(section);
 
     print_report("tsunagi id", &out)
@@ -1408,14 +1560,30 @@ async fn rotate_key(
 }
 
 /// The secret of every network this device has joined.
-fn show_secrets(paths: &StoragePaths) -> Result<(), Box<dyn std::error::Error>> {
+fn show_secrets(
+    paths: &StoragePaths,
+    wanted: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let networks = stored_networks(paths);
     if networks.is_empty() {
         eprintln!("no network has been joined");
         return Ok(());
     }
-    for network in networks {
-        println!("{}  {}", network.name, network.secret.encode().as_str());
+    match wanted {
+        Some(wanted) => {
+            let network = resolve_network(&networks, wanted)?;
+            println!("{}", network.secret.encode().as_str());
+        }
+        None => {
+            for network in networks {
+                println!(
+                    "{}  {}  {}",
+                    network.name,
+                    network.network_id,
+                    network.secret.encode().as_str()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1720,7 +1888,7 @@ fn network_section(
             )
             .with_note(
                 "a network is its name *and* its secret, so these two share nothing. \
-                 Usually a mistyped secret; `tsunagi id secret` shows which is which.",
+                 Usually a mistyped secret; `tsunagi network secret` shows which is which.",
             ),
         );
     }
@@ -2515,7 +2683,34 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let agent = Agent::spawn(config).await?;
+    let agent = match Agent::spawn(config).await {
+        Ok(agent) => agent,
+        // One agent per identity, and the state directory is that identity.
+        // It can be in as many networks as you like — but only through the
+        // agent that is already running, so the lock on its own is an
+        // answer to a question nobody asked.
+        Err(tsunagi::Error::StateLocked { path }) => {
+            let socket = control_socket(&paths, args.control_socket.as_ref());
+            if socket.exists() {
+                return Err(format!(
+                    "an agent is already running for {}, and one state directory is one \
+                     agent.\n\n\
+                     To add `{name}` to it — same device, same interface, another network:\n\n  \
+                     tsunagi network join --network {name} --secret <secret>\n\n\
+                     To run a second, separate agent instead, give it everything of its \
+                     own:\n\n  \
+                     tsunagi up --state-dir <dir> --cache-dir <dir> --interface tsun1 \
+                     --ipv4-range <cidr> --network {name} --secret <secret>\n\n\
+                     That is a different identity with its own interface, not this one \
+                     with another network. `tsunagi network` lists what this one has.",
+                    path.display()
+                )
+                .into());
+            }
+            return Err(tsunagi::Error::StateLocked { path }.into());
+        }
+        Err(err) => return Err(err.into()),
+    };
     // From here on every exit goes through `agent.shutdown()`, so the endpoint
     // is never dropped without being closed.
     let mut events = agent.subscribe();

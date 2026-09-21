@@ -29,6 +29,12 @@ Keep these separate. Crossing them is the main thing to review for.
   protocols may be carrying traffic at once and none of them owns the thing
   they carry it for. A protocol is handed a routed packet and hands back a
   decrypted one; it never creates an interface and never picks an address.
+- **One state directory, one identity, one live agent — many networks.** A
+  network is added to the agent that is already running, never by starting a
+  second one on the same directory. A second agent is a second identity and
+  is isolated: its own directories, its own interface, its own runtime. Do
+  not add anything that lets two agents share a directory, and do not make a
+  network's lifetime depend on the process that happened to start it.
 - **A protocol is a separate crate with its own version.** The version peers
   compare is the *wire* version, never the software version: two peers on
   different releases work together for as long as the bytes between them

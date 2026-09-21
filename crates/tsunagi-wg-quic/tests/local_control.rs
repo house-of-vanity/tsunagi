@@ -243,6 +243,36 @@ impl tsunagi::ipc::unix::ReportSource for Control {
         Box::pin(async move { StatusReport::default() })
     }
 
+    fn join(
+        &self,
+        name: String,
+        secret: String,
+    ) -> BoxFuture<'_, Result<tsunagi::ipc::JoinedReport, String>> {
+        Box::pin(async move {
+            let name = tsunagi::identity::NetworkName::new(&name).map_err(|e| e.to_string())?;
+            let secret =
+                tsunagi::identity::NetworkSecret::decode(&secret).map_err(|e| e.to_string())?;
+            let already = self
+                .0
+                .list_networks()
+                .await
+                .map_err(|err| err.to_string())?
+                .iter()
+                .any(|other| other.name == name);
+            let network_id = self
+                .0
+                .join_network(&name, &secret)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(tsunagi::ipc::JoinedReport {
+                name: name.as_str().to_string(),
+                network_id: network_id.to_string(),
+                already_configured: already,
+                name_shared_with: None,
+            })
+        })
+    }
+
     fn leave(&self, network_id: String) -> BoxFuture<'_, Result<tsunagi::ipc::LeftReport, String>> {
         Box::pin(async move {
             let wanted: tsunagi::NetworkId = network_id.parse().map_err(|_| "not an id")?;
@@ -311,4 +341,64 @@ async fn a_client_can_leave_a_network_through_the_running_agent() {
     control.shutdown().await;
     agent.shutdown().await;
     peer.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_client_can_add_a_network_to_a_running_agent() {
+    // One agent per identity, and it may be in several networks at once —
+    // but the state directory belongs to that one live agent, so a second
+    // `up` cannot add a network to it. Without this there was no way at
+    // all: you could leave a network while running, but not join one.
+    let discovery = SharedMemoryDiscovery::new();
+    let (first, first_secret) = network("control-join-one");
+    let (second, second_secret) = network("control-join-two");
+
+    let dir = TempDir::new().unwrap();
+    let agent = Agent::spawn(config_with(dir.path(), &discovery))
+        .await
+        .unwrap();
+    agent.join_network(&first, &first_secret).await.unwrap();
+
+    let socket_path = dir.path().join("control.sock");
+    let control = ControlSocket::bind(&socket_path, Arc::new(Control(agent.clone())))
+        .await
+        .unwrap();
+
+    let report = tsunagi::ipc::unix::join_network(
+        &socket_path,
+        second.as_str(),
+        second_secret.encode().as_str(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.name, second.as_str());
+    assert!(!report.already_configured);
+
+    // Running, not merely written down: it is in the agent's own list and
+    // answering for status straight away, on the same identity.
+    let joined: tsunagi::NetworkId = report.network_id.parse().unwrap();
+    assert!(agent.is_active(joined).await);
+    assert_eq!(agent.list_networks().await.unwrap().len(), 2);
+    assert!(agent.network_status(joined).await.is_ok());
+
+    // Joining the same one again is not an error, and says which it was.
+    let again = tsunagi::ipc::unix::join_network(
+        &socket_path,
+        second.as_str(),
+        second_secret.encode().as_str(),
+    )
+    .await
+    .unwrap();
+    assert!(again.already_configured);
+    assert_eq!(again.network_id, report.network_id);
+
+    // A secret that is not one is refused rather than stored.
+    let err = tsunagi::ipc::unix::join_network(&socket_path, "rubbish", "not-a-secret")
+        .await
+        .unwrap_err();
+    assert!(!err.to_string().is_empty());
+    assert_eq!(agent.list_networks().await.unwrap().len(), 2);
+
+    control.shutdown().await;
+    agent.shutdown().await;
 }
