@@ -8,7 +8,7 @@
 //! # What this plugin does and does not know
 //!
 //! * It does **not** know where a peer is. It is handed a
-//!   [`PacketLink`](crate::dataplane::transport::PacketLink) per peer and runs
+//!   [`PacketLink`](tsunagi::dataplane::transport::PacketLink) per peer and runs
 //!   a WireGuard tunnel over it. Reachability, hole punching and relaying are
 //!   the transport's problem.
 //! * It does **not** know which addresses anybody holds, and owns no
@@ -34,17 +34,17 @@ use iroh::EndpointId;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::BoxFuture;
-use crate::dataplane::PacketSink;
-use crate::dataplane::transport::SharedLink;
-use crate::dataplane::{IpPlugin, PluginCapability, PluginContext, PluginError};
-use crate::identity::NetworkId;
+use tsunagi::BoxFuture;
+use tsunagi::dataplane::PacketSink;
+use tsunagi::dataplane::transport::SharedLink;
+use tsunagi::dataplane::{IpPlugin, PluginCapability, PluginContext, PluginError};
+use tsunagi::identity::NetworkId;
 
-use super::announcement::{ValidatedAnnouncement, WgAnnouncement};
-use super::device::{PeerSummary, WireguardDevice};
-use super::keys::{WgPublicKey, WgSecretKey};
-use super::store::WgKeyStore;
-use crate::state::Ipv4Range;
+use crate::announcement::{ValidatedAnnouncement, WgAnnouncement};
+use crate::device::{PeerSummary, WireguardDevice};
+use crate::keys::{WgPublicKey, WgSecretKey};
+use crate::store::WgKeyStore;
+use tsunagi::state::Ipv4Range;
 
 /// The protocol identifier this plugin announces.
 /// The protocol id of this plugin.
@@ -235,14 +235,14 @@ pub struct WireguardPlugin {
 
 impl WireguardPlugin {
     /// The settings this protocol accepts.
-    pub const OPTIONS: &'static [crate::dataplane::ProtocolOption] = &[
-        crate::dataplane::ProtocolOption {
+    pub const OPTIONS: &'static [tsunagi::dataplane::ProtocolOption] = &[
+        tsunagi::dataplane::ProtocolOption {
             key: "keepalive",
             value: "SECONDS",
             help: "keeps a tunnel and its link warm through a NAT; 0 turns it off",
             default: Some("25"),
         },
-        crate::dataplane::ProtocolOption {
+        tsunagi::dataplane::ProtocolOption {
             key: "mtu",
             value: "BYTES",
             help: "largest packet a tunnel will carry, at least 576",
@@ -470,7 +470,7 @@ impl Worker {
             Some(sink) => Arc::clone(sink),
             // Not attached to an agent: the protocol still runs, and its
             // packets have nowhere to go.
-            None => Arc::new(crate::dataplane::DiscardPackets) as Arc<dyn PacketSink>,
+            None => Arc::new(tsunagi::dataplane::DiscardPackets) as Arc<dyn PacketSink>,
         };
         let device = Arc::new(WireguardDevice::start(network, key, sink));
 
@@ -650,10 +650,10 @@ impl IpPlugin for WireguardPlugin {
     }
 
     fn protocol_version(&self) -> u16 {
-        super::announcement::ANNOUNCEMENT_VERSION
+        crate::announcement::ANNOUNCEMENT_VERSION
     }
 
-    fn options(&self) -> &'static [crate::dataplane::ProtocolOption] {
+    fn options(&self) -> &'static [tsunagi::dataplane::ProtocolOption] {
         Self::OPTIONS
     }
 
@@ -686,7 +686,7 @@ impl IpPlugin for WireguardPlugin {
         let announcement = WgAnnouncement::new(network, &state.key.public());
         Ok(Some(PluginCapability {
             protocol: WIREGUARD_PROTOCOL.to_string(),
-            version: super::announcement::ANNOUNCEMENT_VERSION,
+            version: crate::announcement::ANNOUNCEMENT_VERSION,
             enabled: true,
             data: announcement.encode()?,
         }))

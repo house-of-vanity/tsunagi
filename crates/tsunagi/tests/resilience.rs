@@ -3,18 +3,18 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{TestAgent, config_with, local_config, network, settle, wait_event, wait_for_peers};
 use iroh::{EndpointAddr, SecretKey};
 use tsunagi::agent::Event;
 use tsunagi::config::ReconnectPolicy;
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::NetworkKeys;
 use tsunagi::proto::ControlMessage;
+use tsunagi::testing::{
+    TestAgent, config_with, local_config, network, settle, wait_event, wait_for_peers,
+};
 use tsunagi::{Agent, Error};
 
 /// An endpoint id nobody is listening for, at an address nothing answers on.

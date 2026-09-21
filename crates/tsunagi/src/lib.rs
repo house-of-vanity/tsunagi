@@ -48,6 +48,8 @@ pub mod overlay;
 pub mod proto;
 pub mod state;
 pub mod storage;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use agent::{Agent, AgentStatus, Event, NetworkStatus, PeerStatus};
 pub use config::{AgentConfig, Limits, ReconnectPolicy, StoragePaths, TransportPolicy};

@@ -1,26 +1,26 @@
 //! What a WireGuard peer tells the network about itself.
 //!
 //! This is the opaque payload the control plane carries in a
-//! [`crate::dataplane::PluginCapability`]. The agent core never parses it —
+//! [`tsunagi::dataplane::PluginCapability`]. The agent core never parses it —
 //! only this module does, and only after bounding every field.
 //!
 //! The announcement is deliberately tiny: a participant says **who it is**,
 //! not **where it is**. Reachability is the data plane transport's job, and
 //! the transport already solves it — see
-//! [`crate::dataplane::transport`]. A plugin that also tried to advertise
+//! [`tsunagi::dataplane::transport`]. A plugin that also tried to advertise
 //! addresses would be reimplementing NAT traversal badly.
 
 use serde::{Deserialize, Serialize};
 
-use crate::dataplane::PluginError;
-use crate::identity::NetworkId;
+use tsunagi::dataplane::PluginError;
+use tsunagi::identity::NetworkId;
 
-use super::keys::WgPublicKey;
+use crate::keys::WgPublicKey;
 
 /// Version of the announcement format.
 ///
 /// Version 3 dropped the IPv4 range again: overlay addressing moved to the
-/// signed records in [`crate::state`], which carry the range and survive a
+/// signed records in [`tsunagi::state`], which carry the range and survive a
 /// participant being away. postcard is not self-describing, so an older peer
 /// cannot read a newer announcement; the mismatch is reported, not misparsed.
 pub const ANNOUNCEMENT_VERSION: u16 = 4;
@@ -122,7 +122,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
-    use crate::identity::{NetworkKeys, NetworkName, NetworkSecret};
+    use tsunagi::identity::{NetworkKeys, NetworkName, NetworkSecret};
 
     use super::super::keys::WgSecretKey;
 
@@ -237,7 +237,7 @@ mod tests {
         let peer = WgSecretKey::generate().public();
         let payload = WgAnnouncement::new(id, &peer).encode().unwrap();
         assert!(
-            payload.len() < crate::config::Limits::default().max_capability_data_len,
+            payload.len() < tsunagi::config::Limits::default().max_capability_data_len,
             "announcement is {} bytes",
             payload.len()
         );

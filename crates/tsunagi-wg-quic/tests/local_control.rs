@@ -6,19 +6,18 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{config_with, network, wait_for_peers, wait_until};
 use tempfile::TempDir;
 use tsunagi::dataplane::IpPlugin;
-use tsunagi::dataplane::wireguard::{MemoryTunFactory, WireguardConfig, WireguardPlugin};
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::ipc::unix::{ControlSocket, request_status};
 use tsunagi::ipc::{StatusReport, control_socket_path};
+use tsunagi::overlay::MemoryTunFactory;
+use tsunagi::testing::{config_with, network, wait_for_peers, wait_until};
 use tsunagi::{Agent, BoxFuture};
+use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 
 /// Builds the report the way the binary does, from the agent plus the plugin.
 fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::unix::ReportSource> {

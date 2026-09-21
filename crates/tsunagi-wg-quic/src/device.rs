@@ -39,11 +39,11 @@ use bytes::Bytes;
 use iroh::EndpointId;
 use tokio::task::JoinHandle;
 
-use crate::dataplane::transport::{SharedLink, TransportError};
-use crate::dataplane::{PacketSink, PluginError};
-use crate::identity::NetworkId;
+use tsunagi::dataplane::transport::{SharedLink, TransportError};
+use tsunagi::dataplane::{PacketSink, PluginError};
+use tsunagi::identity::NetworkId;
 
-use super::keys::{WgPublicKey, WgSecretKey};
+use crate::keys::{WgPublicKey, WgSecretKey};
 
 /// How often WireGuard's own timers are driven.
 ///

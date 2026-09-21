@@ -11,23 +11,21 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{config_with, network, wait_until};
 use tempfile::TempDir;
 use tsunagi::dataplane::IpPlugin;
-use tsunagi::dataplane::wireguard::{
-    Cidr, InterfaceState, LinkKind, ManagedTunFactory, MockHost, MockProvisioner, WireguardConfig,
-    WireguardPlugin,
-};
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::NetworkId;
+use tsunagi::overlay::{
+    Cidr, InterfaceState, LinkKind, ManagedTunFactory, MockHost, MockProvisioner,
+};
 use tsunagi::state::DEFAULT_IPV4_RANGE;
+use tsunagi::testing::{config_with, network, wait_until};
 use tsunagi::{Agent, NetworkStatus};
+use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 
 /// An agent whose overlay interface is applied to a pretend host.
 struct HostedAgent {

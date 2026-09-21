@@ -3,16 +3,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 use std::sync::Arc;
 
-use common::{TestAgent, local_config, network, settle, wait_for_peers};
 use tsunagi::Agent;
 use tsunagi::discovery::{
     CandidateSource, CompositeDiscovery, NetworkDiscovery, SharedMemoryDiscovery, StaticBootstrap,
 };
 use tsunagi::identity::NetworkKeys;
+use tsunagi::testing::{TestAgent, local_config, network, settle, wait_for_peers};
 
 #[tokio::test]
 async fn a_static_bootstrap_candidate_is_enough_to_join() {

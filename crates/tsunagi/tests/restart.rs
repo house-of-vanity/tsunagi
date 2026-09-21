@@ -2,13 +2,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
-use common::{TestAgent, config_with, network, settle, wait_event, wait_for_peers};
 use tsunagi::agent::Event;
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::{NetworkName, NetworkSecret};
 use tsunagi::proto::ControlMessage;
+use tsunagi::testing::{TestAgent, config_with, network, settle, wait_event, wait_for_peers};
 use tsunagi::{Agent, Error};
 
 #[tokio::test]

@@ -86,13 +86,13 @@ It prints its endpoint id and then waits. On the second machine, pass that id:
 Within a few seconds both print something like:
 
 ```text
-  + peer b47c958462 connected over Direct rtt=Some(4.5ms)
-  + data link to b47c958462 for wireguard: Direct via Ip(…), datagram 1382
+  + peer b47c958462 connected over direct rtt=Some(4.5ms)
+  + data link to b47c958462 for wg-quic: direct via 192.0.2.7:41234, datagram 1382
 
 --- status ---
 control: 1 peer(s), 0 dial failure(s), 0 handshake failure(s)
-wireguard: tsunkkcp43lmdje on fd15:1d9e:fa21:f201:…/64 mtu 1280, 1/1 tunnel(s) established
-  4jO4kx9Z fd15:1d9e:fa21:f201:… handshake 3s ago tx=0 rx=0 dropped=0 path=Direct via Ip(…)
+wg-quic: tsun0 on 10.13.37.69/24 mtu 1280, 1/1 tunnel(s) established
+  4jO4kx9Z 10.13.37.237 handshake 3s ago tx=0 rx=0 dropped=0 path=direct via 192.0.2.7:41234
 ```
 
 `1/1 tunnel(s) established` means a real WireGuard handshake completed.
@@ -384,7 +384,6 @@ tests:
 
 ```bash
 cargo run --example two_agents       # control plane only
-cargo run --example wireguard_mesh   # a WireGuard overlay carrying a real packet
 ```
 
 Both run with no privileges and change nothing on the host.
@@ -477,9 +476,9 @@ paths; tests always use temporary directories.
 | `state.sqlite` | device identity, network configuration, hostname | clear error, never reset |
 | `cache.sqlite` | address hints and other recoverable data          | discarded and recreated  |
 
-The WireGuard plugin keeps its own keys in its own `wireguard.sqlite`, wherever
-its configuration points, because plugin keys are neither the iroh identity nor
-the network secret.
+The `wg-quic` protocol keeps its own keys in its own store under `wg-quic/`,
+because a protocol's keys are neither the iroh identity nor the network
+secret.
 
 The command line agent puts everything under the platform's per-user
 directories by default; `--state-dir` and `--cache-dir` override them.

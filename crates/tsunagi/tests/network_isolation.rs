@@ -2,9 +2,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
-use common::{TestAgent, network, settle, wait_event, wait_for_peers};
 use iroh::endpoint::{PortmapperConfig, presets};
 use iroh::{Endpoint, RelayMode};
 use tsunagi::agent::Event;
@@ -16,6 +13,7 @@ use tsunagi::proto::message::{
 };
 use tsunagi::proto::{read_frame, write_frame};
 use tsunagi::test_support;
+use tsunagi::testing::{TestAgent, network, settle, wait_event, wait_for_peers};
 
 const LIMIT: usize = 64 * 1024;
 

@@ -1,0 +1,39 @@
+[package]
+name = "tsunagi-wg-quic"
+# Its own version, and deliberately separate from the wire version it
+# negotiates: a release here does not stop it talking to a peer on an older
+# build, because what peers compare is `ANNOUNCEMENT_VERSION`.
+version = "0.1.0"
+description = "The wg-quic protocol for tsunagi: WireGuard's cryptography carried in iroh's QUIC datagrams."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tsunagi = { path = "../tsunagi", version = "0.1.0" }
+iroh.workspace = true
+tokio.workspace = true
+serde.workspace = true
+postcard.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+data-encoding.workspace = true
+hex.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.11"
+hkdf = "0.13"
+subtle = "2.6"
+zeroize = { version = "1.9", features = ["derive"] }
+rand = "0.10"
+boringtun = { version = "0.7.1", default-features = false }
+
+[dev-dependencies]
+tsunagi = { path = "../tsunagi", features = ["testing"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

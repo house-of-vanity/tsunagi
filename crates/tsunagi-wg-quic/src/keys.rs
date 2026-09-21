@@ -11,7 +11,7 @@ use boringtun::x25519;
 use data_encoding::BASE64;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::dataplane::PluginError;
+use tsunagi::dataplane::PluginError;
 
 /// Length of a raw WireGuard key, in bytes.
 pub const KEY_LEN: usize = 32;

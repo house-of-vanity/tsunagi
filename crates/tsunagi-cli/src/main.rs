@@ -15,14 +15,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tsunagi::agent::Event;
 use tsunagi::config::{AgentConfig, StoragePaths, TransportPolicy};
 use tsunagi::dataplane::IpPlugin;
-use tsunagi::dataplane::wireguard::{
-    MemoryTunFactory, TunFactory, WireguardConfig, WireguardPlugin,
-};
 use tsunagi::discovery::{CompositeDiscovery, NetworkDiscovery, StaticBootstrap};
 use tsunagi::identity::{NetworkName, NetworkSecret};
 use tsunagi::iroh_types::EndpointAddr;
+use tsunagi::overlay::{MemoryTunFactory, TunFactory};
 use tsunagi::state::Ipv4Range;
 use tsunagi::{Agent, NetworkId};
+use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 
 /// A small agent for private mesh networks.
 #[derive(Debug, Parser)]
@@ -775,8 +774,8 @@ struct ProtocolSpec {
 
 /// Every protocol this build has.
 const PROTOCOLS: &[ProtocolSpec] = &[ProtocolSpec {
-    name: tsunagi::dataplane::wireguard::WIREGUARD_PROTOCOL,
-    version: tsunagi::dataplane::wireguard::ANNOUNCEMENT_VERSION,
+    name: tsunagi_wg_quic::WIREGUARD_PROTOCOL,
+    version: tsunagi_wg_quic::ANNOUNCEMENT_VERSION,
     summary: "WireGuard's cryptography carried in iroh's QUIC datagrams, so it \
               crosses NAT and survives where plain WireGuard is blocked",
     options: WireguardPlugin::OPTIONS,
@@ -1509,7 +1508,7 @@ fn host_section() -> report::Section {
             });
         }
 
-        use tsunagi::dataplane::wireguard::{Privilege, probe_net_admin};
+        use tsunagi::overlay::{Privilege, probe_net_admin};
         match probe_net_admin() {
             Privilege::Available => {
                 host.push(Row::new(Health::Good, "privileges", "CAP_NET_ADMIN held"));
@@ -2064,16 +2063,14 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             system_tun_factory()?
         };
-        let mtu = args
-            .mtu
-            .unwrap_or(tsunagi::dataplane::wireguard::DEFAULT_MTU);
+        let mtu = args.mtu.unwrap_or(tsunagi_wg_quic::DEFAULT_MTU);
         config = config.with_interface(tun_factory, args.interface.clone(), mtu);
     }
 
     for spec in &wanted {
         let options = settings_for(spec, &settings);
         match spec.name {
-            tsunagi::dataplane::wireguard::WIREGUARD_PROTOCOL => {
+            tsunagi_wg_quic::WIREGUARD_PROTOCOL => {
                 let mut wg = WireguardConfig::new(paths.state_dir.join("wg-quic"));
                 if let Some(mtu) = args.mtu {
                     wg = wg.with_mtu(mtu);
@@ -2381,7 +2378,7 @@ async fn stop_signal() -> &'static str {
 /// goes away.
 #[cfg(target_os = "linux")]
 fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
-    use tsunagi::dataplane::wireguard::{ManagedTunFactory, NetlinkProvisioner};
+    use tsunagi::overlay::{ManagedTunFactory, NetlinkProvisioner};
     let provisioner = NetlinkProvisioner::new()?;
     Ok(Arc::new(ManagedTunFactory::new(Arc::new(provisioner))))
 }

@@ -8,9 +8,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
-use common::{config_with, network, wait_until};
 use tempfile::TempDir;
 use tsunagi::Agent;
 use tsunagi::config::StoragePaths;
@@ -18,6 +15,7 @@ use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::{NetworkKeys, NetworkName, NetworkSecret};
 use tsunagi::state::{RecordBody, StateSet};
 use tsunagi::storage::StateStore;
+use tsunagi::testing::{config_with, network, wait_until};
 
 #[tokio::test]
 async fn a_changed_name_reaches_peers_and_replaces_the_old_claim() {

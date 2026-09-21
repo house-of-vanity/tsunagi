@@ -18,18 +18,31 @@ Design accordingly: a majority is not a root of trust.
 Keep these separate. Crossing them is the main thing to review for.
 
 - **Control plane vs data plane.** The separation is **logical, not physical**.
-  The control protocol in `crates/tsunagi/src/proto/` knows nothing about packets, and
-  `crates/tsunagi/src/dataplane/` knows nothing about the control protocol; either can be
-  replaced on its own. Both may ride on iroh — refusing to would throw away
-  iroh's NAT traversal and force the data plane to reimplement it. They use
-  different ALPNs and different connections, so a busy or broken data plane
-  cannot disturb control traffic.
+  The control protocol in `crates/tsunagi/src/proto/` knows nothing about
+  packets, and a protocol crate knows nothing about the control protocol;
+  either can be replaced on its own. Both may ride on iroh — refusing to
+  would throw away iroh's NAT traversal and force the data plane to
+  reimplement it. They use different ALPNs and different connections, so a
+  busy or broken data plane cannot disturb control traffic.
+- **One agent, one interface.** It belongs to the system level, along with
+  the addresses on it and the decision of whose packet is whose. Several
+  protocols may be carrying traffic at once and none of them owns the thing
+  they carry it for. A protocol is handed a routed packet and hands back a
+  decrypted one; it never creates an interface and never picks an address.
+- **A protocol is a separate crate with its own version.** The version peers
+  compare is the *wire* version, never the software version: two peers on
+  different releases work together for as long as the bytes between them
+  have not changed. Nothing negotiated may be derived from anything that
+  moves with a release.
+- **A protocol never sees the network secret.** It proves who is at the other
+  end of a tunnel; proving membership of a network stays in the core, which
+  is why the authenticated transport does too.
 - **Plugins never learn reachability.** An `IpPlugin` is handed a `PacketLink`
   per peer and moves datagrams over it. Addresses, hole punching and relays
   belong to `crates/tsunagi/src/dataplane/transport/`. A plugin announcement says *who*, never
   *where*.
 - **The core never parses a plugin payload.** See `crates/tsunagi/src/dataplane/mod.rs`. Only
-  `crates/tsunagi/src/dataplane/wireguard/announcement.rs` interprets WireGuard payloads, and
+  `crates/tsunagi-wg-quic/src/announcement.rs` interprets `wg-quic` payloads, and
   only after bounding every field. A data plane failure must never stop the
   control plane.
 - **Derived, not claimed.** A peer's overlay address is derived from its public
@@ -106,7 +119,10 @@ Keep these separate. Crossing them is the main thing to review for.
 | `crates/tsunagi/src/net.rs`        | iroh endpoint adapter and observability snapshots |
 | `crates/tsunagi/src/agent/`        | agent lifecycle, per-network runtimes, sessions, events, status |
 | `crates/tsunagi/src/state/`        | signed records that outlive a session, their merge rules and address allocation |
-| `crates/tsunagi/src/dataplane/`    | the plugin contract, the packet transport, and the WireGuard plugin |
+| `crates/tsunagi/src/overlay/`   | the one interface an agent owns: provisioning, the TUN, routing, source checks |
+| `crates/tsunagi/src/dataplane/` | the protocol contract and the authenticated packet transport |
+| `crates/tsunagi/src/dns/`       | the DNS view of a network: zone, server, resolver publication |
+| `crates/tsunagi-wg-quic/`       | the `wg-quic` protocol: its keys, its announcement, its tunnels |
 | `crates/tsunagi-cli/` | the command line agent; the only place that owns a runtime, a logger and signals |
 | `tests/`            | integration tests; `tests/common/` is the shared harness |
 

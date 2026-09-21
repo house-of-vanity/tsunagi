@@ -3,16 +3,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use common::{TestAgent, network, wait_event, wait_for_peers, wait_until};
 use tsunagi::agent::Event;
 use tsunagi::dataplane::TestCapabilityPlugin;
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::proto::ControlMessage;
+use tsunagi::testing::{TestAgent, network, wait_event, wait_for_peers, wait_until};
 
 #[tokio::test]
 async fn four_agents_form_a_mesh_and_exchange_distinguishable_messages() {

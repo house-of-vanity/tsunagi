@@ -17,10 +17,10 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::dataplane::PluginError;
-use crate::identity::NetworkId;
+use tsunagi::dataplane::PluginError;
+use tsunagi::identity::NetworkId;
 
-use super::keys::{KEY_LEN, WgSecretKey};
+use crate::keys::{KEY_LEN, WgSecretKey};
 
 /// Schema version written by this build.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -37,14 +37,14 @@ impl WgKeyStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PluginError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            crate::storage::create_dir(parent)
+            tsunagi::storage::create_dir(parent)
                 .map_err(|err| PluginError::Other(format!("cannot create {parent:?}: {err}")))?;
         }
         let existed = path.exists();
         let conn = Connection::open(&path).map_err(|err| {
             PluginError::Other(format!("cannot open the WireGuard key store: {err}"))
         })?;
-        crate::storage::restrict_path_permissions(&path)
+        tsunagi::storage::restrict_path_permissions(&path)
             .map_err(|err| PluginError::Other(format!("cannot secure the key store: {err}")))?;
 
         conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -169,7 +169,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
-    use crate::identity::{NetworkKeys, NetworkName, NetworkSecret};
+    use tsunagi::identity::{NetworkKeys, NetworkName, NetworkSecret};
 
     fn network(name: &str) -> NetworkId {
         NetworkKeys::derive(

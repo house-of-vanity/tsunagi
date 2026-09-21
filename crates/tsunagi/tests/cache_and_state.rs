@@ -2,14 +2,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 use std::io::Write;
 
-use common::{TestAgent, config_with, local_config, network, wait_for_peers};
 use tsunagi::config::StoragePaths;
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::storage::CacheOutcome;
+use tsunagi::testing::{TestAgent, config_with, local_config, network, wait_for_peers};
 use tsunagi::{Agent, Error};
 
 /// Overwrites a file with bytes that are definitely not a SQLite database.

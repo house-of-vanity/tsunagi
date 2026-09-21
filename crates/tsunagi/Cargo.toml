@@ -18,6 +18,9 @@ tun-device = ["dep:tun", "dep:rtnetlink", "dep:caps", "dep:futures-util"]
 # Telling the operating system where to send its DNS questions. Linux only
 # for now; the zone and the server work without it.
 dns-publish = ["dep:zbus"]
+# The test harness in `testing`, for this crate's own tests and for a
+# protocol crate's. Not on by default: it is only of use to a test.
+testing = ["dep:tempfile", "dep:tracing-subscriber"]
 
 [dependencies]
 iroh.workspace = true
@@ -50,8 +53,10 @@ directories = "6.0"
 # forbidden `unsafe` and will not make one.
 gethostname = "1.1"
 netwatch = "0.19.3"
-boringtun = { version = "0.7.1", default-features = false }
 tun = { version = "0.8", features = ["async"], optional = true }
+# Only for the `testing` harness, which a protocol crate's tests use too.
+tempfile = { version = "3.24", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Linux-only interface provisioning. `rtnetlink` configures the interface in
 # process, so no `ip` invocation is ever needed; `caps` keeps CAP_NET_ADMIN
@@ -65,6 +70,8 @@ caps = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
+# Its own tests use the harness it publishes.
+tsunagi = { path = ".", features = ["testing"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true

@@ -56,8 +56,13 @@ fn restrict_permissions(_file: &std::fs::File, _path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Restricts a file to the user that owns it.
+///
+/// Part of what the system level offers a protocol: a plugin keeping keys of
+/// its own on disk has the same obligation as the agent, and should not have
+/// to work out the platform details again to meet it.
 #[cfg(unix)]
-pub(crate) fn restrict_path_permissions(path: &Path) -> Result<()> {
+pub fn restrict_path_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
         Error::Io {
@@ -67,13 +72,15 @@ pub(crate) fn restrict_path_permissions(path: &Path) -> Result<()> {
     })
 }
 
+/// Restricts a file to the user that owns it. A no-op off Unix.
 #[cfg(not(unix))]
-pub(crate) fn restrict_path_permissions(_path: &Path) -> Result<()> {
+pub fn restrict_path_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Restricts a directory to the user that owns it.
 #[cfg(unix)]
-pub(crate) fn restrict_dir_permissions(path: &Path) -> Result<()> {
+pub fn restrict_dir_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
         Error::Io {
@@ -83,12 +90,14 @@ pub(crate) fn restrict_dir_permissions(path: &Path) -> Result<()> {
     })
 }
 
+/// Restricts a directory to the user that owns it. A no-op off Unix.
 #[cfg(not(unix))]
-pub(crate) fn restrict_dir_permissions(_path: &Path) -> Result<()> {
+pub fn restrict_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn create_dir(path: &Path) -> Result<()> {
+/// Creates a directory and every parent, restricted to this user.
+pub fn create_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,

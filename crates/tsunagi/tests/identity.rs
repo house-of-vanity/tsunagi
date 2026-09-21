@@ -5,12 +5,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
-use common::{TestAgent, config_with, network};
 use tsunagi::Agent;
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::{NetworkKeys, NetworkName, NetworkSecret};
+use tsunagi::testing::{TestAgent, config_with, network};
 
 #[test]
 fn derivation_is_a_pure_function_of_name_and_secret() {

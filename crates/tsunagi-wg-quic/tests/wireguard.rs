@@ -8,25 +8,24 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::{config_with, network, settle, wait_event, wait_for_peers, wait_until};
 use iroh::EndpointId;
 use tempfile::TempDir;
 use tsunagi::agent::Event;
 use tsunagi::dataplane::IpPlugin;
-use tsunagi::dataplane::wireguard::{
-    Ipv4Range, MemoryTun, MemoryTunFactory, WIREGUARD_PROTOCOL, WgAnnouncement, WgSecretKey,
-    WireguardConfig, WireguardPlugin,
-};
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::{NetworkId, NetworkName, NetworkSecret};
+use tsunagi::overlay::{MemoryTun, MemoryTunFactory};
+use tsunagi::state::Ipv4Range;
+use tsunagi::testing::{config_with, network, settle, wait_event, wait_for_peers, wait_until};
 use tsunagi::{Agent, NetworkStatus};
+use tsunagi_wg_quic::{
+    WIREGUARD_PROTOCOL, WgAnnouncement, WgSecretKey, WireguardConfig, WireguardPlugin,
+};
 
 /// An agent with a WireGuard plugin backed by an in-memory packet interface.
 struct WgAgent {
@@ -217,7 +216,7 @@ async fn two_agents_carry_real_ip_packets_through_a_wireguard_tunnel() {
     let payload = b"hello over the overlay";
     tun_a.push_from_os(ipv4_packet(addr_a, addr_b, payload));
 
-    let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
+    let received = tokio::time::timeout(tsunagi::testing::DEADLINE, tun_b.pop_to_os())
         .await
         .expect("the packet should arrive")
         .expect("the interface should still be open");
@@ -227,7 +226,7 @@ async fn two_agents_carry_real_ip_packets_through_a_wireguard_tunnel() {
 
     // And back the other way.
     tun_b.push_from_os(ipv4_packet(addr_b, addr_a, b"and back"));
-    let back = tokio::time::timeout(common::DEADLINE, tun_a.pop_to_os())
+    let back = tokio::time::timeout(tsunagi::testing::DEADLINE, tun_a.pop_to_os())
         .await
         .expect("the reply should arrive")
         .unwrap();
@@ -281,7 +280,7 @@ async fn a_peer_cannot_send_from_an_address_it_does_not_own() {
 
     // A legitimate packet still goes through, so the tunnel is not broken.
     tun_a.push_from_os(ipv4_packet(addr_a, addr_b, b"honest"));
-    let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
+    let received = tokio::time::timeout(tsunagi::testing::DEADLINE, tun_b.pop_to_os())
         .await
         .expect("the honest packet should arrive")
         .unwrap();
@@ -327,7 +326,7 @@ async fn the_overlay_uses_a_range_the_network_was_told_to_use() {
 
     // A real IPv4 packet through the same tunnel.
     tun_a.push_from_os(ipv4_packet(v4_a, v4_b, b"ipv4 over the overlay"));
-    let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
+    let received = tokio::time::timeout(tsunagi::testing::DEADLINE, tun_b.pop_to_os())
         .await
         .expect("the IPv4 packet should arrive")
         .unwrap();
@@ -379,7 +378,7 @@ async fn an_ipv4_source_a_peer_does_not_own_is_dropped() {
 
     // The honest one still gets through.
     tun_a.push_from_os(ipv4_packet(v4_a, v4_b, b"honest v4"));
-    let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
+    let received = tokio::time::timeout(tsunagi::testing::DEADLINE, tun_b.pop_to_os())
         .await
         .expect("the honest packet should arrive")
         .unwrap();
@@ -669,10 +668,13 @@ async fn a_mesh_of_three_establishes_every_tunnel() {
     a.tun(network_id)
         .await
         .push_from_os(ipv4_packet(addr_a, addr_c, b"a to c"));
-    let received = tokio::time::timeout(common::DEADLINE, c.tun(network_id).await.pop_to_os())
-        .await
-        .expect("the packet should arrive")
-        .unwrap();
+    let received = tokio::time::timeout(
+        tsunagi::testing::DEADLINE,
+        c.tun(network_id).await.pop_to_os(),
+    )
+    .await
+    .expect("the packet should arrive")
+    .unwrap();
     assert_eq!(&received[20..], b"a to c");
 
     a.shutdown().await;
@@ -773,10 +775,13 @@ async fn two_networks_share_one_interface_with_keys_and_ranges_of_their_own() {
     hub.tun(alpha)
         .await
         .push_from_os(ipv4_packet(hub_alpha, left_addr, b"alpha only"));
-    let seen = tokio::time::timeout(common::DEADLINE, left.tun(alpha).await.pop_to_os())
-        .await
-        .expect("the packet should arrive")
-        .unwrap();
+    let seen = tokio::time::timeout(
+        tsunagi::testing::DEADLINE,
+        left.tun(alpha).await.pop_to_os(),
+    )
+    .await
+    .expect("the packet should arrive")
+    .unwrap();
     assert_eq!(&seen[20..], b"alpha only");
     assert!(
         tokio::time::timeout(
@@ -1062,7 +1067,7 @@ impl IpPlugin for FromTheFuture {
     }
 
     fn protocol_version(&self) -> u16 {
-        tsunagi::dataplane::wireguard::ANNOUNCEMENT_VERSION + 1
+        tsunagi_wg_quic::ANNOUNCEMENT_VERSION + 1
     }
 
     fn local_capability(
@@ -1105,7 +1110,7 @@ impl IpPlugin for ForgingPlugin {
     /// The same version, so the announcement is looked at rather than
     /// dismissed for the wrong reason.
     fn protocol_version(&self) -> u16 {
-        tsunagi::dataplane::wireguard::ANNOUNCEMENT_VERSION
+        tsunagi_wg_quic::ANNOUNCEMENT_VERSION
     }
 
     fn local_capability(
@@ -1120,7 +1125,7 @@ impl IpPlugin for ForgingPlugin {
             protocol: WIREGUARD_PROTOCOL.to_string(),
             // The version it actually speaks, so the payload is examined
             // rather than set aside for the wrong reason.
-            version: tsunagi::dataplane::wireguard::ANNOUNCEMENT_VERSION,
+            version: tsunagi_wg_quic::ANNOUNCEMENT_VERSION,
             enabled: true,
             data,
         }))
@@ -1141,7 +1146,7 @@ impl IpPlugin for ForgingPlugin {
 
 #[tokio::test]
 async fn an_mtu_below_what_ipv4_guarantees_is_refused() {
-    use tsunagi::dataplane::wireguard::{DEFAULT_MTU, MIN_MTU, WIREGUARD_OVERHEAD};
+    use tsunagi_wg_quic::{DEFAULT_MTU, MIN_MTU, WIREGUARD_OVERHEAD};
 
     // 576 bytes is what every IPv4 host must be able to reassemble, so
     // nothing below it is worth offering. The floor used to be 1280 for

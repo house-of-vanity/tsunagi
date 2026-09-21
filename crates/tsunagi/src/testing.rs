@@ -1,26 +1,31 @@
-//! Shared helpers for the integration tests.
+//! A harness for testing against a real agent.
 //!
-//! Every test uses real iroh endpoints on loopback, its own temporary SQLite
-//! files and independent agent instances. Only discovery is substituted; iroh,
-//! the handshake, message passing and persistent storage are not.
+//! Behind the `testing` feature, because it is only of use to a test and
+//! pulls in `tempfile` and a tracing subscriber. It lives here rather than
+//! being copied into each crate's `tests/` directory: a protocol plugin in
+//! its own crate needs exactly the same harness, and two copies of it would
+//! drift.
 //!
-//! Synchronisation is always "wait for a specific event or condition, under one
-//! overall deadline", never a fixed multi-second sleep.
+//! Everything here builds agents that touch nothing outside a temporary
+//! directory: loopback only, no relay, no address publication.
 
-#![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// A harness fails a test loudly and at once; that is the whole job. The
+// crate forbids these elsewhere for the opposite reason — nothing off the
+// network may panic — and this module never sees anything off the network.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::agent::Event;
+use crate::config::{AgentConfig, StoragePaths, TransportPolicy};
+use crate::discovery::SharedMemoryDiscovery;
+use crate::identity::{NetworkName, NetworkSecret};
+use crate::{Agent, Result};
 use tempfile::TempDir;
 use tokio::sync::broadcast::error::RecvError;
-use tsunagi::agent::Event;
-use tsunagi::config::{AgentConfig, StoragePaths, TransportPolicy};
-use tsunagi::discovery::SharedMemoryDiscovery;
-use tsunagi::identity::{NetworkName, NetworkSecret};
-use tsunagi::{Agent, Result};
 
 /// Installs a tracing subscriber when `TSUNAGI_TEST_LOG` is set.
 ///
@@ -50,7 +55,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// port mapping, so the suite needs neither the internet nor privileges.
 /// Timeouts are shortened so that failure paths finish quickly.
 pub fn local_config(dir: &Path) -> AgentConfig {
-    let limits = tsunagi::Limits {
+    let limits = crate::Limits {
         dial_timeout: Duration::from_millis(1500),
         handshake_timeout: Duration::from_secs(5),
         ..Default::default()
@@ -69,7 +74,9 @@ pub fn config_with(dir: &Path, discovery: &SharedMemoryDiscovery) -> AgentConfig
 
 /// A temporary directory plus the agent running on it.
 pub struct TestAgent {
+    /// The directory it keeps its state in, removed when this is dropped.
     pub dir: TempDir,
+    /// The agent itself.
     pub agent: Agent,
 }
 
@@ -170,7 +177,7 @@ pub async fn settle() {
 /// Waits until `agent` has `count` authenticated peers in `network`.
 pub async fn wait_for_peers(
     agent: &Agent,
-    network: tsunagi::NetworkId,
+    network: crate::NetworkId,
     count: usize,
 ) -> Vec<iroh::EndpointId> {
     wait_until(&format!("{count} peers in {network}"), || async move {

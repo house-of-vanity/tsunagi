@@ -3821,7 +3821,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tsunagi"
 version = "0.1.0"
 dependencies = [
- "boringtun",
  "bytes",
  "caps",
  "data-encoding",
@@ -3848,6 +3847,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tsunagi",
  "tun",
  "zbus",
  "zeroize",
@@ -3868,6 +3868,32 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tsunagi",
+ "tsunagi-wg-quic",
+]
+
+[[package]]
+name = "tsunagi-wg-quic"
+version = "0.1.0"
+dependencies = [
+ "boringtun",
+ "bytes",
+ "data-encoding",
+ "hex",
+ "hkdf",
+ "iroh",
+ "postcard",
+ "rand 0.10.3",
+ "rusqlite",
+ "serde",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tsunagi",
+ "zeroize",
 ]
 
 [[package]]

@@ -8,9 +8,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
-use common::{TestAgent, network, settle, wait_event};
 use iroh::endpoint::{Connection, PortmapperConfig, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use tsunagi::agent::Event;
@@ -22,6 +19,7 @@ use tsunagi::proto::message::{
 };
 use tsunagi::proto::{read_frame, write_frame};
 use tsunagi::test_support;
+use tsunagi::testing::{TestAgent, network, settle, wait_event};
 
 /// A bare iroh endpoint with no tsunagi agent behind it.
 async fn raw_endpoint() -> Endpoint {

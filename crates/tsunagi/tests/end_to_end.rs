@@ -3,12 +3,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-mod common;
-
-use common::{TestAgent, network, wait_event, wait_for_peers};
 use tsunagi::agent::Event;
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::proto::ControlMessage;
+use tsunagi::testing::{TestAgent, network, wait_event, wait_for_peers};
 
 #[tokio::test]
 async fn two_agents_authenticate_and_exchange_messages() {
