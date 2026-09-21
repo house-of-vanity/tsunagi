@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 use simple_dns::rdata::{A, PTR, RData, SOA};
 use simple_dns::{Name, PacketFlag, QCLASS, QTYPE, RCODE, ResourceRecord, TYPE};
 
-use super::zone::{Answer, Query, Zone};
+use super::zone::{Answer, Query, Zone, Zones};
 
 /// How long an answer may be cached.
 ///
@@ -39,30 +39,35 @@ const TCP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How many TCP questions may be in flight at once.
 const MAX_TCP_CONNECTIONS: usize = 32;
 
-/// The zone the server answers from, swapped as the roster changes.
+/// The zones the server answers from, swapped as the rosters change.
 ///
-/// Shared rather than copied into the server so that a roster change is one
-/// write, not a restart: rebinding the socket would drop questions in flight
-/// for no reason.
-#[derive(Debug, Clone)]
-pub struct SharedZone(Arc<RwLock<Arc<Zone>>>);
+/// Shared rather than copied into the server so that a roster change — or a
+/// network joining or leaving — is one write, not a restart: rebinding the
+/// socket would drop questions in flight for no reason.
+#[derive(Debug, Clone, Default)]
+pub struct SharedZone(Arc<RwLock<Arc<Zones>>>);
 
 impl SharedZone {
-    /// Wraps a zone.
-    pub fn new(zone: Zone) -> Self {
-        Self(Arc::new(RwLock::new(Arc::new(zone))))
+    /// Wraps a set of zones.
+    pub fn new(zones: Zones) -> Self {
+        Self(Arc::new(RwLock::new(Arc::new(zones))))
     }
 
-    /// Replaces it.
-    pub fn set(&self, zone: Zone) {
+    /// Wraps a single zone, which is the common case in a test.
+    pub fn one(zone: Zone) -> Self {
+        Self::new(Zones::new([zone]))
+    }
+
+    /// Replaces them.
+    pub fn set(&self, zones: Zones) {
         match self.0.write() {
-            Ok(mut guard) => *guard = Arc::new(zone),
-            Err(poisoned) => *poisoned.into_inner() = Arc::new(zone),
+            Ok(mut guard) => *guard = Arc::new(zones),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(zones),
         }
     }
 
-    /// The zone as it is now.
-    pub fn get(&self) -> Arc<Zone> {
+    /// The zones as they are now.
+    pub fn get(&self) -> Arc<Zones> {
         match self.0.read() {
             Ok(guard) => Arc::clone(&guard),
             Err(poisoned) => Arc::clone(&poisoned.into_inner()),
@@ -75,7 +80,7 @@ impl SharedZone {
 /// `None` means say nothing at all: the message was not a question this
 /// server should reply to, and replying anyway would make this a useful
 /// amplifier for somebody spoofing a source address.
-pub fn respond(zone: &Zone, query: &[u8]) -> Option<Vec<u8>> {
+pub fn respond(zones: &Zones, query: &[u8]) -> Option<Vec<u8>> {
     let packet = simple_dns::Packet::parse(query).ok()?;
     if packet.has_flags(PacketFlag::RESPONSE) {
         return None;
@@ -105,7 +110,16 @@ pub fn respond(zone: &Zone, query: &[u8]) -> Option<Vec<u8>> {
     }
 
     let qname = question.qname.to_string();
-    let answer = zone.lookup(&qname, query_kind(question.qtype));
+    // Which zone answers is part of the answer: a denial is bounded by the
+    // SOA of the zone that denied it, and this server may hold several.
+    let (zone, answer) = match zones.lookup(&qname, query_kind(question.qtype)) {
+        Some(answered) => answered,
+        None => {
+            reply.questions.push(question.clone());
+            *reply.rcode_mut() = RCODE::Refused;
+            return reply.build_bytes_vec_compressed().ok();
+        }
+    };
     reply.questions.push(question.clone());
 
     let name = Name::new(&qname).ok()?;
@@ -338,7 +352,11 @@ mod tests {
     use crate::dns::zone::ZoneName;
     use std::net::Ipv4Addr;
 
-    fn zone() -> Zone {
+    fn zone() -> Zones {
+        Zones::new([one_zone()])
+    }
+
+    fn one_zone() -> Zone {
         Zone::new(
             ZoneName::new("lab").unwrap(),
             [
@@ -468,7 +486,7 @@ mod tests {
         let many: Vec<(String, Ipv4Addr)> = (0..200)
             .map(|i| ("host".to_string(), Ipv4Addr::new(10, 13, 37, i as u8)))
             .collect();
-        let wide = Zone::new(ZoneName::new("lab").unwrap(), many);
+        let wide = Zones::new([Zone::new(ZoneName::new("lab").unwrap(), many)]);
         let query = ask("host.lab", TYPE::A);
         let full = respond(&wide, &query).unwrap();
         assert!(
@@ -525,7 +543,7 @@ mod tests {
         // answer the same thing. Answering one family only leaves the other
         // timing out, which looks like a broken overlay.
         let shared = SharedZone::new(zone());
-        let plan = crate::dns::listen_plan(None, 0);
+        let plan = crate::dns::listen_plan(0);
         let mut answered = 0;
 
         for family in plan.families() {
@@ -575,7 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn replacing_the_zone_changes_what_the_running_server_answers() {
-        let shared = SharedZone::new(Zone::new(ZoneName::new("lab").unwrap(), []));
+        let shared = SharedZone::one(Zone::new(ZoneName::new("lab").unwrap(), []));
         let server = DnsServer::bind("127.0.0.1:0".parse().unwrap(), shared.clone())
             .await
             .unwrap();

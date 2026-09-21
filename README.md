@@ -127,17 +127,20 @@ ping  100.65.243.53
 
 `tx` and `rx` in the status should start moving.
 
-IPv6 works out of the box: each member's address is derived from the network
-id and collides with essentially nothing.
-
-**IPv4 addresses are allocated and then remembered.** The default range is
+**Addresses are allocated and then remembered.** The default range is
 `10.13.37.0/24`; the first member to join settles it and later members adopt
 what they find, so `--ipv4-range` only matters for whoever starts the network:
 
 ```bash
 tsunagi up --network lab --secret "$SECRET"  --ipv4-range 10.44.0.0/16
-tsunagi up --network lab --secret "$SECRET"  --ipv4-range none   # IPv6 only
+tsunagi up --network lab --secret "$SECRET"  --ipv4-range none   # no data plane
 ```
+
+One agent has one interface, so two of its networks cannot both use that
+range. The second takes the range **derived from its own network id**: not
+picked locally — every member derives the same one from something they all
+already have — so it is an agreement rather than a guess, and a device in
+several networks gets an address in each.
 
 An address is claimed with a record signed by that member's persistent device
 key, stored, and merged between every replica. A member that disappears for a
@@ -187,24 +190,35 @@ session with no agreed protocol.
 
 ## Names
 
-`--dns` serves a local DNS zone for the network's members, so they can be
-reached by name instead of by address:
+`--dns` serves a local DNS zone for **every network this device is in**,
+each named after the network, so members can be reached by name instead of
+by address:
 
 ```bash
 tsunagi up --network lab --secret "$SECRET" --dns
-dig @10.13.37.69 -p 5354 music.lab
+dig @127.0.0.1 -p 5354 music.lab
 ```
+
+It is remembered with the device rather than with the command line: once on
+it stays on across restarts, and `tsunagi dns off` is what turns it off. A
+resolver that quietly disappears because a flag was not retyped is worse
+than none, because the names simply stop working. `tsunagi dns on` also
+turns it on for an agent that is already running, without restarting it.
+
+The zone of a network is its name — `--dns-zone` is gone, because with
+several networks there is no single zone to name. A network name may contain
+dots, so `--network lab.internal` is how you get `music.lab.internal`.
 
 Names come from signed state, which is the point: **a member that is
 switched off still resolves**, because its claim outlived the session.
 
 The answers are IPv4 addresses, because that is what the overlay is. The
-*questions* are taken over both families, on UDP and TCP: the server listens
-on the overlay address and on `127.0.0.1`, and on `[::1]` for IPv6, so a
-resolver reaches it over whichever it uses. All of those are published to
-the system resolver together. A listening address is disposable — unlike an
-address a member holds in signed state — so serving one family over the
-overlay and the other over loopback costs nothing.
+*questions* are taken on `127.0.0.1` and `[::1]`, over UDP and TCP, so a
+resolver reaches it over whichever family it uses; both are published to the
+system resolver together. Loopback and nothing else: the zones are a view
+for the host running the agent, and binding an overlay address would put
+them in front of the whole mesh — an agent in two networks would then answer
+one network's questions about the other's names.
 
 The zone is the network name unless `--dns-zone` says otherwise. It is
 yours to choose, so a name that shadows a real public domain is reported and
@@ -309,11 +323,39 @@ tsunagi id key rotate           replace that key
 
 tsunagi network                 the networks this device belongs to
 tsunagi network join -n lab -s tsn1…   join one; adds it to a running agent
+tsunagi network join -n lab     join one whose secret this device already has
 tsunagi network leave <id>      give up the address and name, then forget it
 tsunagi network secret          the secret of each joined network
 tsunagi network secret <id>     just that one, for copying
 tsunagi network secret generate a fresh secret for a network that does not exist yet
+
+tsunagi dns                     whether the local resolver is serving, and what
+tsunagi dns on                  start it, now and after every restart
+tsunagi dns off                 stop it, now and after every restart
 ```
+
+**A network without a secret makes one.** `tsunagi up --network lab` with no
+`--secret` resolves in the obvious way: if this device is already in exactly
+one network called `lab`, that one — so the name alone resumes what you have;
+if it is in none, a fresh random secret, printed in full along with the one
+line to send the others:
+
+```
+tsunagi is up
+  network      lab (k2on43wadb…)
+  secret       tsn1u7c…
+
+No --peer was given, so this agent waits to be contacted. Run this on the
+other machine:
+
+  tsunagi up --network lab --secret tsn1u7c… --peer 91e83a6e2b7a…
+```
+
+That is the ad-hoc case: one person makes a network and sends the command
+round. The secret is printed *only* when the agent invented it — there is
+nowhere else to read it from — and never when it was supplied, because then
+it is already yours. Two networks of one name and no secret is the one case
+with no answer, and it says so instead of choosing.
 
 A secret is printed by `network secret` and nowhere else — not by `id`, not
 by `status`, not in a log, a `Debug` rendering or anything sent to a peer.

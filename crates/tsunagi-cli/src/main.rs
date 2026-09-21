@@ -53,8 +53,35 @@ enum Command {
     Protocols,
     /// Shows the networks this device belongs to, and leaves them.
     Network(NetworkArgs),
+    /// Shows the local resolver, and turns it on or off.
+    Dns(DnsArgs),
     /// Removes everything this device has stored and starts over.
     Wipe(WipeArgs),
+}
+
+#[derive(Debug, Args)]
+struct DnsArgs {
+    #[command(flatten)]
+    paths: PathArgs,
+
+    /// Control socket to talk to. Derived from the state directory by default.
+    #[arg(long, global = true)]
+    control_socket: Option<PathBuf>,
+
+    #[command(subcommand)]
+    action: Option<DnsAction>,
+}
+
+#[derive(Debug, Subcommand)]
+enum DnsAction {
+    /// Starts serving, now and after every restart.
+    On {
+        /// Port to listen on, on loopback of both families.
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
+    },
+    /// Stops serving, now and after every restart.
+    Off,
 }
 
 #[derive(Debug, Args)]
@@ -357,22 +384,23 @@ struct UpArgs {
     #[arg(long, value_name = "CIDR", help_heading = "System")]
     ipv4_range: Option<String>,
 
-    /// Serve a local DNS zone for this network's members.
+    /// Serve a local DNS zone for every network this device is in.
     ///
-    /// Members resolve as `<hostname>.<zone>`, from signed state, so a
-    /// member that is switched off still resolves. The answers are the
-    /// overlay's IPv4 addresses; questions are taken over both IPv4 and
-    /// IPv6, on UDP and TCP.
+    /// Each network becomes a zone named after it, and its members resolve
+    /// as `<hostname>.<network>` from signed state, so a member that is
+    /// switched off still resolves. Answers are the overlay's IPv4
+    /// addresses; questions are taken on loopback of both families, over
+    /// UDP and TCP.
+    ///
+    /// Remembered: once on it stays on, and `tsunagi dns off` turns it off.
     #[arg(long, help_heading = "System")]
     dns: bool,
 
-    /// The zone to answer for. Defaults to the network name.
-    #[arg(long, value_name = "NAME", help_heading = "System")]
-    dns_zone: Option<String>,
-
-    /// Port for the local DNS server, on every address it listens on.
-    #[arg(long, default_value_t = 5354, help_heading = "System")]
-    dns_port: u16,
+    /// Port for the local DNS server, on loopback of both families.
+    ///
+    /// Remembered with the setting, so it needs giving only when changing.
+    #[arg(long, value_name = "PORT", help_heading = "System")]
+    dns_port: Option<u16>,
 
     /// How often to print a status summary, in seconds. Zero disables it.
     #[arg(long, default_value_t = 15)]
@@ -401,6 +429,115 @@ fn load_secret(
     match NetworkSecret::decode(text) {
         Ok(secret) => Ok(secret),
         Err(_) => Ok(NetworkSecret::from_bytes(text.as_bytes().to_vec())?),
+    }
+}
+
+/// Port the local resolver listens on unless told otherwise.
+const DEFAULT_DNS_PORT: u16 = 5354;
+
+/// Settings key: whether the local resolver is wanted.
+const DNS_ENABLED: &str = "dns.enabled";
+/// Settings key: which port it listens on.
+const DNS_PORT: &str = "dns.port";
+
+/// Whether the local resolver is on, and on which port.
+///
+/// Stored with the device rather than passed on every start: a resolver
+/// that quietly goes away when a command line is retyped is worse than no
+/// resolver at all, because the names simply stop working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DnsSetting {
+    enabled: bool,
+    port: u16,
+}
+
+impl Default for DnsSetting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: DEFAULT_DNS_PORT,
+        }
+    }
+}
+
+/// Reads the stored resolver setting. Read-only, so it needs no lock.
+fn dns_setting(paths: &StoragePaths) -> DnsSetting {
+    let Ok(store) = tsunagi::storage::StateStore::open(paths.state_db()) else {
+        return DnsSetting::default();
+    };
+    DnsSetting {
+        enabled: matches!(
+            store.get_setting(DNS_ENABLED).ok().flatten().as_deref(),
+            Some("1")
+        ),
+        port: store
+            .get_setting(DNS_PORT)
+            .ok()
+            .flatten()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(DEFAULT_DNS_PORT),
+    }
+}
+
+/// Writes the resolver setting, for the next start and for this one.
+fn store_dns_setting(
+    paths: &StoragePaths,
+    setting: DnsSetting,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = tsunagi::storage::StateStore::open(paths.state_db())?;
+    store.set_setting(DNS_ENABLED, if setting.enabled { "1" } else { "0" })?;
+    store.set_setting(DNS_PORT, &setting.port.to_string())?;
+    Ok(())
+}
+
+/// Where the secret a command is about to use came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretOrigin {
+    /// Given on the command line, in a file or in the environment.
+    Given,
+    /// Read from the one network of that name this device already has.
+    Stored,
+    /// Invented here, because there was nothing to go on.
+    Generated,
+}
+
+/// Works out which secret a network name means.
+///
+/// Three cases, and they are what make the name alone a usable command:
+///
+/// * given — use it, whatever is stored;
+/// * not given and this device is already in exactly one network of that
+///   name — that one, so `up --network lab` resumes rather than making a
+///   stranger with the same name;
+/// * not given and there is none — invent one, because an ad-hoc network is
+///   a thing people want and "generate a secret first" is a step with no
+///   purpose. The caller prints it: a secret nobody can read is no use.
+///
+/// Two networks of one name and no secret is the one case with no answer,
+/// and it says so rather than choosing.
+fn resolve_secret(
+    paths: &StoragePaths,
+    name: &NetworkName,
+    secret: Option<&str>,
+    secret_file: Option<&std::path::Path>,
+) -> Result<(NetworkSecret, SecretOrigin), Box<dyn std::error::Error>> {
+    if secret.is_some() || secret_file.is_some() {
+        return Ok((load_secret(secret, secret_file)?, SecretOrigin::Given));
+    }
+
+    let known: Vec<tsunagi::storage::StoredNetwork> = stored_networks(paths)
+        .into_iter()
+        .filter(|network| network.name == *name)
+        .collect();
+    match known.as_slice() {
+        [] => Ok((NetworkSecret::generate(), SecretOrigin::Generated)),
+        [one] => Ok((one.secret.clone(), SecretOrigin::Stored)),
+        several => Err(format!(
+            "this device is in {} networks called `{name}`, so the name alone does not say \
+             which. Give --secret, or `tsunagi network` lists them with their ids.",
+            several.len()
+        )
+        .into()),
     }
 }
 
@@ -462,6 +599,7 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status(args) => status(args).await,
         Command::Protocols => show_protocols(),
         Command::Network(args) => network_command(args).await,
+        Command::Dns(args) => dns_command(args).await,
         Command::Wipe(args) => wipe(args).await,
     }
 }
@@ -603,12 +741,14 @@ fn configured_networks_section(paths: &StoragePaths) -> report::Section {
 /// What the local DNS service is doing, for `status` to report.
 #[derive(Debug, Clone, Default)]
 struct DnsState {
-    zone: String,
+    /// One zone per network, named after it.
+    zones: Vec<String>,
+    /// Anything worth saying about those names, one line each.
+    zone_warnings: Vec<String>,
     listening: Vec<SocketAddr>,
     bind_error: Option<String>,
     publish_error: Option<String>,
     publish_remedy: Option<String>,
-    zone_warning: Option<String>,
     names: u32,
 }
 
@@ -618,9 +758,14 @@ struct DnsState {
 /// the resolver can be configured, because a resolver the user can point at
 /// by hand is worth more than nothing, and the reason it was not configured
 /// is reported rather than swallowed.
+///
+/// One service for the agent, not one per network: an agent has one
+/// identity and as many networks as it likes, each of them a zone named
+/// after it, and they all arrive at the same socket.
 struct DnsService {
     state: Arc<std::sync::Mutex<DnsState>>,
     publisher: Arc<dyn tsunagi::dns::DnsPublisher>,
+    port: u16,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -631,6 +776,23 @@ impl DnsService {
         if let Err(err) = self.publisher.revert().await {
             tracing::debug!(%err, "cannot undo the resolver setting");
         }
+    }
+}
+
+/// What the control socket reports about the resolver.
+fn dns_report(dns: DnsState) -> tsunagi::ipc::DnsReport {
+    tsunagi::ipc::DnsReport {
+        zones: dns.zones,
+        listening: dns
+            .listening
+            .iter()
+            .map(|address| address.to_string())
+            .collect(),
+        bind_error: dns.bind_error,
+        publish_error: dns.publish_error,
+        publish_remedy: dns.publish_remedy,
+        zone_warnings: dns.zone_warnings,
+        names: dns.names,
     }
 }
 
@@ -646,38 +808,27 @@ fn dns_publisher() -> Arc<dyn tsunagi::dns::DnsPublisher> {
     }
 }
 
-/// Starts the DNS service for one network and keeps it in step with state.
-fn spawn_dns(
-    agent: Agent,
-    network: NetworkId,
-    zone: tsunagi::dns::ZoneName,
-    port: u16,
-) -> DnsService {
-    use tsunagi::dns::{DnsServer, SharedZone, Zone, listen_plan};
+/// Starts the DNS service and keeps it in step with the agent's state.
+///
+/// Every network the agent is in becomes a zone named after it, so joining
+/// or leaving one changes what resolves without restarting anything.
+fn spawn_dns(agent: Agent, port: u16) -> DnsService {
+    use tsunagi::dns::{DnsServer, SharedZone, Zone, ZoneName, Zones, listen_plan};
 
-    let state = Arc::new(std::sync::Mutex::new(DnsState {
-        zone: zone.as_str().to_string(),
-        zone_warning: zone.collision(),
-        ..DnsState::default()
-    }));
+    let state = Arc::new(std::sync::Mutex::new(DnsState::default()));
     let publisher = dns_publisher();
 
     let task = {
         let state = Arc::clone(&state);
         let publisher = Arc::clone(&publisher);
         tokio::spawn(async move {
-            let shared = SharedZone::new(Zone::new(zone.clone(), []));
-            // Held for their `Drop`, which stops each server: the values are
-            // never read, but letting them go is what closes the sockets.
-            // One per address family, so a question is answered over
-            // whichever the resolver uses.
+            let shared = SharedZone::default();
+            // Held for their `Drop`, which stops each server: the values
+            // are never read, but letting them go is what closes the
+            // sockets. One per address family, so a question is answered
+            // over whichever the resolver uses.
             let mut _servers: Vec<DnsServer> = Vec::new();
             let mut bound: Vec<SocketAddr> = Vec::new();
-            // What was tried last time, not what was got. Comparing against
-            // what was got would rebind on every tick whenever the preferred
-            // address is one that cannot be bound, closing the port each
-            // time for no reason.
-            let mut attempted: Option<tsunagi::dns::ListenPlan> = None;
             let mut published: Option<tsunagi::dns::Published> = None;
             // A condition that persists is worth saying once, not every
             // pass; and a refusal will not lift without somebody acting, so
@@ -687,87 +838,95 @@ fn spawn_dns(
             let mut recipe_shown = false;
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
 
+            // The port does not change while the service runs; turning DNS
+            // off and on again is what changes it, and that is a new
+            // service. So this is bound once and kept.
+            let wanted = listen_plan(port);
+            let mut last: Option<std::io::Error> = None;
+            for family in wanted.families() {
+                for candidate in family {
+                    match DnsServer::bind(*candidate, shared.clone()).await {
+                        Ok(fresh) => {
+                            tracing::info!(address = %fresh.local_addr(), "dns listening");
+                            bound.push(fresh.local_addr());
+                            _servers.push(fresh);
+                            break;
+                        }
+                        Err(err) => last = Some(err),
+                    }
+                }
+            }
+            let bind_error = bound.is_empty().then(|| {
+                last.map_or_else(
+                    || "no address to listen on".to_string(),
+                    |err| err.to_string(),
+                )
+            });
+            {
+                let listening = bound.clone();
+                update(&state, |state| {
+                    state.listening = listening;
+                    state.bind_error = bind_error;
+                });
+            }
+
             loop {
                 ticker.tick().await;
-                let Ok(status) = agent.network_status(network).await else {
+                let Ok(status) = agent.status().await else {
                     continue;
                 };
 
-                // Names come from signed state, so a member that is away is
-                // in here too.
-                let members = status.members.iter().filter_map(|member| {
-                    Some((member.hostname.clone()?, member.overlay_address_v4?))
+                // One zone per network, named after it. A name that cannot
+                // be a zone is said once and skipped: the network works,
+                // it just has no names.
+                let mut zones = Vec::new();
+                let mut labels = Vec::new();
+                let mut warnings = Vec::new();
+                for network in &status.networks {
+                    let zone = match ZoneName::new(network.name.as_str()) {
+                        Ok(zone) => zone,
+                        Err(err) => {
+                            warnings.push(format!(
+                                "`{}` cannot be a zone, so its members have no names: {err}",
+                                network.name
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Some(warning) = zone.collision() {
+                        warnings.push(warning);
+                    }
+                    labels.push(zone.as_str().to_string());
+                    // Names come from signed state, so a member that is
+                    // away is in here too.
+                    let members = network.members.iter().filter_map(|member| {
+                        Some((member.hostname.clone()?, member.overlay_address_v4?))
+                    });
+                    zones.push(Zone::new(zone, members));
+                }
+                let zones = Zones::new(zones);
+                let names = zones.names() as u32;
+                shared.set(zones);
+                update(&state, |state| {
+                    state.zones = labels.clone();
+                    state.zone_warnings = warnings;
+                    state.names = names;
                 });
-                let fresh = Zone::new(zone.clone(), members);
-                let names = fresh.len() as u32;
-                shared.set(fresh);
 
-                // Listen where the resolver will be told to ask, which is an
-                // address on the overlay interface when there is one.
-                let own = agent.endpoint_id();
-                let overlay = status
-                    .members
-                    .iter()
-                    .find(|member| member.endpoint_id == own)
-                    .and_then(|member| member.overlay_address_v4);
+                if bound.is_empty() {
+                    continue;
+                }
                 // The interface belongs to the agent, so the resolver
-                // setting attaches to that one and not to a protocol's. Only
-                // one that is really on the host: an in-memory interface has
-                // a name and nothing else, and telling the operating system
-                // about that name would configure whatever else happens to
-                // be called it.
+                // setting attaches to that one and not to a protocol's.
+                // Only one that is really on the host: an in-memory
+                // interface has a name and nothing else, and telling the
+                // operating system about that name would configure
+                // whatever else happens to be called it.
                 let interface = agent
                     .overlay()
                     .filter(|overlay| overlay.on_host)
                     .map(|overlay| overlay.interface)
                     .filter(|name| !name.is_empty());
-                let wanted = listen_plan(overlay, port);
-                if attempted.as_ref() != Some(&wanted) {
-                    attempted = Some(wanted.clone());
-                    // Dropping the old ones first releases the port, so the
-                    // rebind is not racing itself.
-                    _servers.clear();
-                    let mut last: Option<std::io::Error> = None;
-                    bound.clear();
-                    // Each family on its own: one of them being unavailable
-                    // — IPv6 switched off, an address not on an interface —
-                    // is no reason to answer on neither.
-                    for family in wanted.families() {
-                        for candidate in family {
-                            match DnsServer::bind(*candidate, shared.clone()).await {
-                                Ok(fresh) => {
-                                    tracing::info!(
-                                        address = %fresh.local_addr(),
-                                        zone = %zone.as_str(),
-                                        "dns listening"
-                                    );
-                                    bound.push(fresh.local_addr());
-                                    _servers.push(fresh);
-                                    break;
-                                }
-                                Err(err) => last = Some(err),
-                            }
-                        }
-                    }
-                    let bind_error = bound.is_empty().then(|| {
-                        last.map_or_else(
-                            || "no address to listen on".to_string(),
-                            |err| err.to_string(),
-                        )
-                    });
-                    let listening = bound.clone();
-                    update(&state, |state| {
-                        state.listening = listening;
-                        state.bind_error = bind_error;
-                    });
-                    // The addresses moved, so whatever the resolver was told
-                    // is now wrong.
-                    published = None;
-                }
-
-                if bound.is_empty() {
-                    continue;
-                }
                 let Some(interface) = interface else {
                     update(&state, |state| {
                         state.publish_error = Some(
@@ -776,22 +935,29 @@ fn spawn_dns(
                                 .to_string(),
                         );
                         state.publish_remedy = None;
-                        state.names = names;
                     });
                     continue;
                 };
+                if labels.is_empty() {
+                    // Nothing to route here yet. Whatever was published is
+                    // now wrong, and saying nothing is the honest setting.
+                    if published.take().is_some() {
+                        let _ = publisher.revert().await;
+                    }
+                    continue;
+                }
 
                 let want_published = tsunagi::dns::Published {
                     interface,
                     servers: bound.clone(),
-                    domains: vec![zone.as_str().to_string()],
+                    domains: labels.clone(),
                 };
                 let due = retry_after.is_none_or(|at| tokio::time::Instant::now() >= at);
                 if published.as_ref() != Some(&want_published) && due {
                     match publisher.apply(&want_published).await {
                         Ok(()) => {
                             tracing::info!(
-                                zone = %zone.as_str(),
+                                zones = %labels.join(", "),
                                 interface = %want_published.interface,
                                 "the system resolver was told where to ask"
                             );
@@ -834,7 +1000,6 @@ fn spawn_dns(
                         }
                     }
                 }
-                update(&state, |state| state.names = names);
             }
         })
     };
@@ -842,6 +1007,7 @@ fn spawn_dns(
     DnsService {
         state,
         publisher,
+        port,
         task,
     }
 }
@@ -966,17 +1132,77 @@ fn show_protocols() -> Result<(), Box<dyn std::error::Error>> {
 struct AgentControl {
     agent: Agent,
     plugin: Option<Arc<WireguardPlugin>>,
-    dns: Option<Arc<std::sync::Mutex<DnsState>>>,
+    /// The resolver, which this owns so it can be switched while running.
+    dns: Arc<tokio::sync::Mutex<Option<DnsService>>>,
+    /// Where the setting is remembered, so it survives a restart.
+    paths: StoragePaths,
 }
 
 impl tsunagi::ipc::unix::ReportSource for AgentControl {
     fn report(&self) -> tsunagi::BoxFuture<'_, tsunagi::ipc::StatusReport> {
         Box::pin(async move {
-            let dns = self.dns.as_ref().map(|state| match state.lock() {
-                Ok(guard) => guard.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
-            });
+            let dns = self.dns_state().await;
             build_report(&self.agent, self.plugin.as_deref(), dns).await
+        })
+    }
+
+    fn set_dns(
+        &self,
+        enable: bool,
+        port: Option<u16>,
+    ) -> tsunagi::BoxFuture<'_, Result<Option<tsunagi::ipc::DnsReport>, String>> {
+        Box::pin(async move {
+            let mut service = self.dns.lock().await;
+            let port = port
+                .or_else(|| service.as_ref().map(|service| service.port))
+                .unwrap_or_else(|| dns_setting(&self.paths).port);
+
+            // Remembered first: what the agent is doing and what it will do
+            // after a restart must not drift apart, and a failure to store
+            // it is exactly the kind of drift.
+            store_dns_setting(
+                &self.paths,
+                DnsSetting {
+                    enabled: enable,
+                    port,
+                },
+            )
+            .map_err(|err| err.to_string())?;
+
+            match (enable, service.take()) {
+                // Already serving on that port: nothing to restart.
+                (true, Some(running)) if running.port == port => {
+                    *service = Some(running);
+                }
+                // A different port means a different socket.
+                (true, previous) => {
+                    if let Some(previous) = previous {
+                        previous.shutdown().await;
+                    }
+                    *service = Some(spawn_dns(self.agent.clone(), port));
+                }
+                (false, Some(running)) => running.shutdown().await,
+                (false, None) => {}
+            }
+            let handle = service.as_ref().map(|service| Arc::clone(&service.state));
+            // The lock goes before the wait: nothing else should queue
+            // behind a sleep, and the state is shared by an `Arc` anyway.
+            drop(service);
+
+            let state = match handle {
+                // Freshly started: let it bind and collect a zone or two
+                // before answering, so the report is the state and not a
+                // snapshot of nothing.
+                Some(state) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    Some(match state.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    })
+                }
+                None => None,
+            };
+            Ok(state.map(dns_report))
         })
     }
 
@@ -1058,6 +1284,17 @@ impl tsunagi::ipc::unix::ReportSource for AgentControl {
                 announced: outcome.announced,
                 peers_told: outcome.peers_told as u32,
             })
+        })
+    }
+}
+
+impl AgentControl {
+    /// The resolver's state, when there is one.
+    async fn dns_state(&self) -> Option<DnsState> {
+        let service = self.dns.lock().await;
+        service.as_ref().map(|service| match service.state.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         })
     }
 }
@@ -1405,6 +1642,98 @@ async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `tsunagi dns`: the local resolver, and turning it on or off.
+async fn dns_command(args: DnsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = args.paths.resolve()?;
+    let socket = control_socket(&paths, args.control_socket.as_ref());
+
+    let enable = match args.action {
+        None => return show_dns(&paths, &socket).await,
+        Some(DnsAction::On { .. }) => true,
+        Some(DnsAction::Off) => false,
+    };
+    let port = match args.action {
+        Some(DnsAction::On { port }) => port,
+        _ => None,
+    };
+
+    // The running agent, so it takes effect now; it stores the setting too,
+    // so the two can never say different things.
+    if socket.exists() {
+        let report = tsunagi::ipc::unix::set_dns(&socket, enable, port).await?;
+        match report {
+            Some(report) => {
+                println!(
+                    "serving {} on {}",
+                    match report.zones.as_slice() {
+                        [] => "no zone yet".to_string(),
+                        zones => zones.join(", "),
+                    },
+                    if report.listening.is_empty() {
+                        report
+                            .bind_error
+                            .clone()
+                            .unwrap_or_else(|| "nothing".to_string())
+                    } else {
+                        report.listening.join(", ")
+                    }
+                );
+                if let Some(err) = &report.publish_error {
+                    eprintln!("\nthe system resolver was not told: {err}");
+                }
+            }
+            None => println!("not serving"),
+        }
+        return Ok(());
+    }
+
+    let stored = dns_setting(&paths);
+    store_dns_setting(
+        &paths,
+        DnsSetting {
+            enabled: enable,
+            port: port.unwrap_or(stored.port),
+        },
+    )?;
+    println!("{} for future starts", if enable { "on" } else { "off" });
+    eprintln!("\nNo agent is running here, so it takes effect with the next `tsunagi up`.");
+    Ok(())
+}
+
+/// What the resolver is doing, or why it is not.
+async fn show_dns(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use report::Report;
+
+    let observed = observe(paths, socket).await;
+    let mut out = Report::new();
+    match &observed {
+        Observed::Agent(report) => out.push(match &report.dns {
+            Some(dns) => dns_section(dns),
+            None => dns_absent_section(),
+        }),
+        // Not running: the stored setting is what it will do next time,
+        // which is the only truthful thing to say.
+        Observed::Stored { .. } => {
+            use report::{Health, Row, Section};
+            let setting = dns_setting(paths);
+            let mut section = Section::new("dns");
+            section.push(
+                Row::new(
+                    Health::Info,
+                    if setting.enabled { "on" } else { "off" },
+                    format!("port {}, for the next start", setting.port),
+                )
+                .with_note("no agent is running, so nothing is answering right now"),
+            );
+            out.push(section);
+        }
+    }
+    print_report("tsunagi dns", &out)
+}
+
 /// `tsunagi id`: what this device is, and what changes it.
 async fn id(args: IdArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
@@ -1689,10 +2018,13 @@ fn dns_section(dns: &tsunagi::ipc::DnsReport) -> report::Section {
     let mut section = Section::new("dns");
     section.push(Row::new(
         Health::Info,
-        "zone",
-        format!("{}  ·  {} name(s)", dns.zone, dns.names),
+        "zones",
+        match dns.zones.as_slice() {
+            [] => "none yet: this agent is in no network that can be one".to_string(),
+            zones => format!("{}  ·  {} name(s)", zones.join(", "), dns.names),
+        },
     ));
-    if let Some(warning) = &dns.zone_warning {
+    for warning in &dns.zone_warnings {
         section.push(Row::new(Health::Degraded, "zone name", warning.clone()));
     }
 
@@ -1730,7 +2062,7 @@ fn dns_section(dns: &tsunagi::ipc::DnsReport) -> report::Section {
                     "resolve names yourself with `dig @{} -p {} <name>.{}`",
                     address.rsplit_once(':').map_or("", |(host, _)| host),
                     address.rsplit_once(':').map_or("", |(_, port)| port),
-                    dns.zone
+                    dns.zones.first().map_or("<zone>", String::as_str)
                 )),
                 (None, None) => row,
             });
@@ -2585,12 +2917,36 @@ async fn netwatch_addresses() -> Vec<std::net::IpAddr> {
 
 async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let name = NetworkName::new(args.network.clone())?;
-    let secret = load_secret(args.secret.as_deref(), args.secret_file.as_deref())?;
     let paths = args.paths.resolve()?;
+    let (secret, secret_origin) = resolve_secret(
+        &paths,
+        &name,
+        args.secret.as_deref(),
+        args.secret_file.as_deref(),
+    )?;
 
     // Parsed up front so a typo is reported immediately, and so the option is
     // never silently ignored when the data plane is off.
     let ipv4_range = resolve_ipv4_range(args.ipv4_range.as_ref())?;
+
+    // The resolver is a property of the device, not of this command line.
+    // `--dns` turns it on and it stays on; `tsunagi dns off` is what turns
+    // it off. Anything else means names work today and are gone tomorrow
+    // because a flag was not retyped.
+    let stored_dns = dns_setting(&paths);
+    let serve_dns = args.dns || stored_dns.enabled;
+    let dns_port = args.dns_port.unwrap_or(stored_dns.port);
+    if serve_dns != stored_dns.enabled || dns_port != stored_dns.port {
+        // Written before the agent takes the directory, which it is about
+        // to do; nothing else holds it at this point.
+        store_dns_setting(
+            &paths,
+            DnsSetting {
+                enabled: serve_dns,
+                port: dns_port,
+            },
+        )?;
+    }
 
     let mut bootstrap: Vec<EndpointAddr> = Vec::new();
     for peer in &args.peers {
@@ -2727,43 +3083,40 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("  hostname     {}", agent.hostname());
     println!("  network      {name} ({network})");
     println!("  state        {}", paths.state_dir.display());
-    if args.peers.is_empty() {
-        println!(
-            "\nNo --peer was given, so this agent waits to be contacted.\n\
-             On the other machine run:\n\n  tsunagi up --network {name} --secret <secret> \\\n    --peer {}\n",
-            agent.endpoint_id()
-        );
+    // One line, everything the other side needs, ready to paste. The
+    // secret is printed in full only when this agent invented it: then
+    // there is nowhere else to read it from, and an ad-hoc network is
+    // exactly "one person made it and sent the command round". A secret
+    // the user supplied is theirs already and is not echoed.
+    let shareable = match secret_origin {
+        SecretOrigin::Generated => secret.encode().as_str().to_string(),
+        SecretOrigin::Given | SecretOrigin::Stored => "<secret>".to_string(),
+    };
+    if secret_origin == SecretOrigin::Generated {
+        println!("  secret       {}", secret.encode().as_str());
     }
-    // A local resolver for this network's members. The zone name is the
-    // user's to choose; a name that shadows a public one is reported and
-    // then used, because that is a decision and not a mistake.
-    let dns = if args.dns {
-        let raw = args.dns_zone.clone().unwrap_or_else(|| name.to_string());
-        match tsunagi::dns::ZoneName::new(&raw) {
-            Ok(zone) => {
-                if let Some(warning) = zone.collision() {
-                    tracing::warn!("{warning}");
-                }
-                println!("  dns zone     {}", zone.as_str());
-                Some(spawn_dns(agent.clone(), network, zone, args.dns_port))
-            }
-            Err(err) => {
-                agent.shutdown().await;
-                return Err(format!("--dns-zone {raw}: {err}").into());
-            }
-        }
+    // A local resolver for every network this agent is in, each a zone
+    // named after it. A name that shadows a public one is reported and then
+    // used, because that is a decision and not a mistake.
+    let dns = Arc::new(tokio::sync::Mutex::new(if serve_dns {
+        println!("  dns          127.0.0.1:{dns_port} and [::1]:{dns_port}");
+        Some(spawn_dns(agent.clone(), dns_port))
     } else {
         None
-    };
+    }));
 
     // Serve `tsunagi status` for as long as this agent runs. Failing to bind
     // is not fatal: the agent itself works fine without it.
     let control = {
         let agent = agent.clone();
         let plugin = wireguard.clone();
-        let dns = dns.as_ref().map(|service| Arc::clone(&service.state));
-        let source: Arc<dyn tsunagi::ipc::unix::ReportSource> =
-            Arc::new(AgentControl { agent, plugin, dns });
+        let dns = Arc::clone(&dns);
+        let source: Arc<dyn tsunagi::ipc::unix::ReportSource> = Arc::new(AgentControl {
+            agent,
+            plugin,
+            dns,
+            paths: paths.clone(),
+        });
         let path = control_socket(&paths, args.control_socket.as_ref());
         match tsunagi::ipc::unix::ControlSocket::bind(path, source).await {
             Ok(socket) => {
@@ -2777,7 +3130,17 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    println!("Press Ctrl-C to stop.\n");
+    // Last, after the facts, because it is the line to act on: one
+    // command with everything the other side needs.
+    if args.peers.is_empty() {
+        println!(
+            "\nNo --peer was given, so this agent waits to be contacted. \
+             Run this on the other machine:\n\n  \
+             tsunagi up --network {name} --secret {shareable} --peer {}",
+            agent.endpoint_id()
+        );
+    }
+    println!("\nPress Ctrl-C to stop.\n");
 
     let status_every =
         (args.status_interval > 0).then(|| Duration::from_secs(args.status_interval));
@@ -2812,7 +3175,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     // Before the agent, so the resolver stops being pointed at a server
     // that is about to stop answering.
-    if let Some(dns) = dns {
+    if let Some(dns) = dns.lock().await.take() {
         dns.shutdown().await;
     }
     agent.shutdown().await;
@@ -2829,24 +3192,11 @@ async fn build_report(
     dns: Option<DnsState>,
 ) -> tsunagi::ipc::StatusReport {
     use tsunagi::ipc::{
-        DnsReport, MemberReport, NetworkReport, OverlayPeerReport, OverlayReport, PeerReport,
-        StatusReport,
+        MemberReport, NetworkReport, OverlayPeerReport, OverlayReport, PeerReport, StatusReport,
     };
 
     let overlay = agent.overlay();
-    let dns = dns.map(|dns| DnsReport {
-        zone: dns.zone,
-        listening: dns
-            .listening
-            .iter()
-            .map(|address| address.to_string())
-            .collect(),
-        bind_error: dns.bind_error,
-        publish_error: dns.publish_error,
-        publish_remedy: dns.publish_remedy,
-        zone_warning: dns.zone_warning,
-        names: dns.names,
-    });
+    let dns = dns.map(dns_report);
 
     let Ok(status) = agent.status().await else {
         return StatusReport::default();
@@ -3303,7 +3653,7 @@ mod status_tests {
         use tsunagi::ipc::DnsReport;
 
         let both = DnsReport {
-            zone: "lab".into(),
+            zones: vec!["lab".into()],
             listening: vec!["10.13.37.69:5354".into(), "[::1]:5354".into()],
             names: 2,
             ..Default::default()
@@ -3518,5 +3868,94 @@ mod network_tests {
         }
         let err = resolve_network(&networks, shared).unwrap_err();
         assert!(err.contains("use more of the id"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use tsunagi::identity::NetworkKeys;
+
+    fn paths(dir: &tempfile::TempDir) -> StoragePaths {
+        StoragePaths::new(dir.path().join("state"), dir.path().join("cache"))
+    }
+
+    fn already_joined(paths: &StoragePaths, name: &str) -> NetworkSecret {
+        let name = NetworkName::new(name).unwrap();
+        let secret = NetworkSecret::generate();
+        let keys = NetworkKeys::derive(&name, &secret);
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let store = tsunagi::storage::StateStore::open(paths.state_db()).unwrap();
+        store
+            .upsert_network(keys.network_id(), &name, &secret, true)
+            .unwrap();
+        secret
+    }
+
+    #[test]
+    fn a_name_nobody_has_yet_gets_a_secret_of_its_own() {
+        // An ad-hoc network is a thing people want, and "generate a secret
+        // first" is a step with no purpose. The caller prints what this
+        // invents, because a secret nobody can read is no use.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(&dir);
+        let name = NetworkName::new("spontaneous").unwrap();
+
+        let (secret, origin) = resolve_secret(&paths, &name, None, None).unwrap();
+        assert_eq!(origin, SecretOrigin::Generated);
+        // A real one: decodable, and different every time.
+        let text = secret.encode().as_str().to_string();
+        assert!(NetworkSecret::decode(&text).is_ok());
+        let (other, _) = resolve_secret(&paths, &name, None, None).unwrap();
+        assert_ne!(other.encode().as_str(), text);
+    }
+
+    #[test]
+    fn a_name_this_device_already_has_resumes_it() {
+        // Otherwise `tsunagi up --network lab` would invent a stranger with
+        // the same name every time, which is the confusion this whole
+        // report format exists to prevent.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(&dir);
+        let joined = already_joined(&paths, "lab");
+
+        let (secret, origin) =
+            resolve_secret(&paths, &NetworkName::new("lab").unwrap(), None, None).unwrap();
+        assert_eq!(origin, SecretOrigin::Stored);
+        assert_eq!(secret.encode().as_str(), joined.encode().as_str());
+    }
+
+    #[test]
+    fn a_secret_that_was_given_wins_over_the_stored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(&dir);
+        already_joined(&paths, "lab");
+        let given = NetworkSecret::generate();
+
+        let (secret, origin) = resolve_secret(
+            &paths,
+            &NetworkName::new("lab").unwrap(),
+            Some(given.encode().as_str()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(origin, SecretOrigin::Given);
+        assert_eq!(secret.encode().as_str(), given.encode().as_str());
+    }
+
+    #[test]
+    fn two_networks_of_one_name_refuse_to_guess() {
+        // The mistyped-secret case. Picking one would be picking wrong half
+        // the time, and doing it silently.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(&dir);
+        already_joined(&paths, "lab");
+        already_joined(&paths, "lab");
+
+        let err = resolve_secret(&paths, &NetworkName::new("lab").unwrap(), None, None)
+            .expect_err("it cannot choose");
+        assert!(err.to_string().contains("does not say which"), "{err}");
     }
 }

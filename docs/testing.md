@@ -41,6 +41,7 @@ of several system processes, and is not presented as one.
 | 9 | wrong version, a message before authentication, a proof replayed on another connection, an oversized frame and a `Hello` for an inactive network are all rejected without taking the agent down | `tests/authentication.rs` |
 | 10 | a second agent on the same state directory gets a clear error; after a clean stop the directory reopens; shutdown ends background tasks and refuses further work; independent agents coexist in one process | `tests/resilience.rs` |
 | 11 | leaving a network frees the address for the others, says plainly when there was nobody to tell, and rejoining afterwards is not mistaken for a stale record; a wipe empties both directories and the next start is a stranger, while a directory that is not ours is refused | `tests/leaving.rs`, `tests/cache_and_state.rs` |
+| 12 | a network can be joined into a running agent over the control socket and is live at once; a name with no secret resumes the one network of that name, invents one when there is none, and refuses to choose between two; two networks on one agent each get a range of their own | `tests/local_control.rs`, `tests/network_isolation.rs`, CLI unit tests |
 
 `tests/wireguard.rs` drives the WireGuard data plane over real iroh
 connections. Everything is real except the packet interface: real agents, real
@@ -64,9 +65,15 @@ walks past everything taken and reports a full range instead of handing out a
 duplicate.
 
 `tests/local_control.rs` covers the local control socket end to end: a client
-asking a running agent for status over a real Unix socket, a leftover socket
-file being replaced while a live one is not, and the derived socket path
-staying short enough to bind.
+asking a running agent for status over a real Unix socket, joining and
+leaving a network through it, a leftover socket file being replaced while a
+live one is not, and the derived socket path staying short enough to bind.
+
+`crates/tsunagi-cli/tests/dns_service.rs` runs the real binary: the resolver
+comes up with no interface to attach it to, the listener is not rebuilt on
+the way past, a name outside every zone is refused, each network gets a zone
+of its own as it is joined, and the resolver can be switched on and off
+while the agent runs.
 
 `tests/discovery.rs` covers the discovery contract itself: a static bootstrap
 candidate is enough to join, several backends compose, entries are withdrawn

@@ -120,6 +120,35 @@ pub const DEFAULT_IPV4_RANGE: Ipv4Range = Ipv4Range {
     prefix_len: 24,
 };
 
+/// A range derived from a network's own identity.
+///
+/// One agent has one interface, so two of its networks cannot both use the
+/// configured range. The second needs another one — and it cannot be picked
+/// locally, because every member has to arrive at the same answer without
+/// being told. So it comes from the network id, which every member already
+/// has and nobody can choose: the same network derives the same range on
+/// every device.
+///
+/// Inside 10/8 like the default, and never equal to it, so the first
+/// network keeps what it has always had.
+pub fn derived_ipv4_range(network: NetworkId) -> Ipv4Range {
+    let bytes = network.as_bytes();
+    let second = bytes[0];
+    let third = bytes[1];
+    let candidate = Ipv4Addr::new(10, second, third, 0);
+    // The default is somebody's already. One step along is still derived
+    // from the id and still the same everywhere.
+    let base = if candidate == DEFAULT_IPV4_RANGE.base {
+        Ipv4Addr::new(10, second, third.wrapping_add(1), 0)
+    } else {
+        candidate
+    };
+    Ipv4Range {
+        base,
+        prefix_len: 24,
+    }
+}
+
 /// Frozen domain separator for the bytes a record signature covers.
 pub const RECORD_DOMAIN: &str = "tsunagi-signed-record-v2";
 
@@ -1052,5 +1081,33 @@ mod tests {
             a,
             SignedRecord::canonical_bytes(network("other"), author, 1, &claim("10.13.37.5"))
         );
+    }
+
+    #[test]
+    fn a_derived_range_is_the_same_wherever_it_is_derived() {
+        // Every member has to arrive at it without being told, so it comes
+        // from the one thing they all already agree on.
+        let network = NetworkKeys::derive(
+            &NetworkName::new("second").unwrap(),
+            &NetworkSecret::from_bytes([7u8; 32]).unwrap(),
+        )
+        .network_id();
+        let once = derived_ipv4_range(network);
+        assert_eq!(once, derived_ipv4_range(network));
+        assert_eq!(once.prefix_len, 24);
+        assert_eq!(once.base.octets()[0], 10, "inside 10/8 like the default");
+        assert_ne!(
+            once, DEFAULT_IPV4_RANGE,
+            "the default belongs to whichever network asked first"
+        );
+
+        // A different network derives a different range, which is the
+        // whole point of deriving it.
+        let other = NetworkKeys::derive(
+            &NetworkName::new("third").unwrap(),
+            &NetworkSecret::from_bytes([9u8; 32]).unwrap(),
+        )
+        .network_id();
+        assert_ne!(once, derived_ipv4_range(other));
     }
 }

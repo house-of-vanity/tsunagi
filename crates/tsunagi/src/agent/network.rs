@@ -143,6 +143,14 @@ pub(crate) struct RuntimeParams {
     /// The range it was configured with but cannot have, because another
     /// network on this agent holds it.
     pub(crate) range_conflict: Option<Ipv4Range>,
+    /// The range derived from this network's own id, proposed when the
+    /// configured one belongs to another network here.
+    ///
+    /// Held back at first: a network that already exists has a range of its
+    /// own, and a member that proposed before hearing anything would be
+    /// arguing with it instead of adopting it. Every member derives the
+    /// same one, so once the wait is over there is nothing to argue about.
+    pub(crate) ipv4_fallback: Option<Ipv4Range>,
     /// How data plane links are opened. `None` disables the data plane.
     pub(crate) transport: Option<Arc<dyn PacketTransport>>,
 }
@@ -204,8 +212,18 @@ pub(crate) fn spawn(params: RuntimeParams) -> NetworkHandle {
     }
 }
 
+/// How long a network waits to be told its range before proposing the one
+/// derived from its id.
+///
+/// Only for that fallback: the configured range is proposed at once, as it
+/// always was. This is the window in which an existing network's records
+/// can arrive and be adopted instead.
+const RANGE_PROPOSAL_GRACE: Duration = Duration::from_secs(3);
+
 struct Runtime {
     params: RuntimeParams,
+    /// When this runtime started, for the fallback range's grace period.
+    activated: std::time::Instant,
     network_id: NetworkId,
     local_id: EndpointId,
     shutdown: Shutdown,
@@ -226,6 +244,12 @@ struct Runtime {
     /// Peers already told about a protocol version that cannot match, so it
     /// is said once rather than on every announcement.
     reported_mismatch: HashSet<(EndpointId, String)>,
+    /// Set once this agent has given everything up here.
+    ///
+    /// A release is a statement on the way out, and anything that would
+    /// publish a claim afterwards — the periodic check, a peer's records
+    /// arriving — would silently take it back.
+    released: bool,
     /// The address last reported as absent from the interface, so it is said
     /// once rather than for ever.
     reported_missing: Option<std::net::Ipv4Addr>,
@@ -246,6 +270,7 @@ impl Runtime {
         let (link_results_tx, link_results_rx) = mpsc::channel(64);
         Self {
             params,
+            activated: std::time::Instant::now(),
             network_id,
             local_id,
             shutdown,
@@ -262,6 +287,7 @@ impl Runtime {
             link_results_tx,
             link_results_rx,
             reported_mismatch: HashSet::new(),
+            released: false,
             reported_missing: None,
             state: StateSet::new(),
             pending_state: Vec::new(),
@@ -372,6 +398,7 @@ impl Runtime {
                 // are freed for somebody else instead of staying reserved
                 // to a member that has gone.
                 self.publish_record(RecordBody::Release).await;
+                self.released = true;
                 let _ = reply.send(self.sessions.len());
             }
             NetCommand::SetHostname(hostname) => {
@@ -460,6 +487,10 @@ impl Runtime {
         if self.shutdown.is_triggered() {
             return;
         }
+        // The fallback range becomes available with the passage of time
+        // alone, so something has to look again; this runs on a timer and
+        // the check is a comparison when nothing has changed.
+        self.ensure_own_claim().await;
 
         let mut candidates: Vec<Candidate> = Vec::new();
 
@@ -664,12 +695,30 @@ impl Runtime {
         // one interface, and claiming an address in a range another network
         // already owns would spread the collision rather than contain it —
         // "the lowest author's range wins" would carry it to everybody.
-        // Better to hold off and adopt whatever the network settles on.
-        let wanted = self.params.ipv4_range?;
-        match self.params.routes.would_overlap(self.network_id, wanted) {
-            None => Some(wanted),
-            Some(_) => None,
+        if let Some(wanted) = self.params.ipv4_range
+            && self
+                .params
+                .routes
+                .would_overlap(self.network_id, wanted)
+                .is_none()
+        {
+            return Some(wanted);
         }
+
+        // The configured range is another network's here, so this one falls
+        // back to the range derived from its id — after a moment's wait, so
+        // that a network which already exists gets to say what it uses
+        // first. Every member derives the same one, so members that reach
+        // this point agree without negotiating.
+        let fallback = self.params.ipv4_fallback?;
+        if self.activated.elapsed() < RANGE_PROPOSAL_GRACE {
+            return None;
+        }
+        self.params
+            .routes
+            .would_overlap(self.network_id, fallback)
+            .is_none()
+            .then_some(fallback)
     }
 
     /// Makes sure this agent holds an address, claiming one if it does not.
@@ -677,6 +726,11 @@ impl Runtime {
     /// Called after anything that could change the picture: startup, and
     /// every time another replica's records arrive.
     async fn ensure_own_claim(&mut self) {
+        // On the way out. Claiming again here is how a goodbye becomes a
+        // hello nobody asked for.
+        if self.released {
+            return;
+        }
         let wanted_hostname = {
             let hostname = crate::state::sanitise_hostname(&self.params.hostname);
             (!hostname.is_empty()).then_some(hostname)
@@ -1470,7 +1524,13 @@ impl Runtime {
             candidates,
             members,
             range: self.effective_range(),
-            range_conflict: self.params.range_conflict,
+            // Only worth reporting while it is actually stuck: with a
+            // fallback in play the configured range being another
+            // network's is how it is meant to work, not a fault.
+            range_conflict: self
+                .params
+                .range_conflict
+                .filter(|_| self.effective_range().is_none()),
             metrics: self.metrics.clone(),
         }
     }

@@ -20,6 +20,8 @@ use tempfile::TempDir;
 const PORT_BINDS: u16 = 15361;
 const PORT_REBIND: u16 = 15362;
 const PORT_REFUSE: u16 = 15363;
+const PORT_TWO_ZONES: u16 = 15364;
+const PORT_SWITCH: u16 = 15365;
 
 /// Asks, and returns the raw reply. Raw because a parsed packet borrows
 /// from the bytes it came out of.
@@ -67,7 +69,21 @@ fn wait_for_answer(server: SocketAddr, name: &str) -> Vec<u8> {
 /// The agent, running as a real process with its DNS service on.
 struct Running {
     child: std::process::Child,
-    _dir: TempDir,
+    dir: TempDir,
+}
+
+impl Running {
+    /// Runs another `tsunagi` command against this agent's directory.
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+            .args(args)
+            .arg("--state-dir")
+            .arg(self.dir.path().join("state"))
+            .arg("--cache-dir")
+            .arg(self.dir.path().join("cache"))
+            .output()
+            .expect("the agent binary runs")
+    }
 }
 
 impl Drop for Running {
@@ -77,13 +93,17 @@ impl Drop for Running {
     }
 }
 
+/// Starts an agent in one network, whose name is therefore the zone.
+///
+/// There is no separate zone setting: an agent serves a zone per network,
+/// named after it, so the network name is the zone name.
 fn start(zone: &str, port: u16) -> Running {
     let dir = TempDir::new().unwrap();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
         .args([
             "up",
             "--network",
-            "dnswiring",
+            zone,
             "--secret",
             "a-secret-for-the-dns-test",
         ])
@@ -93,21 +113,44 @@ fn start(zone: &str, port: u16) -> Running {
         .arg(dir.path().join("cache"))
         // No real interface and no internet: this is about the wiring.
         .args(["--reach", "local", "--no-tun", "--dns"])
-        .args(["--dns-zone", zone])
         .args(["--dns-port", &port.to_string()])
         .args(["--log", "error", "--status-interval", "0"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("the agent binary starts");
-    Running { child, _dir: dir }
+    Running { child, dir }
+}
+
+/// Starts an agent with the resolver off, to be switched on later.
+fn start_without_dns(network: &str) -> Running {
+    let dir = TempDir::new().unwrap();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+        .args([
+            "up",
+            "--network",
+            network,
+            "--secret",
+            "a-secret-for-the-dns-test",
+        ])
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--cache-dir")
+        .arg(dir.path().join("cache"))
+        .args(["--reach", "local", "--no-tun"])
+        .args(["--log", "error", "--status-interval", "0"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the agent binary starts");
+    Running { child, dir }
 }
 
 #[test]
 fn the_resolver_comes_up_even_with_no_overlay_interface_to_put_it_on() {
-    // The promise is that the port is served whatever else fails. With
-    // `--no-tun` the allocated overlay address is on no interface, so
-    // binding to it cannot work and loopback is the answer — getting this
+    // The promise is that the port is served whatever else fails: with
+    // `--no-tun` there is no interface to attach a resolver setting to,
+    // and the zone is answered on loopback all the same. Getting this
     // wrong left the feature silently dead.
     let _agent = start("lab.internal", PORT_BINDS);
     let server: SocketAddr = format!("127.0.0.1:{PORT_BINDS}").parse().unwrap();
@@ -123,10 +166,10 @@ fn the_resolver_comes_up_even_with_no_overlay_interface_to_put_it_on() {
 
 #[test]
 fn the_listener_is_not_rebuilt_on_every_pass() {
-    // The supervisor compares what it tried last time, not what it got. The
-    // other way round it rebound on every tick, because the preferred
-    // address is one that never binds here — and the port was shut for a
-    // moment each time.
+    // The listener is bound once and kept, and the zones are swapped
+    // underneath it as networks and members come and go. Rebuilding it on
+    // the way past — which an earlier version did on every tick — shut the
+    // port for a moment each time.
     let _agent = start("rebind.internal", PORT_REBIND);
     let server: SocketAddr = format!("127.0.0.1:{PORT_REBIND}").parse().unwrap();
     let name = format!("{}.rebind.internal", hostname());
@@ -156,4 +199,73 @@ fn a_name_outside_the_zone_is_refused_and_never_forwarded() {
 
 fn hostname() -> String {
     tsunagi::agent::system_hostname().unwrap_or_else(|| "unknown".into())
+}
+
+#[test]
+fn every_network_gets_a_zone_of_its_own() {
+    // One agent, one identity, several networks — and a question carries a
+    // name, not the network it belongs to. Each network is a zone named
+    // after it, and joining one while the agent runs adds its zone without
+    // restarting anything.
+    let agent = start("first.internal", PORT_TWO_ZONES);
+    let server: SocketAddr = format!("127.0.0.1:{PORT_TWO_ZONES}").parse().unwrap();
+    let host = hostname();
+    wait_for_answer(server, &format!("{host}.first.internal"));
+
+    let joined = agent.run(&[
+        "network",
+        "join",
+        "--network",
+        "second.internal",
+        "--secret",
+        "another-secret-for-the-dns-test",
+    ]);
+    assert!(
+        joined.status.success(),
+        "joining failed: {}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+
+    // The second network's zone answers too, and neither leaks into the
+    // other: a member of one is not a name in the other.
+    let reply = wait_for_answer(server, &format!("{host}.second.internal"));
+    assert_eq!(Packet::parse(&reply).unwrap().rcode(), RCODE::NoError);
+    let first = wait_for_answer(server, &format!("{host}.first.internal"));
+    assert_eq!(Packet::parse(&first).unwrap().rcode(), RCODE::NoError);
+}
+
+#[test]
+fn the_resolver_can_be_switched_on_and_off_while_the_agent_runs() {
+    // Forgetting `--dns` on a command line should not be a decision that
+    // lasts until the next restart, and it is not: the setting belongs to
+    // the device, and turning it on takes effect at once.
+    let agent = start_without_dns("switch.internal");
+    let server: SocketAddr = format!("127.0.0.1:{PORT_SWITCH}").parse().unwrap();
+    let host = hostname();
+
+    // Give the agent time to be up before asking it anything.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        query(server, &format!("{host}.switch.internal"), TYPE::A).is_none(),
+        "nothing should be answering yet"
+    );
+
+    let on = agent.run(&["dns", "on", "--port", &PORT_SWITCH.to_string()]);
+    assert!(
+        on.status.success(),
+        "dns on failed: {}",
+        String::from_utf8_lossy(&on.stderr)
+    );
+    wait_for_answer(server, &format!("{host}.switch.internal"));
+
+    let off = agent.run(&["dns", "off"]);
+    assert!(off.status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while query(server, &format!("{host}.switch.internal"), TYPE::A).is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "it kept answering after `dns off`"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }

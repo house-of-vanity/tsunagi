@@ -82,6 +82,13 @@ pub enum Request {
     /// only it can publish the release, and only while its sessions are up.
     /// The network is named by its id, in the text form `status` prints.
     Leave(String),
+    /// Turn the local resolver on or off, now and for future starts.
+    Dns {
+        /// Whether it should be serving.
+        enable: bool,
+        /// The port to serve on. Keeps the stored one when absent.
+        port: Option<u16>,
+    },
     /// Join a network, or start one that is configured and not running.
     ///
     /// Asked of the running agent because that is the only way to add a
@@ -105,6 +112,9 @@ impl std::fmt::Debug for Request {
             Request::SetHostname(name) => write!(f, "SetHostname({name})"),
             Request::Leave(network) => write!(f, "Leave({network})"),
             // The name is not a secret; the secret is.
+            Request::Dns { enable, port } => {
+                write!(f, "Dns {{ enable: {enable}, port: {port:?} }}")
+            }
             Request::Join { name, .. } => write!(f, "Join {{ name: {name}, secret: <redacted> }}"),
         }
     }
@@ -122,6 +132,10 @@ pub enum Response {
     Left(LeftReport),
     /// A network was joined, or was already there and is now running.
     Joined(JoinedReport),
+    /// What the local resolver is doing, after being changed or asked.
+    ///
+    /// `None` means it is not serving at all.
+    Dns(Option<DnsReport>),
     /// The request could not be served.
     Error(String),
 }
@@ -184,8 +198,8 @@ pub struct StatusReport {
 /// The local DNS service.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsReport {
-    /// The zone it answers for.
-    pub zone: String,
+    /// The zones it answers for: one per network, named after it.
+    pub zones: Vec<String>,
     /// Every address it is listening on, one per family where it could.
     ///
     /// Empty means it answers nowhere, and `bind_error` says why.
@@ -199,8 +213,8 @@ pub struct DnsReport {
     pub publish_error: Option<String>,
     /// What to do about that, when there is something.
     pub publish_remedy: Option<String>,
-    /// Something worth saying about the zone name itself.
-    pub zone_warning: Option<String>,
+    /// Anything worth saying about those names, one line each.
+    pub zone_warnings: Vec<String>,
     /// How many names it answers for.
     pub names: u32,
 }

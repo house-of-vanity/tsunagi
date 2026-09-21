@@ -336,6 +336,86 @@ impl Zone {
     }
 }
 
+/// Every zone one agent serves.
+///
+/// One agent has one identity and as many networks as it likes, and each of
+/// them is a zone of its own named after the network. They are served
+/// together because they arrive at the same socket: a question is not
+/// labelled with the network it belongs to, only with a name, and the
+/// suffix is what decides. Nothing is shared between them — a member of one
+/// network is not a name in another.
+#[derive(Debug, Clone, Default)]
+pub struct Zones {
+    zones: Vec<Zone>,
+}
+
+impl Zones {
+    /// Collects zones, dropping any that repeats an origin already taken.
+    ///
+    /// Two networks can be given the same name, and then only one of them
+    /// can own the suffix. First wins, deterministically, rather than one
+    /// shadowing the other depending on the order they happened to start.
+    pub fn new(zones: impl IntoIterator<Item = Zone>) -> Self {
+        let mut taken: Vec<Zone> = Vec::new();
+        for zone in zones {
+            if taken.iter().any(|other| other.origin() == zone.origin()) {
+                continue;
+            }
+            taken.push(zone);
+        }
+        Self { zones: taken }
+    }
+
+    /// The zones, in the order they will be consulted.
+    pub fn iter(&self) -> impl Iterator<Item = &Zone> {
+        self.zones.iter()
+    }
+
+    /// How many zones are served.
+    pub fn len(&self) -> usize {
+        self.zones.len()
+    }
+
+    /// Whether nothing is served.
+    pub fn is_empty(&self) -> bool {
+        self.zones.is_empty()
+    }
+
+    /// How many names are answered for, across every zone.
+    pub fn names(&self) -> usize {
+        self.zones.iter().map(Zone::len).sum()
+    }
+
+    /// Answers one question, and says which zone answered it.
+    ///
+    /// The answer has to travel with its zone because the SOA that bounds a
+    /// denial belongs to the zone that denied it, and serving several means
+    /// that is no longer a foregone conclusion.
+    ///
+    /// A reverse question carries no suffix to match on, so every zone is
+    /// asked and the one that holds the address answers; if none does, the
+    /// denial comes from whichever is authoritative for that reverse zone,
+    /// and from nowhere at all when none is.
+    pub fn lookup(&self, qname: &str, query: Query) -> Option<(&Zone, Answer)> {
+        let mut denial: Option<(&Zone, Answer)> = None;
+        for zone in &self.zones {
+            match zone.lookup(qname, query) {
+                // Not this zone's question. Another may still own it.
+                Answer::NotOurs => continue,
+                // A zone that owns the suffix but not the name can still be
+                // overruled by one that has an answer: only reverse
+                // questions reach more than one zone, and there the zone
+                // holding the address is the one that knows.
+                answer @ (Answer::NoSuchName | Answer::NoData) => {
+                    denial.get_or_insert((zone, answer));
+                }
+                answer => return Some((zone, answer)),
+            }
+        }
+        denial
+    }
+}
+
 /// The address a reverse name asks about, if it is one.
 fn reverse_address(qname: &str) -> Option<Ipv4Addr> {
     let name = qname.trim_end_matches('.').to_ascii_lowercase();
@@ -576,5 +656,95 @@ mod tests {
             [("music".to_string(), Ipv4Addr::new(10, 13, 37, 238))],
         );
         assert_ne!(a.serial(), changed.serial());
+    }
+
+    #[test]
+    fn each_network_answers_only_for_its_own_zone() {
+        // One agent, several networks, one socket. A question carries a
+        // name and not the network it belongs to, so the suffix is what
+        // decides — and a member of one network is not a name in another.
+        let zones = Zones::new([
+            Zone::new(
+                ZoneName::new("lab").unwrap(),
+                [("music".to_string(), Ipv4Addr::new(10, 13, 37, 2))],
+            ),
+            Zone::new(
+                ZoneName::new("home").unwrap(),
+                [("music".to_string(), Ipv4Addr::new(10, 20, 0, 2))],
+            ),
+        ]);
+        assert_eq!(zones.len(), 2);
+        assert_eq!(zones.names(), 2);
+
+        let (zone, answer) = zones.lookup("music.lab", Query::A).unwrap();
+        assert_eq!(zone.origin().as_str(), "lab");
+        assert_eq!(
+            answer,
+            Answer::Addresses(vec![Ipv4Addr::new(10, 13, 37, 2)])
+        );
+
+        let (zone, answer) = zones.lookup("music.home", Query::A).unwrap();
+        assert_eq!(zone.origin().as_str(), "home");
+        assert_eq!(answer, Answer::Addresses(vec![Ipv4Addr::new(10, 20, 0, 2)]));
+
+        // A name under neither is nobody's business here.
+        assert!(zones.lookup("music.example.com", Query::A).is_none());
+        assert!(Zones::default().lookup("music.lab", Query::A).is_none());
+    }
+
+    #[test]
+    fn a_denial_comes_from_the_zone_that_owns_the_name() {
+        // The SOA that bounds a negative answer belongs to the zone that
+        // denied it; with several served that is no longer a given.
+        let zones = Zones::new([
+            Zone::new(ZoneName::new("lab").unwrap(), []),
+            Zone::new(
+                ZoneName::new("home").unwrap(),
+                [("music".to_string(), Ipv4Addr::new(10, 20, 0, 2))],
+            ),
+        ]);
+        let (zone, answer) = zones.lookup("nobody.lab", Query::A).unwrap();
+        assert_eq!(zone.origin().as_str(), "lab");
+        assert_eq!(answer, Answer::NoSuchName);
+    }
+
+    #[test]
+    fn a_reverse_question_is_answered_by_whichever_zone_holds_the_address() {
+        // It carries no suffix to match on, so every zone is asked.
+        let zones = Zones::new([
+            Zone::new(
+                ZoneName::new("lab").unwrap(),
+                [("music".to_string(), Ipv4Addr::new(10, 13, 37, 2))],
+            ),
+            Zone::new(
+                ZoneName::new("home").unwrap(),
+                [("kitchen".to_string(), Ipv4Addr::new(10, 20, 0, 2))],
+            ),
+        ]);
+        let (_, answer) = zones.lookup("2.0.20.10.in-addr.arpa", Query::Ptr).unwrap();
+        assert_eq!(answer, Answer::Name("kitchen.home".to_string()));
+        let (_, answer) = zones.lookup("2.37.13.10.in-addr.arpa", Query::Ptr).unwrap();
+        assert_eq!(answer, Answer::Name("music.lab".to_string()));
+    }
+
+    #[test]
+    fn two_networks_of_one_name_do_not_shadow_each_other_at_random() {
+        // Exactly the two-`LAB` case. Only one can own the suffix; which
+        // one must not depend on the order they happened to start in.
+        let first = Zone::new(
+            ZoneName::new("lab").unwrap(),
+            [("music".to_string(), Ipv4Addr::new(10, 13, 37, 2))],
+        );
+        let second = Zone::new(
+            ZoneName::new("lab").unwrap(),
+            [("music".to_string(), Ipv4Addr::new(10, 99, 0, 2))],
+        );
+        let zones = Zones::new([first, second]);
+        assert_eq!(zones.len(), 1, "one suffix, one zone");
+        let (_, answer) = zones.lookup("music.lab", Query::A).unwrap();
+        assert_eq!(
+            answer,
+            Answer::Addresses(vec![Ipv4Addr::new(10, 13, 37, 2)])
+        );
     }
 }

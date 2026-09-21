@@ -355,21 +355,51 @@ impl Agent {
     /// waits to adopt whatever it settles on. One agent has one interface, so
     /// proposing a range it could not route would be worse than having none:
     /// the lowest author's range wins, and the collision would spread.
-    fn reserve_range(&self, network: NetworkId) -> (Option<Ipv4Range>, Option<Ipv4Range>) {
-        let Some(wanted) = self.inner.config.overlay_ipv4_range else {
-            return (None, None);
+    fn reserve_range(&self, network: NetworkId) -> RangePlan {
+        let Some(configured) = self.inner.config.overlay_ipv4_range else {
+            return RangePlan::default();
         };
-        let reservation = crate::overlay::NetworkRoutes {
-            range: Some(wanted),
-            local: None,
-            peers: Vec::new(),
+        let reserve = |wanted: Ipv4Range| {
+            let reservation = crate::overlay::NetworkRoutes {
+                range: Some(wanted),
+                local: None,
+                peers: Vec::new(),
+            };
+            self.inner.routes.set_network(network, reservation).is_ok()
         };
-        match self.inner.routes.set_network(network, reservation) {
-            Ok(()) => (Some(wanted), None),
-            Err(err) => {
-                tracing::info!(%err, "not proposing a range for this network");
-                (None, Some(wanted))
-            }
+
+        // The configured range first, so a network a device has always had
+        // keeps the addresses it has always had.
+        if reserve(configured) {
+            return RangePlan {
+                propose: Some(configured),
+                ..RangePlan::default()
+            };
+        }
+
+        // A second network on the same agent cannot have it — one agent,
+        // one interface — so it falls back to the range derived from its
+        // own id, which every one of its members derives identically
+        // without being told.
+        let derived = crate::state::derived_ipv4_range(network);
+        if reserve(derived) {
+            tracing::info!(
+                %network,
+                range = %derived,
+                "another network here holds the configured range; this one uses the \
+                 range derived from its id unless its members settled another"
+            );
+            return RangePlan {
+                fallback: Some(derived),
+                conflict: Some(configured),
+                ..RangePlan::default()
+            };
+        }
+
+        tracing::info!(%network, "not proposing a range for this network");
+        RangePlan {
+            conflict: Some(configured),
+            ..RangePlan::default()
         }
     }
 
@@ -521,7 +551,7 @@ impl Agent {
             return Err(Error::NetworkAlreadyActive(network_id));
         }
 
-        let (reserved, conflict) = self.reserve_range(network_id);
+        let range = self.reserve_range(network_id);
         let handle = network::spawn(RuntimeParams {
             keys,
             adapter: self.inner.adapter.clone(),
@@ -537,8 +567,9 @@ impl Agent {
             hostname: self.inner.read_hostname(),
             transport: self.inner.transport.get().cloned(),
             device_secret: self.inner.identity.signing_key(),
-            ipv4_range: reserved,
-            range_conflict: conflict,
+            ipv4_range: range.propose,
+            ipv4_fallback: range.fallback,
+            range_conflict: range.conflict,
         });
         networks.insert(network_id, handle);
         drop(networks);
@@ -854,6 +885,18 @@ impl Agent {
         };
         sender.send(command).await.map_err(|_| Error::Stopped)
     }
+}
+
+/// What a network may propose as its overlay range, and what it cannot have.
+#[derive(Debug, Clone, Copy, Default)]
+struct RangePlan {
+    /// Proposed straight away: the configured range, when it is free here.
+    propose: Option<Ipv4Range>,
+    /// Proposed after a moment, when the configured range is another
+    /// network's: the range derived from this network's own id.
+    fallback: Option<Ipv4Range>,
+    /// The configured range, when this network cannot have it.
+    conflict: Option<Ipv4Range>,
 }
 
 /// How long a release is given to reach the sessions it was queued on.

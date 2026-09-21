@@ -13,7 +13,7 @@ use tsunagi::proto::message::{
 };
 use tsunagi::proto::{read_frame, write_frame};
 use tsunagi::test_support;
-use tsunagi::testing::{TestAgent, network, settle, wait_event, wait_for_peers};
+use tsunagi::testing::{TestAgent, network, settle, wait_event, wait_for_peers, wait_until};
 
 const LIMIT: usize = 64 * 1024;
 
@@ -259,6 +259,76 @@ async fn deactivating_one_network_leaves_the_agent_and_others_running() {
     // And it can be brought back.
     agent.agent.activate_network(alpha).await.unwrap();
     assert!(agent.agent.network_status(alpha).await.is_ok());
+
+    agent.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_networks_on_one_agent_each_get_a_range_of_their_own() {
+    // One agent, one interface: the configured range can only belong to one
+    // of them. The second does not go without — it takes the range derived
+    // from its own id, which every one of its members derives identically,
+    // so it is an agreement and not a local invention.
+    let discovery = SharedMemoryDiscovery::new();
+    let (first, first_secret) = network("two-ranges-one");
+    let (second, second_secret) = network("two-ranges-two");
+
+    let agent = TestAgent::spawn(&discovery).await.unwrap();
+    let one = agent
+        .agent
+        .join_network(&first, &first_secret)
+        .await
+        .unwrap();
+    let two = agent
+        .agent
+        .join_network(&second, &second_secret)
+        .await
+        .unwrap();
+
+    let own = agent.agent.endpoint_id();
+    let addresses = wait_until("both networks allocate an address", || {
+        let handle = agent.agent.clone();
+        async move {
+            let mine = async |network| {
+                handle
+                    .network_status(network)
+                    .await
+                    .ok()?
+                    .members
+                    .into_iter()
+                    .find(|member| member.endpoint_id == own)?
+                    .overlay_address_v4
+            };
+            Some((mine(one).await?, mine(two).await?))
+        }
+    })
+    .await;
+
+    assert_ne!(
+        addresses.0, addresses.1,
+        "different networks, different addresses"
+    );
+    assert!(
+        tsunagi::state::DEFAULT_IPV4_RANGE.contains(addresses.0),
+        "the first keeps the configured range: {}",
+        addresses.0
+    );
+    assert!(
+        tsunagi::state::derived_ipv4_range(two).contains(addresses.1),
+        "the second is in the range derived from its id: {}",
+        addresses.1
+    );
+    assert!(
+        !tsunagi::state::DEFAULT_IPV4_RANGE.contains(addresses.1),
+        "and not in the one the first network holds"
+    );
+
+    // And the ranges do not overlap, which is what lets one interface
+    // carry both without a packet being ambiguous.
+    assert!(
+        !tsunagi::state::derived_ipv4_range(two).contains(addresses.0),
+        "the two ranges must not overlap"
+    );
 
     agent.agent.shutdown().await;
 }

@@ -16,7 +16,9 @@ use tokio::task::JoinHandle;
 use crate::BoxFuture;
 use crate::error::{Error, Result};
 
-use super::{JoinedReport, LeftReport, MAX_MESSAGE_LEN, Request, Response, StatusReport};
+use super::{
+    DnsReport, JoinedReport, LeftReport, MAX_MESSAGE_LEN, Request, Response, StatusReport,
+};
 
 /// Builds the report that answers a status request.
 ///
@@ -57,6 +59,17 @@ pub trait ReportSource: Send + Sync + 'static {
         _secret: String,
     ) -> BoxFuture<'_, std::result::Result<JoinedReport, String>> {
         Box::pin(async move { Err("this agent cannot join a network".to_string()) })
+    }
+
+    /// Turns the local resolver on or off while the agent runs.
+    ///
+    /// Defaulted to a refusal, like the others.
+    fn set_dns(
+        &self,
+        _enable: bool,
+        _port: Option<u16>,
+    ) -> BoxFuture<'_, std::result::Result<Option<DnsReport>, String>> {
+        Box::pin(async move { Err("this agent cannot serve DNS".to_string()) })
     }
 }
 
@@ -194,6 +207,10 @@ async fn handle(mut stream: UnixStream, source: Arc<dyn ReportSource>) -> Result
             Ok(report) => Response::Joined(report),
             Err(reason) => Response::Error(reason),
         },
+        Request::Dns { enable, port } => match source.set_dns(enable, port).await {
+            Ok(report) => Response::Dns(report),
+            Err(reason) => Response::Error(reason),
+        },
     };
     write_message(&mut stream, &response).await
 }
@@ -289,6 +306,20 @@ pub async fn join_network(
     }
 }
 
+/// Turns the running agent's local resolver on or off.
+pub async fn set_dns(
+    path: impl AsRef<Path>,
+    enable: bool,
+    port: Option<u16>,
+) -> Result<Option<DnsReport>> {
+    let path = path.as_ref();
+    match exchange(path, &Request::Dns { enable, port }, EXCHANGE_TIMEOUT).await? {
+        Response::Dns(report) => Ok(report),
+        Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
 /// Marks the wire format of the local control socket.
 ///
 /// `b"TSN"` followed by the version, so a mismatch is recognised as one
@@ -300,7 +331,7 @@ pub async fn join_network(
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 9]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 10]);
 
 async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let encoded = postcard::to_stdvec(value)
