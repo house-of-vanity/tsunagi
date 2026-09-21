@@ -52,6 +52,38 @@ pub struct PluginCapability {
     pub data: Vec<u8>,
 }
 
+/// Where a protocol hands the packets it has decrypted.
+///
+/// A protocol proves *who* sent a packet; it does not know what that member
+/// is entitled to say, because entitlement is an address claim the system
+/// level holds. So a decrypted packet goes here rather than straight to an
+/// interface, and is checked on the way.
+pub trait PacketSink: Send + Sync + 'static {
+    /// Hands over one packet, attributed to the peer whose tunnel decrypted
+    /// it.
+    fn deliver<'a>(
+        &'a self,
+        network: NetworkId,
+        peer: EndpointId,
+        packet: bytes::Bytes,
+    ) -> BoxFuture<'a, ()>;
+}
+
+/// A sink that drops everything, for a protocol running without an interface.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiscardPackets;
+
+impl PacketSink for DiscardPackets {
+    fn deliver<'a>(
+        &'a self,
+        _network: NetworkId,
+        _peer: EndpointId,
+        _packet: bytes::Bytes,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {})
+    }
+}
+
 /// Errors a plugin may return. They are recorded, never fatal for the agent.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -109,13 +141,32 @@ pub(crate) enum PluginRequest {
 pub struct PluginContext {
     sender: Option<mpsc::Sender<PluginRequest>>,
     local: Option<EndpointId>,
+    /// Where decrypted packets go. Absent when nothing is carrying traffic,
+    /// in which case a protocol still runs and its packets are discarded.
+    sink: Option<Arc<dyn PacketSink>>,
 }
 
 impl PluginContext {
-    pub(crate) fn new(sender: mpsc::Sender<PluginRequest>, local: EndpointId) -> Self {
+    pub(crate) fn new(
+        sender: mpsc::Sender<PluginRequest>,
+        local: EndpointId,
+        sink: Option<Arc<dyn PacketSink>>,
+    ) -> Self {
         Self {
             sender: Some(sender),
             local: Some(local),
+            sink,
+        }
+    }
+
+    /// Where to hand a decrypted packet.
+    ///
+    /// Always answers: with no interface to write to, the packets are
+    /// discarded, which is what `--no-tun` means and is not an error.
+    pub fn packet_sink(&self) -> Arc<dyn PacketSink> {
+        match &self.sink {
+            Some(sink) => Arc::clone(sink),
+            None => Arc::new(DiscardPackets),
         }
     }
 
@@ -124,6 +175,7 @@ impl PluginContext {
         Self {
             sender: None,
             local: None,
+            sink: None,
         }
     }
 
@@ -236,6 +288,20 @@ pub trait IpPlugin: Send + Sync + std::fmt::Debug + 'static {
         allocations: &[(EndpointId, std::net::Ipv4Addr)],
     ) {
         let _ = (network, range, allocations);
+    }
+
+    /// Carries one packet to a peer, encrypting it however this protocol
+    /// does.
+    ///
+    /// `false` when it cannot right now — no link, no tunnel, not this
+    /// protocol's peer — which the caller reports rather than treats as an
+    /// error. The packet came off the one interface the agent owns, and
+    /// which protocol takes it is settled by asking.
+    ///
+    /// The default carries nothing, which is right for a plugin that only
+    /// announces something.
+    fn carry(&self, _network: NetworkId, _peer: EndpointId, _packet: bytes::Bytes) -> bool {
+        false
     }
 
     /// A data plane link to a peer is available for this plugin's protocol.

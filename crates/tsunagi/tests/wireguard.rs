@@ -106,15 +106,15 @@ impl WgAgent {
         let tuns = MemoryTunFactory::new();
         let wg = tune(
             WireguardConfig::new(root.join("wireguard"))
-                .with_interface_prefix(tag)
                 .with_reconcile(Duration::from_millis(20), Duration::from_millis(250)),
         );
-        let plugin = WireguardPlugin::open(wg, Arc::new(tuns.clone()))
-            .await
-            .unwrap();
+        let plugin = WireguardPlugin::open(wg).await.unwrap();
+        // The interface belongs to the agent now, so the tag names it
+        // directly rather than prefixing one per network.
         let agent = Agent::spawn(
             config_with(root, discovery)
                 .with_overlay_ipv4_range(range)
+                .with_interface(Arc::new(tuns.clone()), tag, 1280)
                 .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
         )
         .await
@@ -137,14 +137,16 @@ impl WgAgent {
         .await
     }
 
-    /// The in-memory packet interface for a network.
-    async fn tun(&self, network: NetworkId) -> Arc<MemoryTun> {
+    /// The one in-memory packet interface this agent owns.
+    ///
+    /// Not per network: one agent has one interface, and which network a
+    /// packet on it belongs to is decided by its address.
+    async fn tun(&self, _network: NetworkId) -> Arc<MemoryTun> {
         let name = wait_until("the packet interface exists", || async {
-            let view = self.plugin.overview(network)?;
-            self.tuns.device(&view.interface).map(|_| view.interface)
+            self.agent.overlay().map(|overlay| overlay.interface)
         })
         .await;
-        self.tuns.device(&name).unwrap()
+        self.tuns.device(&name).expect("the device was created")
     }
 
     /// Waits until `count` tunnels have completed a WireGuard handshake.
@@ -269,10 +271,11 @@ async fn a_peer_cannot_send_from_an_address_it_does_not_own() {
     tun_a.push_from_os(ipv4_packet(someone_else, addr_b, b"spoofed"));
 
     // B must drop it: the source is not the address A holds.
+    // Counted on the interface, not on the tunnel: the protocol proved who
+    // sent the packet, and whether that member may use the address it chose
+    // is a question about a signed claim, which the system level holds.
     wait_until("the spoofed packet is dropped", || async {
-        let view = b.plugin.overview(network_id)?;
-        let tunnel = view.peers.first()?.tunnel.as_ref()?;
-        (tunnel.stats.dropped_wrong_source >= 1).then_some(())
+        (b.agent.overlay()?.counters.wrong_source >= 1).then_some(())
     })
     .await;
 
@@ -370,9 +373,7 @@ async fn an_ipv4_source_a_peer_does_not_own_is_dropped() {
     tun_a.push_from_os(ipv4_packet(forged, v4_b, b"spoofed v4"));
 
     wait_until("the spoofed IPv4 packet is dropped", || async {
-        let view = b.plugin.overview(network_id)?;
-        let tunnel = view.peers.first()?.tunnel.as_ref()?;
-        (tunnel.stats.dropped_wrong_source >= 1).then_some(())
+        (b.agent.overlay()?.counters.wrong_source >= 1).then_some(())
     })
     .await;
 
@@ -611,7 +612,8 @@ async fn packets_for_an_unknown_address_are_counted_not_broadcast() {
 
     wait_until("the packet is counted as unroutable", || async {
         let view = a.plugin.overview(network_id)?;
-        (view.unroutable_packets >= 1).then_some(())
+        let _ = view;
+        (a.agent.overlay()?.counters.unroutable >= 1).then_some(())
     })
     .await;
 
@@ -712,34 +714,61 @@ async fn a_departing_peer_loses_its_tunnel() {
 }
 
 #[tokio::test]
-async fn two_networks_get_separate_interfaces_keys_and_overlays() {
+async fn two_networks_share_one_interface_with_keys_and_ranges_of_their_own() {
+    // One agent, one interface — so two networks on it must use different
+    // ranges, or an address would belong to both. Each network's range is
+    // settled by whoever got there first, and the agent adopts what it
+    // finds; see the routing table's own tests for the refusal when they
+    // overlap.
     let discovery = SharedMemoryDiscovery::new();
     let (name_a, secret_a) = network("wg-left");
     let (name_b, secret_b) = network("wg-right");
+    let beta_range = Some("10.99.0.0/16".parse::<Ipv4Range>().unwrap());
 
     let hub = WgAgent::spawn(&discovery, "th").await;
     let left = WgAgent::spawn(&discovery, "tl").await;
-    let right = WgAgent::spawn(&discovery, "tr").await;
+    let right = WgAgent::spawn_range(&discovery, "tr", beta_range).await;
 
-    let alpha = hub.agent.join_network(&name_a, &secret_a).await.unwrap();
-    let beta = hub.agent.join_network(&name_b, &secret_b).await.unwrap();
-    left.agent.join_network(&name_a, &secret_a).await.unwrap();
-    right.agent.join_network(&name_b, &secret_b).await.unwrap();
+    // The other members settle each range before the hub joins, so it has
+    // something to adopt rather than a default to collide with.
+    let alpha = left.agent.join_network(&name_a, &secret_a).await.unwrap();
+    let beta = right.agent.join_network(&name_b, &secret_b).await.unwrap();
+    left.overlay(alpha).await;
+    right.overlay(beta).await;
 
+    hub.agent.join_network(&name_a, &secret_a).await.unwrap();
+    hub.agent.join_network(&name_b, &secret_b).await.unwrap();
     hub.wait_for_tunnels(alpha, 1).await;
     hub.wait_for_tunnels(beta, 1).await;
 
-    let view_alpha = hub.plugin.overview(alpha).unwrap();
-    let view_beta = hub.plugin.overview(beta).unwrap();
-    assert_ne!(view_alpha.interface, view_beta.interface);
     assert_ne!(
-        view_alpha.public_key, view_beta.public_key,
+        hub.plugin.overview(alpha).unwrap().public_key,
+        hub.plugin.overview(beta).unwrap().public_key,
         "one WireGuard identity per network, not one per host"
     );
-    assert_eq!(hub.tuns.devices().len(), 2);
+    assert_eq!(
+        hub.tuns.devices().len(),
+        1,
+        "one agent has one interface, whatever it is a member of"
+    );
 
-    // Traffic in one overlay never surfaces in the other.
-    let hub_alpha = hub.overlay(alpha).await;
+    // Each network's address comes from its own range.
+    let hub_alpha = wait_until("the hub settles into alpha's range", || async {
+        let address = hub.plugin.overview(alpha)?.overlay_address_v4?;
+        tsunagi::state::DEFAULT_IPV4_RANGE
+            .contains(address)
+            .then_some(address)
+    })
+    .await;
+    let hub_beta = wait_until("the hub settles into beta's range", || async {
+        let address = hub.plugin.overview(beta)?.overlay_address_v4?;
+        beta_range?.contains(address).then_some(address)
+    })
+    .await;
+    assert_ne!(hub_alpha, hub_beta);
+
+    // Traffic in one overlay never surfaces in the other, though both cross
+    // the same interface.
     let left_addr = left.overlay(alpha).await;
     hub.tun(alpha)
         .await
@@ -758,14 +787,6 @@ async fn two_networks_get_separate_interfaces_keys_and_overlays() {
         .is_err(),
         "the other overlay must see nothing"
     );
-
-    // Deactivating one network removes only its interface.
-    hub.agent.deactivate_network(alpha).await.unwrap();
-    wait_until("the alpha interface is gone", || async {
-        hub.plugin.overview(alpha).is_none().then_some(())
-    })
-    .await;
-    assert!(hub.plugin.overview(beta).is_some());
 
     hub.shutdown().await;
     left.shutdown().await;
@@ -971,11 +992,8 @@ async fn an_mtu_below_what_ipv4_guarantees_is_refused() {
     // IPv6's sake; the overlay is IPv4 now and a relayed path with small
     // datagrams can be matched instead of warned about.
     let dir = TempDir::new().unwrap();
-    let result = WireguardPlugin::open(
-        WireguardConfig::new(dir.path()).with_mtu(MIN_MTU - 1),
-        Arc::new(MemoryTunFactory::new()),
-    )
-    .await;
+    let result =
+        WireguardPlugin::open(WireguardConfig::new(dir.path()).with_mtu(MIN_MTU - 1)).await;
     match result {
         Err(err) => {
             let text = err.to_string();
@@ -989,11 +1007,8 @@ async fn an_mtu_below_what_ipv4_guarantees_is_refused() {
     const { assert!(DEFAULT_MTU > MIN_MTU) };
     assert_eq!(WIREGUARD_OVERHEAD, 32);
     assert!(
-        WireguardPlugin::open(
-            WireguardConfig::new(dir.path().join("ok")),
-            Arc::new(MemoryTunFactory::new()),
-        )
-        .await
-        .is_ok()
+        WireguardPlugin::open(WireguardConfig::new(dir.path().join("ok")))
+            .await
+            .is_ok()
     );
 }

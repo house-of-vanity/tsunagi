@@ -36,6 +36,19 @@ pub struct CandidateStatus {
     pub consecutive_failures: u32,
 }
 
+/// The overlay interface, as the agent sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayStatus {
+    /// The interface name the operating system gave.
+    pub interface: String,
+    /// Its MTU.
+    pub mtu: u32,
+    /// The addresses it should be carrying.
+    pub addresses: Vec<crate::overlay::Cidr>,
+    /// What has happened on it.
+    pub counters: crate::overlay::Counters,
+}
+
 /// A member the signed state knows about, connected or not.
 ///
 /// This is the durable roster: it comes from signed records, so a member that

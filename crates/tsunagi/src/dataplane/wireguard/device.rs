@@ -29,7 +29,7 @@
 //! against.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -39,13 +39,11 @@ use bytes::Bytes;
 use iroh::EndpointId;
 use tokio::task::JoinHandle;
 
-use crate::dataplane::PluginError;
 use crate::dataplane::transport::{SharedLink, TransportError};
+use crate::dataplane::{PacketSink, PluginError};
 use crate::identity::NetworkId;
 
 use super::keys::{WgPublicKey, WgSecretKey};
-use crate::overlay::packet::IpHeader;
-use crate::overlay::tun::TunDevice;
 
 /// How often WireGuard's own timers are driven.
 ///
@@ -65,6 +63,8 @@ struct PeerCounters {
     rx_bytes: AtomicU64,
     dropped_wrong_source: AtomicU64,
     dropped_oversize: AtomicU64,
+    /// Packets there was no session to encrypt with yet.
+    dropped_no_session: AtomicU64,
     protocol_errors: AtomicU64,
 }
 
@@ -85,6 +85,11 @@ pub struct PeerStats {
     pub dropped_wrong_source: u64,
     /// Packets dropped because they did not fit in one link datagram.
     pub dropped_oversize: u64,
+    /// Packets dropped because there was no session to encrypt with yet.
+    ///
+    /// A handful while a tunnel comes up is normal; a number that keeps
+    /// climbing means the handshake is not completing.
+    pub dropped_no_session: u64,
     /// WireGuard protocol errors, including packets that failed to decrypt.
     pub protocol_errors: u64,
 }
@@ -149,6 +154,7 @@ impl Peer {
             rx_bytes: self.counters.rx_bytes.load(Ordering::Relaxed),
             dropped_wrong_source: self.counters.dropped_wrong_source.load(Ordering::Relaxed),
             dropped_oversize: self.counters.dropped_oversize.load(Ordering::Relaxed),
+            dropped_no_session: self.counters.dropped_no_session.load(Ordering::Relaxed),
             protocol_errors: self.counters.protocol_errors.load(Ordering::Relaxed),
         }
     }
@@ -186,29 +192,25 @@ pub struct PeerSummary {
 struct Inner {
     network: NetworkId,
     private_key: WgSecretKey,
-    tun: Arc<dyn TunDevice>,
-    /// The IPv4 overlay range, when the overlay is dual stack.
     peers: RwLock<HashMap<WgPublicKey, Arc<Peer>>>,
-    /// Both families, so one lookup routes any packet.
-    routes: RwLock<HashMap<IpAddr, WgPublicKey>>,
+    /// Where decrypted packets go.
+    ///
+    /// The interface belongs to the system level, so this hands a packet up
+    /// rather than writing it out: only that level knows which addresses the
+    /// sending member is entitled to use.
+    sink: Arc<dyn PacketSink>,
     next_index: AtomicU32,
-    unroutable: AtomicU64,
-    /// One destination nobody owned, kept so the counter can be acted on.
-    unroutable_sample: Mutex<Option<IpAddr>>,
-    multicast: AtomicU64,
-    ipv4_conflicts: AtomicU64,
 }
 
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
             .field("network", &self.network.fmt_short())
-            .field("tun", &self.tun.name())
             .finish()
     }
 }
 
-/// A userspace WireGuard interface for one network.
+/// The userspace WireGuard tunnels of one network.
 #[derive(Debug)]
 pub struct WireguardDevice {
     inner: Arc<Inner>,
@@ -216,38 +218,73 @@ pub struct WireguardDevice {
 }
 
 impl WireguardDevice {
-    /// Starts a device on top of `tun`.
-    pub fn start(network: NetworkId, private_key: WgSecretKey, tun: Arc<dyn TunDevice>) -> Self {
+    /// Starts the tunnels for one network.
+    ///
+    /// No interface is involved: packets arrive through [`Self::carry`] and
+    /// leave through the sink. Which address belongs to whom, and therefore
+    /// where a packet should go, is decided above this.
+    pub fn start(network: NetworkId, private_key: WgSecretKey, sink: Arc<dyn PacketSink>) -> Self {
         let inner = Arc::new(Inner {
             network,
             private_key,
-            tun,
             peers: RwLock::new(HashMap::new()),
-            routes: RwLock::new(HashMap::new()),
+            sink,
             next_index: AtomicU32::new(1),
-            unroutable: AtomicU64::new(0),
-            unroutable_sample: Mutex::new(None),
-            multicast: AtomicU64::new(0),
-            ipv4_conflicts: AtomicU64::new(0),
         });
 
-        let reader = tokio::spawn(read_from_os(Arc::clone(&inner)));
         let timers = tokio::spawn(drive_timers(Arc::clone(&inner)));
 
         Self {
             inner,
-            tasks: vec![reader, timers],
+            tasks: vec![timers],
         }
     }
 
-    /// The interface name in use.
-    pub fn interface(&self) -> &str {
-        self.inner.tun.name()
-    }
+    /// Encrypts a packet and sends it to a peer.
+    ///
+    /// `false` when there is no tunnel for that peer, which is a state the
+    /// caller reports rather than an error: a peer whose link has not come
+    /// up yet is normal.
+    pub fn carry(&self, peer: iroh::EndpointId, packet: &[u8]) -> bool {
+        let found = read_lock(&self.inner.peers)
+            .values()
+            .find(|candidate| candidate.endpoint_id == peer)
+            .map(Arc::clone);
+        let Some(peer) = found else {
+            return false;
+        };
 
-    /// The interface MTU.
-    pub fn mtu(&self) -> u32 {
-        self.inner.tun.mtu()
+        let mut scratch = vec![0u8; SCRATCH];
+        // The encryption is the whole of what this protocol contributes, so
+        // it happens here rather than anywhere the packet passes through.
+        // The lock is released before the send: a slow link must not hold up
+        // the tunnel's timers.
+        let len = {
+            let mut tunn = match peer.tunn.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match tunn.encapsulate(packet, &mut scratch) {
+                TunnResult::WriteToNetwork(out) => Some(out.len()),
+                // No session yet, so nothing to send. Counted as dropped
+                // rather than reported: the handshake is in flight and the
+                // next packet will go.
+                _ => None,
+            }
+        };
+        let Some(len) = len else {
+            peer.counters
+                .dropped_no_session
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+
+        send_to_peer(&peer, &scratch[..len]);
+        peer.counters.tx_packets.fetch_add(1, Ordering::Relaxed);
+        peer.counters
+            .tx_bytes
+            .fetch_add(packet.len() as u64, Ordering::Relaxed);
+        true
     }
 
     /// Adds or replaces a peer and starts its tunnel.
@@ -295,9 +332,6 @@ impl WireguardDevice {
         }
 
         write_lock(&self.inner.peers).insert(public_key, Arc::clone(&peer));
-        if let Some(v4) = overlay_v4 {
-            write_lock(&self.inner.routes).insert(IpAddr::V4(v4), public_key);
-        }
 
         // Start the handshake now instead of waiting for the next timer tick,
         // so the tunnel is usable as soon as the link exists.
@@ -307,21 +341,9 @@ impl WireguardDevice {
 
     /// Removes a peer and stops its tunnel.
     pub fn remove_peer(&self, public_key: &WgPublicKey) {
-        if let Some(peer) = write_lock(&self.inner.peers).remove(public_key) {
-            let mut routes = write_lock(&self.inner.routes);
-            let v4 = match peer.overlay_v4.lock() {
-                Ok(guard) => *guard,
-                Err(poisoned) => *poisoned.into_inner(),
-            };
-            if let Some(v4) = v4 {
-                routes.remove(&IpAddr::V4(v4));
-            }
-        }
-    }
-
-    /// How many IPv4 derivation collisions have been resolved.
-    pub fn ipv4_conflicts(&self) -> u64 {
-        self.inner.ipv4_conflicts.load(Ordering::Relaxed)
+        // Dropping it stops the task and closes the link; there is no route
+        // to withdraw, because routes are not kept here.
+        write_lock(&self.inner.peers).remove(public_key);
     }
 
     /// Removes every peer whose key is not in `keep`.
@@ -363,34 +385,6 @@ impl WireguardDevice {
             .collect();
         peers.sort_by_key(|peer| peer.public_key);
         peers
-    }
-
-    /// Unicast packets the operating system sent to an address no peer owns.
-    ///
-    /// A non-zero value means something tried to reach a host that is not in
-    /// the overlay.
-    pub fn unroutable_packets(&self) -> u64 {
-        self.inner.unroutable.load(Ordering::Relaxed)
-    }
-
-    /// One destination that nobody owned, if there was one.
-    ///
-    /// A bare count says something is wrong but not what; the address usually
-    /// says it outright.
-    pub fn unroutable_sample(&self) -> Option<IpAddr> {
-        match self.inner.unroutable_sample.lock() {
-            Ok(guard) => *guard,
-            Err(poisoned) => *poisoned.into_inner(),
-        }
-    }
-
-    /// Multicast packets dropped.
-    ///
-    /// Expected and harmless: Linux emits multicast listener and router
-    /// solicitation traffic on any IPv6 interface, and this overlay is
-    /// unicast only. Counted separately so it does not look like a fault.
-    pub fn multicast_packets(&self) -> u64 {
-        self.inner.multicast.load(Ordering::Relaxed)
     }
 }
 
@@ -454,77 +448,6 @@ fn send_to_peer(peer: &Peer, payload: &[u8]) {
     }
 }
 
-/// Operating system -> peer.
-async fn read_from_os(inner: Arc<Inner>) {
-    loop {
-        let Some(packet) = inner.tun.recv().await else {
-            return;
-        };
-
-        // Route by destination: only the peer that owns that overlay address
-        // may receive it. Both families go through the same table.
-        let Some(destination) = IpHeader::parse(&packet).map(|header| header.destination()) else {
-            inner.unroutable.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        // The kernel emits multicast on every IPv6 interface. The overlay is
-        // unicast only, so this is dropped, but it is not a fault.
-        if destination.is_multicast() {
-            inner.multicast.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        let target = read_lock(&inner.routes).get(&destination).copied();
-        let Some(target) = target else {
-            note_unroutable(&inner, destination);
-            continue;
-        };
-        let peer = read_lock(&inner.peers).get(&target).cloned();
-        let Some(peer) = peer else {
-            note_unroutable(&inner, destination);
-            continue;
-        };
-
-        let mut scratch = vec![0u8; SCRATCH];
-        let outcome = {
-            let mut tunn = match peer.tunn.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            match tunn.encapsulate(&packet, &mut scratch) {
-                TunnResult::WriteToNetwork(out) => Some(out.len()),
-                TunnResult::Done => None,
-                TunnResult::Err(err) => {
-                    tracing::trace!(?err, "wireguard encapsulation failed");
-                    peer.counters
-                        .protocol_errors
-                        .fetch_add(1, Ordering::Relaxed);
-                    None
-                }
-                _ => None,
-            }
-        };
-
-        if let Some(len) = outcome {
-            send_to_peer(&peer, &scratch[..len]);
-            peer.counters.tx_packets.fetch_add(1, Ordering::Relaxed);
-            peer.counters
-                .tx_bytes
-                .fetch_add(packet.len() as u64, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Counts a packet nobody owned the destination of, keeping one example.
-fn note_unroutable(inner: &Inner, destination: IpAddr) {
-    inner.unroutable.fetch_add(1, Ordering::Relaxed);
-    let mut sample = match inner.unroutable_sample.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    *sample = Some(destination);
-}
-
-/// Peer -> operating system.
 async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
     loop {
         let Some(datagram) = peer.link.recv().await else {
@@ -543,12 +466,11 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                 };
                 match tunn.decapsulate(None, input.unwrap_or(&[]), &mut scratch) {
                     TunnResult::WriteToNetwork(out) => Outcome::ToNetwork(out.len()),
-                    TunnResult::WriteToTunnelV6(out, source) => {
-                        Outcome::ToTunnel(out.len(), IpAddr::V6(source))
-                    }
-                    TunnResult::WriteToTunnelV4(out, source) => {
-                        Outcome::ToTunnel(out.len(), IpAddr::V4(source))
-                    }
+                    // The source boringtun reports is not consulted here:
+                    // whether the peer may use it is checked where the
+                    // claims live.
+                    TunnResult::WriteToTunnelV6(out, _) => Outcome::ToTunnel(out.len()),
+                    TunnResult::WriteToTunnelV4(out, _) => Outcome::ToTunnel(out.len()),
                     TunnResult::Done => Outcome::Done,
                     TunnResult::Err(err) => {
                         tracing::trace!(?err, "wireguard decapsulation failed");
@@ -564,37 +486,20 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                     input = None;
                     continue;
                 }
-                Outcome::ToTunnel(len, source) => {
+                Outcome::ToTunnel(len) => {
+                    // Handed up, not written out. This end has proved *who*
+                    // sent the packet; whether that member may use the source
+                    // address it chose is a question about a signed claim,
+                    // and only the system level holds those.
                     let payload = Bytes::copy_from_slice(&scratch[..len]);
-                    // Enforce address ownership: a peer may only send from
-                    // the address the control plane agreed it holds. An
-                    // overlay address is signed by its holder, so this is
-                    // checked against the agreement and never against
-                    // anything the peer said here.
-                    let owned = match source {
-                        IpAddr::V4(addr) => {
-                            let held = match peer.overlay_v4.lock() {
-                                Ok(guard) => *guard,
-                                Err(poisoned) => *poisoned.into_inner(),
-                            };
-                            held == Some(addr)
-                        }
-                        // The overlay is IPv4. Anything else has no owner
-                        // here and is dropped rather than guessed at.
-                        IpAddr::V6(_) => false,
-                    };
-                    if !owned {
-                        peer.counters
-                            .dropped_wrong_source
-                            .fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    if inner.tun.send(payload).await.is_ok() {
-                        peer.counters.rx_packets.fetch_add(1, Ordering::Relaxed);
-                        peer.counters
-                            .rx_bytes
-                            .fetch_add(len as u64, Ordering::Relaxed);
-                    }
+                    inner
+                        .sink
+                        .deliver(inner.network, peer.endpoint_id, payload)
+                        .await;
+                    peer.counters.rx_packets.fetch_add(1, Ordering::Relaxed);
+                    peer.counters
+                        .rx_bytes
+                        .fetch_add(len as u64, Ordering::Relaxed);
                     break;
                 }
                 Outcome::Failed => {
@@ -611,7 +516,7 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
 
 enum Outcome {
     ToNetwork(usize),
-    ToTunnel(usize, IpAddr),
+    ToTunnel(usize),
     Done,
     Failed,
 }

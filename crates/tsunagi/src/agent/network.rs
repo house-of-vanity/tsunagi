@@ -120,6 +120,10 @@ pub(crate) struct RuntimeParams {
     pub(crate) discovery: Option<Arc<dyn NetworkDiscovery>>,
     pub(crate) discovery_interval: Duration,
     pub(crate) plugins: Vec<SharedPlugin>,
+    /// Who holds which overlay address, shared with every other network.
+    pub(crate) routes: Arc<crate::overlay::RoutingTable>,
+    /// The one interface, when the agent has one.
+    pub(crate) interface: Option<Arc<crate::overlay::Interface>>,
     pub(crate) hostname: String,
     /// Signing key for this agent's own records.
     pub(crate) device_secret: iroh::SecretKey,
@@ -615,7 +619,7 @@ impl Runtime {
             .unwrap_or(0);
 
         self.ensure_own_claim().await;
-        self.publish_allocations();
+        self.publish_allocations().await;
     }
 
     /// The range this network uses: whatever it has already settled on, else
@@ -624,7 +628,20 @@ impl Runtime {
     /// Adopting the agreed one is what lets a participant join without being
     /// told the range out of band.
     fn effective_range(&self) -> Option<Ipv4Range> {
-        self.state.agreed_range().or(self.params.ipv4_range)
+        if let Some(agreed) = self.state.agreed_range() {
+            return Some(agreed);
+        }
+        // Nobody has settled one yet, so this agent would be proposing its
+        // own. It must not propose a range it cannot route: one agent has
+        // one interface, and claiming an address in a range another network
+        // already owns would spread the collision rather than contain it —
+        // "the lowest author's range wins" would carry it to everybody.
+        // Better to hold off and adopt whatever the network settles on.
+        let wanted = self.params.ipv4_range?;
+        match self.params.routes.would_overlap(self.network_id, wanted) {
+            None => Some(wanted),
+            Some(_) => None,
+        }
     }
 
     /// Makes sure this agent holds an address, claiming one if it does not.
@@ -810,14 +827,14 @@ impl Runtime {
 
         // Somebody may have taken the address we were using.
         self.ensure_own_claim().await;
-        self.publish_allocations();
+        self.publish_allocations().await;
         if self.state.records() != before {
             self.broadcast_state();
         }
     }
 
     /// Tells the plugins who holds which overlay address.
-    fn publish_allocations(&mut self) {
+    async fn publish_allocations(&mut self) {
         let Some(range) = self.effective_range() else {
             return;
         };
@@ -831,6 +848,40 @@ impl Runtime {
 
         for plugin in &self.params.plugins {
             plugin.on_address_allocation(self.network_id, range, &allocations);
+        }
+
+        // And the system level's own view, which is what decides whose
+        // packet is whose. The local address is kept out of the peer list:
+        // a packet for ourselves does not go over a tunnel.
+        let local = self.state.address_of(&self.local_id);
+        let routes = crate::overlay::NetworkRoutes {
+            range: Some(range),
+            local,
+            peers: allocations
+                .iter()
+                .filter(|(holder, _)| *holder != self.local_id)
+                .map(|(holder, address)| (*address, *holder))
+                .collect(),
+        };
+        if let Err(err) = self.params.routes.set_network(self.network_id, routes) {
+            // Reported once per change rather than swallowed: two networks
+            // wanting the same addresses is a thing the user has to settle.
+            self.metrics.plugin_errors += 1;
+            self.emit(Event::PluginError {
+                network: self.network_id,
+                protocol: "overlay".into(),
+                reason: err.to_string(),
+            });
+            return;
+        }
+        if let Some(interface) = &self.params.interface
+            && let Err(err) = interface.sync_addresses().await
+        {
+            self.emit(Event::PluginError {
+                network: self.network_id,
+                protocol: "overlay".into(),
+                reason: err.to_string(),
+            });
         }
     }
 

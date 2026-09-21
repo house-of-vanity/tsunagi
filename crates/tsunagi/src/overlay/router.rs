@@ -175,6 +175,23 @@ impl RoutingTable {
         addresses
     }
 
+    /// Whether a range would collide with one another network already uses.
+    ///
+    /// Asked before proposing a range rather than after: with one interface
+    /// an agent that claimed an address it could not route would also be
+    /// telling everybody else to use that range, and "the range of the
+    /// lowest author wins" would spread the collision instead of containing
+    /// it.
+    pub fn would_overlap(&self, network: NetworkId, range: Ipv4Range) -> Option<Ipv4Range> {
+        self.read().iter().find_map(|(other, existing)| {
+            if *other == network {
+                return None;
+            }
+            let other_range = existing.range?;
+            ranges_overlap(range, other_range).then_some(other_range)
+        })
+    }
+
     /// How many networks the table covers.
     pub fn len(&self) -> usize {
         self.read().len()
@@ -317,6 +334,25 @@ mod tests {
         );
         // And the first network still answers for its own.
         assert_eq!(table.route(addr(2)).map(|route| route.network), Some(first));
+    }
+
+    #[test]
+    fn a_range_can_be_asked_about_before_it_is_proposed() {
+        // The point of asking first: an agent that claims an address it
+        // cannot route also tells everybody else to use that range.
+        let table = RoutingTable::new();
+        let first = network("first");
+        let second = network("second");
+        table.set_network(first, routes()).unwrap();
+
+        let mine: Ipv4Range = "10.13.37.0/24".parse().unwrap();
+        assert_eq!(table.would_overlap(second, mine), Some(mine));
+        // Its own range is not a collision with itself.
+        assert_eq!(table.would_overlap(first, mine), None);
+        assert_eq!(
+            table.would_overlap(second, "10.99.0.0/16".parse().unwrap()),
+            None
+        );
     }
 
     #[test]

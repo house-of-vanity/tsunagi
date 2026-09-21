@@ -33,7 +33,7 @@ use tsunagi::{Agent, NetworkStatus};
 struct HostedAgent {
     _dir: TempDir,
     agent: Agent,
-    plugin: Arc<WireguardPlugin>,
+    _plugin: Arc<WireguardPlugin>,
     host: MockHost,
 }
 
@@ -43,12 +43,12 @@ impl HostedAgent {
         let provisioner = Arc::new(MockProvisioner::new(host.clone()));
         let factory = Arc::new(ManagedTunFactory::new(provisioner));
         let config = WireguardConfig::new(dir.path().join("wireguard"))
-            .with_interface_prefix(tag)
             .with_reconcile(Duration::from_millis(20), Duration::from_millis(100));
-        let plugin = WireguardPlugin::open(config, factory).await.unwrap();
+        let plugin = WireguardPlugin::open(config).await.unwrap();
         let agent = Agent::spawn(
             config_with(dir.path(), discovery)
                 .with_overlay_ipv4_range(Some(DEFAULT_IPV4_RANGE))
+                .with_interface(factory, tag, 1280)
                 .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
         )
         .await
@@ -56,17 +56,18 @@ impl HostedAgent {
         Self {
             _dir: dir,
             agent,
-            plugin,
+            _plugin: plugin,
             host,
         }
     }
 
     /// The interface name the plugin settled on for a network.
-    async fn interface(&self, network: NetworkId) -> String {
-        wait_until("the plugin named its interface", || async {
-            self.plugin
-                .overview(network)
-                .map(|view| view.interface)
+    /// The one interface this agent owns. Not per network.
+    async fn interface(&self, _network: NetworkId) -> String {
+        wait_until("the agent named its interface", || async {
+            self.agent
+                .overlay()
+                .map(|overlay| overlay.interface)
                 .filter(|name| !name.is_empty())
         })
         .await
@@ -217,7 +218,10 @@ async fn an_interface_belonging_to_something_else_is_left_alone() {
 }
 
 #[tokio::test]
-async fn leaving_a_network_removes_the_interface_from_the_host() {
+async fn leaving_a_network_takes_its_address_off_the_interface_but_not_the_interface() {
+    // The interface belongs to the agent, so it outlives any one network:
+    // another may still be using it. What a network takes with it is its own
+    // address.
     let discovery = SharedMemoryDiscovery::new();
     let (name, secret) = network("provision-cleanup");
     let agent = HostedAgent::spawn(&discovery, "tsunx", MockHost::new()).await;
@@ -225,21 +229,25 @@ async fn leaving_a_network_removes_the_interface_from_the_host() {
     let network_id = agent.agent.join_network(&name, &secret).await.unwrap();
     let interface = agent.interface(network_id).await;
     agent
-        .wait_for_host("the interface to exist", &interface, |state| state)
+        .wait_for_host("the address to be assigned", &interface, |state| {
+            state.filter(addressed)
+        })
         .await;
 
     agent.agent.deactivate_network(network_id).await.unwrap();
 
-    agent
-        .wait_for_host("the interface to be removed", &interface, |state| {
-            state.is_none().then_some(())
+    let state = agent
+        .wait_for_host("the address to be withdrawn", &interface, |state| {
+            state.filter(|state| !addressed(state))
         })
         .await;
+    assert_eq!(state.kind, LinkKind::Tun, "the interface is still there");
+
+    // And it goes when the agent does.
+    agent.agent.shutdown().await;
     assert!(
         agent.host.names().is_empty(),
         "nothing is left behind: {:?}",
         agent.host.names()
     );
-
-    agent.agent.shutdown().await;
 }

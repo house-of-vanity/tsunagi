@@ -123,20 +123,28 @@ impl Tally {
 #[derive(Debug)]
 pub struct Interface {
     device: Arc<dyn TunDevice>,
+    factory: Arc<dyn TunFactory>,
+    name: String,
+    mtu: u32,
     routes: Arc<RoutingTable>,
     tally: Arc<Tally>,
+    /// What was last applied to the host, so an unchanged table is not
+    /// re-applied on every pass.
+    applied: std::sync::Mutex<Vec<Cidr>>,
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Interface {
     /// Creates the interface and starts moving packets.
     pub async fn start(
-        factory: &dyn TunFactory,
-        request: TunRequest,
+        factory: Arc<dyn TunFactory>,
+        name: impl Into<String>,
+        mtu: u32,
         routes: Arc<RoutingTable>,
         carrier: Arc<dyn PacketCarrier>,
     ) -> Result<Self, OverlayError> {
-        let device = factory.create(request).await?;
+        let name = name.into();
+        let device = factory.create(TunRequest::bare(name.clone(), mtu)).await?;
         let tally = Arc::new(Tally::default());
 
         let task = {
@@ -172,10 +180,50 @@ impl Interface {
 
         Ok(Self {
             device,
+            factory,
+            name,
+            mtu,
             routes,
             tally,
+            applied: std::sync::Mutex::new(Vec::new()),
             task: std::sync::Mutex::new(Some(task)),
         })
+    }
+
+    /// Brings the addresses on the host in line with the routing table.
+    ///
+    /// Called whenever a network agrees a different address for this agent.
+    /// The interface is never recreated for it: that would drop every tunnel
+    /// riding on it for the sake of one address.
+    pub async fn sync_addresses(&self) -> Result<(), OverlayError> {
+        let wanted = self.wanted_addresses();
+        {
+            let applied = match self.applied.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if applied == wanted {
+                return Ok(());
+            }
+        }
+
+        // One address per network, so at most a handful; the request carries
+        // the first and the provisioner reconciles the rest.
+        let request = TunRequest {
+            name: self.name.clone(),
+            address: wanted.first().and_then(|cidr| match cidr.addr {
+                IpAddr::V4(address) => Some(address),
+                IpAddr::V6(_) => None,
+            }),
+            prefix_len: wanted.first().map_or(0, |cidr| cidr.prefix_len),
+            mtu: self.mtu,
+        };
+        self.factory.reconfigure(request).await?;
+        match self.applied.lock() {
+            Ok(mut guard) => *guard = wanted,
+            Err(poisoned) => *poisoned.into_inner() = wanted,
+        }
+        Ok(())
     }
 
     /// The interface name the operating system gave.
@@ -186,6 +234,11 @@ impl Interface {
     /// The interface MTU.
     pub fn mtu(&self) -> u32 {
         self.device.mtu()
+    }
+
+    /// Removes the interface from the host.
+    pub async fn remove(&self) {
+        self.factory.destroy(self.device.name()).await;
     }
 
     /// The counters as they stand.
@@ -355,10 +408,11 @@ mod tests {
             carried: std::sync::Mutex::new(Vec::new()),
             refuse,
         });
-        let factory = MemoryTunFactory::new();
+        let factory = Arc::new(MemoryTunFactory::new());
         let interface = Interface::start(
-            &factory,
-            TunRequest::bare("tsuntest", 1280),
+            Arc::clone(&factory) as Arc<dyn TunFactory>,
+            "tsuntest",
+            1280,
             Arc::clone(&routes),
             Arc::clone(&carrier) as Arc<dyn PacketCarrier>,
         )

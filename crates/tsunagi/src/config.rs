@@ -237,6 +237,17 @@ pub struct AgentConfig {
     pub reconnect: ReconnectPolicy,
     /// IP plugins whose capabilities are announced and dispatched.
     pub plugins: Vec<SharedPlugin>,
+    /// Where the overlay interface comes from, when the agent should have one.
+    ///
+    /// One agent, one interface: it belongs here rather than to a protocol,
+    /// because every protocol carries traffic for the same addresses on it.
+    /// `None` means no interface — the protocols still run and their packets
+    /// are discarded.
+    pub tun_factory: Option<Arc<dyn crate::overlay::TunFactory>>,
+    /// The name to ask the operating system for.
+    pub interface_name: String,
+    /// The interface MTU.
+    pub interface_mtu: u32,
     /// The IPv4 overlay range this agent proposes.
     ///
     /// Addresses are allocated from it and recorded in signed state, so a
@@ -259,6 +270,9 @@ impl AgentConfig {
             limits: Limits::default(),
             reconnect: ReconnectPolicy::default(),
             plugins: Vec::new(),
+            tun_factory: None,
+            interface_name: "tsun0".to_string(),
+            interface_mtu: 1280,
             overlay_ipv4_range: Some(crate::state::DEFAULT_IPV4_RANGE),
         }
     }
@@ -311,6 +325,19 @@ impl AgentConfig {
     /// Registers an IP plugin.
     pub fn with_plugin(mut self, plugin: SharedPlugin) -> Self {
         self.plugins.push(plugin);
+        self
+    }
+
+    /// Gives the agent an overlay interface, from this factory.
+    pub fn with_interface(
+        mut self,
+        factory: Arc<dyn crate::overlay::TunFactory>,
+        name: impl Into<String>,
+        mtu: u32,
+    ) -> Self {
+        self.tun_factory = Some(factory);
+        self.interface_name = name.into();
+        self.interface_mtu = mtu;
         self
     }
 

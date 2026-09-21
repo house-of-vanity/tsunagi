@@ -46,8 +46,11 @@ fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::u
                         .collect(),
                     overlay: plugin.overview(net.network_id).map(|view| {
                         tsunagi::ipc::OverlayReport {
-                            interface: view.interface.clone(),
-                            mtu: view.mtu,
+                            // The interface belongs to the agent now.
+                            interface: agent
+                                .overlay()
+                                .map_or_else(String::new, |overlay| overlay.interface),
+                            mtu: agent.overlay().map_or(0, |overlay| overlay.mtu),
                             address: view.overlay_address_v4.map(|a| a.to_string()),
                             prefix_len: view.ipv4_range.map_or(0, |range| range.prefix_len),
                             peers: view
@@ -95,14 +98,14 @@ async fn a_client_sees_the_agent_and_its_overlay() {
     let tuns = MemoryTunFactory::new();
     let plugin = WireguardPlugin::open(
         WireguardConfig::new(dir_a.path().join("wg"))
-            .with_interface_prefix("tca")
             .with_reconcile(Duration::from_millis(20), Duration::from_millis(250)),
-        Arc::new(tuns),
     )
     .await
     .unwrap();
     let agent = Agent::spawn(
-        config_with(dir_a.path(), &discovery).with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+        config_with(dir_a.path(), &discovery)
+            .with_interface(Arc::new(tuns), "tca0", 1280)
+            .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
     )
     .await
     .unwrap();
@@ -110,14 +113,14 @@ async fn a_client_sees_the_agent_and_its_overlay() {
     let dir_b = TempDir::new().unwrap();
     let plugin_b = WireguardPlugin::open(
         WireguardConfig::new(dir_b.path().join("wg"))
-            .with_interface_prefix("tcb")
             .with_reconcile(Duration::from_millis(20), Duration::from_millis(250)),
-        Arc::new(MemoryTunFactory::new()),
     )
     .await
     .unwrap();
     let agent_b = Agent::spawn(
-        config_with(dir_b.path(), &discovery).with_plugin(plugin_b.clone() as Arc<dyn IpPlugin>),
+        config_with(dir_b.path(), &discovery)
+            .with_interface(Arc::new(MemoryTunFactory::new()), "tcb0", 1280)
+            .with_plugin(plugin_b.clone() as Arc<dyn IpPlugin>),
     )
     .await
     .unwrap();

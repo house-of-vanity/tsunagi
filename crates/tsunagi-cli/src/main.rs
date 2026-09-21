@@ -1884,17 +1884,24 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // The data plane is optional and never required for the control plane.
     let wireguard = if args.wireguard {
+        // The interface belongs to the agent, not to the protocol: one
+        // agent, one interface, and every protocol carries traffic for the
+        // same addresses on it.
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
         } else {
             system_tun_factory()?
         };
-        let mut wg = WireguardConfig::new(paths.state_dir.join("wireguard"))
-            .with_interface_prefix(args.wg_prefix.clone());
+        let mtu = args
+            .wg_mtu
+            .unwrap_or(tsunagi::dataplane::wireguard::DEFAULT_MTU);
+        config = config.with_interface(tun_factory, args.wg_prefix.clone(), mtu);
+
+        let mut wg = WireguardConfig::new(paths.state_dir.join("wireguard"));
         if let Some(mtu) = args.wg_mtu {
             wg = wg.with_mtu(mtu);
         }
-        let plugin = WireguardPlugin::open(wg, tun_factory).await?;
+        let plugin = WireguardPlugin::open(wg).await?;
         config = config.with_plugin(plugin.clone() as Arc<dyn IpPlugin>);
         Some(plugin)
     } else {
@@ -2030,6 +2037,7 @@ async fn build_report(
         StatusReport,
     };
 
+    let overlay = agent.overlay();
     let dns = dns.map(|dns| DnsReport {
         zone: dns.zone,
         listening: dns.listening.map(|address| address.to_string()),
@@ -2051,8 +2059,10 @@ async fn build_report(
             let overlay = wireguard
                 .and_then(|plugin| plugin.overview(network.network_id))
                 .map(|view| OverlayReport {
-                    interface: view.interface.clone(),
-                    mtu: view.mtu,
+                    interface: overlay
+                        .as_ref()
+                        .map_or_else(String::new, |overlay| overlay.interface.clone()),
+                    mtu: overlay.as_ref().map_or(0, |overlay| overlay.mtu),
                     address: view.overlay_address_v4.map(|addr| addr.to_string()),
                     prefix_len: view.ipv4_range.map_or(0, |range| range.prefix_len),
                     peers: view
@@ -2089,9 +2099,21 @@ async fn build_report(
                                 .unwrap_or_else(|| "no data link".into()),
                         })
                         .collect(),
-                    unroutable_packets: view.unroutable_packets,
-                    multicast_packets: view.multicast_packets,
-                    unroutable_sample: view.unroutable_sample.map(|address| address.to_string()),
+                    // The interface belongs to the agent, so the counters
+                    // about it come from there and are the same for every
+                    // network sharing it.
+                    unroutable_packets: overlay
+                        .as_ref()
+                        .map_or(0, |overlay| overlay.counters.unroutable),
+                    multicast_packets: overlay
+                        .as_ref()
+                        .map_or(0, |overlay| overlay.counters.multicast),
+                    unroutable_sample: overlay.as_ref().and_then(|overlay| {
+                        overlay
+                            .counters
+                            .unroutable_sample
+                            .map(|address| address.to_string())
+                    }),
                 });
 
             NetworkReport {
@@ -2309,12 +2331,18 @@ async fn print_status(agent: &Agent, network: NetworkId, wireguard: Option<&Wire
                 ),
             }
         }
-        if view.unroutable_packets > 0 {
-            println!(
-                "  {} packet(s) for unknown addresses",
-                view.unroutable_packets
-            );
-        }
+    }
+    if let Some(overlay) = agent.overlay()
+        && overlay.counters.unroutable > 0
+    {
+        println!(
+            "  {} packet(s) for unknown addresses{}",
+            overlay.counters.unroutable,
+            match overlay.counters.unroutable_sample {
+                Some(sample) => format!(" (for example {sample})"),
+                None => String::new(),
+            }
+        );
     }
     println!();
 }

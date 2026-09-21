@@ -1,4 +1,4 @@
-//! The WireGuard IP plugin.
+//! The WireGuard protocol plugin.
 //!
 //! Each agent builds its own view of the overlay from the set of participants
 //! the control plane agreed on. For a full mesh of `N` members that is `N - 1`
@@ -11,16 +11,16 @@
 //!   [`PacketLink`](crate::dataplane::transport::PacketLink) per peer and runs
 //!   a WireGuard tunnel over it. Reachability, hole punching and relaying are
 //!   the transport's problem.
+//! * It does **not** know which addresses anybody holds, and owns no
+//!   interface. One agent has one interface, at the system level, and every
+//!   protocol carries traffic for the same addresses on it. A packet arrives
+//!   here already routed and leaves here already decrypted.
 //! * It owns one WireGuard key per network, in its own store, unrelated to the
 //!   iroh device key and to the network secret.
-//! * It owns one packet interface per network, named deterministically.
-//! * It never touches an interface it did not create, and never changes
-//!   routing, DNS or firewall settings beyond its own device.
 //!
 //! WireGuard runs in userspace via [`boringtun`], so there is no kernel module
-//! and no `wg` tool to depend on. The only privileged step is creating the
-//! packet interface, and even that is behind [`TunFactory`] so the whole data
-//! plane can run unprivileged in tests.
+//! and no `wg` tool to depend on, and nothing this plugin does needs
+//! privileges: creating the interface is somebody else's job now.
 //!
 //! A failure here is reported and retried. It never stops the control plane.
 
@@ -35,6 +35,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::BoxFuture;
+use crate::dataplane::PacketSink;
 use crate::dataplane::transport::SharedLink;
 use crate::dataplane::{IpPlugin, PluginCapability, PluginContext, PluginError};
 use crate::identity::NetworkId;
@@ -44,7 +45,6 @@ use super::device::{PeerSummary, WireguardDevice};
 use super::keys::{WgPublicKey, WgSecretKey};
 use super::store::WgKeyStore;
 use crate::overlay::config::{DEFAULT_INTERFACE_PREFIX, interface_name};
-use crate::overlay::tun::{TunFactory, TunRequest};
 use crate::state::Ipv4Range;
 
 /// The protocol identifier this plugin announces.
@@ -150,12 +150,6 @@ pub struct NetworkOverview {
     pub ipv4_range: Option<Ipv4Range>,
     /// Peers this agent knows about.
     pub peers: Vec<PeerOverview>,
-    /// Unicast packets the operating system sent to an address no peer owns.
-    pub unroutable_packets: u64,
-    /// Multicast packets dropped. Expected, not a fault.
-    pub multicast_packets: u64,
-    /// One destination nobody owned, if there was one.
-    pub unroutable_sample: Option<IpAddr>,
 }
 
 impl NetworkOverview {
@@ -202,12 +196,6 @@ struct NetworkState {
     ipv4_range: Option<Ipv4Range>,
     /// The address last reported as missing, so it is said once, not forever.
     reported_missing_v4: Option<Ipv4Addr>,
-    /// What was last applied to the host interface.
-    ///
-    /// The overlay IPv4 address is allocated at run time and can change while
-    /// the agent runs, so the interface has to be brought back in line
-    /// without being recreated — recreating it would drop every tunnel.
-    applied: Option<TunRequest>,
 }
 
 #[derive(Debug, Default)]
@@ -232,16 +220,16 @@ struct Worker {
     config: WireguardConfig,
     /// This agent's endpoint id, learned when the plugin is attached.
     local_id: OnceLock<EndpointId>,
-    tun_factory: Arc<dyn TunFactory>,
     store: WgKeyStore,
     shared: Mutex<Shared>,
     context: OnceLock<PluginContext>,
+    /// Where decrypted packets go, once the agent has attached one.
+    sink: OnceLock<Arc<dyn PacketSink>>,
 }
 
 impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
-            .field("tun", &self.tun_factory.name())
             .field("store", &self.store.path())
             .finish()
     }
@@ -260,10 +248,7 @@ impl WireguardPlugin {
     ///
     /// Must be called from inside a tokio runtime; the plugin starts no
     /// runtime of its own.
-    pub async fn open(
-        config: WireguardConfig,
-        tun_factory: Arc<dyn TunFactory>,
-    ) -> Result<Arc<Self>, PluginError> {
+    pub async fn open(config: WireguardConfig) -> Result<Arc<Self>, PluginError> {
         // Validate the prefix once, here, rather than failing per network.
         interface_name(&config.interface_prefix, NetworkId::from_bytes([0u8; 32]))?;
 
@@ -283,10 +268,10 @@ impl WireguardPlugin {
         let worker = Arc::new(Worker {
             config,
             local_id: OnceLock::new(),
-            tun_factory,
             store,
             shared: Mutex::new(Shared::default()),
             context: OnceLock::new(),
+            sink: OnceLock::new(),
         });
 
         let (commands, receiver) = mpsc::channel(64);
@@ -337,20 +322,6 @@ impl WireguardPlugin {
             overlay_address_v4: state.allocations.get(&self.worker.local_id()).copied(),
             ipv4_range: state.ipv4_range,
             peers,
-            unroutable_packets: state
-                .device
-                .as_ref()
-                .map(|device| device.unroutable_packets())
-                .unwrap_or(0),
-            multicast_packets: state
-                .device
-                .as_ref()
-                .map(|device| device.multicast_packets())
-                .unwrap_or(0),
-            unroutable_sample: state
-                .device
-                .as_ref()
-                .and_then(|device| device.unroutable_sample()),
         })
     }
 
@@ -436,7 +407,6 @@ impl Worker {
                 allocations: HashMap::new(),
                 ipv4_range: None,
                 reported_missing_v4: None,
-                applied: None,
             });
         }
 
@@ -449,73 +419,33 @@ impl Worker {
         Ok(true)
     }
 
-    /// What the host interface for a network should look like.
-    fn desired_request(&self, state: &NetworkState) -> TunRequest {
-        let own_range = state.ipv4_range;
-        TunRequest {
-            name: state.interface.clone(),
-            address: state.allocations.get(&self.local_id()).copied(),
-            prefix_len: own_range.map_or(0, |range| range.prefix_len),
-            mtu: self.config.mtu,
-        }
-    }
-
-    /// Creates the packet interface and starts the WireGuard device.
+    /// Starts this network's tunnels.
+    ///
+    /// No interface is created: one agent has one, it belongs to the system
+    /// level, and decrypted packets are handed there rather than written
+    /// out.
     async fn ensure_device(&self, network: NetworkId) -> Result<(), PluginError> {
-        let (request, key) = {
+        let key = {
             let shared = self.lock_shared();
             match shared.networks.get(&network) {
-                Some(state) if state.device.is_none() => {
-                    (self.desired_request(state), state.key.clone())
-                }
+                Some(state) if state.device.is_none() => state.key.clone(),
                 _ => return Ok(()),
             }
         };
 
-        let applied = request.clone();
-        let tun = self.tun_factory.create(request).await?;
-        let device = Arc::new(WireguardDevice::start(network, key, tun));
+        let sink = match self.sink.get() {
+            Some(sink) => Arc::clone(sink),
+            // Not attached to an agent: the protocol still runs, and its
+            // packets have nowhere to go.
+            None => Arc::new(crate::dataplane::DiscardPackets) as Arc<dyn PacketSink>,
+        };
+        let device = Arc::new(WireguardDevice::start(network, key, sink));
 
         let mut shared = self.lock_shared();
         if let Some(state) = shared.networks.get_mut(&network) {
-            state.interface = device.interface().to_string();
             state.device = Some(device);
-            state.applied = Some(applied);
         }
         Ok(())
-    }
-
-    /// Brings a live interface back in line after the overlay changed its
-    /// mind about this agent's address.
-    async fn ensure_addresses(&self, network: NetworkId) {
-        let wanted = {
-            let shared = self.lock_shared();
-            match shared.networks.get(&network) {
-                Some(state) if state.device.is_some() => {
-                    let wanted = self.desired_request(state);
-                    if state.applied.as_ref() == Some(&wanted) {
-                        return;
-                    }
-                    wanted
-                }
-                _ => return,
-            }
-        };
-
-        match self.tun_factory.reconfigure(wanted.clone()).await {
-            Ok(()) => {
-                let mut shared = self.lock_shared();
-                if let Some(state) = shared.networks.get_mut(&network) {
-                    state.applied = Some(wanted);
-                }
-            }
-            Err(err) => {
-                // Not fatal: the tunnels keep running on the addresses that
-                // are there, and the next reconciliation tries again.
-                tracing::warn!(%err, "cannot update the overlay interface addresses");
-                self.report(network, err);
-            }
-        }
     }
 
     /// Brings the running tunnels in line with what is known.
@@ -637,11 +567,10 @@ impl Worker {
         // kernel to remove an interface this agent created; the explicit
         // destroy makes that immediate and definite rather than dependent on
         // the last reader letting go.
-        let removed = self.lock_shared().networks.remove(&network);
-        if let Some(state) = removed {
-            drop(state.device);
-            self.tun_factory.destroy(&state.interface).await;
-        }
+        // Dropping the state drops the tunnels, which stops their tasks and
+        // closes their links. There is no interface to remove: the agent owns
+        // it, and it outlives any one network.
+        self.lock_shared().networks.remove(&network);
     }
 
     fn known_networks(&self) -> Vec<NetworkId> {
@@ -707,7 +636,6 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
             }, if wait_until.is_some() => {
                 deadline = None;
                 for network in std::mem::take(&mut pending) {
-                    worker.ensure_addresses(network).await;
                     worker.sync(network);
                 }
             }
@@ -718,7 +646,6 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
                     if let Err(err) = worker.ensure_device(network).await {
                         tracing::debug!(%err, "packet interface still unavailable");
                     }
-                    worker.ensure_addresses(network).await;
                     worker.sync(network);
                 }
             }
@@ -735,6 +662,7 @@ impl IpPlugin for WireguardPlugin {
         if let Some(local) = context.local_endpoint_id() {
             let _ = self.worker.local_id.set(local);
         }
+        let _ = self.worker.sink.set(context.packet_sink());
         let _ = self.worker.context.set(context);
     }
 
@@ -825,6 +753,15 @@ impl IpPlugin for WireguardPlugin {
         if changed {
             self.nudge(Command::Sync(network));
         }
+    }
+
+    fn carry(&self, network: NetworkId, peer: EndpointId, packet: bytes::Bytes) -> bool {
+        let shared = self.worker.lock_shared();
+        shared
+            .networks
+            .get(&network)
+            .and_then(|state| state.device.as_ref())
+            .is_some_and(|device| device.carry(peer, &packet))
     }
 
     fn on_peer_link(&self, network: NetworkId, peer: EndpointId, link: SharedLink) {

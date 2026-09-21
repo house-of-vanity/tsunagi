@@ -27,7 +27,7 @@ mod status;
 pub use events::Event;
 pub use status::{
     AgentStatus, CandidateStatus, MemberStatus, NetworkMetrics, NetworkState, NetworkStatus,
-    PeerStatus,
+    OverlayStatus, PeerStatus,
 };
 
 use std::collections::HashMap;
@@ -37,13 +37,15 @@ use iroh::{EndpointAddr, EndpointId};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::BoxFuture;
 use crate::config::{AgentConfig, Limits};
 use crate::dataplane::transport::PacketTransport;
 use crate::dataplane::transport::iroh_link::{IrohTransport, TransportContext};
-use crate::dataplane::{PluginContext, PluginRequest};
+use crate::dataplane::{PacketSink, PluginContext, PluginRequest};
 use crate::error::{Error, Result};
 use crate::identity::{DeviceIdentity, NetworkId, NetworkKeys, NetworkName, NetworkSecret};
 use crate::net::EndpointAdapter;
+use crate::overlay::PacketCarrier;
 use crate::proto::handshake;
 use crate::proto::message::ControlMessage;
 use crate::storage::{CacheOutcome, Storage};
@@ -87,6 +89,10 @@ struct Inner {
     accept_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     plugin_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     transport: std::sync::OnceLock<Arc<dyn PacketTransport>>,
+    /// Who holds which overlay address, across every network.
+    routes: Arc<crate::overlay::RoutingTable>,
+    /// The one interface, when the agent was given a way to make one.
+    interface: std::sync::OnceLock<Arc<crate::overlay::Interface>>,
 }
 
 impl Inner {
@@ -107,11 +113,69 @@ impl Inner {
     }
 }
 
+/// Routes an outbound packet to whichever protocol can carry it.
+///
+/// Holds a weak reference: the interface belongs to the agent, and a strong
+/// one here would keep the agent alive for as long as its own interface.
+struct Carrier(Weak<Inner>);
+
+impl std::fmt::Debug for Carrier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Carrier")
+    }
+}
+
+impl std::fmt::Debug for Sink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sink")
+    }
+}
+
+impl PacketCarrier for Carrier {
+    fn carry(&self, route: crate::overlay::Route, packet: bytes::Bytes) -> bool {
+        let Some(inner) = self.0.upgrade() else {
+            return false;
+        };
+        // Offered to each protocol in turn. With one configured this is a
+        // single call; the shape is what allows several to be live at once,
+        // each carrying the peers it has a link to.
+        inner
+            .config
+            .plugins
+            .iter()
+            .any(|plugin| plugin.carry(route.network, route.peer, packet.clone()))
+    }
+}
+
+/// Writes a packet a protocol decrypted to the interface.
+struct Sink(Weak<Inner>);
+
+impl PacketSink for Sink {
+    fn deliver<'a>(
+        &'a self,
+        network: NetworkId,
+        peer: EndpointId,
+        packet: bytes::Bytes,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(inner) = self.0.upgrade() else {
+                return;
+            };
+            let Some(interface) = inner.interface.get() else {
+                return;
+            };
+            // The rejection is already counted on the interface; there is
+            // nothing useful to do with it here.
+            let _ = interface.deliver(network, peer, packet).await;
+        })
+    }
+}
+
 /// Answers the data plane transport's questions about the agent.
 ///
-/// Holds a weak reference on purpose: the transport lives inside the agent, so
-/// a strong one would be a cycle and the agent — with its open databases and
-/// its directory lock — would never be released.
+/// Holds a weak reference for the same reason as [`Carrier`]: the transport
+/// lives inside the agent, so a strong one would be a cycle and the agent —
+/// with its open databases and its directory lock — would never be released.
 #[derive(Debug)]
 struct TransportCtx(Weak<Inner>);
 
@@ -178,8 +242,37 @@ impl Agent {
             accept_task: std::sync::Mutex::new(None),
             plugin_task: std::sync::Mutex::new(None),
             transport: std::sync::OnceLock::new(),
+            routes: Arc::new(crate::overlay::RoutingTable::new()),
+            interface: std::sync::OnceLock::new(),
             config,
         });
+
+        // One interface for the agent, if it was given a way to make one.
+        // Failing to is reported and not fatal: the control plane works, and
+        // so do the protocols, they just have nowhere to put packets.
+        if let Some(factory) = inner.config.tun_factory.clone() {
+            let carrier = Arc::new(Carrier(Arc::downgrade(&inner))) as Arc<dyn PacketCarrier>;
+            match crate::overlay::Interface::start(
+                factory,
+                inner.config.interface_name.clone(),
+                inner.config.interface_mtu,
+                Arc::clone(&inner.routes),
+                carrier,
+            )
+            .await
+            {
+                Ok(interface) => {
+                    let _ = inner.interface.set(Arc::new(interface));
+                }
+                Err(err) => {
+                    let _ = inner.events.send(Event::PluginError {
+                        network: NetworkId::from_bytes([0u8; 32]),
+                        protocol: "overlay".into(),
+                        reason: err.to_string(),
+                    });
+                }
+            }
+        }
 
         // The data plane rides on iroh too, which is where it gets hole
         // punching and relay fallback from. It is a separate ALPN and a
@@ -205,7 +298,11 @@ impl Agent {
         // bound; overflow drops the request rather than stalling the plugin.
         if !inner.config.plugins.is_empty() {
             let (plugin_tx, plugin_rx) = mpsc::channel(64);
-            let context = PluginContext::new(plugin_tx, inner.identity.endpoint_id());
+            let sink = inner
+                .interface
+                .get()
+                .map(|_| Arc::new(Sink(Arc::downgrade(&inner))) as Arc<dyn PacketSink>);
+            let context = PluginContext::new(plugin_tx, inner.identity.endpoint_id(), sink);
             for plugin in &inner.config.plugins {
                 plugin.attach(context.clone());
             }
@@ -243,6 +340,47 @@ impl Agent {
     /// handed literal addresses, as in the test suite.
     pub fn local_addr(&self) -> EndpointAddr {
         self.inner.adapter.loopback_addr()
+    }
+
+    /// Reserves the configured overlay range for a network, if it can.
+    ///
+    /// Done here, where activations are serialised, rather than inside the
+    /// runtime: whether a range is free depends on what the other networks
+    /// took, and deciding that in a task would make the answer depend on
+    /// which task ran first.
+    ///
+    /// `None` means this agent will not propose a range for that network and
+    /// waits to adopt whatever it settles on. One agent has one interface, so
+    /// proposing a range it could not route would be worse than having none:
+    /// the lowest author's range wins, and the collision would spread.
+    fn reserve_range(&self, network: NetworkId) -> Option<crate::state::Ipv4Range> {
+        let wanted = self.inner.config.overlay_ipv4_range?;
+        let reservation = crate::overlay::NetworkRoutes {
+            range: Some(wanted),
+            local: None,
+            peers: Vec::new(),
+        };
+        match self.inner.routes.set_network(network, reservation) {
+            Ok(()) => Some(wanted),
+            Err(err) => {
+                tracing::info!(%err, "not proposing a range for this network");
+                None
+            }
+        }
+    }
+
+    /// The overlay interface this agent owns, when it has one.
+    ///
+    /// One agent, one interface, so this is not asked per network: a packet
+    /// on it may belong to any of them.
+    pub fn overlay(&self) -> Option<OverlayStatus> {
+        let interface = self.inner.interface.get()?;
+        Some(OverlayStatus {
+            interface: interface.name().to_string(),
+            mtu: interface.mtu(),
+            addresses: interface.wanted_addresses(),
+            counters: interface.counters(),
+        })
     }
 
     /// The hostname announced to peers.
@@ -367,10 +505,12 @@ impl Agent {
             discovery: self.inner.config.discovery.clone(),
             discovery_interval: self.inner.config.discovery_interval,
             plugins: self.inner.config.plugins.clone(),
+            routes: Arc::clone(&self.inner.routes),
+            interface: self.inner.interface.get().cloned(),
             hostname: self.inner.read_hostname(),
             transport: self.inner.transport.get().cloned(),
             device_secret: self.inner.identity.signing_key(),
-            ipv4_range: self.inner.config.overlay_ipv4_range,
+            ipv4_range: self.reserve_range(network_id),
         });
         networks.insert(network_id, handle);
         drop(networks);
@@ -400,6 +540,15 @@ impl Agent {
         handle.stop().await;
         for plugin in &self.inner.config.plugins {
             plugin.on_network_deactivated(network_id);
+        }
+        // The network's addresses come off the interface; the interface
+        // itself stays, because the agent owns it and other networks may
+        // still be using it.
+        self.inner.routes.remove_network(network_id);
+        if let Some(interface) = self.inner.interface.get()
+            && let Err(err) = interface.sync_addresses().await
+        {
+            tracing::warn!(%err, "cannot update the overlay addresses");
         }
         self.inner.storage.set_auto_start(network_id, false).await?;
         Ok(())
@@ -581,6 +730,12 @@ impl Agent {
             if let Some(task) = task {
                 let _ = task.await;
             }
+        }
+
+        // The interface goes with the agent that owns it. Before the
+        // plugins, so nothing is still trying to write to it.
+        if let Some(interface) = self.inner.interface.get() {
+            interface.remove().await;
         }
 
         // Plugins remove whatever system objects they created. A plugin that
