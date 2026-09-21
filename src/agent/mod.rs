@@ -37,6 +37,8 @@ use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::{AgentConfig, Limits};
+use crate::dataplane::transport::PacketTransport;
+use crate::dataplane::transport::iroh_link::{IrohTransport, TransportContext};
 use crate::dataplane::{PluginContext, PluginRequest};
 use crate::error::{Error, Result};
 use crate::identity::{DeviceIdentity, NetworkId, NetworkKeys, NetworkName, NetworkSecret};
@@ -82,20 +84,47 @@ struct Inner {
     shutdown: Shutdown,
     accept_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     plugin_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    transport: std::sync::OnceLock<Arc<dyn PacketTransport>>,
 }
 
-impl Drop for Inner {
-    fn drop(&mut self) {
-        // Nothing here awaits; this is only a safety net for a handle that was
-        // dropped without an explicit shutdown.
-        self.shutdown.trigger();
-        for guard in [&self.accept_task, &self.plugin_task] {
-            if let Ok(mut guard) = guard.lock()
-                && let Some(task) = guard.take()
-            {
-                task.abort();
+/// Answers the data plane transport's questions about the agent.
+///
+/// Holds a weak reference on purpose: the transport lives inside the agent, so
+/// a strong one would be a cycle and the agent — with its open databases and
+/// its directory lock — would never be released.
+#[derive(Debug)]
+struct TransportCtx(Weak<Inner>);
+
+impl TransportContext for TransportCtx {
+    fn snapshot(&self) -> crate::BoxFuture<'_, HashMap<NetworkId, NetworkKeys>> {
+        Box::pin(async move {
+            let Some(inner) = self.0.upgrade() else {
+                return HashMap::new();
+            };
+            inner
+                .networks
+                .read()
+                .await
+                .iter()
+                .map(|(id, handle)| (*id, handle.keys.clone()))
+                .collect()
+        })
+    }
+
+    fn serves<'a>(&'a self, network: NetworkId, protocol: &'a str) -> crate::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let Some(inner) = self.0.upgrade() else {
+                return false;
+            };
+            if !inner.networks.read().await.contains_key(&network) {
+                return false;
             }
-        }
+            inner
+                .config
+                .plugins
+                .iter()
+                .any(|plugin| plugin.protocol_id() == protocol)
+        })
     }
 }
 
@@ -127,8 +156,19 @@ impl Agent {
             shutdown: Shutdown::new(),
             accept_task: std::sync::Mutex::new(None),
             plugin_task: std::sync::Mutex::new(None),
+            transport: std::sync::OnceLock::new(),
             config,
         });
+
+        // The data plane rides on iroh too, which is where it gets hole
+        // punching and relay fallback from. It is a separate ALPN and a
+        // separate connection, so the two planes stay independent.
+        let transport: Arc<dyn PacketTransport> = Arc::new(IrohTransport::new(
+            inner.adapter.clone(),
+            Arc::clone(&inner.limits),
+            Arc::new(TransportCtx(Arc::downgrade(&inner))) as Arc<dyn TransportContext>,
+        ));
+        let _ = inner.transport.set(transport);
 
         if let CacheOutcome::Reset(reason) = inner.storage.cache_outcome().clone() {
             let _ = inner.events.send(Event::CacheReset { reason });
@@ -257,6 +297,7 @@ impl Agent {
             discovery_interval: self.inner.config.discovery_interval,
             plugins: self.inner.config.plugins.clone(),
             hostname: self.inner.hostname.clone(),
+            transport: self.inner.transport.get().cloned(),
         });
         networks.insert(network_id, handle);
         drop(networks);
@@ -625,6 +666,12 @@ async fn handle_incoming(inner: Arc<Inner>, incoming: iroh::endpoint::Incoming) 
     };
     let peer = conn.remote_id();
 
+    // Two protocols share the endpoint; they are told apart here and never mix.
+    if conn.alpn() == crate::proto::message::DATA_ALPN {
+        handle_inbound_data(inner, conn).await;
+        return;
+    }
+
     let (mut send, mut recv) = match conn.accept_bi().await {
         Ok(streams) => streams,
         Err(err) => {
@@ -693,6 +740,45 @@ async fn handle_incoming(inner: Arc<Inner>, incoming: iroh::endpoint::Incoming) 
         .is_err()
     {
         tracing::debug!("network runtime stopped before the session could be installed");
+    }
+}
+
+/// Completes an inbound data plane connection and routes it to its network.
+async fn handle_inbound_data(inner: Arc<Inner>, conn: iroh::endpoint::Connection) {
+    let Some(transport) = inner.transport.get().cloned() else {
+        conn.close(5u32.into(), b"data plane not ready");
+        return;
+    };
+    // Downcasting is avoided by keeping the accept side on the concrete type.
+    let Some(iroh_transport) = transport.as_ref().as_any().downcast_ref::<IrohTransport>() else {
+        conn.close(5u32.into(), b"unsupported data transport");
+        return;
+    };
+
+    let inbound = match iroh_transport.accept(conn).await {
+        Ok(inbound) => inbound,
+        Err(err) => {
+            tracing::debug!(%err, "inbound data channel rejected");
+            return;
+        }
+    };
+
+    let sender = {
+        let networks = inner.networks.read().await;
+        networks
+            .get(&inbound.network)
+            .map(|handle| handle.commands.clone())
+    };
+    let Some(sender) = sender else {
+        // The network went away while the channel was being set up.
+        return;
+    };
+    if sender
+        .send(NetCommand::InboundLink(Box::new(inbound)))
+        .await
+        .is_err()
+    {
+        tracing::debug!("network runtime stopped before the data link was installed");
     }
 }
 

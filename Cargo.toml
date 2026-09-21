@@ -10,7 +10,23 @@ readme = "README.md"
 keywords = ["mesh", "p2p", "iroh", "networking"]
 categories = ["network-programming"]
 
+[features]
+default = ["cli"]
+# The `tsunagi` command line binary. Library users can opt out.
+cli = ["dep:clap", "dep:tracing-subscriber", "tokio/signal", "tun-device"]
+# A real TUN device, so the WireGuard plugin can carry actual IP traffic.
+# Needs CAP_NET_ADMIN at run time; without it the plugin still runs and its
+# in-memory device can be used for tests.
+tun-device = ["dep:tun"]
+
+[[bin]]
+name = "tsunagi"
+path = "src/bin/tsunagi.rs"
+required-features = ["cli"]
+
 [dependencies]
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 iroh = { version = "1.2", default-features = false, features = ["tls-ring"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -28,8 +44,10 @@ thiserror = "2.0"
 tracing = "0.1"
 fs4 = { version = "1.1", features = ["sync"] }
 directories = "6.0"
-x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 netwatch = "0.19.3"
+bytes = "1.12.1"
+boringtun = { version = "0.7.1", default-features = false }
+tun = { version = "0.8", features = ["async"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }

@@ -22,6 +22,17 @@ use crate::error::ProtocolError;
 /// bumping it must not change any existing [`crate::NetworkId`].
 pub const ALPN: &[u8] = b"tsunagi/ctrl/1";
 
+/// ALPN of the tsunagi data plane.
+///
+/// Data plane connections are deliberately separate from control plane ones.
+/// They carry one IP plugin's packets for one network and nothing else, so a
+/// saturated or broken data plane cannot disturb control traffic, and the
+/// transport underneath can be replaced without touching the control protocol.
+pub const DATA_ALPN: &[u8] = b"tsunagi/data/1";
+
+/// Largest plugin protocol identifier accepted when opening a data channel.
+pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
+
 /// Control protocol version carried inside the handshake.
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -59,6 +70,26 @@ pub struct Announcement {
     pub hostname: String,
     /// Announced IP plugin capabilities. Opaque to the core.
     pub capabilities: Vec<PluginCapability>,
+}
+
+/// Opens a data channel, sent by the initiator right after the membership
+/// handshake on a [`DATA_ALPN`] connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataOpen {
+    /// Which IP plugin's packets this channel will carry.
+    pub protocol: String,
+}
+
+/// The responder's answer to [`DataOpen`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataOpenAck {
+    /// Whether the channel was accepted.
+    ///
+    /// A channel is refused when the responder has no plugin for that
+    /// protocol in that network. That is an ordinary outcome, not an error.
+    pub accepted: bool,
+    /// Largest datagram the responder is willing to receive, in bytes.
+    pub max_datagram: u32,
 }
 
 /// A control message exchanged after a successful handshake.

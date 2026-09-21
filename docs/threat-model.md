@@ -19,10 +19,15 @@ Read this before relying on anything here. The protocol is in
   messages for network B, even over a shared physical connection.
 - **Confidentiality and integrity in transit.** Provided by QUIC/TLS. This
   crate adds no encryption of its own.
-- **Overlay address ownership.** A WireGuard peer's `AllowedIPs` are derived
-  from its public key, not taken from its announcement, so a member cannot
-  claim another member's overlay address and receive its traffic. See
-  [wireguard.md](wireguard.md#deterministic-overlay-addressing).
+- **Overlay address ownership.** A peer's overlay address is derived from its
+  public key, not taken from its announcement. Outbound packets go to the owner
+  of the destination address; inbound packets are dropped unless their source
+  is the address derived for the peer that sent them. A member can therefore
+  neither receive nor forge another member's traffic. See
+  [wireguard.md](wireguard.md#address-ownership-is-enforced-not-announced).
+- **Tunnelled traffic is end-to-end encrypted by WireGuard**, independently of
+  this crate. The transport underneath is also encrypted by iroh, but the
+  tunnel's confidentiality does not depend on that.
 - **Resource bounds.** Frame lengths are validated before allocation; strings,
   lists, queues, concurrent dials and in-flight handshakes are all bounded;
   handshakes, dials and writes have timeouts.
@@ -49,10 +54,14 @@ Read this before relying on anything here. The protocol is in
   permissions are owner-only where the platform supports it, and the state
   directory takes an ownership lock, but neither defends against a user who can
   read the file or against malware running as that user.
-- **User IP traffic.** Carried by the WireGuard plugin, not by iroh, and
-  encrypted by WireGuard itself. *Filtering* it is still the operating system's
-  and the user's job: the plugin creates connectivity between members and does
-  not police what flows over it.
+- **User IP traffic.** Carried by the WireGuard plugin over an iroh data
+  connection, and encrypted by WireGuard end to end. *Filtering* it is still
+  the operating system's and the user's job: the plugin creates connectivity
+  between members and does not police what flows over it.
+- **Traffic metadata reaches the relay when one is used.** If iroh cannot hole
+  punch, the data connection goes through a relay, which then sees the volume
+  and timing of tunnelled traffic — though not its contents, which WireGuard
+  encrypted, nor the iroh layer's contents.
 - **Overlay address squatting.** A member can mint many WireGuard keys and
   therefore occupy many overlay addresses. It cannot pick which ones, but it
   can consume them and appear as many participants.
@@ -60,9 +69,9 @@ Read this before relying on anything here. The protocol is in
   `wireguard.sqlite`, owner-only where the platform supports it. Copying that
   file copies this agent's overlay identity, exactly as copying `state.sqlite`
   copies its control plane identity.
-- **What the data plane does not police.** The plugin sets `AllowedIPs` per
-  peer, which stops a member impersonating another member's overlay address.
-  It does not stop a member sending whatever it likes *from its own* address.
+- **What the data plane does not police.** Address ownership stops a member
+  impersonating another member. It does not stop a member sending whatever it
+  likes *from its own* address.
 - **Denial of service.** Bounds and timeouts stop trivial resource exhaustion
   from a single peer. They do not make the agent resistant to a determined
   attacker who knows the secret, and no rate limiting per identity exists yet.

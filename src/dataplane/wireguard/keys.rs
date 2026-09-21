@@ -7,6 +7,7 @@
 //! Keys are X25519, encoded the way WireGuard encodes them: standard base64
 //! with padding, 44 characters.
 
+use boringtun::x25519;
 use data_encoding::BASE64;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -44,6 +45,11 @@ impl WgPublicKey {
     /// The raw key bytes.
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
         &self.0
+    }
+
+    /// The key in the form the WireGuard implementation expects.
+    pub(crate) fn into_x25519(self) -> x25519::PublicKey {
+        x25519::PublicKey::from(self.0)
     }
 
     /// Whether this is the all-zero key, which is never a valid peer.
@@ -121,9 +127,12 @@ impl WgSecretKey {
 
     /// The matching public key.
     pub fn public(&self) -> WgPublicKey {
-        let secret = x25519_dalek::StaticSecret::from(*self.0);
-        let public = x25519_dalek::PublicKey::from(&secret);
-        WgPublicKey(public.to_bytes())
+        WgPublicKey(x25519::PublicKey::from(&self.to_static_secret()).to_bytes())
+    }
+
+    /// The key in the form the WireGuard implementation expects.
+    pub(crate) fn to_static_secret(&self) -> x25519::StaticSecret {
+        x25519::StaticSecret::from(*self.0)
     }
 
     /// The base64 form, for the WireGuard configuration. Zeroized on drop.

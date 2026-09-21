@@ -100,6 +100,35 @@ pub enum Event {
         /// Why it was discarded. Free of secrets.
         reason: String,
     },
+    /// A data plane link to a peer is up.
+    ///
+    /// The data plane is a separate connection from the control plane; this
+    /// says nothing about the control session, and vice versa.
+    DataLinkUp {
+        /// The network.
+        network: NetworkId,
+        /// The peer.
+        peer: EndpointId,
+        /// Plugin protocol the link carries.
+        protocol: String,
+        /// What the transport reports about the path in use.
+        path: String,
+        /// Largest datagram the link can carry.
+        max_datagram: usize,
+    },
+    /// A data plane link went away or could not be opened.
+    ///
+    /// Never fatal: the control plane keeps running and the link is retried.
+    DataLinkDown {
+        /// The network.
+        network: NetworkId,
+        /// The peer.
+        peer: EndpointId,
+        /// Plugin protocol the link would have carried.
+        protocol: String,
+        /// Why it is not up.
+        reason: String,
+    },
     /// An IP plugin reported an error. Never fatal.
     PluginError {
         /// The network the call was scoped to.

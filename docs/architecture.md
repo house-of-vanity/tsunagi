@@ -12,12 +12,21 @@ authentication, participant announcements, capability exchange and — later —
 state synchronisation and delivery of IP-plugin data.
 
 **Data plane.** Separate plugins create IP connectivity. WireGuard is the first
-one and is implemented — see [wireguard.md](wireguard.md). Plugin keys,
-configuration and lifecycle are separate from iroh identity and from the
+one and is implemented in userspace — see [wireguard.md](wireguard.md). Plugin
+keys, configuration and lifecycle are separate from iroh identity and from the
 network secret. The core moves an opaque, bounded payload and never parses it.
 
-Only control messages travel over iroh. User IP traffic is not tunnelled
-through it; WireGuard packets travel over WireGuard's own UDP sockets.
+**The transport in between.** Plugins do not open connections. They are handed
+a `PacketLink` — an authenticated, unreliable datagram channel to one peer for
+one protocol — and never learn how it is carried.
+
+The separation between the two planes is **logical, not physical**. Both ride
+on iroh, on different ALPNs and different connections. That is deliberate:
+iroh's whole value is hole punching a direct path between peers behind NAT,
+with a relay as fallback, and a data plane that refused to use it would have to
+reimplement all of it. What the separation buys is that `proto` knows nothing
+about packets and `dataplane` knows nothing about the control protocol, so
+either can be replaced on its own.
 
 A plugin talks to the core through three narrow hooks — `on_network_activated`,
 a `PluginContext` for re-announcements and error reports, and a bounded
@@ -36,26 +45,35 @@ and the agent stays manageable.
 | `proto` | message format, handshake, membership proof, protocol limits |
 | `agent` | agent and per-network lifecycle, reconnect, in-process message routing |
 | `storage` | mandatory state and the separately recoverable cache |
+| `dataplane::transport` | authenticated datagram links to peers; where reachability lives |
 | `dataplane` | the contract IP plugins implement, plus the WireGuard plugin |
 
 Abstractions exist only where something is really substituted or really needs
-isolating for tests: `NetworkDiscovery`, `IpPlugin`, and `WireguardBackend`
-(which is what lets the plugin be tested in full without root). Everything else
-is a concrete type.
+isolating for tests: `NetworkDiscovery`, `IpPlugin`, `PacketTransport` /
+`PacketLink` (so the data plane's carrier can change), and `TunFactory` (which
+is what lets the whole data plane be tested without privileges). Everything
+else is a concrete type.
 
 ## Runtime shape
 
 ```text
 Agent                                   one persistent identity, one iroh endpoint,
- ├── EndpointAdapter                     one state directory, N networks
+ ├── EndpointAdapter (two ALPNs)         one state directory, N networks
  ├── Storage  (state.sqlite + cache.sqlite + ownership lock)
- ├── accept loop task  ── weak ref, exits when the agent is dropped
+ ├── IrohTransport   ── data plane links, weak ref back to the agent
+ ├── accept loop task ── routes by ALPN; weak ref, exits when the agent drops
+ ├── plugin request loop ── re-announcements and plugin error reports
  └── NetworkRuntime per NetworkId
       ├── discovery + dial loop (bounded concurrency, backoff with jitter)
-      └── Session per peer
-           ├── reader task  ── frames in  -> SessionEvent
-           └── writer task  ── encoded frames out
+      ├── Session per peer (control)
+      │    ├── reader task  ── frames in  -> SessionEvent
+      │    └── writer task  ── encoded frames out
+      └── PacketLink per (peer, plugin protocol), handed to the plugin
 ```
+
+Every strong reference from a background task back to the agent is a `Weak`.
+A cycle there would keep the databases open and the directory lock held
+forever after shutdown.
 
 The library starts no runtime, installs no logging subscriber, handles no
 signals, never forks and never calls `process::exit`. Startup

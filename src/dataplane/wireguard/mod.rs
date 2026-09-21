@@ -6,15 +6,18 @@
 //!
 //! The two planes stay separate:
 //!
-//! * **No user IP traffic goes through iroh.** iroh carries this plugin's
-//!   announcements and nothing else; the packets themselves travel over
-//!   WireGuard's own UDP sockets.
-//! * **An iroh address is not a WireGuard address.** The plugin gathers its
-//!   own reachability and advertises that.
+//! * **The plugin knows nothing about reachability.** It is handed a
+//!   [`PacketLink`](crate::dataplane::transport::PacketLink) per peer and
+//!   bridges the kernel WireGuard device onto it. Hole punching and relaying
+//!   belong to the transport.
+//! * **The announcement says who, not where.** It carries a public key, so
+//!   there is no address for a peer to lie about.
 //! * **The core never parses these announcements.** It moves a bounded opaque
 //!   blob; only [`announcement`] interprets it.
 //! * **Keys are separate.** The plugin has its own key per network, in its own
 //!   store, unrelated to the iroh device key and to the network secret.
+//! * **WireGuard's own crypto is untouched.** The bridge is a pipe; the
+//!   handshake and encryption run end to end between the two kernels.
 //!
 //! # How a mesh forms
 //!
@@ -24,34 +27,41 @@
 //! peer's `AllowedIPs` itself instead of believing what the peer claims — a
 //! member cannot route another member's traffic to itself.
 //!
-//! Each agent then builds its own local configuration with one peer entry per
-//! other participant ([`config`]) and hands it to a [`backend`]. The
-//! [`backend::RecordingBackend`] applies it in memory, which is what the test
-//! suite uses; [`wgtool::WgToolBackend`] drives the real `wg` and `ip` tools
-//! and needs Linux with `CAP_NET_ADMIN`.
+//! WireGuard itself is [`boringtun`]'s protocol state machine, running in this
+//! process: no kernel module, no `wg` tool, the same code on every platform.
+//! [`device::WireguardDevice`] drives one tunnel per peer and routes packets
+//! between them and a [`tun::TunDevice`].
+//!
+//! The only part that needs privileges is the packet interface. With
+//! [`tun::MemoryTunFactory`] the whole data plane — handshake, encryption,
+//! routing, address ownership — runs and is tested with no privileges at all;
+//! `SystemTunFactory` swaps in a real interface when you want traffic to
+//! reach the operating system.
 //!
 //! See `docs/wireguard.md` for the full picture.
 
 pub mod announcement;
-pub mod backend;
 pub mod config;
+pub mod device;
 pub mod keys;
 pub mod overlay;
+pub mod packet;
 pub mod plugin;
 pub mod store;
-pub mod wgtool;
+pub mod tun;
 
 pub use announcement::{ValidatedAnnouncement, WgAnnouncement};
-pub use backend::{BackendCall, RecordingBackend, WireguardBackend};
-pub use config::{
-    Cidr, InterfaceConfig, InterfaceParams, InterfaceState, PeerConfig, PeerState, PortPolicy,
-    build_interface, interface_name,
-};
+pub use config::{Cidr, DEFAULT_INTERFACE_PREFIX, MAX_INTERFACE_NAME_LEN, interface_name};
+pub use device::{PeerHealth, PeerStats, PeerSummary, WireguardDevice};
 pub use keys::{WgPublicKey, WgSecretKey};
-pub use overlay::{overlay_address, overlay_prefix};
+pub use overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_prefix};
+pub use packet::IpHeader;
 pub use plugin::{
-    AdvertisePolicy, NetworkOverview, PeerOverview, WIREGUARD_PROTOCOL, WireguardConfig,
+    DEFAULT_MTU, NetworkOverview, PeerOverview, WIREGUARD_PROTOCOL, WireguardConfig,
     WireguardPlugin,
 };
 pub use store::WgKeyStore;
-pub use wgtool::{WgToolBackend, plan_apply, plan_remove};
+pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest};
+
+#[cfg(feature = "tun-device")]
+pub use tun::SystemTunFactory;

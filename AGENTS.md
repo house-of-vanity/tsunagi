@@ -17,18 +17,27 @@ Design accordingly: a majority is not a root of trust.
 
 Keep these separate. Crossing them is the main thing to review for.
 
-- **Control plane vs data plane.** iroh carries control messages only. User IP
-  traffic is never tunnelled through it. The core must never parse a plugin's
-  payload — see `src/dataplane/mod.rs`. Only
+- **Control plane vs data plane.** The separation is **logical, not physical**.
+  The control protocol in `src/proto/` knows nothing about packets, and
+  `src/dataplane/` knows nothing about the control protocol; either can be
+  replaced on its own. Both may ride on iroh — refusing to would throw away
+  iroh's NAT traversal and force the data plane to reimplement it. They use
+  different ALPNs and different connections, so a busy or broken data plane
+  cannot disturb control traffic.
+- **Plugins never learn reachability.** An `IpPlugin` is handed a `PacketLink`
+  per peer and moves datagrams over it. Addresses, hole punching and relays
+  belong to `src/dataplane/transport/`. A plugin announcement says *who*, never
+  *where*.
+- **The core never parses a plugin payload.** See `src/dataplane/mod.rs`. Only
   `src/dataplane/wireguard/announcement.rs` interprets WireGuard payloads, and
   only after bounding every field. A data plane failure must never stop the
   control plane.
-- **Derived, not claimed.** A WireGuard peer's `AllowedIPs` are always derived
-  locally from its public key. Never take them from what the peer announces, or
-  a member can route another member's traffic to itself.
+- **Derived, not claimed.** A peer's overlay address is derived from its public
+  key. Outbound packets are routed to the owner of the destination address;
+  inbound packets are dropped unless their source is the address derived for
+  the peer that sent them. Never trust an address a peer announces.
 - **Plugins own their system objects.** A plugin creates and removes its own
-  interface and nothing else. An interface that already exists and is not ours
-  is refused, never adopted. Never touch routing, DNS or firewall settings.
+  interface and nothing else. Never touch routing, DNS or firewall settings.
 - **Device identity vs network identity.** The iroh endpoint id is the device's
   public key. `NetworkId` is derived from name + secret only. Never conflate
   them, and never let one change the other.
@@ -88,7 +97,8 @@ Keep these separate. Crossing them is the main thing to review for.
 | `src/proto/`        | framing, message formats, membership handshake |
 | `src/net.rs`        | iroh endpoint adapter and observability snapshots |
 | `src/agent/`        | agent lifecycle, per-network runtimes, sessions, events, status |
-| `src/dataplane/`    | the contract IP plugins implement, and the WireGuard plugin |
+| `src/dataplane/`    | the plugin contract, the packet transport, and the WireGuard plugin |
+| `src/bin/tsunagi.rs`| the command line agent; the only place that owns a runtime, a logger and signals |
 | `tests/`            | integration tests; `tests/common/` is the shared harness |
 
 Add abstractions only at real substitution or testing boundaries. Do not add a
@@ -106,11 +116,11 @@ trait per struct. Prefer one crate with clear modules over many small crates.
   happen.
 - The default suite must pass with no internet, no DHT, no public relay, no
   administrator rights and no changes to OS network settings. Anything needing
-  the internet, or root, stays out of the default set — the real WireGuard
-  backend's tests live in `tests/wireguard_system.rs` behind `--ignored`.
-- The WireGuard backend may be substituted (`RecordingBackend`). Its key
-  handling, announcements, derived addressing, configuration builder and
-  reconciliation may not.
+  the internet or root stays out of the default set.
+- The WireGuard packet interface may be substituted (`MemoryTunFactory`). Its
+  key handling, announcements, derived addressing, the WireGuard protocol
+  itself and address-ownership enforcement may not — the default suite runs
+  real handshakes and real encryption.
 - Running several library instances in one process is not a test of several
   system processes; do not describe it as one.
 

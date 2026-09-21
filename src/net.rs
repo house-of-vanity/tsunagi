@@ -32,7 +32,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode};
 use crate::config::{AgentConfig, TransportPolicy};
 use crate::error::{Error, Result};
 use crate::identity::DeviceIdentity;
-use crate::proto::message::ALPN;
+use crate::proto::message::{ALPN, DATA_ALPN};
 
 /// A network path address as reported by iroh.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +193,10 @@ fn local_addr_string(addr: &iroh::endpoint::LocalTransportAddr) -> Option<String
 }
 
 /// Thin wrapper around the iroh endpoint.
+///
+/// The endpoint serves two ALPNs: the control protocol and the data plane.
+/// They are separate connections with separate congestion control, so a busy
+/// or broken data plane cannot disturb control traffic.
 #[derive(Debug, Clone)]
 pub struct EndpointAdapter {
     endpoint: Endpoint,
@@ -203,7 +207,7 @@ impl EndpointAdapter {
     pub async fn bind(config: &AgentConfig, identity: &DeviceIdentity) -> Result<Self> {
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(identity.secret_key())
-            .alpns(vec![ALPN.to_vec()]);
+            .alpns(vec![ALPN.to_vec(), DATA_ALPN.to_vec()]);
 
         builder = match config.transport {
             TransportPolicy::LocalOnly => builder

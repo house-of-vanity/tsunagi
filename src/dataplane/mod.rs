@@ -19,6 +19,7 @@
 //! A data plane failure never stops the daemon: errors returned here are
 //! recorded and surfaced, the control plane keeps running.
 
+pub mod transport;
 pub mod wireguard;
 
 use std::sync::Arc;
@@ -28,6 +29,8 @@ use tokio::sync::mpsc;
 
 use crate::BoxFuture;
 use crate::identity::NetworkId;
+
+pub use transport::{PacketLink, PacketTransport, SharedLink, TransportError};
 
 /// Maximum length of a plugin protocol identifier.
 pub const MAX_PROTOCOL_ID_LEN: usize = 32;
@@ -194,7 +197,17 @@ pub trait IpPlugin: Send + Sync + std::fmt::Debug + 'static {
         capability: &PluginCapability,
     ) -> std::result::Result<(), PluginError>;
 
+    /// A data plane link to a peer is available for this plugin's protocol.
+    ///
+    /// The plugin moves its packets over this link and never learns how the
+    /// link is carried. A new link for a peer replaces any previous one.
+    fn on_peer_link(&self, network: NetworkId, peer: EndpointId, link: SharedLink) {
+        let _ = (network, peer, link);
+    }
+
     /// Called when a peer's session in a network goes away.
+    ///
+    /// Any link handed to the plugin for that peer must be dropped here.
     fn on_peer_gone(&self, network: NetworkId, peer: EndpointId);
 
     /// Called when a network is deactivated locally.

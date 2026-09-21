@@ -3,8 +3,8 @@
 **Nothing in this document is implemented.** The proof of concept exchanges
 hostname and capability announcements over live sessions and keeps no
 replicated history. That is also why WireGuard peer membership is
-session-scoped today: a peer disappears from the overlay configuration when its
-control session ends, because there is no agreed durable state to keep it. This file records the intended direction so the module
+session-scoped today: a peer leaves the overlay when its control session ends,
+because there is no agreed durable state to keep it. This file records the intended direction so the module
 boundaries in [architecture.md](architecture.md) stay compatible with it, and so
 nobody mistakes the current announcements for synchronisation.
 

@@ -94,6 +94,10 @@ pub struct NetworkMetrics {
     pub protocol_violations: u64,
     /// Errors reported by IP plugins. Never fatal.
     pub plugin_errors: u64,
+    /// Data plane links that were established.
+    pub data_links_established: u64,
+    /// Attempts to open a data plane link that failed.
+    pub data_link_failures: u64,
 }
 
 /// Status of one network.

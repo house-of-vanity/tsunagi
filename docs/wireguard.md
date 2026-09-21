@@ -1,22 +1,54 @@
-# The WireGuard plugin
+# The WireGuard data plane
 
-WireGuard is the first IP plugin. It creates real IP connectivity between
+WireGuard is the first IP plugin. It carries user traffic between
 participants while the control plane keeps doing its own job: deciding who is
 in the network and carrying each participant's opaque announcement.
 
 Module boundaries are in [architecture.md](architecture.md), the control
-protocol in [protocol.md](protocol.md), and the security consequences in
+protocol in [protocol.md](protocol.md), the security consequences in
 [threat-model.md](threat-model.md).
 
-## What stays separate
+## Userspace, not the kernel
 
-| | |
-|---|---|
-| **User IP traffic** | Never goes through iroh. iroh carries announcements; packets travel over WireGuard's own UDP sockets. |
-| **Addresses** | An iroh address is an address for iroh. The plugin gathers and advertises its own reachability. |
-| **Payloads** | The core moves a bounded opaque blob. Only `dataplane::wireguard::announcement` interprets it. |
-| **Keys** | One WireGuard key per network, in the plugin's own store. Unrelated to the iroh device key and to the network secret. |
-| **Failures** | A data plane error is reported and retried. The control plane keeps running and the agent stays manageable. |
+WireGuard here is [boringtun]'s protocol state machine running in this
+process. There is **no kernel WireGuard module** and **no `wg` tool**: the same
+code runs everywhere, and the protocol can be exercised in tests without any
+privileges at all.
+
+The only privileged step left is creating a packet interface so the operating
+system can hand us IP packets, and even that is behind a trait
+([`TunFactory`]) with an in-memory implementation.
+
+| | needs privileges | what it proves |
+|---|---|---|
+| `MemoryTunFactory` | no | handshake, encryption, routing, address ownership |
+| `SystemTunFactory` | `CAP_NET_ADMIN` | traffic actually reaches the OS |
+
+[boringtun]: https://docs.rs/boringtun
+[`TunFactory`]: https://docs.rs/tsunagi
+
+## Where the packets go
+
+The plugin does not know and does not care. It is handed a `PacketLink` per
+peer by the agent and runs a WireGuard tunnel over it:
+
+```text
+  TUN device (IP packets)                  PacketLink per peer
+       |                                          |
+       v                                          v
+  destination address -> peer  --Tunn.encapsulate-->  ciphertext -> transport
+  source address checked       <--Tunn.decapsulate--  ciphertext <- transport
+```
+
+Reachability — hole punching, relay fallback — belongs to the transport, which
+today is iroh. That is the whole reason the plugin's announcement says *who* it
+is and never *where* it is: there is no address for a peer to advertise, get
+wrong, or lie about.
+
+**Two peers behind NAT work exactly as well as iroh does.** iroh hole punches a
+direct path when it can and falls back to a relay when it cannot; the tunnel
+rides on whichever it got. There is no separate STUN, no separate hole punching
+and no second set of NAT problems to solve for WireGuard.
 
 ## Deterministic overlay addressing
 
@@ -36,110 +68,73 @@ Two consequences matter:
 
 * every member of a network derives the **same `/64`**, so the overlay is one
   subnet that nobody had to allocate;
-* a member's address is bound to its WireGuard public key, so
-  **`AllowedIPs` are derived locally and never taken from what a peer claims**.
+* a member's address is bound to its WireGuard public key, so address
+  ownership can be checked locally rather than believed.
 
-That second point is the plugin's central security property. A participant who
-knows the network secret can mint as many WireGuard keys — and therefore as
-many overlay addresses — as it likes, but it cannot choose to collide with an
-existing member's address without finding a hash preimage. An announcement
-whose claimed address does not match the derivation is rejected outright.
+## Address ownership is enforced, not announced
 
-## The announcement
+Kernel WireGuard enforces `AllowedIPs`. In userspace that is our job, and
+[`device`] does it on both sides:
 
-Carried as the opaque `PluginCapability { protocol: "wireguard", .. }` payload,
-encoded with postcard:
+* **outbound**, a packet is routed to the peer that *owns* its destination
+  address; a destination nobody owns is counted as unroutable and dropped;
+* **inbound**, a decrypted packet is dropped unless its *source* is exactly the
+  address derived for the peer whose tunnel decrypted it.
 
-| field | meaning |
-|---|---|
-| `version` | announcement format version, currently 1 |
-| `public_key` | the peer's X25519 WireGuard key |
-| `listen_port` | the UDP port its interface listens on |
-| `endpoints` | reachability the plugin gathered for itself, at most 8 |
-| `overlay_address` | what the peer believes its address is — cross-checked, never used |
+So a participant cannot receive traffic addressed to somebody else and cannot
+forge traffic that appears to come from somebody else. A participant who knows
+the network secret can mint many keys and therefore occupy many addresses, but
+it cannot choose to collide with an existing member without finding a hash
+preimage.
 
-Validation, all before anything reaches a configuration: the version must
-match, the key must not be zero and must not be our own, the port must not be
-zero, the endpoint list must be within bounds, unusable endpoints
-(unspecified, multicast, broadcast, documentation, port zero) are dropped, and
-the claimed overlay address must equal the derived one.
+The announcement also carries the address the peer believes it has. It is never
+used — only cross-checked — so a version skew produces a clear rejection rather
+than silent non-connectivity.
 
-## Building the configuration
+[`device`]: https://docs.rs/tsunagi
 
-Each agent builds its **own** configuration from the agreed set of
-participants: for a full mesh of `N` members that is `N - 1` peers locally.
-Nobody hands a configuration to anybody else and no participant is
-authoritative.
+## MTU
 
-* **Interface name** — `prefix + base32(network_id)`, truncated to the
-  platform's 15 characters. Stable across restarts. Two agents on one host in
-  the same network need different prefixes.
-* **Port** — `PortPolicy::Derived` picks a stable port from the network id
-  inside a range, so a peer's cached endpoint keeps working across restarts and
-  two networks on one host do not collide. `PortPolicy::Fixed` pins it.
-* **Addresses** — the agent's own `/128` plus the shared `/64`.
-* **Peer entries** — public key, derived `AllowedIPs`, the peer's first usable
-  advertised endpoint, and a keepalive.
+Every packet rides in one transport datagram, and WireGuard adds 32 bytes. A
+QUIC datagram on a relayed path can be as small as roughly 1160 bytes, so the
+default interface MTU is **1100**, which leaves headroom rather than relying on
+the best case. Packets that do not fit are dropped and counted
+(`dropped_oversize`), never truncated. The observed datagram limit of each link
+is reported in the status output.
 
-Nothing free-form from the network reaches a command argument or a
-configuration directive: peer keys, endpoints, prefixes and keepalives are
-typed values that the plugin re-serialises itself.
+## Lifecycle
 
-## Backends
+* A network is activated → the plugin loads or creates its key for that
+  network, derives the interface name, and creates the packet interface. If
+  that fails — no privileges, for instance — the key and the announcement still
+  work and the interface is retried on the next reconcile.
+* A peer announces its key → recorded.
+* A data link to that peer arrives → recorded.
+* Reconciliation starts a tunnel for every peer that has **both**, and removes
+  tunnels for peers that lost either.
+* A network is deactivated, or the agent shuts down → the interface and every
+  tunnel go away. The key stays, so coming back keeps the same overlay address.
 
-The plugin computes *what* the interface should look like; a backend makes it
-so. Splitting them is what keeps every interesting decision testable without
-root.
-
-* **`RecordingBackend`** — applies configurations in memory. The default test
-  suite and the example use it, so neither needs privileges nor touches the
-  host. It can also be told to fail, or to report drift.
-* **`WgToolBackend`** — drives the real `wg` and `ip` tools. Linux only,
-  requires `CAP_NET_ADMIN`. It is split into a **pure planner** and pure
-  parsers, which are unit tested on every platform, plus a thin executor. The
-  WireGuard configuration is piped to `wg setconf` / `wg syncconf` on standard
-  input, so the private key never reaches the filesystem.
-
-Ownership is explicit: the plugin creates the interface and the plugin removes
-it. An interface that already exists and is not a WireGuard device is
-**refused, not adopted**, so the agent never takes over something it did not
-create. It changes no routing, DNS or firewall settings.
-
-## Reconciliation
-
-The plugin reconciles on every change — a peer announcement, a peer leaving —
-coalesced over a short debounce, and again on a timer. Each pass reads the
-interface back, compares it with the desired state, and applies only if they
-differ. A configuration edited by hand is therefore put back the way it should
-be, which is exactly what `reconciliation_repairs_a_configuration_edited_by_hand`
-in `tests/wireguard.rs` checks.
-
-Deactivating a network removes its interface but **keeps its key**, so coming
-back later keeps the same overlay address. Agent shutdown removes every
-interface the plugin created.
-
-## What the plugin needs from the core
-
-Three small additions to the `IpPlugin` contract, all generic rather than
-WireGuard-specific:
-
-* `on_network_activated` — prepare per-network state before any peer appears;
-* `attach(PluginContext)` — a handle to ask for a re-announcement when the
-  plugin's own capability changes, and to report an error from its own tasks;
-* `shutdown` — remove system objects during a bounded agent shutdown.
-
-Errors reported through the context are counted by the owning network's
-runtime, so `NetworkMetrics::plugin_errors` and `Event::PluginError` always
-agree.
+There is no external configuration file and no command line tool, so unlike a
+kernel-WireGuard setup there is nothing outside this process for anybody to
+edit. Reconciliation is purely "do the running tunnels match what is known".
 
 ## Using it
 
+```bash
+# On both machines
+tsunagi up --network lab --secret "$SECRET" --wireguard
+```
+
+See the two-machine walkthrough in [../README.md](../README.md#trying-it-on-two-machines).
+
+From the library:
+
 ```rust,no_run
 use std::sync::Arc;
-use std::time::Duration;
 use tsunagi::config::{AgentConfig, StoragePaths, TransportPolicy};
 use tsunagi::dataplane::IpPlugin;
-use tsunagi::dataplane::wireguard::{WgToolBackend, WireguardConfig, WireguardPlugin};
+use tsunagi::dataplane::wireguard::{MemoryTunFactory, WireguardConfig, WireguardPlugin};
 use tsunagi::identity::{NetworkName, NetworkSecret};
 use tsunagi::{Agent, Result};
 
@@ -147,12 +142,14 @@ use tsunagi::{Agent, Result};
 async fn main() -> Result<()> {
     let paths = StoragePaths::user_default()?;
 
-    // The plugin's own state, separate from the agent's.
-    let wireguard = WireguardConfig::new(paths.state_dir.join("wireguard"));
-    let backend = WgToolBackend::new().expect("Linux with wg and CAP_NET_ADMIN");
-    let plugin = WireguardPlugin::open(wireguard, Arc::new(backend))
-        .await
-        .expect("wireguard plugin");
+    // MemoryTunFactory needs no privileges; swap in SystemTunFactory for a
+    // real interface.
+    let plugin = WireguardPlugin::open(
+        WireguardConfig::new(paths.state_dir.join("wireguard")),
+        Arc::new(MemoryTunFactory::new()),
+    )
+    .await
+    .expect("wireguard plugin");
 
     let agent = Agent::spawn(
         AgentConfig::new(paths)
@@ -162,35 +159,30 @@ async fn main() -> Result<()> {
     .await?;
 
     let network = agent
-        .join_network(&NetworkName::new("kitchen-table")?, &NetworkSecret::generate())
+        .join_network(&NetworkName::new("lab")?, &NetworkSecret::generate())
         .await?;
 
     if let Some(view) = plugin.overview(network) {
-        println!("{} on {} at {}", view.interface, view.overlay_prefix, view.overlay_address);
+        println!("{} on {}", view.interface, view.overlay_address);
     }
-
-    tokio::time::sleep(Duration::from_secs(60)).await;
-    agent.shutdown().await;   // removes the interface
+    agent.shutdown().await;
     Ok(())
 }
 ```
 
-There is a runnable version in `examples/wireguard_mesh.rs`, which uses the
-in-memory backend by default and the real one with `--real`.
-
 ## Limits and future work
 
-* **Full mesh only.** Every member configures every other member. Routing
-  through an intermediate participant is not implemented.
-* **No IPv4 overlay.** Addressing is IPv6 ULA, because it can be derived
+* **Full mesh only.** Every member runs a tunnel to every other member.
+  Routing through an intermediate participant is not implemented.
+* **IPv6 overlay only.** Addressing is IPv6 ULA because it can be derived
   collision-free. An IPv4 overlay would need an allocator, which needs the
   agreed state described in [sync-model.md](sync-model.md).
-* **Peer membership is session-scoped.** A peer disappears from the
-  configuration when its control session ends. Persisting membership across a
-  long absence is part of the same future work.
-* **`WgToolBackend` is Linux only.** A netlink backend, and backends for macOS
-  and Windows, are not implemented. `WgToolBackend::new()` fails with a clear
-  message elsewhere.
-* **No MTU or path discovery.** The MTU is a configured constant.
-* **The real backend is not exercised by the default suite.** It needs root,
-  so its tests live in `tests/wireguard_system.rs` behind `--ignored`.
+* **No routes, DNS or firewall rules.** The plugin creates its interface and
+  nothing else. Anything beyond the overlay `/64` is the operator's business.
+* **Membership is session-scoped.** A peer leaves the overlay when its control
+  session ends; surviving a long absence is the same future work.
+* **Userspace costs CPU.** Kernel WireGuard is faster. A kernel backend could
+  return behind the same boundary, but it would give up transport-provided NAT
+  traversal unless paired with a local proxy.
+* **The system interface path is barely exercised by the default suite**,
+  because it needs privileges. Everything else about the data plane is.

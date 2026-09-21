@@ -31,9 +31,10 @@ A working library with **real iroh connections** and integration tests:
 - status snapshots, an event stream and honest diagnostics;
 - configuration restored after a restart;
 - correct behaviour when the disposable cache is missing or corrupt;
-- a **WireGuard data plane plugin**: its own key per network, deterministic
-  IPv6 overlay addressing, a full-mesh configuration built locally, and
-  reconciliation that repairs drift.
+- a **WireGuard data plane**, in userspace: its own key per network,
+  deterministic IPv6 overlay addressing, real tunnels carried over iroh, and
+  address ownership enforced rather than believed;
+- a **command line agent**, `tsunagi`.
 
 ### What it deliberately does **not** do
 
@@ -45,15 +46,69 @@ and signed revocations are designed for but not implemented — see
 including that its system backend is Linux-only, are in
 [docs/wireguard.md](docs/wireguard.md#limits-and-future-work).
 
-**Only control messages travel over iroh. User IP traffic is not tunnelled
-through it.** Filtering user traffic is the operating system's and the user's
-responsibility, not this library's.
+**Control and data are separated logically, not physically.** Both ride on
+iroh, on different ALPNs and different connections, so the data plane inherits
+iroh's hole punching and relay fallback instead of reimplementing them — while
+the control protocol still knows nothing about packets and can keep a different
+transport underneath it later. Filtering user traffic remains the operating
+system's and the user's responsibility, not this library's.
 
 ## Requirements
 
-- Rust 1.91 or newer (iroh 1.2 requires it) (edition 2024). Pinned dependencies in `Cargo.lock`.
+- Rust 1.91 or newer (iroh 1.2 requires it), edition 2024. Pinned dependencies
+  in `Cargo.lock`.
 - No internet, no DHT, no public relay, no administrator rights and no changes
   to OS network settings are needed to build or test.
+- WireGuard runs in userspace (boringtun): **no kernel module and no `wg`
+  tool**. Only creating a real network interface needs `CAP_NET_ADMIN`, and
+  `--no-tun` skips even that.
+
+## Trying it on two machines
+
+On the first machine:
+
+```bash
+cargo build --release
+./target/release/tsunagi secret          # prints tsn1...; share it privately
+./target/release/tsunagi doctor          # what this host can and cannot do
+
+./target/release/tsunagi up --network lab --secret "$SECRET" --wireguard
+```
+
+It prints its endpoint id and then waits. On the second machine, pass that id:
+
+```bash
+./target/release/tsunagi up --network lab --secret "$SECRET" --wireguard \
+  --peer <endpoint-id-from-the-first-machine>
+```
+
+Within a few seconds both print something like:
+
+```text
+  + peer b47c958462 connected over Direct rtt=Some(4.5ms)
+  + data link to b47c958462 for wireguard: Direct via Ip(…), datagram 1382
+
+--- status ---
+control: 1 peer(s), 0 dial failure(s), 0 handshake failure(s)
+wireguard: tsunkkcp43lmdje on fd15:1d9e:fa21:f201:…/64 mtu 1100, 1/1 tunnel(s) established
+  4jO4kx9Z fd15:1d9e:fa21:f201:… handshake 3s ago tx=0 rx=0 dropped=0 path=Direct via Ip(…)
+```
+
+`1/1 tunnel(s) established` means a real WireGuard handshake completed. Then
+`ping6` the peer's overlay address.
+
+Notes:
+
+- Only one side needs `--peer`; the link is bidirectional. Peer discovery
+  beyond this manual bootstrap is future work.
+- The default `--transport n0` uses iroh's public address lookup and relays, so
+  two machines behind NAT find each other. `--transport local` keeps everything
+  on the local network.
+- Without `CAP_NET_ADMIN`, add `--no-tun`: the mesh, the data links and the
+  WireGuard handshakes all still run and are visible in the status output, only
+  traffic does not reach the operating system. That is the quickest way to
+  confirm the network forms.
+- Run as root (or grant `CAP_NET_ADMIN`) to get a real interface.
 
 ## Checks
 
@@ -71,17 +126,10 @@ tests:
 
 ```bash
 cargo run --example two_agents       # control plane only
-cargo run --example wireguard_mesh   # two agents forming a WireGuard overlay
+cargo run --example wireguard_mesh   # a WireGuard overlay carrying a real packet
 ```
 
 Both run with no privileges and change nothing on the host.
-
-The one part that does change the host's network — the real `wg`/`ip` backend —
-is behind `--ignored` and needs Linux, wireguard-tools and `CAP_NET_ADMIN`:
-
-```bash
-sudo -E cargo test --test wireguard_system -- --ignored --test-threads=1
-```
 
 ## Usage
 
@@ -145,6 +193,9 @@ paths; tests always use temporary directories.
 The WireGuard plugin keeps its own keys in its own `wireguard.sqlite`, wherever
 its configuration points, because plugin keys are neither the iroh identity nor
 the network secret.
+
+The command line agent puts everything under the platform's per-user
+directories by default; `--state-dir` and `--cache-dir` override them.
 
 One state directory belongs to one live agent, enforced with a real OS file
 lock rather than an existence check.

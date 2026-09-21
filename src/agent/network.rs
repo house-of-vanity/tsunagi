@@ -5,7 +5,7 @@
 //! explicit [`NetworkId`], so deactivating or breaking one network cannot
 //! disturb another and cannot stop the agent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::{Limits, ReconnectPolicy};
+use crate::dataplane::transport::{InboundLink, PacketTransport, SharedLink};
 use crate::dataplane::{PluginCapability, SharedPlugin};
 use crate::discovery::{Candidate, CandidateSource, NetworkDiscovery};
 use crate::error::{Error, Result};
@@ -50,6 +51,8 @@ pub(crate) enum NetCommand {
         message: ControlMessage,
         reply: oneshot::Sender<usize>,
     },
+    /// A peer opened a data plane link towards us.
+    InboundLink(Box<InboundLink>),
     Status {
         reply: oneshot::Sender<Box<NetworkStatus>>,
     },
@@ -69,6 +72,7 @@ impl std::fmt::Debug for NetCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NetCommand::Inbound(_) => f.write_str("Inbound"),
+            NetCommand::InboundLink(link) => write!(f, "InboundLink({})", link.protocol),
             NetCommand::Send { peer, message, .. } => {
                 write!(f, "Send({}, {})", peer.fmt_short(), kind(message))
             }
@@ -110,6 +114,15 @@ pub(crate) struct RuntimeParams {
     pub(crate) discovery_interval: Duration,
     pub(crate) plugins: Vec<SharedPlugin>,
     pub(crate) hostname: String,
+    /// How data plane links are opened. `None` disables the data plane.
+    pub(crate) transport: Option<Arc<dyn PacketTransport>>,
+}
+
+/// Outcome of one attempt to open a data plane link.
+struct LinkOutcome {
+    peer: EndpointId,
+    protocol: String,
+    result: Result<SharedLink, String>,
 }
 
 /// Outcome of one outbound dial.
@@ -175,6 +188,12 @@ struct Runtime {
     session_events_rx: mpsc::Receiver<SessionEvent>,
     dial_results_tx: mpsc::Sender<DialOutcome>,
     dial_results_rx: mpsc::Receiver<DialOutcome>,
+    /// Live data plane links, keyed by peer and plugin protocol.
+    links: HashMap<(EndpointId, String), SharedLink>,
+    /// Links currently being opened, so we do not start two.
+    opening: HashSet<(EndpointId, String)>,
+    link_results_tx: mpsc::Sender<LinkOutcome>,
+    link_results_rx: mpsc::Receiver<LinkOutcome>,
 }
 
 impl Runtime {
@@ -183,6 +202,7 @@ impl Runtime {
         let local_id = params.adapter.endpoint_id();
         let (session_events_tx, session_events_rx) = mpsc::channel(256);
         let (dial_results_tx, dial_results_rx) = mpsc::channel(64);
+        let (link_results_tx, link_results_rx) = mpsc::channel(64);
         Self {
             params,
             network_id,
@@ -196,6 +216,10 @@ impl Runtime {
             session_events_rx,
             dial_results_tx,
             dial_results_rx,
+            links: HashMap::new(),
+            opening: HashSet::new(),
+            link_results_tx,
+            link_results_rx,
         }
     }
 
@@ -226,7 +250,15 @@ impl Runtime {
                         self.handle_dial_result(result).await;
                     }
                 }
-                _ = ticker.tick() => self.discovery_round().await,
+                result = self.link_results_rx.recv() => {
+                    if let Some(result) = result {
+                        self.handle_link_result(result);
+                    }
+                }
+                _ = ticker.tick() => {
+                    self.discovery_round().await;
+                    self.ensure_links();
+                }
             }
         }
 
@@ -242,6 +274,7 @@ impl Runtime {
                 .unpublish(self.params.keys.discovery_key(), self.local_id)
                 .await;
         }
+        self.links.clear();
         let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
         for peer in peers {
             if let Some(session) = self.sessions.remove(&peer) {
@@ -260,6 +293,7 @@ impl Runtime {
             NetCommand::Inbound(inbound) => {
                 self.install_session(*inbound).await;
             }
+            NetCommand::InboundLink(inbound) => self.install_link(*inbound),
             NetCommand::Send {
                 peer,
                 message,
@@ -516,6 +550,163 @@ impl Runtime {
         }
     }
 
+    // ------------------------------------------------------------ data plane
+
+    /// Protocol ids this agent has a plugin for.
+    fn served_protocols(&self) -> Vec<String> {
+        self.params
+            .plugins
+            .iter()
+            .map(|plugin| plugin.protocol_id().to_string())
+            .collect()
+    }
+
+    /// Opens whatever data plane links are missing, and forgets dead ones.
+    ///
+    /// Only one side dials, chosen by a rule both sides compute the same way,
+    /// so two agents never open two links for the same thing.
+    fn ensure_links(&mut self) {
+        let Some(transport) = self.params.transport.clone() else {
+            return;
+        };
+        let served = self.served_protocols();
+        if served.is_empty() {
+            return;
+        }
+
+        let mut dead: Vec<(EndpointId, String)> = Vec::new();
+        for (key, link) in &self.links {
+            if link.is_closed() {
+                dead.push(key.clone());
+            }
+        }
+        for (peer, protocol) in dead {
+            self.links.remove(&(peer, protocol.clone()));
+            self.emit(Event::DataLinkDown {
+                network: self.network_id,
+                peer,
+                protocol,
+                reason: "link closed".into(),
+            });
+        }
+
+        let wanted: Vec<(EndpointId, String)> = self
+            .sessions
+            .values()
+            .flat_map(|session| {
+                let peer = session.peer;
+                session
+                    .capabilities
+                    .iter()
+                    .filter(|capability| capability.enabled)
+                    .map(move |capability| (peer, capability.protocol.clone()))
+            })
+            .filter(|(_, protocol)| served.contains(protocol))
+            .collect();
+
+        for (peer, protocol) in wanted {
+            let key = (peer, protocol.clone());
+            if self.links.contains_key(&key) || self.opening.contains(&key) {
+                continue;
+            }
+            // The smaller endpoint id dials; the other side accepts. Both
+            // compute this identically, so exactly one link is created.
+            if self.local_id.as_bytes() >= peer.as_bytes() {
+                continue;
+            }
+            self.opening.insert(key);
+
+            let results = self.link_results_tx.clone();
+            let transport = Arc::clone(&transport);
+            let network = self.network_id;
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let result = tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => Err("network deactivated".to_string()),
+                    result = transport.open(network, peer, &protocol) => {
+                        result.map_err(|err| err.to_string())
+                    }
+                };
+                let _ = results
+                    .send(LinkOutcome {
+                        peer,
+                        protocol,
+                        result,
+                    })
+                    .await;
+            });
+        }
+    }
+
+    fn handle_link_result(&mut self, outcome: LinkOutcome) {
+        let key = (outcome.peer, outcome.protocol.clone());
+        self.opening.remove(&key);
+        match outcome.result {
+            Ok(link) => self.adopt_link(outcome.peer, outcome.protocol, link),
+            Err(reason) => {
+                // A data plane that cannot be set up is reported, never fatal.
+                self.metrics.data_link_failures += 1;
+                self.emit(Event::DataLinkDown {
+                    network: self.network_id,
+                    peer: outcome.peer,
+                    protocol: outcome.protocol,
+                    reason,
+                });
+            }
+        }
+    }
+
+    fn install_link(&mut self, inbound: InboundLink) {
+        self.adopt_link(inbound.peer, inbound.protocol, inbound.link);
+    }
+
+    /// Hands a link to the plugin that owns its protocol.
+    fn adopt_link(&mut self, peer: EndpointId, protocol: String, link: SharedLink) {
+        let Some(plugin) = self
+            .params
+            .plugins
+            .iter()
+            .find(|plugin| plugin.protocol_id() == protocol)
+            .cloned()
+        else {
+            return;
+        };
+
+        let path = link.path_description();
+        let max_datagram = link.max_datagram_size();
+        self.links
+            .insert((peer, protocol.clone()), Arc::clone(&link));
+        plugin.on_peer_link(self.network_id, peer, link);
+        self.metrics.data_links_established += 1;
+        self.emit(Event::DataLinkUp {
+            network: self.network_id,
+            peer,
+            protocol,
+            path,
+            max_datagram,
+        });
+    }
+
+    /// Drops every link to a peer.
+    fn drop_links_for(&mut self, peer: EndpointId) {
+        let keys: Vec<(EndpointId, String)> = self
+            .links
+            .keys()
+            .filter(|(id, _)| *id == peer)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.links.remove(&key);
+            self.emit(Event::DataLinkDown {
+                network: self.network_id,
+                peer,
+                protocol: key.1,
+                reason: "peer session ended".into(),
+            });
+        }
+    }
+
     // --------------------------------------------------------------- sessions
 
     async fn install_session(&mut self, inbound: InboundSession) {
@@ -682,6 +873,7 @@ impl Runtime {
                     session.conn.close(0u32.into(), b"session ended");
                 }
                 self.metrics.disconnects += 1;
+                self.drop_links_for(peer);
                 for plugin in &self.params.plugins {
                     plugin.on_peer_gone(self.network_id, peer);
                 }
@@ -711,6 +903,7 @@ impl Runtime {
                     session.capabilities = capabilities.clone();
                 }
                 self.dispatch_capabilities(peer, &capabilities);
+                self.ensure_links();
             }
             ControlMessage::Ping { seq, payload } => {
                 let pong = ControlMessage::Pong {

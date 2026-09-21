@@ -1,26 +1,31 @@
 //! The WireGuard IP plugin.
 //!
-//! Each agent builds its **own** local configuration from the set of
-//! participants the control plane agreed on. For a full mesh of `N` members
-//! that is `N - 1` peers locally. Nobody is handed a configuration by anybody
-//! else, and no participant is authoritative.
+//! Each agent builds its own view of the overlay from the set of participants
+//! the control plane agreed on. For a full mesh of `N` members that is `N - 1`
+//! tunnels locally. Nobody is handed a configuration by anybody else, and no
+//! participant is authoritative.
 //!
-//! What the plugin owns and what it never touches:
+//! # What this plugin does and does not know
 //!
-//! * it owns one WireGuard key per network, in its own store;
-//! * it owns one interface per network, named deterministically from the
-//!   network id and its configured prefix;
-//! * it never enumerates, adopts or edits an interface it did not create, and
-//!   it never changes routing, DNS or firewall settings.
+//! * It does **not** know where a peer is. It is handed a
+//!   [`PacketLink`](crate::dataplane::transport::PacketLink) per peer and runs
+//!   a WireGuard tunnel over it. Reachability, hole punching and relaying are
+//!   the transport's problem.
+//! * It owns one WireGuard key per network, in its own store, unrelated to the
+//!   iroh device key and to the network secret.
+//! * It owns one packet interface per network, named deterministically.
+//! * It never touches an interface it did not create, and never changes
+//!   routing, DNS or firewall settings beyond its own device.
 //!
-//! Reconciliation runs on every change and on a timer, so a configuration
-//! edited by hand is put back the way it should be.
+//! WireGuard runs in userspace via [`boringtun`], so there is no kernel module
+//! and no `wg` tool to depend on. The only privileged step is creating the
+//! packet interface, and even that is behind [`TunFactory`] so the whole data
+//! plane can run unprivileged in tests.
 //!
-//! A failure here is reported and retried. It never stops the control plane:
-//! the agent keeps receiving state and stays manageable.
+//! A failure here is reported and retried. It never stops the control plane.
 
 use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -30,39 +35,28 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::BoxFuture;
+use crate::dataplane::transport::SharedLink;
 use crate::dataplane::{IpPlugin, PluginCapability, PluginContext, PluginError};
 use crate::identity::NetworkId;
 
 use super::announcement::{ValidatedAnnouncement, WgAnnouncement};
-use super::backend::WireguardBackend;
-use super::config::{
-    DEFAULT_INTERFACE_PREFIX, InterfaceConfig, InterfaceParams, PortPolicy, build_interface,
-    interface_name,
-};
+use super::config::{DEFAULT_INTERFACE_PREFIX, interface_name};
+use super::device::{PeerSummary, WireguardDevice};
 use super::keys::{WgPublicKey, WgSecretKey};
-use super::overlay::{overlay_address, overlay_prefix};
+use super::overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_prefix};
 use super::store::WgKeyStore;
+use super::tun::{TunFactory, TunRequest};
 
 /// The protocol identifier this plugin announces.
 pub const WIREGUARD_PROTOCOL: &str = "wireguard";
 
-/// How the plugin advertises its own reachability.
+/// Default interface MTU.
 ///
-/// An iroh address is an address for iroh. WireGuard needs its own, so the
-/// plugin gathers its own rather than reusing the control plane's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AdvertisePolicy {
-    /// Advertise nothing.
-    ///
-    /// Peers can still reach this agent if they are reachable themselves:
-    /// WireGuard learns a peer's real source address from the first
-    /// authenticated packet it receives.
-    None,
-    /// Advertise exactly these addresses, combined with the listening port.
-    Explicit(Vec<IpAddr>),
-    /// Advertise the host's own non-loopback addresses.
-    LocalInterfaces,
-}
+/// Every packet rides in one transport datagram, and WireGuard adds 32 bytes.
+/// A QUIC datagram on a relayed path can be as small as roughly 1160 bytes, so
+/// 1100 leaves headroom instead of relying on the best case. Packets that do
+/// not fit are dropped and counted, never truncated.
+pub const DEFAULT_MTU: u32 = 1100;
 
 /// Configuration of the WireGuard plugin.
 #[derive(Debug, Clone)]
@@ -74,18 +68,14 @@ pub struct WireguardConfig {
     /// Two agents on one host in the same network need different prefixes,
     /// because the rest of the name is derived from the network id.
     pub interface_prefix: String,
-    /// How the listening port is chosen.
-    pub ports: PortPolicy,
-    /// What reachability to advertise.
-    pub advertise: AdvertisePolicy,
-    /// Keepalive interval, which holds a NAT mapping open.
+    /// WireGuard keepalive, which keeps tunnels and their links warm.
     pub keepalive: Option<u16>,
-    /// Interface MTU.
-    pub mtu: Option<u32>,
+    /// Interface MTU. See [`DEFAULT_MTU`].
+    pub mtu: u32,
     /// How long to coalesce changes before reconciling.
     pub reconcile_debounce: Duration,
-    /// How often to reconcile even when nothing changed, which is what
-    /// corrects a configuration someone edited by hand.
+    /// How often to reconcile anyway, which is also when a packet interface
+    /// that could not be created before is retried.
     pub reconcile_interval: Duration,
 }
 
@@ -95,12 +85,10 @@ impl WireguardConfig {
         Self {
             state_dir: state_dir.into(),
             interface_prefix: DEFAULT_INTERFACE_PREFIX.to_string(),
-            ports: PortPolicy::default(),
-            advertise: AdvertisePolicy::LocalInterfaces,
             keepalive: Some(25),
-            mtu: Some(1380),
+            mtu: DEFAULT_MTU,
             reconcile_debounce: Duration::from_millis(200),
-            reconcile_interval: Duration::from_secs(30),
+            reconcile_interval: Duration::from_secs(15),
         }
     }
 
@@ -110,15 +98,9 @@ impl WireguardConfig {
         self
     }
 
-    /// Sets the port policy.
-    pub fn with_ports(mut self, ports: PortPolicy) -> Self {
-        self.ports = ports;
-        self
-    }
-
-    /// Sets what reachability to advertise.
-    pub fn with_advertise(mut self, advertise: AdvertisePolicy) -> Self {
-        self.advertise = advertise;
+    /// Sets the interface MTU.
+    pub fn with_mtu(mut self, mtu: u32) -> Self {
+        self.mtu = mtu;
         self
     }
 
@@ -140,23 +122,32 @@ impl WireguardConfig {
 pub struct NetworkOverview {
     /// The network.
     pub network: NetworkId,
-    /// Interface this plugin created for it.
+    /// Packet interface this plugin created for it.
     pub interface: String,
+    /// Interface MTU.
+    pub mtu: u32,
     /// This agent's WireGuard public key in this network.
     pub public_key: WgPublicKey,
     /// This agent's overlay address.
     pub overlay_address: IpAddr,
     /// The overlay subnet every member shares.
     pub overlay_prefix: IpAddr,
-    /// Port the interface listens on.
-    pub listen_port: u16,
-    /// Reachability advertised to peers.
-    pub advertised: Vec<SocketAddr>,
-    /// Peers whose announcements were accepted.
+    /// Prefix length of the overlay subnet.
+    pub overlay_prefix_len: u8,
+    /// Peers this agent knows about.
     pub peers: Vec<PeerOverview>,
+    /// Packets the operating system sent to an address no peer owns.
+    pub unroutable_packets: u64,
 }
 
-/// One accepted peer.
+impl NetworkOverview {
+    /// Peers whose tunnel has completed a handshake.
+    pub fn established_peers(&self) -> usize {
+        self.peers.iter().filter(|peer| peer.is_up()).count()
+    }
+}
+
+/// One peer of the overlay.
 #[derive(Debug, Clone)]
 pub struct PeerOverview {
     /// The peer's control plane identity.
@@ -165,17 +156,28 @@ pub struct PeerOverview {
     pub public_key: WgPublicKey,
     /// The overlay address derived for it locally.
     pub overlay_address: IpAddr,
-    /// Endpoint that will be configured for it, if any.
-    pub endpoint: Option<SocketAddr>,
+    /// Whether a data plane link to it exists.
+    pub has_link: bool,
+    /// The running tunnel, once there is a link.
+    pub tunnel: Option<PeerSummary>,
+}
+
+impl PeerOverview {
+    /// Whether the tunnel to this peer has handshaken and can carry traffic.
+    pub fn is_up(&self) -> bool {
+        self.tunnel
+            .as_ref()
+            .is_some_and(|tunnel| tunnel.health.is_up())
+    }
 }
 
 #[derive(Debug)]
 struct NetworkState {
     key: WgSecretKey,
     interface: String,
-    listen_port: u16,
-    advertised: Vec<SocketAddr>,
-    peers: HashMap<EndpointId, ValidatedAnnouncement>,
+    device: Option<Arc<WireguardDevice>>,
+    announcements: HashMap<EndpointId, ValidatedAnnouncement>,
+    links: HashMap<EndpointId, SharedLink>,
 }
 
 #[derive(Debug, Default)]
@@ -185,19 +187,20 @@ struct Shared {
 
 #[derive(Debug)]
 enum Command {
-    /// Make sure a network has keys, a name and a port.
     Prepare(NetworkId),
-    /// Bring the interface in line with the known peers.
     Sync(NetworkId),
-    /// Remove the interface for a network.
+    Link {
+        network: NetworkId,
+        peer: EndpointId,
+        link: SharedLink,
+    },
     Teardown(NetworkId),
-    /// Tear everything down and stop.
     Stop(oneshot::Sender<()>),
 }
 
 struct Worker {
     config: WireguardConfig,
-    backend: Arc<dyn WireguardBackend>,
+    tun_factory: Arc<dyn TunFactory>,
     store: WgKeyStore,
     shared: Mutex<Shared>,
     context: OnceLock<PluginContext>,
@@ -206,7 +209,7 @@ struct Worker {
 impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
-            .field("backend", &self.backend.name())
+            .field("tun", &self.tun_factory.name())
             .field("store", &self.store.path())
             .finish()
     }
@@ -227,7 +230,7 @@ impl WireguardPlugin {
     /// runtime of its own.
     pub async fn open(
         config: WireguardConfig,
-        backend: Arc<dyn WireguardBackend>,
+        tun_factory: Arc<dyn TunFactory>,
     ) -> Result<Arc<Self>, PluginError> {
         // Validate the prefix once, here, rather than failing per network.
         interface_name(&config.interface_prefix, NetworkId::from_bytes([0u8; 32]))?;
@@ -239,7 +242,7 @@ impl WireguardPlugin {
 
         let worker = Arc::new(Worker {
             config,
-            backend,
+            tun_factory,
             store,
             shared: Mutex::new(Shared::default()),
             context: OnceLock::new(),
@@ -259,14 +262,28 @@ impl WireguardPlugin {
     pub fn overview(&self, network: NetworkId) -> Option<NetworkOverview> {
         let shared = self.worker.lock_shared();
         let state = shared.networks.get(&network)?;
+
+        let tunnels: HashMap<WgPublicKey, PeerSummary> = state
+            .device
+            .as_ref()
+            .map(|device| {
+                device
+                    .peers()
+                    .into_iter()
+                    .map(|summary| (summary.public_key, summary))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut peers: Vec<PeerOverview> = state
-            .peers
+            .announcements
             .iter()
             .map(|(endpoint_id, announcement)| PeerOverview {
                 endpoint_id: *endpoint_id,
                 public_key: announcement.public_key,
                 overlay_address: IpAddr::V6(announcement.overlay_address),
-                endpoint: announcement.preferred_endpoint(),
+                has_link: state.links.contains_key(endpoint_id),
+                tunnel: tunnels.get(&announcement.public_key).cloned(),
             })
             .collect();
         peers.sort_by_key(|peer| peer.public_key);
@@ -274,18 +291,21 @@ impl WireguardPlugin {
         Some(NetworkOverview {
             network,
             interface: state.interface.clone(),
+            mtu: self.worker.config.mtu,
             public_key: state.key.public(),
             overlay_address: IpAddr::V6(overlay_address(network, &state.key.public())),
             overlay_prefix: IpAddr::V6(overlay_prefix(network)),
-            listen_port: state.listen_port,
-            advertised: state.advertised.clone(),
+            overlay_prefix_len: OVERLAY_PREFIX_LEN,
             peers,
+            unroutable_packets: state
+                .device
+                .as_ref()
+                .map(|device| device.unroutable_packets())
+                .unwrap_or(0),
         })
     }
 
-    /// Asks the reconciliation task to run now, and waits for it to be queued.
-    ///
-    /// Tests use it to avoid waiting for the periodic tick.
+    /// Asks the reconciliation task to run now.
     pub async fn reconcile_now(&self, network: NetworkId) {
         let _ = self.commands.send(Command::Sync(network)).await;
     }
@@ -293,7 +313,7 @@ impl WireguardPlugin {
     fn nudge(&self, command: Command) {
         if let Err(err) = self.commands.try_send(command) {
             // A full queue means work is already scheduled; the periodic
-            // reconcile will pick anything up that was missed.
+            // reconcile picks up anything that was missed.
             tracing::debug!(%err, "wireguard command queue is busy");
         }
     }
@@ -320,55 +340,27 @@ impl Worker {
         }
     }
 
-    /// Gathers the addresses to advertise for our own listening port.
-    async fn advertised_endpoints(&self, listen_port: u16) -> Vec<SocketAddr> {
-        let addresses: Vec<IpAddr> = match &self.config.advertise {
-            AdvertisePolicy::None => Vec::new(),
-            AdvertisePolicy::Explicit(addresses) => addresses.clone(),
-            AdvertisePolicy::LocalInterfaces => {
-                let state = netwatch::interfaces::State::new().await;
-                state.local_addresses.regular
-            }
-        };
-
-        let mut endpoints: Vec<SocketAddr> = addresses
-            .into_iter()
-            .filter(|addr| !addr.is_loopback() && !addr.is_unspecified() && !is_link_local(addr))
-            .map(|addr| SocketAddr::new(addr, listen_port))
-            .collect();
-        endpoints.sort();
-        endpoints.dedup();
-        endpoints.truncate(super::announcement::MAX_ENDPOINTS);
-        endpoints
-    }
-
-    /// Makes sure a network has a key, an interface name and a port.
+    /// Makes sure a network has a key, a name and a running packet interface.
     ///
-    /// Returns `true` when something changed and peers should be told.
+    /// Returns `true` when the key became available now, so peers should be
+    /// told. Creating the interface may fail without privileges; the key and
+    /// the announcement still work, and the interface is retried.
     async fn prepare(self: &Arc<Self>, network: NetworkId) -> Result<bool, PluginError> {
         let existing = {
             let shared = self.lock_shared();
             shared
                 .networks
                 .get(&network)
-                .map(|state| (state.listen_port, state.advertised.clone()))
+                .map(|state| state.device.is_some())
         };
 
-        let listen_port = match existing {
-            Some((port, _)) => port,
-            None => self.config.ports.port_for(network)?,
-        };
-        let advertised = self.advertised_endpoints(listen_port).await;
-
-        if let Some((_, previous)) = existing {
-            if previous == advertised {
+        if let Some(has_device) = existing {
+            if has_device {
                 return Ok(false);
             }
-            let mut shared = self.lock_shared();
-            if let Some(state) = shared.networks.get_mut(&network) {
-                state.advertised = advertised;
-            }
-            return Ok(true);
+            // The key is there but the interface is not. Try again.
+            self.ensure_device(network).await?;
+            return Ok(false);
         }
 
         let name = interface_name(&self.config.interface_prefix, network)?;
@@ -377,86 +369,97 @@ impl Worker {
             .await
             .map_err(|err| PluginError::Other(format!("key store task failed: {err}")))??;
 
-        let mut shared = self.lock_shared();
-        shared.networks.entry(network).or_insert(NetworkState {
-            key,
-            interface: name,
-            listen_port,
-            advertised,
-            peers: HashMap::new(),
-        });
+        {
+            let mut shared = self.lock_shared();
+            shared.networks.entry(network).or_insert(NetworkState {
+                key,
+                interface: name,
+                device: None,
+                announcements: HashMap::new(),
+                links: HashMap::new(),
+            });
+        }
+
+        // The announcement only needs the key, so peers can be told even if
+        // the interface is not up yet.
+        let device = self.ensure_device(network).await;
+        if let Err(err) = device {
+            self.report(network, err);
+        }
         Ok(true)
     }
 
-    /// Builds the configuration this agent wants for a network.
-    fn desired_config(&self, network: NetworkId) -> Option<InterfaceConfig> {
-        let shared = self.lock_shared();
-        let state = shared.networks.get(&network)?;
-
-        let endpoints: HashMap<WgPublicKey, SocketAddr> = state
-            .peers
-            .values()
-            .filter_map(|announcement| {
-                announcement
-                    .preferred_endpoint()
-                    .map(|endpoint| (announcement.public_key, endpoint))
-            })
-            .collect();
-        let keys: Vec<WgPublicKey> = state
-            .peers
-            .values()
-            .map(|announcement| announcement.public_key)
-            .collect();
-
-        Some(build_interface(
-            InterfaceParams {
-                network,
-                name: state.interface.clone(),
-                private_key: state.key.clone(),
-                listen_port: state.listen_port,
-                mtu: self.config.mtu,
-                keepalive: self.config.keepalive,
-            },
-            keys,
-            |key| endpoints.get(key).copied(),
-        ))
-    }
-
-    /// Brings the interface in line with the desired configuration.
-    async fn sync(&self, network: NetworkId) -> Result<(), PluginError> {
-        let Some(desired) = self.desired_config(network) else {
-            return Ok(());
-        };
-        let backend = Arc::clone(&self.backend);
-        tokio::task::spawn_blocking(move || {
-            let current = backend.inspect(&desired.name)?;
-            // Reconciliation: anything that drifted, including an edit made by
-            // hand, is corrected here.
-            if current.as_ref() == Some(&desired.to_state()) {
-                return Ok(());
+    /// Creates the packet interface and starts the WireGuard device.
+    async fn ensure_device(&self, network: NetworkId) -> Result<(), PluginError> {
+        let (name, key) = {
+            let shared = self.lock_shared();
+            match shared.networks.get(&network) {
+                Some(state) if state.device.is_none() => {
+                    (state.interface.clone(), state.key.clone())
+                }
+                _ => return Ok(()),
             }
-            backend.apply(&desired)
-        })
-        .await
-        .map_err(|err| PluginError::Other(format!("wireguard apply task failed: {err}")))?
+        };
+
+        let request = TunRequest {
+            name: name.clone(),
+            address: overlay_address(network, &key.public()),
+            prefix_len: OVERLAY_PREFIX_LEN,
+            mtu: self.config.mtu,
+        };
+        let tun = self.tun_factory.create(request).await?;
+        let device = Arc::new(WireguardDevice::start(network, key, tun));
+
+        let mut shared = self.lock_shared();
+        if let Some(state) = shared.networks.get_mut(&network) {
+            state.interface = device.interface().to_string();
+            state.device = Some(device);
+        }
+        Ok(())
     }
 
-    /// Removes the interface for a network, keeping its key.
-    async fn teardown(&self, network: NetworkId) -> Result<(), PluginError> {
-        let interface = {
-            let mut shared = self.lock_shared();
-            shared
-                .networks
-                .remove(&network)
-                .map(|state| state.interface)
+    /// Brings the running tunnels in line with what is known.
+    ///
+    /// A peer gets a tunnel once both halves have arrived: its announcement,
+    /// which says who it is, and a link, which says packets can reach it.
+    fn sync(&self, network: NetworkId) {
+        let mut shared = self.lock_shared();
+        let Some(state) = shared.networks.get_mut(&network) else {
+            return;
         };
-        let Some(interface) = interface else {
-            return Ok(());
+        let Some(device) = state.device.clone() else {
+            return;
         };
-        let backend = Arc::clone(&self.backend);
-        tokio::task::spawn_blocking(move || backend.remove(&interface))
-            .await
-            .map_err(|err| PluginError::Other(format!("wireguard remove task failed: {err}")))?
+
+        let mut wanted: Vec<WgPublicKey> = Vec::new();
+        for (endpoint_id, announcement) in &state.announcements {
+            let Some(link) = state.links.get(endpoint_id) else {
+                continue;
+            };
+            if link.is_closed() {
+                continue;
+            }
+            wanted.push(announcement.public_key);
+            if device.has_peer(&announcement.public_key) {
+                continue;
+            }
+            if let Err(err) = device.add_peer(
+                *endpoint_id,
+                announcement.public_key,
+                Arc::clone(link),
+                self.config.keepalive,
+            ) {
+                tracing::debug!(%err, "cannot start a WireGuard tunnel");
+            }
+        }
+        device.retain_peers(&wanted);
+    }
+
+    /// Removes a network's interface and tunnels, keeping its key.
+    fn teardown(&self, network: NetworkId) {
+        // Dropping the state drops the device, which stops its tasks and
+        // closes the packet interface.
+        self.lock_shared().networks.remove(&network);
     }
 
     fn known_networks(&self) -> Vec<NetworkId> {
@@ -465,16 +468,11 @@ impl Worker {
 }
 
 /// The reconciliation task.
-///
-/// Changes are coalesced over a short debounce so that a burst of peer
-/// announcements produces one apply, and a periodic tick reconciles even when
-/// nothing changed locally.
 async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
     let mut pending: BTreeSet<NetworkId> = BTreeSet::new();
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut ticker = tokio::time::interval(worker.config.reconcile_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The first tick fires immediately and would reconcile nothing.
     ticker.tick().await;
 
     loop {
@@ -495,18 +493,23 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
                     Command::Sync(network) => {
                         pending.insert(network);
                     }
+                    Command::Link { network, peer, link } => {
+                        {
+                            let mut shared = worker.lock_shared();
+                            if let Some(state) = shared.networks.get_mut(&network) {
+                                state.links.insert(peer, link);
+                            }
+                        }
+                        pending.insert(network);
+                    }
                     Command::Teardown(network) => {
                         pending.remove(&network);
-                        if let Err(err) = worker.teardown(network).await {
-                            worker.report(network, err);
-                        }
+                        worker.teardown(network);
                         continue;
                     }
                     Command::Stop(reply) => {
                         for network in worker.known_networks() {
-                            if let Err(err) = worker.teardown(network).await {
-                                tracing::warn!(%err, "wireguard teardown failed during shutdown");
-                            }
+                            worker.teardown(network);
                         }
                         let _ = reply.send(());
                         return;
@@ -517,34 +520,25 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
             _ = async {
                 match wait_until {
                     Some(at) => tokio::time::sleep_until(at).await,
-                    // Never resolves; the branch is disabled by the guard.
                     None => std::future::pending::<()>().await,
                 }
             }, if wait_until.is_some() => {
                 deadline = None;
                 for network in std::mem::take(&mut pending) {
-                    if let Err(err) = worker.sync(network).await {
-                        worker.report(network, err);
-                    }
+                    worker.sync(network);
                 }
             }
             _ = ticker.tick() => {
-                // Periodic reconciliation is what corrects drift nobody told
-                // us about.
                 for network in worker.known_networks() {
-                    if let Err(err) = worker.sync(network).await {
-                        worker.report(network, err);
+                    // Also the retry for an interface that could not be
+                    // created earlier.
+                    if let Err(err) = worker.ensure_device(network).await {
+                        tracing::debug!(%err, "packet interface still unavailable");
                     }
+                    worker.sync(network);
                 }
             }
         }
-    }
-}
-
-fn is_link_local(addr: &IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(ip) => ip.is_link_local(),
-        IpAddr::V6(ip) => (ip.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
 
@@ -567,19 +561,15 @@ impl IpPlugin for WireguardPlugin {
     ) -> Result<Option<PluginCapability>, PluginError> {
         let shared = self.worker.lock_shared();
         let Some(state) = shared.networks.get(&network) else {
-            // Not ready yet. Ask for preparation; once it finishes the plugin
-            // asks the agent to re-announce, so peers are not left waiting.
+            // Not ready yet. Ask for preparation; once the key exists the
+            // plugin asks the agent to re-announce.
             drop(shared);
             self.nudge(Command::Prepare(network));
             return Ok(None);
         };
 
-        let announcement = WgAnnouncement::new(
-            network,
-            &state.key.public(),
-            state.listen_port,
-            state.advertised.clone(),
-        );
+        // Identity only. Where to send packets is the transport's business.
+        let announcement = WgAnnouncement::new(network, &state.key.public());
         Ok(Some(PluginCapability {
             protocol: WIREGUARD_PROTOCOL.to_string(),
             version: super::announcement::ANNOUNCEMENT_VERSION,
@@ -614,7 +604,7 @@ impl IpPlugin for WireguardPlugin {
             let mut shared = self.worker.lock_shared();
             match shared.networks.get_mut(&network) {
                 Some(state) => {
-                    state.peers.insert(peer, validated) != state.peers.get(&peer).cloned()
+                    state.announcements.insert(peer, validated.clone()) != Some(validated)
                 }
                 None => false,
             }
@@ -625,14 +615,24 @@ impl IpPlugin for WireguardPlugin {
         Ok(())
     }
 
+    fn on_peer_link(&self, network: NetworkId, peer: EndpointId, link: SharedLink) {
+        self.nudge(Command::Link {
+            network,
+            peer,
+            link,
+        });
+    }
+
     fn on_peer_gone(&self, network: NetworkId, peer: EndpointId) {
         let removed = {
             let mut shared = self.worker.lock_shared();
-            shared
-                .networks
-                .get_mut(&network)
-                .and_then(|state| state.peers.remove(&peer))
-                .is_some()
+            match shared.networks.get_mut(&network) {
+                Some(state) => {
+                    let had_link = state.links.remove(&peer).is_some();
+                    state.announcements.remove(&peer).is_some() || had_link
+                }
+                None => false,
+            }
         };
         if removed {
             self.nudge(Command::Sync(network));
@@ -659,7 +659,6 @@ impl IpPlugin for WireguardPlugin {
 
 impl Drop for WireguardPlugin {
     fn drop(&mut self) {
-        // Safety net for a plugin dropped without an explicit shutdown.
         if let Ok(mut guard) = self.task.lock()
             && let Some(task) = guard.take()
         {

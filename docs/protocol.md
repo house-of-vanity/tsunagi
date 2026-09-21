@@ -132,6 +132,34 @@ A `Hello` naming a network this agent does not have active is rejected with
 "unknown network". Because the claim is unverified at that point, the rejection
 event does not report a network id.
 
+## The data plane protocol
+
+IP plugin packets never travel on a control connection. They use their own
+ALPN, `tsunagi/data/1`, on their own iroh connection:
+
+```text
+initiator -> responder : (the same membership handshake as above)
+initiator -> responder : DataOpen    { protocol }
+initiator <- responder : DataOpenAck { accepted, max_datagram }
+thereafter             : QUIC datagrams carrying that plugin's packets
+```
+
+The membership handshake is identical and bound to the same network, so a data
+channel cannot be opened by somebody who does not know the secret. `protocol`
+is bounded and must name a plugin the responder actually runs; otherwise the
+channel is declined, which is an ordinary outcome rather than an error.
+
+Only one side dials — the one with the smaller endpoint id — so two agents
+never open two channels for the same thing.
+
+Packets ride as QUIC **datagrams**: unreliable and unordered, which is what a
+tunnelled protocol wants, and free of the head-of-line blocking a stream would
+add. The datagram limit is what caps a plugin's MTU.
+
+Separate connections mean separate congestion control, so a saturated data
+plane cannot delay control messages, and a data plane failure cannot take the
+control plane down with it.
+
 ## Control messages
 
 After authentication, every frame is an `Envelope { network_id, message }` and

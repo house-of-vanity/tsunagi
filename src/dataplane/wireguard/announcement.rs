@@ -4,11 +4,13 @@
 //! [`crate::dataplane::PluginCapability`]. The agent core never parses it —
 //! only this module does, and only after bounding every field.
 //!
-//! An iroh address is an address for iroh. It is **not** reused here: the
-//! plugin advertises its own reachability, gathered by itself, for its own
-//! listening port.
+//! The announcement is deliberately tiny: a participant says **who it is**,
+//! not **where it is**. Reachability is the data plane transport's job, and
+//! the transport already solves it — see
+//! [`crate::dataplane::transport`]. A plugin that also tried to advertise
+//! addresses would be reimplementing NAT traversal badly.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::Ipv6Addr;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,9 +23,6 @@ use super::overlay::overlay_address;
 /// Version of the announcement format.
 pub const ANNOUNCEMENT_VERSION: u16 = 1;
 
-/// Largest number of advertised endpoints accepted from a peer.
-pub const MAX_ENDPOINTS: usize = 8;
-
 /// What one participant advertises for the WireGuard data plane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WgAnnouncement {
@@ -31,10 +30,6 @@ pub struct WgAnnouncement {
     pub version: u16,
     /// The peer's WireGuard public key. Its overlay address is derived from it.
     pub public_key: [u8; 32],
-    /// The UDP port the peer's WireGuard interface listens on.
-    pub listen_port: u16,
-    /// Reachability the plugin gathered for itself. Advisory, may be empty.
-    pub endpoints: Vec<SocketAddr>,
     /// The overlay address the peer believes it has.
     ///
     /// Carried for diagnostics and cross-checking only. `AllowedIPs` are
@@ -47,40 +42,16 @@ pub struct WgAnnouncement {
 pub struct ValidatedAnnouncement {
     /// The peer's WireGuard public key.
     pub public_key: WgPublicKey,
-    /// The peer's listening port.
-    pub listen_port: u16,
-    /// Usable endpoints, filtered.
-    pub endpoints: Vec<SocketAddr>,
     /// The overlay address derived locally for this key. Authoritative.
     pub overlay_address: Ipv6Addr,
 }
 
-impl ValidatedAnnouncement {
-    /// The endpoint to configure for this peer, if any is usable.
-    ///
-    /// WireGuard takes a single endpoint. The first usable one wins, and
-    /// WireGuard itself will re-learn the peer's real source address from the
-    /// first authenticated packet it receives.
-    pub fn preferred_endpoint(&self) -> Option<SocketAddr> {
-        self.endpoints.first().copied()
-    }
-}
-
 impl WgAnnouncement {
     /// Builds this agent's announcement.
-    pub fn new(
-        network: NetworkId,
-        public_key: &WgPublicKey,
-        listen_port: u16,
-        endpoints: Vec<SocketAddr>,
-    ) -> Self {
-        let mut endpoints = endpoints;
-        endpoints.truncate(MAX_ENDPOINTS);
+    pub fn new(network: NetworkId, public_key: &WgPublicKey) -> Self {
         Self {
             version: ANNOUNCEMENT_VERSION,
             public_key: *public_key.as_bytes(),
-            listen_port,
-            endpoints,
             overlay_address: overlay_address(network, public_key),
         }
     }
@@ -128,18 +99,6 @@ impl WgAnnouncement {
                 "peer announced this agent's own WireGuard key".into(),
             ));
         }
-        if self.listen_port == 0 {
-            return Err(PluginError::Rejected(
-                "WireGuard listen port must not be zero".into(),
-            ));
-        }
-        if self.endpoints.len() > MAX_ENDPOINTS {
-            return Err(PluginError::Rejected(format!(
-                "announcement carries {} endpoints, at most {MAX_ENDPOINTS} are accepted",
-                self.endpoints.len()
-            )));
-        }
-
         // AllowedIPs are derived, never trusted. A mismatch means the peer is
         // confused or lying, and either way its own claim is discarded.
         let derived = overlay_address(network, &public_key);
@@ -150,37 +109,10 @@ impl WgAnnouncement {
             ));
         }
 
-        let endpoints: Vec<SocketAddr> = self
-            .endpoints
-            .into_iter()
-            .filter(is_usable_endpoint)
-            .collect();
-
         Ok(ValidatedAnnouncement {
             public_key,
-            listen_port: self.listen_port,
-            endpoints,
             overlay_address: derived,
         })
-    }
-}
-
-/// Whether an advertised endpoint is worth trying.
-///
-/// Nothing here is trusted; this only discards addresses that cannot be a
-/// peer, so the plugin does not waste a WireGuard endpoint slot on them.
-fn is_usable_endpoint(endpoint: &SocketAddr) -> bool {
-    if endpoint.port() == 0 {
-        return false;
-    }
-    match endpoint.ip() {
-        IpAddr::V4(ip) => {
-            !ip.is_unspecified()
-                && !ip.is_multicast()
-                && !ip.is_broadcast()
-                && !ip.is_documentation()
-        }
-        IpAddr::V6(ip) => !ip.is_unspecified() && !ip.is_multicast(),
     }
 }
 
@@ -201,26 +133,31 @@ mod tests {
         .network_id()
     }
 
-    fn endpoint(text: &str) -> SocketAddr {
-        text.parse().unwrap()
-    }
-
     #[test]
     fn a_well_formed_announcement_round_trips() {
         let id = network("round-trip");
         let peer = WgSecretKey::generate().public();
         let local = WgSecretKey::generate().public();
 
-        let announcement =
-            WgAnnouncement::new(id, &peer, 51820, vec![endpoint("192.0.2.10:51820")]);
-        let payload = announcement.encode().unwrap();
+        let payload = WgAnnouncement::new(id, &peer).encode().unwrap();
         let validated = WgAnnouncement::decode_and_validate(&payload, id, &local).unwrap();
 
         assert_eq!(validated.public_key, peer);
-        assert_eq!(validated.listen_port, 51820);
         assert_eq!(validated.overlay_address, overlay_address(id, &peer));
-        // 192.0.2.0/24 is documentation space and is filtered out.
-        assert!(validated.endpoints.is_empty());
+    }
+
+    #[test]
+    fn the_announcement_says_who_not_where() {
+        // Reachability belongs to the transport. Nothing address-like is
+        // carried here, so there is nothing for a peer to lie about.
+        let id = network("identity-only");
+        let peer = WgSecretKey::generate().public();
+        let payload = WgAnnouncement::new(id, &peer).encode().unwrap();
+        assert!(
+            payload.len() < 80,
+            "the announcement should stay tiny, got {} bytes",
+            payload.len()
+        );
     }
 
     #[test]
@@ -231,7 +168,7 @@ mod tests {
         let local = WgSecretKey::generate().public();
 
         // An attacker claims the victim's overlay address with its own key.
-        let mut forged = WgAnnouncement::new(id, &attacker, 51820, Vec::new());
+        let mut forged = WgAnnouncement::new(id, &attacker);
         forged.overlay_address = overlay_address(id, &victim);
 
         let result = WgAnnouncement::decode_and_validate(&forged.encode().unwrap(), id, &local);
@@ -248,9 +185,7 @@ mod tests {
         let peer = WgSecretKey::generate().public();
         let local = WgSecretKey::generate().public();
 
-        let payload = WgAnnouncement::new(there, &peer, 51820, Vec::new())
-            .encode()
-            .unwrap();
+        let payload = WgAnnouncement::new(there, &peer).encode().unwrap();
         assert!(WgAnnouncement::decode_and_validate(&payload, here, &local).is_err());
     }
 
@@ -260,13 +195,12 @@ mod tests {
         let local = WgSecretKey::generate().public();
         let peer = WgSecretKey::generate().public();
 
-        // Not postcard at all.
         assert!(WgAnnouncement::decode_and_validate(&[0xff; 64], id, &local).is_err());
         assert!(WgAnnouncement::decode_and_validate(&[], id, &local).is_err());
 
         let wrong_version = WgAnnouncement {
             version: ANNOUNCEMENT_VERSION + 1,
-            ..WgAnnouncement::new(id, &peer, 51820, Vec::new())
+            ..WgAnnouncement::new(id, &peer)
         };
         assert!(
             WgAnnouncement::decode_and_validate(&wrong_version.encode().unwrap(), id, &local)
@@ -275,25 +209,10 @@ mod tests {
 
         let zero_key = WgAnnouncement {
             public_key: [0u8; 32],
-            ..WgAnnouncement::new(id, &peer, 51820, Vec::new())
+            ..WgAnnouncement::new(id, &peer)
         };
         assert!(
             WgAnnouncement::decode_and_validate(&zero_key.encode().unwrap(), id, &local).is_err()
-        );
-
-        let zero_port = WgAnnouncement::new(id, &peer, 0, Vec::new());
-        assert!(
-            WgAnnouncement::decode_and_validate(&zero_port.encode().unwrap(), id, &local).is_err()
-        );
-
-        let too_many = WgAnnouncement {
-            endpoints: (0..MAX_ENDPOINTS + 1)
-                .map(|index| endpoint(&format!("10.0.0.1:{}", 1000 + index)))
-                .collect(),
-            ..WgAnnouncement::new(id, &peer, 51820, Vec::new())
-        };
-        assert!(
-            WgAnnouncement::decode_and_validate(&too_many.encode().unwrap(), id, &local).is_err()
         );
     }
 
@@ -301,53 +220,15 @@ mod tests {
     fn a_peer_cannot_claim_our_own_key() {
         let id = network("self");
         let local = WgSecretKey::generate().public();
-        let payload = WgAnnouncement::new(id, &local, 51820, Vec::new())
-            .encode()
-            .unwrap();
+        let payload = WgAnnouncement::new(id, &local).encode().unwrap();
         assert!(WgAnnouncement::decode_and_validate(&payload, id, &local).is_err());
-    }
-
-    #[test]
-    fn unusable_endpoints_are_filtered_and_the_rest_kept() {
-        let id = network("filter");
-        let peer = WgSecretKey::generate().public();
-        let local = WgSecretKey::generate().public();
-
-        let announcement = WgAnnouncement::new(
-            id,
-            &peer,
-            51820,
-            vec![
-                endpoint("0.0.0.0:51820"),
-                endpoint("224.0.0.1:51820"),
-                endpoint("10.1.2.3:0"),
-                endpoint("10.1.2.3:51820"),
-                endpoint("[2001:db8::1]:51820"),
-            ],
-        );
-        let validated =
-            WgAnnouncement::decode_and_validate(&announcement.encode().unwrap(), id, &local)
-                .unwrap();
-        assert_eq!(
-            validated.endpoints,
-            vec![endpoint("10.1.2.3:51820"), endpoint("[2001:db8::1]:51820")]
-        );
-        assert_eq!(
-            validated.preferred_endpoint(),
-            Some(endpoint("10.1.2.3:51820"))
-        );
     }
 
     #[test]
     fn announcements_stay_well_under_the_capability_payload_limit() {
         let id = network("size");
         let peer = WgSecretKey::generate().public();
-        let endpoints = (0..MAX_ENDPOINTS)
-            .map(|index| endpoint(&format!("[2001:db8::{index}]:51820")))
-            .collect();
-        let payload = WgAnnouncement::new(id, &peer, 51820, endpoints)
-            .encode()
-            .unwrap();
+        let payload = WgAnnouncement::new(id, &peer).encode().unwrap();
         assert!(
             payload.len() < crate::config::Limits::default().max_capability_data_len,
             "announcement is {} bytes",
