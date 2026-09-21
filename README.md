@@ -31,10 +31,10 @@ A working library with **real iroh connections** and integration tests:
 - status snapshots, an event stream and honest diagnostics;
 - configuration restored after a restart;
 - correct behaviour when the disposable cache is missing or corrupt;
-- a **WireGuard data plane**, in userspace: its own key per network,
-  deterministic IPv6 overlay addressing, real tunnels carried over iroh, and
-  address ownership enforced rather than believed;
-- a **command line agent**, `tsunagi`.
+- a **WireGuard data plane**, in userspace: its own key per network, a dual
+  stack overlay with deterministically derived addresses, real tunnels carried
+  over iroh, and address ownership enforced rather than believed;
+- a **command line agent**, `tsunagi`, with a local control socket.
 
 ### What it deliberately does **not** do
 
@@ -94,8 +94,41 @@ wireguard: tsunkkcp43lmdje on fd15:1d9e:fa21:f201:…/64 mtu 1280, 1/1 tunnel(s)
   4jO4kx9Z fd15:1d9e:fa21:f201:… handshake 3s ago tx=0 rx=0 dropped=0 path=Direct via Ip(…)
 ```
 
-`1/1 tunnel(s) established` means a real WireGuard handshake completed. Then
-`ping6` the peer's overlay address.
+`1/1 tunnel(s) established` means a real WireGuard handshake completed.
+
+## Checking that it works
+
+From another shell on either machine:
+
+```bash
+tsunagi status
+```
+
+```text
+endpoint  7d76ccbbc21bf30767e14422c0494740a2cecc02aa9f82d5b8d57bdae350e7fc
+hostname  tsunagi-7d76ccbbc2
+bound     0.0.0.0:41641
+
+network lab (z2o4qwrvnj3zb6st2aoqg4abf342j662q2ujttqrsmz22argk2ba)  active
+  peer b345d5271b  tsunagi-b345d5271b  Direct  rtt 24ms
+  overlay tsunz2o4qwrvnj3 fd09:…:c1c6/64 and 100.110.49.177 mtu 1280  1/1 tunnel(s) up
+    SDsEb/WF  fd09:…:c4b / 100.65.243.53  handshake 4s ago  tx 0 rx 0  Direct via Ip(…)
+```
+
+`1/1 tunnel(s) up` and a recent handshake mean the tunnel is live. Then send
+real traffic to the peer's overlay address:
+
+```bash
+ping6 fd09:…:c4b        # or
+ping  100.65.243.53
+```
+
+`tx` and `rx` in the status should start moving.
+
+The overlay is dual stack: every member derives both an IPv6 address, which
+can never collide, and an IPv4 one in `100.64.0.0/10`, which very rarely can —
+see [docs/wireguard.md](docs/wireguard.md#ipv4-alongside-ipv6). `--no-ipv4`
+runs IPv6 only, `--ipv4-range` moves the range.
 
 Notes:
 
@@ -130,6 +163,7 @@ sudo ip tuntap add dev tsunjwc6dcrtmo5 mode tun user ab
 sudo ip link set dev tsunjwc6dcrtmo5 mtu 1280 up
 sudo sysctl -qw net.ipv6.conf.tsunjwc6dcrtmo5.keep_addr_on_down=1
 sudo ip -6 address add fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64 dev tsunjwc6dcrtmo5 nodad
+sudo ip address add 100.110.49.177/10 dev tsunjwc6dcrtmo5
 ```
 
 The MTU is 1280 because that is the minimum IPv6 requires (RFC 8200). Linux

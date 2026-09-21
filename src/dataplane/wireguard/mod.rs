@@ -54,7 +54,9 @@ pub use announcement::{ValidatedAnnouncement, WgAnnouncement};
 pub use config::{Cidr, DEFAULT_INTERFACE_PREFIX, MAX_INTERFACE_NAME_LEN, interface_name};
 pub use device::{PeerHealth, PeerStats, PeerSummary, WireguardDevice};
 pub use keys::{WgPublicKey, WgSecretKey};
-pub use overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_prefix};
+pub use overlay::{
+    DEFAULT_IPV4_RANGE, OVERLAY_PREFIX_LEN, overlay_address, overlay_address_v4, overlay_prefix,
+};
 pub use packet::IpHeader;
 pub use plugin::{
     DEFAULT_MTU, MIN_MTU, NetworkOverview, PeerOverview, WIREGUARD_OVERHEAD, WIREGUARD_PROTOCOL,

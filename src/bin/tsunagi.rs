@@ -98,6 +98,45 @@ struct TunSetupArgs {
     /// Interface MTU, matching `tsunagi up --wg-mtu`. At least 1280.
     #[arg(long)]
     wg_mtu: Option<u32>,
+
+    /// Match `tsunagi up --no-ipv4`.
+    #[arg(long)]
+    no_ipv4: bool,
+
+    /// Match `tsunagi up --ipv4-range`.
+    #[arg(long, value_name = "CIDR", conflicts_with = "no_ipv4")]
+    ipv4_range: Option<String>,
+}
+
+/// Parses `address/prefix` into an IPv4 range.
+fn parse_ipv4_range(text: &str) -> Result<(std::net::Ipv4Addr, u8), String> {
+    let (address, prefix) = text
+        .split_once('/')
+        .ok_or_else(|| format!("`{text}` is not an address with a prefix, e.g. 100.64.0.0/10"))?;
+    let address = address
+        .parse()
+        .map_err(|err| format!("`{address}` is not an IPv4 address: {err}"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|err| format!("`{prefix}` is not a prefix length: {err}"))?;
+    if prefix > 30 {
+        return Err(format!("a /{prefix} has no room for hosts"));
+    }
+    Ok((address, prefix))
+}
+
+/// Resolves the IPv4 overlay range from the flags.
+fn resolve_ipv4_range(
+    no_ipv4: bool,
+    range: Option<&String>,
+) -> Result<Option<(std::net::Ipv4Addr, u8)>, Box<dyn std::error::Error>> {
+    if no_ipv4 {
+        return Ok(None);
+    }
+    match range {
+        Some(text) => Ok(Some(parse_ipv4_range(text)?)),
+        None => Ok(Some(tsunagi::dataplane::wireguard::DEFAULT_IPV4_RANGE)),
+    }
 }
 
 #[derive(Debug, Args, Clone)]
@@ -211,6 +250,14 @@ struct UpArgs {
     /// Must be at least 1280, the minimum IPv6 requires.
     #[arg(long)]
     wg_mtu: Option<u32>,
+
+    /// Run an IPv6-only overlay instead of dual stack.
+    #[arg(long)]
+    no_ipv4: bool,
+
+    /// IPv4 overlay range, as `address/prefix`. Defaults to 100.64.0.0/10.
+    #[arg(long, value_name = "CIDR", conflicts_with = "no_ipv4")]
+    ipv4_range: Option<String>,
 
     /// How often to print a status summary, in seconds. Zero disables it.
     #[arg(long, default_value_t = 15)]
@@ -346,6 +393,7 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
 async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     use tsunagi::dataplane::wireguard::{
         DEFAULT_MTU, OVERLAY_PREFIX_LEN, WgKeyStore, interface_name, overlay_address,
+        overlay_address_v4,
     };
     use tsunagi::identity::NetworkKeys;
 
@@ -364,6 +412,7 @@ async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>>
 
     let interface = interface_name(&args.wg_prefix, network)?;
     let address = overlay_address(network, &key.public());
+    let ipv4_range = resolve_ipv4_range(args.no_ipv4, args.ipv4_range.as_ref())?;
     let mtu = args.wg_mtu.unwrap_or(DEFAULT_MTU);
     let user = args.user.unwrap_or_else(|| {
         std::env::var("SUDO_USER")
@@ -373,6 +422,11 @@ async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>>
 
     println!("# Network  {name} ({network})");
     println!("# Interface {interface}, address {address}/{OVERLAY_PREFIX_LEN}, mtu {mtu}");
+    if let Some((base, prefix)) = ipv4_range
+        && let Some(v4) = overlay_address_v4(network, &key.public(), (base, prefix))
+    {
+        println!("# IPv4 overlay address {v4}/{prefix}");
+    }
     println!("# Run once as root; then run `tsunagi up` as {user}.");
     println!(
         "#\n\
@@ -386,6 +440,11 @@ async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>>
     println!("sudo ip link set dev {interface} mtu {mtu} up");
     println!("sudo sysctl -qw net.ipv6.conf.{interface}.keep_addr_on_down=1");
     println!("sudo ip -6 address add {address}/{OVERLAY_PREFIX_LEN} dev {interface} nodad");
+    if let Some((base, prefix)) = ipv4_range
+        && let Some(v4) = overlay_address_v4(network, &key.public(), (base, prefix))
+    {
+        println!("sudo ip address add {v4}/{prefix} dev {interface}");
+    }
     println!("\n# To check it afterwards:");
     println!("ip -6 addr show dev {interface}");
     println!("\n# To remove it again:");
@@ -516,7 +575,8 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             system_tun_factory()?
         };
         let mut wg = WireguardConfig::new(paths.state_dir.join("wireguard"))
-            .with_interface_prefix(args.wg_prefix.clone());
+            .with_interface_prefix(args.wg_prefix.clone())
+            .with_ipv4_range(resolve_ipv4_range(args.no_ipv4, args.ipv4_range.as_ref())?);
         if let Some(mtu) = args.wg_mtu {
             wg = wg.with_mtu(mtu);
         }
@@ -637,6 +697,7 @@ async fn build_report(
                     interface: view.interface.clone(),
                     mtu: view.mtu,
                     address: view.overlay_address.to_string(),
+                    address_v4: view.overlay_address_v4.map(|addr| addr.to_string()),
                     prefix: view.overlay_prefix.to_string(),
                     prefix_len: view.overlay_prefix_len,
                     peers: view
@@ -645,6 +706,7 @@ async fn build_report(
                         .map(|peer| OverlayPeerReport {
                             public_key: peer.public_key.to_string(),
                             address: peer.overlay_address.to_string(),
+                            address_v4: peer.overlay_address_v4.map(|addr| addr.to_string()),
                             handshake_secs_ago: peer
                                 .tunnel
                                 .as_ref()

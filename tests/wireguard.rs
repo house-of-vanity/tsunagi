@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -121,6 +121,24 @@ impl WgAgent {
         self.agent.shutdown().await;
         self.dir
     }
+}
+
+/// Builds a minimal well-formed IPv4 packet.
+fn ipv4_packet(source: Ipv4Addr, destination: Ipv4Addr, payload: &[u8]) -> Bytes {
+    let total = 20 + payload.len();
+    let mut packet = Vec::with_capacity(total);
+    packet.push((4 << 4) | 5); // version 4, header length 5 words
+    packet.push(0); // dscp/ecn
+    packet.extend_from_slice(&(total as u16).to_be_bytes());
+    packet.extend_from_slice(&[0, 0]); // identification
+    packet.extend_from_slice(&[0, 0]); // flags and fragment offset
+    packet.push(64); // ttl
+    packet.push(253); // an experimental protocol number
+    packet.extend_from_slice(&[0, 0]); // checksum, not verified by the overlay
+    packet.extend_from_slice(&source.octets());
+    packet.extend_from_slice(&destination.octets());
+    packet.extend_from_slice(payload);
+    Bytes::from(packet)
 }
 
 /// Builds a minimal well-formed IPv6 packet.
@@ -239,6 +257,151 @@ async fn a_peer_cannot_send_from_an_address_it_does_not_own() {
         .expect("the honest packet should arrive")
         .unwrap();
     assert_eq!(&received[40..], b"honest");
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_overlay_carries_ipv4_alongside_ipv6() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-dual-stack");
+
+    let a = WgAgent::spawn(&discovery, "ta").await;
+    let b = WgAgent::spawn(&discovery, "tb").await;
+
+    let network_id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(network_id, 1).await;
+    b.wait_for_tunnels(network_id, 1).await;
+
+    let view_a = a.plugin.overview(network_id).unwrap();
+    let view_b = b.plugin.overview(network_id).unwrap();
+
+    let v4_a = view_a.overlay_address_v4.expect("dual stack by default");
+    let v4_b = view_b.overlay_address_v4.expect("dual stack by default");
+    assert_ne!(v4_a, v4_b);
+    // Both inside the configured range.
+    for addr in [v4_a, v4_b] {
+        assert_eq!(
+            u32::from(addr) & 0xffc0_0000,
+            u32::from(Ipv4Addr::new(100, 64, 0, 0))
+        );
+    }
+    // Each side derived the other's address identically.
+    assert_eq!(view_a.peers[0].overlay_address_v4, Some(v4_b));
+    assert_eq!(view_b.peers[0].overlay_address_v4, Some(v4_a));
+    assert!(!view_a.peers[0].tunnel.as_ref().unwrap().ipv4_conflict);
+
+    let tun_a = a.tun(network_id).await;
+    let tun_b = b.tun(network_id).await;
+
+    // A real IPv4 packet through the same tunnel.
+    tun_a.push_from_os(ipv4_packet(v4_a, v4_b, b"ipv4 over the overlay"));
+    let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
+        .await
+        .expect("the IPv4 packet should arrive")
+        .unwrap();
+    assert_eq!(received[0] >> 4, 4, "still an IPv4 packet");
+    assert_eq!(&received[12..16], &v4_a.octets());
+    assert_eq!(&received[16..20], &v4_b.octets());
+    assert_eq!(&received[20..], b"ipv4 over the overlay");
+
+    // IPv6 keeps working on the same tunnel.
+    let addr_a = a.overlay(network_id).await;
+    let addr_b = b.overlay(network_id).await;
+    tun_a.push_from_os(ipv6_packet(addr_a, addr_b, b"and ipv6 too"));
+    let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
+        .await
+        .expect("the IPv6 packet should arrive")
+        .unwrap();
+    assert_eq!(received[0] >> 4, 6);
+    assert_eq!(&received[40..], b"and ipv6 too");
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_ipv4_source_a_peer_does_not_own_is_dropped() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-v4-spoof");
+
+    let a = WgAgent::spawn(&discovery, "ta").await;
+    let b = WgAgent::spawn(&discovery, "tb").await;
+    let network_id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(network_id, 1).await;
+    b.wait_for_tunnels(network_id, 1).await;
+
+    let v4_a = a
+        .plugin
+        .overview(network_id)
+        .unwrap()
+        .overlay_address_v4
+        .unwrap();
+    let v4_b = b
+        .plugin
+        .overview(network_id)
+        .unwrap()
+        .overlay_address_v4
+        .unwrap();
+    let tun_a = a.tun(network_id).await;
+    let tun_b = b.tun(network_id).await;
+
+    // A claims an IPv4 address that is not the one derived from its key.
+    let forged = Ipv4Addr::from(u32::from(v4_a) ^ 0x0000_00ff);
+    tun_a.push_from_os(ipv4_packet(forged, v4_b, b"spoofed v4"));
+
+    wait_until("the spoofed IPv4 packet is dropped", || async {
+        let view = b.plugin.overview(network_id)?;
+        let tunnel = view.peers.first()?.tunnel.as_ref()?;
+        (tunnel.stats.dropped_wrong_source >= 1).then_some(())
+    })
+    .await;
+
+    // The honest one still gets through.
+    tun_a.push_from_os(ipv4_packet(v4_a, v4_b, b"honest v4"));
+    let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
+        .await
+        .expect("the honest packet should arrive")
+        .unwrap();
+    assert_eq!(&received[20..], b"honest v4");
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_ipv6_only_overlay_can_be_asked_for() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-v6-only");
+
+    let a = WgAgent::spawn_with(&discovery, "ta", |config| config.with_ipv4_range(None)).await;
+    let b = WgAgent::spawn_with(&discovery, "tb", |config| config.with_ipv4_range(None)).await;
+
+    let network_id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(network_id, 1).await;
+
+    let view = a.plugin.overview(network_id).unwrap();
+    assert_eq!(view.overlay_address_v4, None);
+    assert_eq!(view.ipv4_range, None);
+    assert_eq!(view.peers[0].overlay_address_v4, None);
+    // No IPv4 configured is not a conflict.
+    assert!(!view.peers[0].tunnel.as_ref().unwrap().ipv4_conflict);
+
+    // IPv6 is unaffected.
+    let addr_a = a.overlay(network_id).await;
+    let addr_b = b.overlay(network_id).await;
+    a.tun(network_id)
+        .await
+        .push_from_os(ipv6_packet(addr_a, addr_b, b"v6 only"));
+    let received = tokio::time::timeout(common::DEADLINE, b.tun(network_id).await.pop_to_os())
+        .await
+        .expect("the packet should arrive")
+        .unwrap();
+    assert_eq!(&received[40..], b"v6 only");
 
     a.shutdown().await;
     b.shutdown().await;

@@ -25,7 +25,7 @@
 //! A failure here is reported and retried. It never stops the control plane.
 
 use std::collections::{BTreeSet, HashMap};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -43,7 +43,9 @@ use super::announcement::{ValidatedAnnouncement, WgAnnouncement};
 use super::config::{DEFAULT_INTERFACE_PREFIX, interface_name};
 use super::device::{PeerSummary, WireguardDevice};
 use super::keys::{WgPublicKey, WgSecretKey};
-use super::overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_prefix};
+use super::overlay::{
+    DEFAULT_IPV4_RANGE, OVERLAY_PREFIX_LEN, overlay_address, overlay_address_v4, overlay_prefix,
+};
 use super::store::WgKeyStore;
 use super::tun::{TunFactory, TunRequest};
 
@@ -86,6 +88,12 @@ pub struct WireguardConfig {
     pub keepalive: Option<u16>,
     /// Interface MTU. See [`DEFAULT_MTU`].
     pub mtu: u32,
+    /// IPv4 overlay range, or `None` for an IPv6-only overlay.
+    ///
+    /// IPv6 addresses are derived collision-free; IPv4 ones cannot be, so a
+    /// collision is detected and resolved deterministically instead. See
+    /// `docs/wireguard.md`.
+    pub ipv4_range: Option<(Ipv4Addr, u8)>,
     /// How long to coalesce changes before reconciling.
     pub reconcile_debounce: Duration,
     /// How often to reconcile anyway, which is also when a packet interface
@@ -101,6 +109,7 @@ impl WireguardConfig {
             interface_prefix: DEFAULT_INTERFACE_PREFIX.to_string(),
             keepalive: Some(25),
             mtu: DEFAULT_MTU,
+            ipv4_range: Some(DEFAULT_IPV4_RANGE),
             reconcile_debounce: Duration::from_millis(200),
             reconcile_interval: Duration::from_secs(15),
         }
@@ -117,6 +126,12 @@ impl WireguardConfig {
     /// Validated when the plugin is opened; see [`MIN_MTU`].
     pub fn with_mtu(mut self, mtu: u32) -> Self {
         self.mtu = mtu;
+        self
+    }
+
+    /// Sets the IPv4 overlay range, or disables IPv4 with `None`.
+    pub fn with_ipv4_range(mut self, range: Option<(Ipv4Addr, u8)>) -> Self {
+        self.ipv4_range = range;
         self
     }
 
@@ -150,6 +165,10 @@ pub struct NetworkOverview {
     pub overlay_prefix: IpAddr,
     /// Prefix length of the overlay subnet.
     pub overlay_prefix_len: u8,
+    /// This agent's IPv4 overlay address, when the overlay is dual stack.
+    pub overlay_address_v4: Option<Ipv4Addr>,
+    /// The IPv4 overlay range in use.
+    pub ipv4_range: Option<(Ipv4Addr, u8)>,
     /// Peers this agent knows about.
     pub peers: Vec<PeerOverview>,
     /// Unicast packets the operating system sent to an address no peer owns.
@@ -174,6 +193,8 @@ pub struct PeerOverview {
     pub public_key: WgPublicKey,
     /// The overlay address derived for it locally.
     pub overlay_address: IpAddr,
+    /// Its IPv4 overlay address, once a tunnel exists and it won the address.
+    pub overlay_address_v4: Option<Ipv4Addr>,
     /// Whether a data plane link to it exists.
     pub has_link: bool,
     /// The running tunnel, once there is a link.
@@ -309,6 +330,9 @@ impl WireguardPlugin {
                 endpoint_id: *endpoint_id,
                 public_key: announcement.public_key,
                 overlay_address: IpAddr::V6(announcement.overlay_address),
+                overlay_address_v4: tunnels
+                    .get(&announcement.public_key)
+                    .and_then(|tunnel| tunnel.overlay_address_v4),
                 has_link: state.links.contains_key(endpoint_id),
                 tunnel: tunnels.get(&announcement.public_key).cloned(),
             })
@@ -323,6 +347,12 @@ impl WireguardPlugin {
             overlay_address: IpAddr::V6(overlay_address(network, &state.key.public())),
             overlay_prefix: IpAddr::V6(overlay_prefix(network)),
             overlay_prefix_len: OVERLAY_PREFIX_LEN,
+            overlay_address_v4: self
+                .worker
+                .config
+                .ipv4_range
+                .and_then(|range| overlay_address_v4(network, &state.key.public(), range)),
+            ipv4_range: self.worker.config.ipv4_range,
             peers,
             unroutable_packets: state
                 .device
@@ -437,10 +467,18 @@ impl Worker {
             name: name.clone(),
             address: overlay_address(network, &key.public()),
             prefix_len: OVERLAY_PREFIX_LEN,
+            address_v4: self.config.ipv4_range.and_then(|range| {
+                overlay_address_v4(network, &key.public(), range).map(|address| (address, range.1))
+            }),
             mtu: self.config.mtu,
         };
         let tun = self.tun_factory.create(request).await?;
-        let device = Arc::new(WireguardDevice::start(network, key, tun));
+        let device = Arc::new(WireguardDevice::start(
+            network,
+            key,
+            tun,
+            self.config.ipv4_range,
+        ));
 
         let mut shared = self.lock_shared();
         if let Some(state) = shared.networks.get_mut(&network) {

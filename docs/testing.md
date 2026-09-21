@@ -50,6 +50,11 @@ keeping the WireGuard identity, shutdown removing every interface, a forged
 overlay claim being rejected, and the core carrying the payload without
 interpreting it.
 
+`tests/local_control.rs` covers the local control socket end to end: a client
+asking a running agent for status over a real Unix socket, a leftover socket
+file being replaced while a live one is not, and the derived socket path
+staying short enough to bind.
+
 `tests/discovery.rs` covers the discovery contract itself: a static bootstrap
 candidate is enough to join, several backends compose, entries are withdrawn
 when a network stops, and a forgotten network stays forgotten across a restart.

@@ -65,6 +65,22 @@ impl IpHeader {
             IpHeader::V4 { .. } => None,
         }
     }
+
+    /// The destination, whichever family it is.
+    pub fn destination(&self) -> std::net::IpAddr {
+        match self {
+            IpHeader::V4 { destination, .. } => std::net::IpAddr::V4(*destination),
+            IpHeader::V6 { destination, .. } => std::net::IpAddr::V6(*destination),
+        }
+    }
+
+    /// The source, whichever family it is.
+    pub fn source(&self) -> std::net::IpAddr {
+        match self {
+            IpHeader::V4 { source, .. } => std::net::IpAddr::V4(*source),
+            IpHeader::V6 { source, .. } => std::net::IpAddr::V6(*source),
+        }
+    }
 }
 
 #[cfg(test)]

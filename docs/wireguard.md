@@ -56,6 +56,12 @@ direct path when it can and falls back to a relay when it cannot; the tunnel
 rides on whichever it got. There is no separate STUN, no separate hole punching
 and no second set of NAT problems to solve for WireGuard.
 
+## Checking it from outside
+
+`tsunagi status` asks a running agent over its local control socket and prints
+what it sees, including whether each tunnel has actually handshaken. See
+[../README.md](../README.md#checking-that-it-works).
+
 ## Deterministic overlay addressing
 
 A mesh with no coordinator cannot hand out addresses, so everyone derives their
@@ -77,6 +83,29 @@ Two consequences matter:
 * a member's address is bound to its WireGuard public key, so address
   ownership can be checked locally rather than believed.
 
+## IPv4 alongside IPv6
+
+The overlay is dual stack by default: every member also derives an IPv4
+address, from the same inputs, into `100.64.0.0/10` (RFC 6598 shared address
+space — deliberately not RFC 1918, so it rarely clashes with the network the
+machine is already on). The range is configurable, and IPv4 can be turned off.
+
+**IPv4 is weaker than IPv6 here, and the difference is not cosmetic.** A 64 bit
+interface identifier makes an IPv6 collision impossible in practice. IPv4 has
+nothing like that much room: in a `/10` with 50 members the chance that two
+derive the same address is roughly 0.03%. Small, but not zero, and a mesh with
+no coordinator cannot simply allocate around it.
+
+So a collision is detected and resolved rather than assumed away: the member
+whose WireGuard public key sorts lower keeps the address, a rule every member
+computes identically and therefore agrees on without exchanging anything. The
+other member ends up with **no IPv4 address** and is still fully reachable over
+IPv6. The status output flags it.
+
+That is the honest summary: **IPv6 always works; IPv4 almost always works and
+degrades predictably when it does not.** Allocating IPv4 properly needs the
+agreed state described in [sync-model.md](sync-model.md).
+
 ## Address ownership is enforced, not announced
 
 Kernel WireGuard enforces `AllowedIPs`. In userspace that is our job, and
@@ -86,6 +115,8 @@ Kernel WireGuard enforces `AllowedIPs`. In userspace that is our job, and
   address; a destination nobody owns is counted as unroutable and dropped;
 * **inbound**, a decrypted packet is dropped unless its *source* is exactly the
   address derived for the peer whose tunnel decrypted it.
+
+Both apply to IPv4 and IPv6 alike.
 
 So a participant cannot receive traffic addressed to somebody else and cannot
 forge traffic that appears to come from somebody else. A participant who knows
@@ -192,9 +223,8 @@ async fn main() -> Result<()> {
 
 * **Full mesh only.** Every member runs a tunnel to every other member.
   Routing through an intermediate participant is not implemented.
-* **IPv6 overlay only.** Addressing is IPv6 ULA because it can be derived
-  collision-free. An IPv4 overlay would need an allocator, which needs the
-  agreed state described in [sync-model.md](sync-model.md).
+* **IPv4 addressing can collide.** See above: it is resolved deterministically
+  and the loser keeps IPv6, but a proper allocator needs agreed state.
 * **No routes, DNS or firewall rules.** The plugin creates its interface and
   nothing else. Anything beyond the overlay `/64` is the operator's business.
 * **Membership is session-scoped.** A peer leaves the overlay when its control

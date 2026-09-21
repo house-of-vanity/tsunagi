@@ -136,6 +136,8 @@ pub struct OverlayReport {
     pub mtu: u32,
     /// This agent's overlay address.
     pub address: String,
+    /// This agent's IPv4 overlay address, when the overlay is dual stack.
+    pub address_v4: Option<String>,
     /// The subnet every member shares.
     pub prefix: String,
     /// Prefix length of that subnet.
@@ -155,6 +157,8 @@ pub struct OverlayPeerReport {
     pub public_key: String,
     /// Its overlay address.
     pub address: String,
+    /// Its IPv4 overlay address, when it has one.
+    pub address_v4: Option<String>,
     /// Seconds since the last WireGuard handshake.
     ///
     /// `None` means the tunnel has never handshaken and cannot carry traffic.
@@ -229,10 +233,14 @@ impl StatusReport {
                 let up = overlay.peers.iter().filter(|peer| peer.is_up()).count();
                 let _ = writeln!(
                     out,
-                    "  overlay {} {}/{} mtu {}  {}/{} tunnel(s) up",
+                    "  overlay {} {}/{}{} mtu {}  {}/{} tunnel(s) up",
                     overlay.interface,
                     overlay.address,
                     overlay.prefix_len,
+                    match &overlay.address_v4 {
+                        Some(v4) => format!(" and {v4}"),
+                        None => String::new(),
+                    },
                     overlay.mtu,
                     up,
                     overlay.peers.len()
@@ -240,9 +248,13 @@ impl StatusReport {
                 for peer in &overlay.peers {
                     let _ = writeln!(
                         out,
-                        "    {}  {}  {}  tx {} rx {}{}  {}",
+                        "    {}  {}{}  {}  tx {} rx {}{}  {}",
                         &peer.public_key[..8.min(peer.public_key.len())],
                         peer.address,
+                        match &peer.address_v4 {
+                            Some(v4) => format!(" / {v4}"),
+                            None => String::new(),
+                        },
                         match peer.handshake_secs_ago {
                             Some(secs) => format!("handshake {secs}s ago"),
                             None => "NOT HANDSHAKEN".to_string(),

@@ -12,7 +12,7 @@
 //! * `SystemTun`, behind the `tun-device` feature, is a real TUN interface.
 //!   Creating one needs `CAP_NET_ADMIN` on Linux or the equivalent elsewhere.
 
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -29,6 +29,8 @@ pub struct TunRequest {
     pub address: Ipv6Addr,
     /// Prefix length of the overlay subnet, so the OS routes it here.
     pub prefix_len: u8,
+    /// The IPv4 overlay address and its prefix length, when dual stack.
+    pub address_v4: Option<(Ipv4Addr, u8)>,
     /// Interface MTU.
     pub mtu: u32,
 }
@@ -381,7 +383,7 @@ mod system {
     /// reason: duplicate address detection can never finish with no carrier,
     /// and the address would stay tentative and unusable.
     pub fn setup_commands(request: &TunRequest, user: &str) -> Vec<String> {
-        vec![
+        let mut commands = vec![
             format!(
                 "sudo ip tuntap add dev {} mode tun user {user}",
                 request.name
@@ -398,7 +400,16 @@ mod system {
                 "sudo ip -6 address add {}/{} dev {} nodad",
                 request.address, request.prefix_len, request.name
             ),
-        ]
+        ];
+        if let Some((address, prefix_len)) = request.address_v4 {
+            // IPv4 is not sensitive to carrier the way IPv6 is, so it needs
+            // no extra settings.
+            commands.push(format!(
+                "sudo ip address add {address}/{prefix_len} dev {}",
+                request.name
+            ));
+        }
+        commands
     }
 
     fn current_user() -> String {
@@ -578,7 +589,8 @@ fd559caf9652cb86321feac65c73bd84 05 40 00 08 tsun0
             name: "tsun0".into(),
             address: "fd00::1".parse().unwrap(),
             prefix_len: 64,
-            mtu: 1100,
+            address_v4: Some(("100.64.1.2".parse().unwrap(), 10)),
+            mtu: 1280,
         };
         let commands = setup_commands(&request, "someone");
 
@@ -586,11 +598,24 @@ fd559caf9652cb86321feac65c73bd84 05 40 00 08 tsun0
         // must survive losing carrier, and it must not wait for duplicate
         // address detection that can never complete.
         let joined = commands.join("\n");
-        let up = joined.find("link set dev tsun0 mtu 1100 up").unwrap();
+        let up = joined.find("link set dev tsun0 mtu 1280 up").unwrap();
         let keep = joined.find("keep_addr_on_down=1").unwrap();
         let add = joined.find("address add fd00::1/64").unwrap();
         assert!(up < keep && keep < add, "wrong order:\n{joined}");
         assert!(joined.contains("nodad"));
         assert!(joined.contains("user someone"));
+        // IPv4 needs no carrier tricks, just the address.
+        assert!(joined.contains("ip address add 100.64.1.2/10 dev tsun0"));
+
+        // An IPv6-only overlay says nothing about IPv4.
+        let v6_only = TunRequest {
+            address_v4: None,
+            ..request
+        };
+        assert!(
+            !setup_commands(&v6_only, "someone")
+                .join("\n")
+                .contains("100.64")
+        );
     }
 }

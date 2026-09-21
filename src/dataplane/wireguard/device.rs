@@ -27,7 +27,7 @@
 //! what it announced.
 
 use std::collections::HashMap;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -42,7 +42,7 @@ use crate::dataplane::transport::{SharedLink, TransportError};
 use crate::identity::NetworkId;
 
 use super::keys::{WgPublicKey, WgSecretKey};
-use super::overlay::overlay_address;
+use super::overlay::{overlay_address, overlay_address_v4};
 use super::packet::IpHeader;
 use super::tun::TunDevice;
 
@@ -109,6 +109,9 @@ struct Peer {
     endpoint_id: EndpointId,
     public_key: WgPublicKey,
     overlay: Ipv6Addr,
+    /// The IPv4 address this peer owns, when the overlay is dual stack and
+    /// nobody else derived the same one.
+    overlay_v4: Mutex<Option<Ipv4Addr>>,
     tunn: Mutex<Tunn>,
     link: SharedLink,
     counters: Arc<PeerCounters>,
@@ -168,6 +171,13 @@ pub struct PeerSummary {
     pub public_key: WgPublicKey,
     /// The overlay address this agent derived for it.
     pub overlay_address: Ipv6Addr,
+    /// Its IPv4 overlay address, when the overlay is dual stack.
+    ///
+    /// `None` with `ipv4_conflict` set means another member derived the same
+    /// address and won it; that peer is still fully reachable over IPv6.
+    pub overlay_address_v4: Option<Ipv4Addr>,
+    /// Whether this peer lost an IPv4 address to a derivation collision.
+    pub ipv4_conflict: bool,
     /// Whether the tunnel has handshaken.
     pub health: PeerHealth,
     /// Traffic counters.
@@ -182,11 +192,15 @@ struct Inner {
     network: NetworkId,
     private_key: WgSecretKey,
     tun: Arc<dyn TunDevice>,
+    /// The IPv4 overlay range, when the overlay is dual stack.
+    ipv4_range: Option<(Ipv4Addr, u8)>,
     peers: RwLock<HashMap<WgPublicKey, Arc<Peer>>>,
-    routes: RwLock<HashMap<Ipv6Addr, WgPublicKey>>,
+    /// Both families, so one lookup routes any packet.
+    routes: RwLock<HashMap<IpAddr, WgPublicKey>>,
     next_index: AtomicU32,
     unroutable: AtomicU64,
     multicast: AtomicU64,
+    ipv4_conflicts: AtomicU64,
 }
 
 impl std::fmt::Debug for Inner {
@@ -207,16 +221,23 @@ pub struct WireguardDevice {
 
 impl WireguardDevice {
     /// Starts a device on top of `tun`.
-    pub fn start(network: NetworkId, private_key: WgSecretKey, tun: Arc<dyn TunDevice>) -> Self {
+    pub fn start(
+        network: NetworkId,
+        private_key: WgSecretKey,
+        tun: Arc<dyn TunDevice>,
+        ipv4_range: Option<(Ipv4Addr, u8)>,
+    ) -> Self {
         let inner = Arc::new(Inner {
             network,
             private_key,
             tun,
+            ipv4_range,
             peers: RwLock::new(HashMap::new()),
             routes: RwLock::new(HashMap::new()),
             next_index: AtomicU32::new(1),
             unroutable: AtomicU64::new(0),
             multicast: AtomicU64::new(0),
+            ipv4_conflicts: AtomicU64::new(0),
         });
 
         let reader = tokio::spawn(read_from_os(Arc::clone(&inner)));
@@ -263,10 +284,12 @@ impl WireguardDevice {
         );
 
         let overlay = overlay_address(self.inner.network, &public_key);
+        let overlay_v4 = self.claim_ipv4(&public_key);
         let peer = Arc::new(Peer {
             endpoint_id,
             public_key,
             overlay,
+            overlay_v4: Mutex::new(overlay_v4),
             tunn: Mutex::new(tunn),
             link,
             counters: Arc::new(PeerCounters::default()),
@@ -279,7 +302,10 @@ impl WireguardDevice {
         }
 
         write_lock(&self.inner.peers).insert(public_key, Arc::clone(&peer));
-        write_lock(&self.inner.routes).insert(overlay, public_key);
+        write_lock(&self.inner.routes).insert(IpAddr::V6(overlay), public_key);
+        if let Some(v4) = overlay_v4 {
+            write_lock(&self.inner.routes).insert(IpAddr::V4(v4), public_key);
+        }
 
         // Start the handshake now instead of waiting for the next timer tick,
         // so the tunnel is usable as soon as the link exists.
@@ -287,11 +313,62 @@ impl WireguardDevice {
         Ok(())
     }
 
+    /// Decides which IPv4 address a new peer gets, if any.
+    ///
+    /// IPv4 has far too little room for a derived address to be collision
+    /// free. When two members derive the same one, the member whose public
+    /// key sorts lower keeps it — a rule every member computes identically,
+    /// so they all agree on the outcome without talking about it. The other
+    /// member simply has no IPv4 address; it is still fully reachable over
+    /// IPv6, which never collides.
+    fn claim_ipv4(&self, public_key: &WgPublicKey) -> Option<Ipv4Addr> {
+        let range = self.inner.ipv4_range?;
+        let wanted = overlay_address_v4(self.inner.network, public_key, range)?;
+
+        let holder = read_lock(&self.inner.routes)
+            .get(&IpAddr::V4(wanted))
+            .copied();
+        let Some(holder) = holder else {
+            return Some(wanted);
+        };
+        if holder == *public_key {
+            return Some(wanted);
+        }
+
+        self.inner.ipv4_conflicts.fetch_add(1, Ordering::Relaxed);
+        if holder.as_bytes() <= public_key.as_bytes() {
+            // The peer already holding it wins.
+            return None;
+        }
+        // The newcomer wins; take the address away from the other peer.
+        if let Some(loser) = read_lock(&self.inner.peers).get(&holder).cloned() {
+            let mut slot = match loser.overlay_v4.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *slot = None;
+        }
+        Some(wanted)
+    }
+
     /// Removes a peer and stops its tunnel.
     pub fn remove_peer(&self, public_key: &WgPublicKey) {
         if let Some(peer) = write_lock(&self.inner.peers).remove(public_key) {
-            write_lock(&self.inner.routes).remove(&peer.overlay);
+            let mut routes = write_lock(&self.inner.routes);
+            routes.remove(&IpAddr::V6(peer.overlay));
+            let v4 = match peer.overlay_v4.lock() {
+                Ok(guard) => *guard,
+                Err(poisoned) => *poisoned.into_inner(),
+            };
+            if let Some(v4) = v4 {
+                routes.remove(&IpAddr::V4(v4));
+            }
         }
+    }
+
+    /// How many IPv4 derivation collisions have been resolved.
+    pub fn ipv4_conflicts(&self) -> u64 {
+        self.inner.ipv4_conflicts.load(Ordering::Relaxed)
     }
 
     /// Removes every peer whose key is not in `keep`.
@@ -315,14 +392,22 @@ impl WireguardDevice {
     pub fn peers(&self) -> Vec<PeerSummary> {
         let mut peers: Vec<PeerSummary> = read_lock(&self.inner.peers)
             .values()
-            .map(|peer| PeerSummary {
-                endpoint_id: peer.endpoint_id,
-                public_key: peer.public_key,
-                overlay_address: peer.overlay,
-                health: peer.health(),
-                stats: peer.stats(),
-                path: peer.link.path_description(),
-                max_datagram: peer.link.max_datagram_size(),
+            .map(|peer| {
+                let overlay_v4 = match peer.overlay_v4.lock() {
+                    Ok(guard) => *guard,
+                    Err(poisoned) => *poisoned.into_inner(),
+                };
+                PeerSummary {
+                    endpoint_id: peer.endpoint_id,
+                    public_key: peer.public_key,
+                    overlay_address: peer.overlay,
+                    overlay_address_v4: overlay_v4,
+                    ipv4_conflict: overlay_v4.is_none() && self.inner.ipv4_range.is_some(),
+                    health: peer.health(),
+                    stats: peer.stats(),
+                    path: peer.link.path_description(),
+                    max_datagram: peer.link.max_datagram_size(),
+                }
             })
             .collect();
         peers.sort_by_key(|peer| peer.public_key);
@@ -415,9 +500,8 @@ async fn read_from_os(inner: Arc<Inner>) {
         };
 
         // Route by destination: only the peer that owns that overlay address
-        // may receive it.
-        let Some(destination) = IpHeader::parse(&packet).and_then(|header| header.v6_destination())
-        else {
+        // may receive it. Both families go through the same table.
+        let Some(destination) = IpHeader::parse(&packet).map(|header| header.destination()) else {
             inner.unroutable.fetch_add(1, Ordering::Relaxed);
             continue;
         };
@@ -488,9 +572,11 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                 match tunn.decapsulate(None, input.unwrap_or(&[]), &mut scratch) {
                     TunnResult::WriteToNetwork(out) => Outcome::ToNetwork(out.len()),
                     TunnResult::WriteToTunnelV6(out, source) => {
-                        Outcome::ToTunnel(out.len(), Some(source))
+                        Outcome::ToTunnel(out.len(), IpAddr::V6(source))
                     }
-                    TunnResult::WriteToTunnelV4(out, _) => Outcome::ToTunnel(out.len(), None),
+                    TunnResult::WriteToTunnelV4(out, source) => {
+                        Outcome::ToTunnel(out.len(), IpAddr::V4(source))
+                    }
                     TunnResult::Done => Outcome::Done,
                     TunnResult::Err(err) => {
                         tracing::trace!(?err, "wireguard decapsulation failed");
@@ -508,9 +594,19 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                 }
                 Outcome::ToTunnel(len, source) => {
                     let payload = Bytes::copy_from_slice(&scratch[..len]);
-                    // Enforce address ownership: a peer may only send from the
-                    // address derived for its own key.
-                    if source != Some(peer.overlay) {
+                    // Enforce address ownership: a peer may only send from an
+                    // address derived for its own key, in either family.
+                    let owned = match source {
+                        IpAddr::V6(addr) => addr == peer.overlay,
+                        IpAddr::V4(addr) => {
+                            let held = match peer.overlay_v4.lock() {
+                                Ok(guard) => *guard,
+                                Err(poisoned) => *poisoned.into_inner(),
+                            };
+                            held == Some(addr)
+                        }
+                    };
+                    if !owned {
                         peer.counters
                             .dropped_wrong_source
                             .fetch_add(1, Ordering::Relaxed);
@@ -538,7 +634,7 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
 
 enum Outcome {
     ToNetwork(usize),
-    ToTunnel(usize, Option<Ipv6Addr>),
+    ToTunnel(usize, IpAddr),
     Done,
     Failed,
 }
