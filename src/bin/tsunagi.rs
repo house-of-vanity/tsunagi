@@ -328,10 +328,21 @@ async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>>
 
     println!("# Network  {name} ({network})");
     println!("# Interface {interface}, address {address}/{OVERLAY_PREFIX_LEN}, mtu {mtu}");
-    println!("# Run once as root; then run `tsunagi up` as {user}.\n");
+    println!("# Run once as root; then run `tsunagi up` as {user}.");
+    println!(
+        "#\n\
+         # keep_addr_on_down matters: a persistent TUN interface has no carrier\n\
+         # until a process attaches, and Linux flushes IPv6 addresses from an\n\
+         # interface that loses carrier unless it is set. `nodad` matters for the\n\
+         # same reason: duplicate address detection can never finish without a\n\
+         # carrier, leaving the address tentative and unusable.\n"
+    );
     println!("sudo ip tuntap add dev {interface} mode tun user {user}");
-    println!("sudo ip -6 address add {address}/{OVERLAY_PREFIX_LEN} dev {interface}");
     println!("sudo ip link set dev {interface} mtu {mtu} up");
+    println!("sudo sysctl -qw net.ipv6.conf.{interface}.keep_addr_on_down=1");
+    println!("sudo ip -6 address add {address}/{OVERLAY_PREFIX_LEN} dev {interface} nodad");
+    println!("\n# To check it afterwards:");
+    println!("ip -6 addr show dev {interface}");
     println!("\n# To remove it again:");
     println!("sudo ip link del dev {interface}");
     Ok(())

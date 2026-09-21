@@ -190,6 +190,11 @@ async fn main() -> Result<()> {
 * **Userspace costs CPU.** Kernel WireGuard is faster. A kernel backend could
   return behind the same boundary, but it would give up transport-provided NAT
   traversal unless paired with a local proxy.
+* **A persistent TUN interface needs `keep_addr_on_down`.** Without a process
+  attached it has no carrier, and Linux then flushes its IPv6 addresses. The
+  setup printed by `tsunagi tun-setup` sets it; the agent checks the address is
+  present *and usable* — not tentative, not DAD-failed — before attaching, and
+  reports what it actually found.
 * **The agent cannot assign the overlay address itself.** The `tun` crate sets
   addresses through an IPv4-only ioctl, so the IPv6 overlay address must come
   from `ip -6 address add` or an equivalent. The agent verifies the address is

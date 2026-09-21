@@ -123,14 +123,22 @@ tsunagi tun-setup --network lab --secret "$SECRET"
 ```
 
 ```text
-# Network  lab (jwc6dcrtmo5zzdk7f6wfpkcqrpvqwr6po7vz3q2fvttgolt4ijfa)
 # Interface tsunjwc6dcrtmo5, address fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64, mtu 1100
 # Run once as root; then run `tsunagi up` as ab.
 
 sudo ip tuntap add dev tsunjwc6dcrtmo5 mode tun user ab
-sudo ip -6 address add fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64 dev tsunjwc6dcrtmo5
 sudo ip link set dev tsunjwc6dcrtmo5 mtu 1100 up
+sudo sysctl -qw net.ipv6.conf.tsunjwc6dcrtmo5.keep_addr_on_down=1
+sudo ip -6 address add fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64 dev tsunjwc6dcrtmo5 nodad
 ```
+
+The order and the last two lines are not decoration. A persistent TUN
+interface has **no carrier** until a process attaches to it, and Linux flushes
+IPv6 addresses from an interface that loses carrier unless
+`keep_addr_on_down` is set — so an address added without it disappears before
+the agent ever starts. `nodad` is needed for the same reason: duplicate
+address detection cannot finish without a carrier, and the address would sit
+there tentative and unusable.
 
 `user ab` is the point: the interface is persistent and owned by that user, so
 `tsunagi up` afterwards opens it with **no privileges and no capabilities at
