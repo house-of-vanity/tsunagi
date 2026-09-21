@@ -39,6 +39,7 @@ pub enum OverlayError {
 pub mod config;
 pub mod packet;
 pub mod provision;
+pub mod router;
 pub mod tun;
 
 pub use config::{Cidr, DEFAULT_INTERFACE_PREFIX, MAX_INTERFACE_NAME_LEN, interface_name};
@@ -48,6 +49,7 @@ pub use provision::{
     MockHost, MockProvisioner, Privilege, Provisioned, UnsupportedProvisioner, plan_changes,
     probe_net_admin,
 };
+pub use router::{NetworkRoutes, Route, RouteError, RoutingTable};
 pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest, address_is_local};
 
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
