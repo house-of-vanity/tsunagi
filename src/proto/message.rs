@@ -33,6 +33,9 @@ pub const DATA_ALPN: &[u8] = b"tsunagi/data/1";
 /// Largest plugin protocol identifier accepted when opening a data channel.
 pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
 
+/// Largest accepted signature on a signed record, in bytes.
+pub const MAX_SIGNATURE_LEN: usize = 64;
+
 /// Control protocol version carried inside the handshake.
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -111,6 +114,15 @@ pub enum ControlMessage {
         seq: u64,
         /// Echoed payload.
         payload: Vec<u8>,
+    },
+    /// A snapshot of signed records this agent holds for the network.
+    ///
+    /// A snapshot is merged into what the receiver already has, never
+    /// substituted for it: an author missing from the batch is left alone,
+    /// because absence is not deletion.
+    State {
+        /// The records. Bounded by [`crate::config::Limits::max_state_records`].
+        records: Vec<crate::state::SignedRecord>,
     },
     /// Graceful goodbye.
     ///
@@ -197,6 +209,12 @@ pub fn validate(message: &ControlMessage, limits: &Limits) -> Result<(), Protoco
         ControlMessage::Ping { payload, .. } | ControlMessage::Pong { payload, .. } => {
             check_len("echo.payload", payload.len(), limits.max_echo_payload_len)?;
         }
+        ControlMessage::State { records } => {
+            check_len("state.records", records.len(), limits.max_state_records)?;
+            for record in records {
+                check_len("state.signature", record.signature.len(), MAX_SIGNATURE_LEN)?;
+            }
+        }
         ControlMessage::Bye { reason } => {
             check_len("bye.reason", reason.len(), limits.max_reason_len)?;
         }
@@ -210,6 +228,7 @@ pub fn kind(message: &ControlMessage) -> &'static str {
         ControlMessage::Announce(_) => "announce",
         ControlMessage::Ping { .. } => "ping",
         ControlMessage::Pong { .. } => "pong",
+        ControlMessage::State { .. } => "state",
         ControlMessage::Bye { .. } => "bye",
     }
 }

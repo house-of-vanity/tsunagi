@@ -1,10 +1,13 @@
 # Planned state synchronisation
 
-**Nothing in this document is implemented.** The proof of concept exchanges
-hostname and capability announcements over live sessions and keeps no
-replicated history. That is also why WireGuard peer membership is
-session-scoped today: a peer leaves the overlay when its control session ends,
-because there is no agreed durable state to keep it. This file records the intended direction so the module
+**The first slice of this model is now implemented**, in `src/state/`, and is
+used for one thing: IPv4 overlay addresses. What follows describes the whole
+model; the section at the end says exactly which parts exist.
+
+The proof of concept still exchanges hostname and capability announcements
+over live sessions and keeps no replicated history for those, which is why
+WireGuard peer *membership* remains session-scoped even though a peer's
+*address* no longer is. This file records the intended direction so the module
 boundaries in [architecture.md](architecture.md) stay compatible with it, and so
 nobody mistakes the current announcements for synchronisation.
 
@@ -71,6 +74,31 @@ migrations for this.
   know what it is missing.
 - Anyone who knows the secret can author records, so a majority of records is
   not evidence of anything.
+
+## What exists today
+
+Implemented, in `src/state/`:
+
+* signed records, one per author per network, each holding that author's
+  complete current statement rather than a delta;
+* signing and verification with the persistent iroh device key, over a
+  length-prefixed canonical encoding;
+* the merge rules above: higher version wins, an older version never rolls
+  back a newer one, duplicates are idempotent, a same-version conflict is
+  resolved identically on every replica and reported;
+* a release tombstone, which merges correctly and is not undone by a replica
+  that has not heard of it — though nothing emits one yet, so freeing an
+  address still means forgetting the network;
+* persistence in `state.sqlite`, with the record and the author's own version
+  counter committed in **one transaction before the record is announced**;
+* distribution as a `State` control message, merged into what the receiver
+  already holds rather than replacing it;
+* allocation of a free IPv4 address against what everybody else holds, which
+  is what makes an address stable across an absence.
+
+Deliberately not implemented: compaction, revoking a whole author, record
+types beyond addressing, and any bound on how large a snapshot may grow
+beyond the per-message limit.
 
 ## Future tests
 

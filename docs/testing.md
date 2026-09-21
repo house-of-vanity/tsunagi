@@ -50,6 +50,15 @@ keeping the WireGuard identity, shutdown removing every interface, a forged
 overlay claim being rejected, and the core carrying the payload without
 interpreting it.
 
+Unit tests in `src/state/` cover the signed record model directly: tampering
+with any field breaks verification, a newer version wins while an older one
+never rolls back, two authors claiming one address resolve the same way no
+matter the merge order, one key used in two places is reported rather than
+silently merged, a release survives a late-arriving old claim, a bad record in
+a batch does not stop the rest, and allocation is deterministic, spread out,
+walks past everything taken and reports a full range instead of handing out a
+duplicate.
+
 `tests/local_control.rs` covers the local control socket end to end: a client
 asking a running agent for status over a real Unix socket, a leftover socket
 file being replaced while a live one is not, and the derived socket path

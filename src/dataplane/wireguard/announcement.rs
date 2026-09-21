@@ -18,14 +18,15 @@ use crate::dataplane::PluginError;
 use crate::identity::NetworkId;
 
 use super::keys::WgPublicKey;
-use super::overlay::{Ipv4Range, overlay_address};
+use super::overlay::overlay_address;
 
 /// Version of the announcement format.
 ///
-/// Bumped to 2 when the IPv4 overlay range was added. postcard is not
-/// self-describing, so an older peer cannot read a newer announcement; the
-/// mismatch is reported rather than misparsed.
-pub const ANNOUNCEMENT_VERSION: u16 = 2;
+/// Version 3 dropped the IPv4 range again: overlay addressing moved to the
+/// signed records in [`crate::state`], which carry the range and survive a
+/// participant being away. postcard is not self-describing, so an older peer
+/// cannot read a newer announcement; the mismatch is reported, not misparsed.
+pub const ANNOUNCEMENT_VERSION: u16 = 3;
 
 /// What one participant advertises for the WireGuard data plane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,12 +40,6 @@ pub struct WgAnnouncement {
     /// Carried for diagnostics and cross-checking only. Addresses are always
     /// derived locally, never taken from this field.
     pub overlay_address: Ipv6Addr,
-    /// The IPv4 overlay range this peer is configured with, if any.
-    ///
-    /// Not a request and not trusted: it exists so that two members who were
-    /// configured differently find out, instead of silently deriving
-    /// different addresses for each other and misrouting IPv4.
-    pub ipv4_range: Option<Ipv4Range>,
 }
 
 /// A peer announcement that has been validated against a specific network.
@@ -54,22 +49,15 @@ pub struct ValidatedAnnouncement {
     pub public_key: WgPublicKey,
     /// The overlay address derived locally for this key. Authoritative.
     pub overlay_address: Ipv6Addr,
-    /// The IPv4 overlay range the peer is configured with.
-    pub ipv4_range: Option<Ipv4Range>,
 }
 
 impl WgAnnouncement {
     /// Builds this agent's announcement.
-    pub fn new(
-        network: NetworkId,
-        public_key: &WgPublicKey,
-        ipv4_range: Option<Ipv4Range>,
-    ) -> Self {
+    pub fn new(network: NetworkId, public_key: &WgPublicKey) -> Self {
         Self {
             version: ANNOUNCEMENT_VERSION,
             public_key: *public_key.as_bytes(),
             overlay_address: overlay_address(network, public_key),
-            ipv4_range,
         }
     }
 
@@ -127,18 +115,9 @@ impl WgAnnouncement {
             ));
         }
 
-        if let Some(range) = self.ipv4_range
-            && range.prefix_len > 30
-        {
-            return Err(PluginError::Rejected(format!(
-                "announced IPv4 range {range} has no room for hosts"
-            )));
-        }
-
         Ok(ValidatedAnnouncement {
             public_key,
             overlay_address: derived,
-            ipv4_range: self.ipv4_range,
         })
     }
 }
@@ -166,7 +145,7 @@ mod tests {
         let peer = WgSecretKey::generate().public();
         let local = WgSecretKey::generate().public();
 
-        let payload = WgAnnouncement::new(id, &peer, None).encode().unwrap();
+        let payload = WgAnnouncement::new(id, &peer).encode().unwrap();
         let validated = WgAnnouncement::decode_and_validate(&payload, id, &local).unwrap();
 
         assert_eq!(validated.public_key, peer);
@@ -179,7 +158,7 @@ mod tests {
         // carried here, so there is nothing for a peer to lie about.
         let id = network("identity-only");
         let peer = WgSecretKey::generate().public();
-        let payload = WgAnnouncement::new(id, &peer, None).encode().unwrap();
+        let payload = WgAnnouncement::new(id, &peer).encode().unwrap();
         assert!(
             payload.len() < 80,
             "the announcement should stay tiny, got {} bytes",
@@ -195,7 +174,7 @@ mod tests {
         let local = WgSecretKey::generate().public();
 
         // An attacker claims the victim's overlay address with its own key.
-        let mut forged = WgAnnouncement::new(id, &attacker, None);
+        let mut forged = WgAnnouncement::new(id, &attacker);
         forged.overlay_address = overlay_address(id, &victim);
 
         let result = WgAnnouncement::decode_and_validate(&forged.encode().unwrap(), id, &local);
@@ -212,7 +191,7 @@ mod tests {
         let peer = WgSecretKey::generate().public();
         let local = WgSecretKey::generate().public();
 
-        let payload = WgAnnouncement::new(there, &peer, None).encode().unwrap();
+        let payload = WgAnnouncement::new(there, &peer).encode().unwrap();
         assert!(WgAnnouncement::decode_and_validate(&payload, here, &local).is_err());
     }
 
@@ -227,7 +206,7 @@ mod tests {
 
         let wrong_version = WgAnnouncement {
             version: ANNOUNCEMENT_VERSION + 1,
-            ..WgAnnouncement::new(id, &peer, None)
+            ..WgAnnouncement::new(id, &peer)
         };
         assert!(
             WgAnnouncement::decode_and_validate(&wrong_version.encode().unwrap(), id, &local)
@@ -236,7 +215,7 @@ mod tests {
 
         let zero_key = WgAnnouncement {
             public_key: [0u8; 32],
-            ..WgAnnouncement::new(id, &peer, None)
+            ..WgAnnouncement::new(id, &peer)
         };
         assert!(
             WgAnnouncement::decode_and_validate(&zero_key.encode().unwrap(), id, &local).is_err()
@@ -244,30 +223,10 @@ mod tests {
     }
 
     #[test]
-    fn the_ipv4_range_travels_so_a_mismatch_can_be_seen() {
-        let id = network("ranges");
-        let peer = WgSecretKey::generate().public();
-        let local = WgSecretKey::generate().public();
-        let range = Some(Ipv4Range::new("10.9.0.0".parse().unwrap(), 16).unwrap());
-
-        let payload = WgAnnouncement::new(id, &peer, range).encode().unwrap();
-        let validated = WgAnnouncement::decode_and_validate(&payload, id, &local).unwrap();
-        assert_eq!(validated.ipv4_range, range);
-
-        // A range with no usable hosts is nonsense and is refused.
-        let mut bad = WgAnnouncement::new(id, &peer, range);
-        bad.ipv4_range = Some(Ipv4Range {
-            base: "10.9.0.0".parse().unwrap(),
-            prefix_len: 31,
-        });
-        assert!(WgAnnouncement::decode_and_validate(&bad.encode().unwrap(), id, &local).is_err());
-    }
-
-    #[test]
     fn a_peer_cannot_claim_our_own_key() {
         let id = network("self");
         let local = WgSecretKey::generate().public();
-        let payload = WgAnnouncement::new(id, &local, None).encode().unwrap();
+        let payload = WgAnnouncement::new(id, &local).encode().unwrap();
         assert!(WgAnnouncement::decode_and_validate(&payload, id, &local).is_err());
     }
 
@@ -275,7 +234,7 @@ mod tests {
     fn announcements_stay_well_under_the_capability_payload_limit() {
         let id = network("size");
         let peer = WgSecretKey::generate().public();
-        let payload = WgAnnouncement::new(id, &peer, None).encode().unwrap();
+        let payload = WgAnnouncement::new(id, &peer).encode().unwrap();
         assert!(
             payload.len() < crate::config::Limits::default().max_capability_data_len,
             "announcement is {} bytes",

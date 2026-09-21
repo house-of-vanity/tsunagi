@@ -184,7 +184,7 @@ impl Agent {
         // bound; overflow drops the request rather than stalling the plugin.
         if !inner.config.plugins.is_empty() {
             let (plugin_tx, plugin_rx) = mpsc::channel(64);
-            let context = PluginContext::new(plugin_tx);
+            let context = PluginContext::new(plugin_tx, inner.identity.endpoint_id());
             for plugin in &inner.config.plugins {
                 plugin.attach(context.clone());
             }
@@ -311,6 +311,8 @@ impl Agent {
             plugins: self.inner.config.plugins.clone(),
             hostname: self.inner.hostname.clone(),
             transport: self.inner.transport.get().cloned(),
+            device_secret: self.inner.identity.signing_key(),
+            ipv4_range: self.inner.config.overlay_ipv4_range,
         });
         networks.insert(network_id, handle);
         drop(networks);

@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::config::StoragePaths;
 use crate::error::{Error, Result};
 use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
+use crate::state::SignedRecord;
 
 /// Applies the pragmas both stores share.
 fn apply_common_pragmas(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -246,8 +247,11 @@ impl Storage {
 
     /// Removes a network configuration and its cached hints.
     pub async fn remove_network(&self, network_id: NetworkId) -> Result<()> {
-        self.with_state(move |state| state.remove_network(network_id))
-            .await?;
+        self.with_state(move |state| {
+            state.remove_network(network_id)?;
+            state.forget_signed_records(network_id)
+        })
+        .await?;
         self.with_cache((), move |cache| cache.forget_network(network_id))
             .await;
         Ok(())
@@ -276,6 +280,31 @@ impl Storage {
             cache.record_hint(network_id, &endpoint_id, &addr, max_per_peer)
         })
         .await;
+    }
+
+    /// Loads every signed record known for a network.
+    pub async fn signed_records(&self, network_id: NetworkId) -> Result<Vec<SignedRecord>> {
+        self.with_state(move |state| state.signed_records(network_id))
+            .await
+    }
+
+    /// Stores a record received from another replica.
+    pub async fn put_signed_record(&self, record: SignedRecord) -> Result<()> {
+        self.with_state(move |state| state.put_signed_record(&record))
+            .await
+    }
+
+    /// Stores one of this agent's own records and bumps its counter in one
+    /// transaction, which must happen before the record is announced.
+    pub async fn publish_own_record(&self, record: SignedRecord) -> Result<()> {
+        self.with_state(move |state| state.publish_own_record(&record))
+            .await
+    }
+
+    /// The highest version this agent has ever published for a network.
+    pub async fn own_record_version(&self, network_id: NetworkId) -> Result<u64> {
+        self.with_state(move |state| state.own_record_version(network_id))
+            .await
     }
 
     /// Reads cached address hints. Returns an empty list if the cache is gone.

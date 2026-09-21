@@ -83,51 +83,52 @@ Two consequences matter:
 * a member's address is bound to its WireGuard public key, so address
   ownership can be checked locally rather than believed.
 
-## IPv4 alongside IPv6
+## IPv4: allocated, signed, and kept
 
-The overlay carries IPv4 as well, but **it is off unless you name a range**,
-and every member must name the same one:
-
-```bash
-tsunagi up --network lab --secret "$SECRET" --wireguard --ipv4-range 10.77.0.0/16
-```
-
-Two reasons it has no default.
-
-**There is no IPv4 range that is free everywhere.** `100.64.0.0/10` is
-Tailscale's and carrier-grade NAT's, `10.0.0.0/8` and `192.168.0.0/16` are on
-half the networks in the world, `172.17.0.0/16` is Docker. Picking one
-requires knowing what is already in use on every machine that will join, which
-is the operator's knowledge, not ours. IPv6 needs none of this: a ULA derived
-from the network id collides with essentially nothing.
-
-**The range is an input to the derivation.** Each agent computes every peer's
-address itself, so two members configured with different ranges would derive
-different addresses for each other and IPv4 would silently misroute. The range
-therefore travels in the announcement — not as a request, and never trusted,
-but so that a mismatch is *detected*. When it happens, the offending peer gets
-no IPv4 address here, keeps working over IPv6, and the reason is reported:
+IPv6 addresses are *derived*: a 64 bit interface identifier makes a collision
+impossible in practice, so nobody has to agree on anything. IPv4 has nothing
+like that room, so deriving would collide. Instead an address is **allocated
+and then recorded as a signed fact**, using the model in
+[sync-model.md](sync-model.md).
 
 ```text
-! wireguard: peer SDsEb/WF is configured with the IPv4 overlay range
-  10.81.0.0/16 but this agent uses 10.80.0.0/16; every member must use the
-  same one. That peer has no IPv4 address here and is reachable over IPv6 only.
+default range          10.13.37.0/24   (override with --ipv4-range)
+who decides            the first member to claim; later ones adopt what they find
+who signs              the claiming member, with its persistent device key
+where it is kept       state.sqlite, and every replica that has seen it
+what a return costs    nothing: the old address is reclaimed
 ```
 
-**IPv4 addresses can also collide with each other.** A 64 bit interface
-identifier makes an IPv6 collision impossible in practice; IPv4 has nothing
-like that room. In a `/16` with 50 members the chance that two members derive
-the same address is roughly 2%. A mesh with no coordinator cannot allocate
-around it, so the collision is resolved instead: the member whose WireGuard
-public key sorts lower keeps the address, a rule every member computes
-identically and therefore agrees on without exchanging anything. The other
-member has no IPv4 address and remains reachable over IPv6. Pick a roomy
-range — a `/16` for a handful of machines, larger for more — and the odds stay
-small.
+How it works:
 
-The honest summary: **IPv6 always works. IPv4 is opt-in, needs agreement, and
-degrades predictably when it does not get it.** Allocating IPv4 properly needs
-the agreed state described in [sync-model.md](sync-model.md).
+1. On joining, an agent reads back the records it already had and learns more
+   from its peers.
+2. If it already holds an address, it keeps it. **That is the whole point**: a
+   participant that was away for a month comes back to the address it signed
+   for, because the claim outlived the session.
+3. Otherwise it picks a free one — starting from a position derived from its
+   own identity, so two newcomers rarely start in the same place — signs the
+   claim, commits it together with its version counter, and only then
+   announces it.
+4. Every replica merges what it receives into what it has. An author missing
+   from a snapshot is left alone: absence is not deletion.
+
+**No vote is involved, deliberately.** Anyone who knows the network secret can
+mint identities, so a majority proves nothing, and a quorum would stall with
+one participant online and diverge across a partition. Two members who claim
+the same address at the same moment are resolved by a rule both compute
+identically — the lower endpoint id keeps it — and the loser simply allocates
+again with a higher version.
+
+**The range is agreed, not configured per member.** `--ipv4-range` says what
+this agent would use; a network that has already settled on something else
+wins, and the agent adopts it. So the flag matters for whoever starts the
+network and is harmless afterwards. Pass `--ipv4-range none` for an IPv6-only
+overlay.
+
+A release tombstone exists in the record type and merges correctly, but
+nothing emits one yet, so an address stays claimed until the network is
+forgotten.
 
 ## Address ownership is enforced, not announced
 
@@ -246,8 +247,10 @@ async fn main() -> Result<()> {
 
 * **Full mesh only.** Every member runs a tunnel to every other member.
   Routing through an intermediate participant is not implemented.
-* **IPv4 is opt-in, must be agreed, and can collide.** See above. A proper
-  allocator needs agreed state.
+* **Nothing frees an address yet.** The release record exists and merges, but
+  no command emits one.
+* **A snapshot grows with the number of members ever seen**, and is capped per
+  message rather than compacted.
 * **No routes, DNS or firewall rules.** The plugin creates its interface and
   nothing else. Anything beyond the overlay `/64` is the operator's business.
 * **Membership is session-scoped.** A peer leaves the overlay when its control

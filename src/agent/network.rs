@@ -23,6 +23,8 @@ use crate::identity::{NetworkId, NetworkKeys};
 use crate::net::{EndpointAdapter, PathAddr, snapshot_connection};
 use crate::proto::handshake::{self, HandshakeOutcome, Role};
 use crate::proto::message::{Announcement, ControlMessage, Envelope, encode, kind};
+use crate::state::allocator::allocate;
+use crate::state::{Ipv4Range, Merged, RecordBody, SignedRecord, StateSet};
 use crate::storage::Storage;
 
 use super::events::Event;
@@ -114,6 +116,11 @@ pub(crate) struct RuntimeParams {
     pub(crate) discovery_interval: Duration,
     pub(crate) plugins: Vec<SharedPlugin>,
     pub(crate) hostname: String,
+    /// Signing key for this agent's own records.
+    pub(crate) device_secret: iroh::SecretKey,
+    /// The IPv4 overlay range this agent would use, if the network has not
+    /// already settled on another one.
+    pub(crate) ipv4_range: Option<Ipv4Range>,
     /// How data plane links are opened. `None` disables the data plane.
     pub(crate) transport: Option<Arc<dyn PacketTransport>>,
 }
@@ -194,6 +201,12 @@ struct Runtime {
     opening: HashSet<(EndpointId, String)>,
     link_results_tx: mpsc::Sender<LinkOutcome>,
     link_results_rx: mpsc::Receiver<LinkOutcome>,
+    /// Signed records, merged from every replica we have talked to.
+    state: StateSet,
+    /// Snapshots received while dispatching, handled on the next loop pass.
+    pending_state: Vec<(EndpointId, Vec<SignedRecord>)>,
+    /// The highest version this agent has ever published for this network.
+    own_version: u64,
 }
 
 impl Runtime {
@@ -220,6 +233,9 @@ impl Runtime {
             opening: HashSet::new(),
             link_results_tx,
             link_results_rx,
+            state: StateSet::new(),
+            pending_state: Vec::new(),
+            own_version: 0,
         }
     }
 
@@ -229,6 +245,10 @@ impl Runtime {
     }
 
     async fn run(&mut self, mut commands: mpsc::Receiver<NetCommand>) {
+        // Everything this agent knew before it restarted, including the
+        // address it holds.
+        self.load_state().await;
+
         let mut ticker = tokio::time::interval(self.params.discovery_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -243,6 +263,7 @@ impl Runtime {
                 event = self.session_events_rx.recv() => {
                     if let Some(event) = event {
                         self.handle_session_event(event).await;
+                        self.drain_pending_state().await;
                     }
                 }
                 result = self.dial_results_rx.recv() => {
@@ -550,6 +571,219 @@ impl Runtime {
         }
     }
 
+    // ----------------------------------------------------------- agreed state
+
+    /// Reads back what this agent already knew before it restarted.
+    ///
+    /// Records are verified again on load: the database is not a trust
+    /// boundary, because a restored backup or a copied file could hold
+    /// anything.
+    async fn load_state(&mut self) {
+        let stored = self
+            .params
+            .storage
+            .signed_records(self.network_id)
+            .await
+            .unwrap_or_default();
+        let (_, errors) = self.state.merge_all(self.network_id, stored);
+        for err in errors {
+            tracing::warn!(%err, "discarding an unusable stored record");
+        }
+        self.own_version = self
+            .params
+            .storage
+            .own_record_version(self.network_id)
+            .await
+            .unwrap_or(0);
+
+        self.ensure_own_claim().await;
+        self.publish_allocations();
+    }
+
+    /// The range this network uses: whatever it has already settled on, else
+    /// what this agent was configured with.
+    ///
+    /// Adopting the agreed one is what lets a participant join without being
+    /// told the range out of band.
+    fn effective_range(&self) -> Option<Ipv4Range> {
+        self.state.agreed_range().or(self.params.ipv4_range)
+    }
+
+    /// Makes sure this agent holds an address, claiming one if it does not.
+    ///
+    /// Called after anything that could change the picture: startup, and
+    /// every time another replica's records arrive.
+    async fn ensure_own_claim(&mut self) {
+        let Some(range) = self.effective_range() else {
+            return;
+        };
+        let holders = self.state.address_holders();
+        let mine = self.state.address_of(&self.local_id);
+
+        // An address we still hold is kept; this is what makes a returning
+        // participant get its old address back.
+        if let Some(mine) = mine
+            && range.contains(mine)
+        {
+            return;
+        }
+
+        let taken: std::collections::HashSet<std::net::Ipv4Addr> = holders
+            .iter()
+            .filter(|(_, holder)| **holder != self.local_id)
+            .map(|(address, _)| *address)
+            .collect();
+
+        let wanted = match allocate(
+            self.network_id,
+            self.local_id,
+            range,
+            &taken,
+            self.state
+                .get(&self.local_id)
+                .and_then(|record| record.body.claimed_address()),
+        ) {
+            Ok(address) => address,
+            Err(err) => {
+                self.metrics.plugin_errors += 1;
+                self.emit(Event::PluginError {
+                    network: self.network_id,
+                    protocol: "overlay".into(),
+                    reason: err.to_string(),
+                });
+                return;
+            }
+        };
+
+        self.publish_record(RecordBody::Ipv4Claim {
+            address: wanted,
+            range,
+        })
+        .await;
+    }
+
+    /// Signs, stores and announces one of this agent's own records.
+    ///
+    /// Stored before it is announced, in one transaction with the version
+    /// counter, so a crash can never let us reuse a version we already put on
+    /// the wire.
+    async fn publish_record(&mut self, body: RecordBody) {
+        let version = self.own_version.saturating_add(1);
+        let record = SignedRecord::sign(&self.params.device_secret, self.network_id, version, body);
+
+        if let Err(err) = self.params.storage.publish_own_record(record.clone()).await {
+            self.emit(Event::PluginError {
+                network: self.network_id,
+                protocol: "overlay".into(),
+                reason: format!("cannot store our own record: {err}"),
+            });
+            return;
+        }
+        self.own_version = version;
+
+        match self.state.merge(self.network_id, record) {
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!(%err, "our own record did not verify");
+                return;
+            }
+        }
+        self.broadcast_state();
+    }
+
+    /// Handles snapshots collected while dispatching messages.
+    async fn drain_pending_state(&mut self) {
+        for (peer, records) in std::mem::take(&mut self.pending_state) {
+            self.receive_state(peer, records).await;
+        }
+    }
+
+    /// Sends everything we know to every peer.
+    fn broadcast_state(&mut self) {
+        let mut records = self.state.records();
+        records.truncate(self.params.limits.max_state_records);
+        if records.is_empty() {
+            return;
+        }
+        let message = ControlMessage::State { records };
+        let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
+        for peer in peers {
+            if let Err(err) = self.send_to(peer, message.clone()) {
+                tracing::debug!(%err, "could not queue a state snapshot");
+            }
+        }
+    }
+
+    /// Merges a snapshot from a peer.
+    async fn receive_state(&mut self, peer: EndpointId, records: Vec<SignedRecord>) {
+        let before = self.state.records();
+        let (outcomes, errors) = self.state.merge_all(self.network_id, records);
+
+        for err in errors {
+            self.metrics.protocol_violations += 1;
+            self.emit(Event::ProtocolViolation {
+                network: Some(self.network_id),
+                peer: Some(peer),
+                reason: format!("unusable signed record: {err}"),
+            });
+        }
+        for outcome in &outcomes {
+            if *outcome == Merged::Conflicted {
+                self.emit(Event::PluginError {
+                    network: self.network_id,
+                    protocol: "overlay".into(),
+                    reason: "two different records from one author at the same version; \
+                             a device key appears to be in use in two places"
+                        .into(),
+                });
+            }
+        }
+
+        let changed = outcomes.iter().any(|outcome| {
+            matches!(
+                outcome,
+                Merged::Added | Merged::Updated | Merged::Conflicted
+            )
+        });
+        if !changed {
+            return;
+        }
+
+        for record in self.state.records() {
+            if record.author == *self.local_id.as_bytes() {
+                continue;
+            }
+            if let Err(err) = self.params.storage.put_signed_record(record).await {
+                tracing::debug!(%err, "cannot persist a record");
+            }
+        }
+
+        // Somebody may have taken the address we were using.
+        self.ensure_own_claim().await;
+        self.publish_allocations();
+        if self.state.records() != before {
+            self.broadcast_state();
+        }
+    }
+
+    /// Tells the plugins who holds which overlay address.
+    fn publish_allocations(&mut self) {
+        let Some(range) = self.effective_range() else {
+            return;
+        };
+        let mut allocations: Vec<(EndpointId, std::net::Ipv4Addr)> = self
+            .state
+            .address_holders()
+            .into_iter()
+            .map(|(address, holder)| (holder, address))
+            .collect();
+        allocations.sort_by_key(|(holder, _)| *holder.as_bytes());
+
+        for plugin in &self.params.plugins {
+            plugin.on_address_allocation(self.network_id, range, &allocations);
+        }
+    }
+
     // ------------------------------------------------------------ data plane
 
     /// Protocol ids this agent has a plugin for.
@@ -771,6 +1005,8 @@ impl Runtime {
             tracing::debug!(%err, "could not queue initial announcement");
         }
 
+        self.broadcast_state();
+
         self.emit(Event::PeerConnected {
             network: self.network_id,
             peer,
@@ -913,6 +1149,9 @@ impl Runtime {
                 if let Err(err) = self.send_to(peer, pong) {
                     tracing::debug!(%err, "could not queue pong");
                 }
+            }
+            ControlMessage::State { records } => {
+                self.pending_state.push((peer, records.clone()));
             }
             ControlMessage::Pong { .. } | ControlMessage::Bye { .. } => {}
         }

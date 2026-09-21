@@ -18,9 +18,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
+use crate::state::SignedRecord;
 
 /// Schema version written by this build.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Key of the stored hostname setting.
 const SETTING_HOSTNAME: &str = "hostname";
@@ -115,6 +116,13 @@ impl StateStore {
             return self.verify_shape();
         }
 
+        // Migration 1 -> 2: signed records that outlive a session.
+        if (1..2).contains(&found) {
+            self.conn
+                .execute_batch(SIGNED_RECORDS_SCHEMA)
+                .map_err(|err| self.corrupt(format!("cannot migrate schema to 2: {err}")))?;
+        }
+
         // Migration 0 -> 1: initial schema.
         if found < 1 {
             self.conn
@@ -140,6 +148,9 @@ impl StateStore {
                      COMMIT;",
                 )
                 .map_err(|err| self.corrupt(format!("cannot create schema: {err}")))?;
+            self.conn
+                .execute_batch(SIGNED_RECORDS_SCHEMA)
+                .map_err(|err| self.corrupt(format!("cannot create schema: {err}")))?;
         }
         Ok(())
     }
@@ -147,7 +158,7 @@ impl StateStore {
     /// Confirms the expected tables exist, so that a truncated or foreign
     /// database is reported rather than used.
     fn verify_shape(&self) -> Result<()> {
-        for table in ["device_identity", "networks", "settings"] {
+        for table in ["device_identity", "networks", "settings", "signed_records"] {
             let present: Option<String> = self
                 .conn
                 .query_row(
@@ -297,6 +308,147 @@ impl StateStore {
         self.set_setting(SETTING_HOSTNAME, hostname)
     }
 
+    /// Loads every signed record known for a network.
+    ///
+    /// Records are returned as stored; the caller verifies them, because the
+    /// database is not a trust boundary — a restored backup or a copied file
+    /// could contain anything.
+    pub fn signed_records(&self, network_id: NetworkId) -> Result<Vec<SignedRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT author, version, body, signature FROM signed_records
+                 WHERE network_id = ?1",
+            )
+            .map_err(|err| Error::Storage(format!("cannot read signed records: {err}")))?;
+        let rows = stmt
+            .query_map(params![network_id.as_bytes().as_slice()], |row| {
+                let author: Vec<u8> = row.get(0)?;
+                let version: i64 = row.get(1)?;
+                let body: Vec<u8> = row.get(2)?;
+                let signature: Vec<u8> = row.get(3)?;
+                Ok((author, version, body, signature))
+            })
+            .map_err(|err| Error::Storage(format!("cannot read signed records: {err}")))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (author, version, body, signature) =
+                row.map_err(|err| Error::Storage(format!("cannot read a record row: {err}")))?;
+            let Ok(author) = <[u8; 32]>::try_from(author.as_slice()) else {
+                continue;
+            };
+            let Ok(body) = postcard::from_bytes(&body) else {
+                continue;
+            };
+            out.push(SignedRecord {
+                author,
+                network: *network_id.as_bytes(),
+                version: version as u64,
+                body,
+                signature,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Stores a record received from somebody else.
+    pub fn put_signed_record(&self, record: &SignedRecord) -> Result<()> {
+        let body = postcard::to_stdvec(&record.body)
+            .map_err(|err| Error::Storage(format!("cannot encode a record body: {err}")))?;
+        self.conn
+            .execute(
+                "INSERT INTO signed_records (network_id, author, version, body, signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(network_id, author) DO UPDATE SET
+                     version = excluded.version,
+                     body = excluded.body,
+                     signature = excluded.signature",
+                params![
+                    record.network.as_slice(),
+                    record.author.as_slice(),
+                    record.version as i64,
+                    body,
+                    record.signature
+                ],
+            )
+            .map_err(|err| Error::Storage(format!("cannot store a signed record: {err}")))?;
+        Ok(())
+    }
+
+    /// Stores one of **our own** records and bumps our counter, atomically.
+    ///
+    /// The model requires that a record and the author's own version counter
+    /// are committed together, and **before** the record is published, so a
+    /// crash can never leave us able to reuse a version number we already put
+    /// on the wire.
+    pub fn publish_own_record(&self, record: &SignedRecord) -> Result<()> {
+        let body = postcard::to_stdvec(&record.body)
+            .map_err(|err| Error::Storage(format!("cannot encode a record body: {err}")))?;
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| Error::Storage(format!("cannot begin a transaction: {err}")))?;
+
+        transaction
+            .execute(
+                "INSERT INTO signed_records (network_id, author, version, body, signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(network_id, author) DO UPDATE SET
+                     version = excluded.version,
+                     body = excluded.body,
+                     signature = excluded.signature",
+                params![
+                    record.network.as_slice(),
+                    record.author.as_slice(),
+                    record.version as i64,
+                    body,
+                    record.signature
+                ],
+            )
+            .map_err(|err| Error::Storage(format!("cannot store our record: {err}")))?;
+        transaction
+            .execute(
+                "INSERT INTO own_record_version (network_id, version) VALUES (?1, ?2)
+                 ON CONFLICT(network_id) DO UPDATE SET
+                     version = max(version, excluded.version)",
+                params![record.network.as_slice(), record.version as i64],
+            )
+            .map_err(|err| Error::Storage(format!("cannot store our version: {err}")))?;
+
+        transaction
+            .commit()
+            .map_err(|err| Error::Storage(format!("cannot commit our record: {err}")))
+    }
+
+    /// The highest version we have ever published for a network.
+    ///
+    /// Monotonic even if our record is later replaced by a conflicting one,
+    /// so we never reuse a number.
+    pub fn own_record_version(&self, network_id: NetworkId) -> Result<u64> {
+        let version: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT version FROM own_record_version WHERE network_id = ?1",
+                params![network_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| Error::Storage(format!("cannot read our version: {err}")))?;
+        Ok(version.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Forgets every record of a network.
+    pub fn forget_signed_records(&self, network_id: NetworkId) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM signed_records WHERE network_id = ?1",
+                params![network_id.as_bytes().as_slice()],
+            )
+            .map_err(|err| Error::Storage(format!("cannot clear signed records: {err}")))?;
+        Ok(())
+    }
+
     /// Reads an arbitrary setting.
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.conn
@@ -321,6 +473,23 @@ impl StateStore {
         Ok(())
     }
 }
+
+/// Schema for the signed records described in [`crate::state`].
+const SIGNED_RECORDS_SCHEMA: &str = "BEGIN;
+     CREATE TABLE IF NOT EXISTS signed_records (
+         network_id BLOB NOT NULL,
+         author     BLOB NOT NULL,
+         version    INTEGER NOT NULL,
+         body       BLOB NOT NULL,
+         signature  BLOB NOT NULL,
+         PRIMARY KEY (network_id, author)
+     );
+     CREATE TABLE IF NOT EXISTS own_record_version (
+         network_id BLOB PRIMARY KEY,
+         version    INTEGER NOT NULL
+     );
+     PRAGMA user_version = 2;
+     COMMIT;";
 
 /// Seconds since the Unix epoch, saturating at 0 before it.
 pub(crate) fn now_unix() -> i64 {

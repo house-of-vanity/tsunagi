@@ -16,6 +16,8 @@
 //! * [`agent`] — the runtime: agent lifecycle, per-network runtimes, reconnect.
 //! * [`dataplane`] — the contract IP plugins satisfy, the packet transport,
 //!   and the WireGuard data plane.
+//! * [`state`] — signed records that outlive a session, and the rules for
+//!   merging them between replicas.
 //! * [`ipc`] — the local control interface a command line tool talks to. An
 //!   adapter over the public API; the core does not know it exists.
 //!
@@ -42,6 +44,7 @@ pub mod identity;
 pub mod ipc;
 pub mod net;
 pub mod proto;
+pub mod state;
 pub mod storage;
 
 pub use agent::{Agent, AgentStatus, Event, NetworkStatus, PeerStatus};

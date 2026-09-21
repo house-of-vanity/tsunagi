@@ -123,6 +123,8 @@ pub struct Limits {
     pub max_echo_payload_len: usize,
     /// Largest accepted free-text reason string, in bytes.
     pub max_reason_len: usize,
+    /// Largest number of signed records accepted in one snapshot.
+    pub max_state_records: usize,
     /// Deadline for the whole handshake.
     pub handshake_timeout: Duration,
     /// Deadline for one outbound dial attempt.
@@ -156,6 +158,7 @@ impl Default for Limits {
             max_capability_data_len: 4 * 1024,
             max_echo_payload_len: 4 * 1024,
             max_reason_len: 256,
+            max_state_records: crate::state::MAX_RECORDS_PER_MESSAGE,
             handshake_timeout: Duration::from_secs(10),
             dial_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(30),
@@ -234,6 +237,13 @@ pub struct AgentConfig {
     pub reconnect: ReconnectPolicy,
     /// IP plugins whose capabilities are announced and dispatched.
     pub plugins: Vec<SharedPlugin>,
+    /// The IPv4 overlay range this agent proposes.
+    ///
+    /// Addresses are allocated from it and recorded in signed state, so a
+    /// participant keeps the same one across restarts. A network that has
+    /// already settled on another range wins: a joining agent adopts what it
+    /// finds rather than imposing this.
+    pub overlay_ipv4_range: Option<crate::state::Ipv4Range>,
 }
 
 impl AgentConfig {
@@ -249,6 +259,7 @@ impl AgentConfig {
             limits: Limits::default(),
             reconnect: ReconnectPolicy::default(),
             plugins: Vec::new(),
+            overlay_ipv4_range: Some(crate::state::DEFAULT_IPV4_RANGE),
         }
     }
 
@@ -288,6 +299,12 @@ impl AgentConfig {
     /// Sets the announced hostname.
     pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
         self.hostname = Some(hostname.into());
+        self
+    }
+
+    /// Sets the IPv4 overlay range this agent proposes, or disables IPv4.
+    pub fn with_overlay_ipv4_range(mut self, range: Option<crate::state::Ipv4Range>) -> Self {
+        self.overlay_ipv4_range = range;
         self
     }
 

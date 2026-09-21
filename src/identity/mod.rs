@@ -58,6 +58,14 @@ impl DeviceIdentity {
     pub(crate) fn secret_key(&self) -> SecretKey {
         self.secret.clone()
     }
+
+    /// A clone of the key used to sign this device's own state records.
+    ///
+    /// The same persistent identity the control plane authenticates, so a
+    /// record signed today is still attributable after any absence.
+    pub(crate) fn signing_key(&self) -> SecretKey {
+        self.secret.clone()
+    }
 }
 
 impl std::fmt::Debug for DeviceIdentity {

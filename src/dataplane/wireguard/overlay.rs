@@ -22,10 +22,9 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::dataplane::PluginError;
+use crate::state::Ipv4Range;
 
 use crate::identity::NetworkId;
 
@@ -39,77 +38,6 @@ pub const OVERLAY_PREFIX_LEN: u8 = 64;
 
 /// Prefix length of one member's address inside the overlay.
 pub const OVERLAY_HOST_PREFIX_LEN: u8 = 128;
-
-/// An IPv4 range the overlay can be derived into.
-///
-/// Every member of a network must be configured with the same one, because
-/// addresses are derived from it. See [`crate::dataplane::wireguard::plugin::WireguardConfig::ipv4_range`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Ipv4Range {
-    /// Base address of the range.
-    pub base: Ipv4Addr,
-    /// Prefix length, at most 30 so there is room for hosts.
-    pub prefix_len: u8,
-}
-
-impl Ipv4Range {
-    /// Builds a range, rejecting one with no room for hosts.
-    pub fn new(base: Ipv4Addr, prefix_len: u8) -> Result<Self, PluginError> {
-        if prefix_len > 30 {
-            return Err(PluginError::Rejected(format!(
-                "a /{prefix_len} has no room for hosts; use /30 or larger"
-            )));
-        }
-        Ok(Self { base, prefix_len })
-    }
-
-    /// Whether an address falls inside the range.
-    pub fn contains(&self, address: Ipv4Addr) -> bool {
-        let host_bits = 32 - u32::from(self.prefix_len);
-        let mask = if host_bits >= 32 {
-            0
-        } else {
-            u32::MAX << host_bits
-        };
-        u32::from(address) & mask == u32::from(self.base) & mask
-    }
-}
-
-impl std::fmt::Display for Ipv4Range {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.base, self.prefix_len)
-    }
-}
-
-impl std::str::FromStr for Ipv4Range {
-    type Err = PluginError;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let (base, prefix) = text.split_once('/').ok_or_else(|| {
-            PluginError::Rejected(format!(
-                "`{text}` is not an address with a prefix, for example 10.77.0.0/16"
-            ))
-        })?;
-        let base = base.parse().map_err(|err| {
-            PluginError::Rejected(format!("`{base}` is not an IPv4 address: {err}"))
-        })?;
-        let prefix_len = prefix.parse().map_err(|err| {
-            PluginError::Rejected(format!("`{prefix}` is not a prefix length: {err}"))
-        })?;
-        Self::new(base, prefix_len)
-    }
-}
-
-/// RFC 6598 shared address space, offered only as a reference point.
-///
-/// **Not a default, and usually a bad choice.** Tailscale uses exactly this
-/// range, and so does carrier-grade NAT, so a machine running either will
-/// collide with it. There is no IPv4 range that is free on every host, which
-/// is why the IPv4 overlay has no default at all and must be configured.
-pub const RFC6598_SHARED_RANGE: Ipv4Range = Ipv4Range {
-    base: Ipv4Addr::new(100, 64, 0, 0),
-    prefix_len: 10,
-};
 
 fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
@@ -252,7 +180,7 @@ mod tests {
     #[test]
     fn ipv4_addresses_land_inside_the_range_and_avoid_its_edges() {
         let id = network("v4");
-        let range = RFC6598_SHARED_RANGE;
+        let range: Ipv4Range = "100.64.0.0/10".parse().unwrap();
         for byte in 0..64u8 {
             let key = WgPublicKey::from_bytes([byte; 32]);
             let addr = overlay_address_v4(id, &key, range).unwrap();
@@ -286,7 +214,7 @@ mod tests {
         let key = WgPublicKey::from_bytes([9u8; 32]);
         let first = network("one");
         let second = network("two");
-        let range = RFC6598_SHARED_RANGE;
+        let range: Ipv4Range = "100.64.0.0/10".parse().unwrap();
 
         assert_eq!(
             overlay_address_v4(first, &key, range),

@@ -172,7 +172,14 @@ not affect other networks.
 | `Announce { hostname, capabilities }` | this agent's hostname and IP-plugin capabilities |
 | `Ping { seq, payload }` | small request used to verify the exchange |
 | `Pong { seq, payload }` | the echoed reply |
+| `State { records }` | a snapshot of signed records, merged into what the receiver holds |
 | `Bye { reason }` | graceful goodbye; not a revocation of anything |
+
+A `State` snapshot is merged, never substituted: an author missing from it is
+left untouched. Each record carries its own signature, so a peer forwarding
+somebody else's record cannot alter it, and a record that fails verification
+is dropped without affecting the rest of the batch. See
+[sync-model.md](sync-model.md).
 
 `PluginCapability { protocol, version, enabled, data }` is opaque to the core:
 `data` is bounded and handed to the matching plugin unparsed. Nothing in it is

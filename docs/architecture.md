@@ -45,6 +45,7 @@ and the agent stays manageable.
 | `proto` | message format, handshake, membership proof, protocol limits |
 | `agent` | agent and per-network lifecycle, reconnect, in-process message routing |
 | `storage` | mandatory state and the separately recoverable cache |
+| `state` | signed records that outlive a session, merged between replicas |
 | `dataplane::transport` | authenticated datagram links to peers; where reachability lives |
 | `dataplane` | the contract IP plugins implement, plus the WireGuard plugin |
 

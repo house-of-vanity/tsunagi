@@ -42,9 +42,10 @@ use crate::dataplane::transport::{SharedLink, TransportError};
 use crate::identity::NetworkId;
 
 use super::keys::{WgPublicKey, WgSecretKey};
-use super::overlay::{Ipv4Range, overlay_address};
+use super::overlay::overlay_address;
 use super::packet::IpHeader;
 use super::tun::TunDevice;
+use crate::state::Ipv4Range;
 
 /// How often WireGuard's own timers are driven.
 ///

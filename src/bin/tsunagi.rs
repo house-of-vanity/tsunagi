@@ -16,11 +16,12 @@ use tsunagi::agent::Event;
 use tsunagi::config::{AgentConfig, StoragePaths, TransportPolicy};
 use tsunagi::dataplane::IpPlugin;
 use tsunagi::dataplane::wireguard::{
-    Ipv4Range, MemoryTunFactory, TunFactory, WireguardConfig, WireguardPlugin,
+    MemoryTunFactory, TunFactory, WireguardConfig, WireguardPlugin,
 };
 use tsunagi::discovery::{CompositeDiscovery, NetworkDiscovery, StaticBootstrap};
 use tsunagi::identity::{NetworkName, NetworkSecret};
 use tsunagi::iroh_types::EndpointAddr;
+use tsunagi::state::Ipv4Range;
 use tsunagi::{Agent, NetworkId};
 
 /// A small agent for private mesh networks.
@@ -104,24 +105,20 @@ struct TunSetupArgs {
     ipv4_range: Option<String>,
 }
 
-/// Strips the error type's own prefix, which is about peers rather than flags.
-fn plain_reason(err: &tsunagi::dataplane::PluginError) -> String {
-    let text = err.to_string();
-    text.split_once(": ")
-        .map(|(_, rest)| rest.to_string())
-        .unwrap_or(text)
-}
-
 /// Resolves the IPv4 overlay range from the flag.
+///
+/// Absent means the built-in default. A network that already settled on
+/// another range wins over both.
 fn resolve_ipv4_range(
     range: Option<&String>,
 ) -> Result<Option<Ipv4Range>, Box<dyn std::error::Error>> {
     match range {
-        Some(text) => Ok(Some(text.parse::<Ipv4Range>().map_err(|err| {
-            // The underlying error type is about peers; reword it for a flag.
-            format!("--ipv4-range {text}: {}", plain_reason(&err))
-        })?)),
-        None => Ok(None),
+        Some(text) if text.eq_ignore_ascii_case("none") => Ok(None),
+        Some(text) => Ok(Some(
+            text.parse::<Ipv4Range>()
+                .map_err(|err| format!("--ipv4-range {text}: {err}"))?,
+        )),
+        None => Ok(Some(tsunagi::state::DEFAULT_IPV4_RANGE)),
     }
 }
 
@@ -237,13 +234,13 @@ struct UpArgs {
     #[arg(long)]
     wg_mtu: Option<u32>,
 
-    /// Also run an IPv4 overlay in this range, as `address/prefix`.
+    /// IPv4 overlay range, as `address/prefix`, or `none` to disable IPv4.
     ///
-    /// Off unless given: no IPv4 range is free on every host. Pick one you
-    /// know is unused everywhere — not 100.64.0.0/10, which is Tailscale's
-    /// and carrier-grade NAT's. Every member must pass the same range; a
-    /// mismatch is detected and reported rather than silently misrouted.
-    /// IPv6 needs none of this and is always on.
+    /// Defaults to 10.13.37.0/24. Only the first member to join decides:
+    /// a network that has already settled on a range wins, and a joining
+    /// agent adopts what it finds. Addresses are allocated from it and
+    /// recorded in signed state, so each member keeps its own across
+    /// restarts and long absences.
     #[arg(long, value_name = "CIDR")]
     ipv4_range: Option<String>,
 
@@ -541,9 +538,6 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Parsed up front so a typo is reported immediately, and so the option is
     // never silently ignored when the data plane is off.
     let ipv4_range = resolve_ipv4_range(args.ipv4_range.as_ref())?;
-    if ipv4_range.is_some() && !args.wireguard {
-        return Err("--ipv4-range only applies together with --wireguard".into());
-    }
 
     let mut bootstrap: Vec<EndpointAddr> = Vec::new();
     for peer in &args.peers {
@@ -555,6 +549,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         ]));
 
     let mut config = AgentConfig::new(paths.clone())
+        .with_overlay_ipv4_range(ipv4_range)
         .with_transport(args.transport.into())
         .with_discovery(discovery)
         .with_discovery_interval(Duration::from_secs(5));
@@ -573,8 +568,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             system_tun_factory()?
         };
         let mut wg = WireguardConfig::new(paths.state_dir.join("wireguard"))
-            .with_interface_prefix(args.wg_prefix.clone())
-            .with_ipv4_range(ipv4_range);
+            .with_interface_prefix(args.wg_prefix.clone());
         if let Some(mtu) = args.wg_mtu {
             wg = wg.with_mtu(mtu);
         }

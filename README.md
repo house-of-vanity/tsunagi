@@ -129,33 +129,21 @@ ping  100.65.243.53
 IPv6 works out of the box: each member's address is derived from the network
 id and collides with essentially nothing.
 
-**IPv4 is opt-in**, because no IPv4 range is free on every host —
-`100.64.0.0/10` is Tailscale's, `10.0.0.0/8` and `192.168.0.0/16` are
-everywhere, `172.17.0.0/16` is Docker. Name one you know is unused, the same
-one on every member:
+**IPv4 addresses are allocated and then remembered.** The default range is
+`10.13.37.0/24`; the first member to join settles it and later members adopt
+what they find, so `--ipv4-range` only matters for whoever starts the network:
 
 ```bash
-tsunagi up --network lab --secret "$SECRET" --wireguard --ipv4-range 10.77.0.0/16
+tsunagi up --network lab --secret "$SECRET" --wireguard --ipv4-range 10.44.0.0/16
+tsunagi up --network lab --secret "$SECRET" --wireguard --ipv4-range none   # IPv6 only
 ```
 
-The range is part of how addresses are derived, so members configured
-differently would misroute. It travels in the announcement purely so a
-mismatch is reported instead: the offending peer gets no IPv4 and keeps
-working over IPv6. See
-[docs/wireguard.md](docs/wireguard.md#ipv4-alongside-ipv6).
-
-Notes:
-
-- Only one side needs `--peer`; the link is bidirectional.
-- The default `--transport relay` uses iroh's public address lookup and relays,
-  so two machines behind NAT find each other. `--transport local` keeps everything
-  on the local network. See *How peers find each other* below — it is worth
-  understanding what gets published.
-- Without a network interface, add `--no-tun`: the mesh, the data links and the
-  WireGuard handshakes all still run and are visible in the status output, only
-  traffic does not reach the operating system. That is the quickest way to
-  confirm the network forms.
-- For real traffic, see *Running unprivileged* below.
+An address is claimed with a record signed by that member's persistent device
+key, stored, and merged between every replica. A member that disappears for a
+month comes back to the same address, because the claim outlived the session.
+No vote is involved — see
+[docs/wireguard.md](docs/wireguard.md#ipv4-allocated-signed-and-kept) and
+[docs/sync-model.md](docs/sync-model.md).
 
 ## Running unprivileged
 

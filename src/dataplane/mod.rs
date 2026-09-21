@@ -94,18 +94,30 @@ pub(crate) enum PluginRequest {
 #[derive(Clone)]
 pub struct PluginContext {
     sender: Option<mpsc::Sender<PluginRequest>>,
+    local: Option<EndpointId>,
 }
 
 impl PluginContext {
-    pub(crate) fn new(sender: mpsc::Sender<PluginRequest>) -> Self {
+    pub(crate) fn new(sender: mpsc::Sender<PluginRequest>, local: EndpointId) -> Self {
         Self {
             sender: Some(sender),
+            local: Some(local),
         }
     }
 
     /// A context that discards everything, for plugins used outside an agent.
     pub fn detached() -> Self {
-        Self { sender: None }
+        Self {
+            sender: None,
+            local: None,
+        }
+    }
+
+    /// This agent's own endpoint id, when the context is attached.
+    ///
+    /// A plugin needs it to find itself in the agreed allocation.
+    pub fn local_endpoint_id(&self) -> Option<EndpointId> {
+        self.local
     }
 
     fn send(&self, request: PluginRequest) {
@@ -148,6 +160,7 @@ impl std::fmt::Debug for PluginContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginContext")
             .field("attached", &self.sender.is_some())
+            .field("local", &self.local.map(|id| id.fmt_short().to_string()))
             .finish()
     }
 }
@@ -196,6 +209,20 @@ pub trait IpPlugin: Send + Sync + std::fmt::Debug + 'static {
         peer: EndpointId,
         capability: &PluginCapability,
     ) -> std::result::Result<(), PluginError>;
+
+    /// The overlay addresses the network has agreed on.
+    ///
+    /// Allocated rather than derived, and backed by the signed records in
+    /// [`crate::state`], so a participant keeps its address across restarts
+    /// and long absences. Called whenever the agreed picture changes.
+    fn on_address_allocation(
+        &self,
+        network: NetworkId,
+        range: crate::state::Ipv4Range,
+        allocations: &[(EndpointId, std::net::Ipv4Addr)],
+    ) {
+        let _ = (network, range, allocations);
+    }
 
     /// A data plane link to a peer is available for this plugin's protocol.
     ///

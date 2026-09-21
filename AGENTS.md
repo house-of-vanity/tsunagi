@@ -36,6 +36,14 @@ Keep these separate. Crossing them is the main thing to review for.
   key. Outbound packets are routed to the owner of the destination address;
   inbound packets are dropped unless their source is the address derived for
   the peer that sent them. Never trust an address a peer announces.
+- **Signed state is the only durable agreement.** A fact that must survive a
+  participant being away goes in `src/state/` as a record signed by its
+  author, never in a session. Merging is deterministic, an older version never
+  rolls back a newer one, and absence from a snapshot is not deletion. Never
+  add a vote or a quorum: a majority is not a trust root here, and it would
+  stall with one peer online.
+- **A record and the author's own version counter commit together**, in one
+  transaction, **before** the record is announced.
 - **Plugins own their system objects.** A plugin creates and removes its own
   interface and nothing else. Never touch routing, DNS or firewall settings.
 - **Device identity vs network identity.** The iroh endpoint id is the device's
@@ -97,6 +105,7 @@ Keep these separate. Crossing them is the main thing to review for.
 | `src/proto/`        | framing, message formats, membership handshake |
 | `src/net.rs`        | iroh endpoint adapter and observability snapshots |
 | `src/agent/`        | agent lifecycle, per-network runtimes, sessions, events, status |
+| `src/state/`        | signed records that outlive a session, their merge rules and address allocation |
 | `src/dataplane/`    | the plugin contract, the packet transport, and the WireGuard plugin |
 | `src/bin/tsunagi.rs`| the command line agent; the only place that owns a runtime, a logger and signals |
 | `tests/`            | integration tests; `tests/common/` is the shared harness |

@@ -46,8 +46,32 @@ impl WgAgent {
         tag: &str,
         tune: impl FnOnce(WireguardConfig) -> WireguardConfig,
     ) -> Self {
+        Self::spawn_full(
+            discovery,
+            tag,
+            tune,
+            Some(tsunagi::state::DEFAULT_IPV4_RANGE),
+        )
+        .await
+    }
+
+    /// Starts an agent with an explicit overlay range, or none at all.
+    async fn spawn_range(
+        discovery: &SharedMemoryDiscovery,
+        tag: &str,
+        range: Option<Ipv4Range>,
+    ) -> Self {
+        Self::spawn_full(discovery, tag, |config| config, range).await
+    }
+
+    async fn spawn_full(
+        discovery: &SharedMemoryDiscovery,
+        tag: &str,
+        tune: impl FnOnce(WireguardConfig) -> WireguardConfig,
+        range: Option<Ipv4Range>,
+    ) -> Self {
         let dir = TempDir::new().unwrap();
-        let (agent, plugin, tuns) = Self::open(dir.path(), discovery, tag, tune).await;
+        let (agent, plugin, tuns) = Self::open_with(dir.path(), discovery, tag, tune, range).await;
         Self {
             dir,
             agent,
@@ -62,6 +86,23 @@ impl WgAgent {
         tag: &str,
         tune: impl FnOnce(WireguardConfig) -> WireguardConfig,
     ) -> (Agent, Arc<WireguardPlugin>, MemoryTunFactory) {
+        Self::open_with(
+            root,
+            discovery,
+            tag,
+            tune,
+            Some(tsunagi::state::DEFAULT_IPV4_RANGE),
+        )
+        .await
+    }
+
+    async fn open_with(
+        root: &std::path::Path,
+        discovery: &SharedMemoryDiscovery,
+        tag: &str,
+        tune: impl FnOnce(WireguardConfig) -> WireguardConfig,
+        range: Option<Ipv4Range>,
+    ) -> (Agent, Arc<WireguardPlugin>, MemoryTunFactory) {
         let tuns = MemoryTunFactory::new();
         let wg = tune(
             WireguardConfig::new(root.join("wireguard"))
@@ -72,7 +113,9 @@ impl WgAgent {
             .await
             .unwrap();
         let agent = Agent::spawn(
-            config_with(root, discovery).with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+            config_with(root, discovery)
+                .with_overlay_ipv4_range(range)
+                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
         )
         .await
         .unwrap();
@@ -268,8 +311,8 @@ async fn the_overlay_carries_ipv4_alongside_ipv6() {
     let (name, secret) = network("wg-dual-stack");
 
     let range = Some("10.77.0.0/16".parse::<Ipv4Range>().unwrap());
-    let a = WgAgent::spawn_with(&discovery, "ta", |c| c.with_ipv4_range(range)).await;
-    let b = WgAgent::spawn_with(&discovery, "tb", |c| c.with_ipv4_range(range)).await;
+    let a = WgAgent::spawn_range(&discovery, "ta", range).await;
+    let b = WgAgent::spawn_range(&discovery, "tb", range).await;
 
     let network_id = a.agent.join_network(&name, &secret).await.unwrap();
     b.agent.join_network(&name, &secret).await.unwrap();
@@ -329,8 +372,8 @@ async fn an_ipv4_source_a_peer_does_not_own_is_dropped() {
     let (name, secret) = network("wg-v4-spoof");
 
     let range = Some("10.78.0.0/16".parse::<Ipv4Range>().unwrap());
-    let a = WgAgent::spawn_with(&discovery, "ta", |c| c.with_ipv4_range(range)).await;
-    let b = WgAgent::spawn_with(&discovery, "tb", |c| c.with_ipv4_range(range)).await;
+    let a = WgAgent::spawn_range(&discovery, "ta", range).await;
+    let b = WgAgent::spawn_range(&discovery, "tb", range).await;
     let network_id = a.agent.join_network(&name, &secret).await.unwrap();
     b.agent.join_network(&name, &secret).await.unwrap();
     a.wait_for_tunnels(network_id, 1).await;
@@ -375,13 +418,12 @@ async fn an_ipv4_source_a_peer_does_not_own_is_dropped() {
 }
 
 #[tokio::test]
-async fn an_ipv6_only_overlay_is_the_default() {
+async fn an_ipv6_only_overlay_can_be_asked_for() {
     let discovery = SharedMemoryDiscovery::new();
     let (name, secret) = network("wg-v6-only");
 
-    // No IPv4 range is configured, which is the default.
-    let a = WgAgent::spawn(&discovery, "ta").await;
-    let b = WgAgent::spawn(&discovery, "tb").await;
+    let a = WgAgent::spawn_range(&discovery, "ta", None).await;
+    let b = WgAgent::spawn_range(&discovery, "tb", None).await;
 
     let network_id = a.agent.join_network(&name, &secret).await.unwrap();
     b.agent.join_network(&name, &secret).await.unwrap();
@@ -411,55 +453,161 @@ async fn an_ipv6_only_overlay_is_the_default() {
 }
 
 #[tokio::test]
-async fn members_configured_with_different_ipv4_ranges_are_told_so() {
+async fn a_joining_member_adopts_the_range_the_network_already_uses() {
     let discovery = SharedMemoryDiscovery::new();
-    let (name, secret) = network("wg-range-mismatch");
+    let (name, secret) = network("wg-range-adopted");
 
-    // Two members configured differently. Deriving addresses from the range
-    // means they would disagree about each other, so IPv4 must be withheld
-    // and the mismatch reported rather than silently misrouting.
-    let a = WgAgent::spawn_with(&discovery, "ta", |c| {
-        c.with_ipv4_range(Some("10.80.0.0/16".parse().unwrap()))
-    })
-    .await;
-    let b = WgAgent::spawn_with(&discovery, "tb", |c| {
-        c.with_ipv4_range(Some("10.81.0.0/16".parse().unwrap()))
-    })
-    .await;
+    // The two were started with different ranges. Rather than misroute, they
+    // converge on one, and every replica computes the same answer.
+    let a = WgAgent::spawn_range(&discovery, "ta", Some("10.80.0.0/16".parse().unwrap())).await;
+    let b = WgAgent::spawn_range(&discovery, "tb", Some("10.81.0.0/16".parse().unwrap())).await;
 
-    let mut events = a.agent.subscribe();
     let network_id = a.agent.join_network(&name, &secret).await.unwrap();
     b.agent.join_network(&name, &secret).await.unwrap();
     a.wait_for_tunnels(network_id, 1).await;
+    b.wait_for_tunnels(network_id, 1).await;
 
-    let reason = wait_event(&mut events, |event| match event {
-        Event::PluginError { reason, .. } if reason.contains("IPv4 overlay range") => {
-            Some(reason.clone())
-        }
-        _ => None,
+    let agreed = wait_until("both settle on one range", || async {
+        let one = a.plugin.overview(network_id)?.ipv4_range?;
+        let two = b.plugin.overview(network_id)?.ipv4_range?;
+        (one == two).then_some(one)
     })
     .await;
-    assert!(reason.contains("10.81.0.0/16"), "unexpected: {reason}");
-    assert!(reason.contains("10.80.0.0/16"), "unexpected: {reason}");
 
-    // The peer has no IPv4 here, but IPv6 is unaffected.
-    let view = a.plugin.overview(network_id).unwrap();
-    assert_eq!(view.peers[0].overlay_address_v4, None);
-    assert!(view.peers[0].is_up(), "the tunnel itself still works");
+    // Whichever won, both hold an address inside it, and they differ.
+    let view_a = wait_until("a has an address in the agreed range", || async {
+        let view = a.plugin.overview(network_id)?;
+        let address = view.overlay_address_v4?;
+        agreed.contains(address).then_some(view)
+    })
+    .await;
+    let view_b = wait_until("b has an address in the agreed range", || async {
+        let view = b.plugin.overview(network_id)?;
+        let address = view.overlay_address_v4?;
+        agreed.contains(address).then_some(view)
+    })
+    .await;
+    assert_ne!(view_a.overlay_address_v4, view_b.overlay_address_v4);
 
-    let addr_a = a.overlay(network_id).await;
-    let addr_b = b.overlay(network_id).await;
-    a.tun(network_id)
-        .await
-        .push_from_os(ipv6_packet(addr_a, addr_b, b"v6 still fine"));
-    let received = tokio::time::timeout(common::DEADLINE, b.tun(network_id).await.pop_to_os())
-        .await
-        .expect("IPv6 should be unaffected")
-        .unwrap();
-    assert_eq!(&received[40..], b"v6 still fine");
+    // And each sees the other at the same address it sees for itself.
+    let seen_b = wait_until("a sees b's address", || async {
+        a.plugin
+            .overview(network_id)?
+            .peers
+            .first()?
+            .overlay_address_v4
+    })
+    .await;
+    assert_eq!(Some(seen_b), view_b.overlay_address_v4);
 
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_address_is_kept_across_a_restart() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-address-persists");
+
+    let peer = WgAgent::spawn(&discovery, "tp").await;
+    let subject = WgAgent::spawn(&discovery, "ts").await;
+
+    let network_id = peer.agent.join_network(&name, &secret).await.unwrap();
+    subject.agent.join_network(&name, &secret).await.unwrap();
+    peer.wait_for_tunnels(network_id, 1).await;
+
+    let before = wait_until("the subject has an address", || async {
+        subject.plugin.overview(network_id)?.overlay_address_v4
+    })
+    .await;
+    // The peer agrees about it.
+    let seen_before = wait_until("the peer sees it", || async {
+        peer.plugin
+            .overview(network_id)?
+            .peers
+            .first()?
+            .overlay_address_v4
+    })
+    .await;
+    assert_eq!(seen_before, before);
+
+    // Go away, come back. The address is a signed record, not a derivation
+    // and not a session fact, so it survives.
+    let dir = subject.shutdown().await;
+    let (agent, plugin, _tuns) = WgAgent::open(dir.path(), &discovery, "ts", |config| config).await;
+
+    let after = wait_until("the restarted agent has an address", || async {
+        plugin.overview(network_id)?.overlay_address_v4
+    })
+    .await;
+    assert_eq!(
+        after, before,
+        "a returning participant must reclaim the address it signed for"
+    );
+
+    // And the peer still agrees, without having had to do anything.
+    let seen_after = wait_until("the peer still agrees", || async {
+        let seen = peer
+            .plugin
+            .overview(network_id)?
+            .peers
+            .first()?
+            .overlay_address_v4?;
+        (seen == after).then_some(seen)
+    })
+    .await;
+    assert_eq!(seen_after, after);
+
+    agent.shutdown().await;
+    peer.agent.shutdown().await;
+    drop(agent);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn three_members_get_three_different_addresses() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-allocation");
+
+    let a = WgAgent::spawn(&discovery, "ta").await;
+    let b = WgAgent::spawn(&discovery, "tb").await;
+    let c = WgAgent::spawn(&discovery, "tc").await;
+
+    let network_id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    c.agent.join_network(&name, &secret).await.unwrap();
+
+    for agent in [&a, &b, &c] {
+        agent.wait_for_tunnels(network_id, 2).await;
+    }
+
+    // Everybody ends up knowing all three addresses, and they are distinct.
+    let addresses = wait_until("everyone agrees on three addresses", || async {
+        let mut all = std::collections::BTreeSet::new();
+        for agent in [&a, &b, &c] {
+            let view = agent.plugin.overview(network_id)?;
+            all.insert(view.overlay_address_v4?);
+            for peer in &view.peers {
+                all.insert(peer.overlay_address_v4?);
+            }
+        }
+        (all.len() == 3).then_some(all)
+    })
+    .await;
+
+    let default_range = tsunagi::state::DEFAULT_IPV4_RANGE;
+    for address in &addresses {
+        assert!(
+            default_range.contains(*address),
+            "{address} outside the range"
+        );
+        assert_ne!(address.octets()[3], 0);
+        assert_ne!(address.octets()[3], 255);
+    }
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
 }
 
 #[tokio::test]
@@ -727,7 +875,7 @@ async fn the_core_carries_the_payload_without_interpreting_it() {
     assert_eq!(capability.protocol, WIREGUARD_PROTOCOL);
 
     let view_b = b.plugin.overview(network_id).unwrap();
-    let expected = WgAnnouncement::new(network_id, &view_b.public_key, None)
+    let expected = WgAnnouncement::new(network_id, &view_b.public_key)
         .encode()
         .unwrap();
     assert_eq!(capability.data, expected);
@@ -750,7 +898,7 @@ async fn a_forged_overlay_claim_is_rejected_and_never_reaches_a_tunnel() {
     // A legitimate member — it knows the secret — claims the victim's overlay
     // address with its own WireGuard key.
     let attacker_key = WgSecretKey::generate().public();
-    let mut forged = WgAnnouncement::new(network_id, &attacker_key, None);
+    let mut forged = WgAnnouncement::new(network_id, &attacker_key);
     forged.overlay_address = victim_address;
 
     let forger = Arc::new(ForgingPlugin {
