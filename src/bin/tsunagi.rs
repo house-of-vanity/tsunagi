@@ -252,6 +252,21 @@ struct UpArgs {
     #[arg(long, value_name = "CIDR")]
     ipv4_range: Option<String>,
 
+    /// Serve a local DNS zone for this network's members.
+    ///
+    /// Members resolve as `<hostname>.<zone>`, from signed state, so a
+    /// member that is switched off still resolves. IPv4 only.
+    #[arg(long)]
+    dns: bool,
+
+    /// The zone to answer for. Defaults to the network name.
+    #[arg(long, value_name = "NAME")]
+    dns_zone: Option<String>,
+
+    /// Port for the local DNS server.
+    #[arg(long, default_value_t = 5354)]
+    dns_port: u16,
+
     /// How often to print a status summary, in seconds. Zero disables it.
     #[arg(long, default_value_t = 15)]
     status_interval: u64,
@@ -475,6 +490,215 @@ fn configured_networks_section(paths: &StoragePaths) -> report::Section {
     section
 }
 
+/// What the local DNS service is doing, for `status` to report.
+#[derive(Debug, Clone, Default)]
+struct DnsState {
+    zone: String,
+    listening: Option<SocketAddr>,
+    bind_error: Option<String>,
+    publish_error: Option<String>,
+    publish_remedy: Option<String>,
+    zone_warning: Option<String>,
+    names: u32,
+}
+
+/// The local DNS service: a server, and an attempt to tell the OS about it.
+///
+/// The two are deliberately independent. The server comes up whether or not
+/// the resolver can be configured, because a resolver the user can point at
+/// by hand is worth more than nothing, and the reason it was not configured
+/// is reported rather than swallowed.
+struct DnsService {
+    state: Arc<std::sync::Mutex<DnsState>>,
+    publisher: Arc<dyn tsunagi::dns::DnsPublisher>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DnsService {
+    /// Stops answering and undoes what was told to the resolver.
+    async fn shutdown(self) {
+        self.task.abort();
+        if let Err(err) = self.publisher.revert().await {
+            tracing::debug!(%err, "cannot undo the resolver setting");
+        }
+    }
+}
+
+/// Picks the publisher for this platform.
+fn dns_publisher() -> Arc<dyn tsunagi::dns::DnsPublisher> {
+    #[cfg(all(feature = "dns-publish", target_os = "linux"))]
+    {
+        Arc::new(tsunagi::dns::publish::ResolvedPublisher::new())
+    }
+    #[cfg(not(all(feature = "dns-publish", target_os = "linux")))]
+    {
+        Arc::new(tsunagi::dns::publish::UnsupportedPublisher::new())
+    }
+}
+
+/// Starts the DNS service for one network and keeps it in step with state.
+fn spawn_dns(
+    agent: Agent,
+    wireguard: Option<Arc<WireguardPlugin>>,
+    network: NetworkId,
+    zone: tsunagi::dns::ZoneName,
+    port: u16,
+) -> DnsService {
+    use tsunagi::dns::{DnsServer, SharedZone, Zone, listen_addresses};
+
+    let state = Arc::new(std::sync::Mutex::new(DnsState {
+        zone: zone.as_str().to_string(),
+        zone_warning: zone.collision(),
+        ..DnsState::default()
+    }));
+    let publisher = dns_publisher();
+
+    let task = {
+        let state = Arc::clone(&state);
+        let publisher = Arc::clone(&publisher);
+        tokio::spawn(async move {
+            let shared = SharedZone::new(Zone::new(zone.clone(), []));
+            // Held for its `Drop`, which stops the server: the value is
+            // never read, but letting it go is what closes the socket.
+            let mut _server: Option<DnsServer> = None;
+            let mut bound: Option<SocketAddr> = None;
+            // What was tried last time, not what was got. Comparing against
+            // what was got would rebind on every tick whenever the preferred
+            // address is one that cannot be bound, closing the port each
+            // time for no reason.
+            let mut attempted: Vec<SocketAddr> = Vec::new();
+            let mut published: Option<tsunagi::dns::Published> = None;
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+
+            loop {
+                ticker.tick().await;
+                let Ok(status) = agent.network_status(network).await else {
+                    continue;
+                };
+
+                // Names come from signed state, so a member that is away is
+                // in here too.
+                let members = status.members.iter().filter_map(|member| {
+                    Some((member.hostname.clone()?, member.overlay_address_v4?))
+                });
+                let fresh = Zone::new(zone.clone(), members);
+                let names = fresh.len() as u32;
+                shared.set(fresh);
+
+                // Listen where the resolver will be told to ask, which is an
+                // address on the overlay interface when there is one.
+                let own = agent.endpoint_id();
+                let overlay = status
+                    .members
+                    .iter()
+                    .find(|member| member.endpoint_id == own)
+                    .and_then(|member| member.overlay_address_v4);
+                let interface = wireguard
+                    .as_ref()
+                    .and_then(|plugin| plugin.overview(network))
+                    .map(|view| view.interface)
+                    .filter(|name| !name.is_empty());
+                let wanted = listen_addresses(overlay, port);
+                if attempted != wanted {
+                    attempted = wanted.clone();
+                    // Dropping the old one first releases the port, so the
+                    // rebind is not racing itself.
+                    _server = None;
+                    let mut last: Option<std::io::Error> = None;
+                    bound = None;
+                    for candidate in &wanted {
+                        match DnsServer::bind(*candidate, shared.clone()).await {
+                            Ok(fresh) => {
+                                tracing::info!(
+                                    address = %fresh.local_addr(),
+                                    zone = %zone.as_str(),
+                                    "dns listening"
+                                );
+                                bound = Some(fresh.local_addr());
+                                _server = Some(fresh);
+                                break;
+                            }
+                            Err(err) => last = Some(err),
+                        }
+                    }
+                    let bind_error = bound.is_none().then(|| {
+                        last.map_or_else(
+                            || "no address to listen on".to_string(),
+                            |err| err.to_string(),
+                        )
+                    });
+                    update(&state, |state| {
+                        state.listening = bound;
+                        state.bind_error = bind_error;
+                    });
+                    // The address moved, so whatever the resolver was told
+                    // is now wrong.
+                    published = None;
+                }
+
+                let Some(address) = bound else { continue };
+                let Some(interface) = interface else {
+                    update(&state, |state| {
+                        state.publish_error = Some(
+                            "there is no overlay interface to attach the resolver setting to"
+                                .to_string(),
+                        );
+                        state.publish_remedy = None;
+                    });
+                    update(&state, |state| state.names = names);
+                    continue;
+                };
+
+                let want_published = tsunagi::dns::Published {
+                    interface,
+                    server: address,
+                    domains: vec![zone.as_str().to_string()],
+                };
+                if published.as_ref() != Some(&want_published) {
+                    match publisher.apply(&want_published).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                zone = %zone.as_str(),
+                                interface = %want_published.interface,
+                                "the system resolver was told where to ask"
+                            );
+                            published = Some(want_published);
+                            update(&state, |state| {
+                                state.publish_error = None;
+                                state.publish_remedy = None;
+                            });
+                        }
+                        Err(err) => {
+                            // Not fatal, by design: the server keeps
+                            // answering and the user is told what is missing.
+                            tracing::warn!(%err, "cannot configure the system resolver");
+                            let remedy = err.remedy().map(str::to_string);
+                            update(&state, |state| {
+                                state.publish_error = Some(err.to_string());
+                                state.publish_remedy = remedy;
+                            });
+                        }
+                    }
+                }
+                update(&state, |state| state.names = names);
+            }
+        })
+    };
+
+    DnsService {
+        state,
+        publisher,
+        task,
+    }
+}
+
+fn update(state: &Arc<std::sync::Mutex<DnsState>>, edit: impl FnOnce(&mut DnsState)) {
+    match state.lock() {
+        Ok(mut guard) => edit(&mut guard),
+        Err(poisoned) => edit(&mut poisoned.into_inner()),
+    }
+}
+
 /// Serves the local control socket from the running agent.
 ///
 /// A struct rather than a closure because this end both answers questions and
@@ -484,11 +708,18 @@ fn configured_networks_section(paths: &StoragePaths) -> report::Section {
 struct AgentControl {
     agent: Agent,
     plugin: Option<Arc<WireguardPlugin>>,
+    dns: Option<Arc<std::sync::Mutex<DnsState>>>,
 }
 
 impl tsunagi::ipc::unix::ReportSource for AgentControl {
     fn report(&self) -> tsunagi::BoxFuture<'_, tsunagi::ipc::StatusReport> {
-        Box::pin(async move { build_report(&self.agent, self.plugin.as_deref()).await })
+        Box::pin(async move {
+            let dns = self.dns.as_ref().map(|state| match state.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            });
+            build_report(&self.agent, self.plugin.as_deref(), dns).await
+        })
     }
 
     fn set_hostname(&self, hostname: String) -> tsunagi::BoxFuture<'_, Result<String, String>> {
@@ -757,9 +988,69 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
         Observed::Stored { .. } => out.push(configured_networks_section(&paths)),
     }
 
+    if let Observed::Agent(report) = &observed
+        && let Some(dns) = &report.dns
+    {
+        out.push(dns_section(dns));
+    }
+
     out.push(host_section());
     out.push(addresses_section().await);
     print_report("tsunagi status", &out)
+}
+
+/// The local resolver: whether it answers, and whether the system asks it.
+fn dns_section(dns: &tsunagi::ipc::DnsReport) -> report::Section {
+    use report::{Health, Row, Section};
+
+    let mut section = Section::new("dns");
+    section.push(Row::new(
+        Health::Info,
+        "zone",
+        format!("{}  ·  {} name(s)", dns.zone, dns.names),
+    ));
+    if let Some(warning) = &dns.zone_warning {
+        section.push(Row::new(Health::Degraded, "zone name", warning.clone()));
+    }
+
+    match (&dns.listening, &dns.bind_error) {
+        (Some(address), _) => {
+            section.push(Row::new(Health::Good, "listening", address.clone()));
+        }
+        (None, Some(err)) => {
+            section.push(Row::new(Health::Broken, "listening", err.clone()));
+        }
+        (None, None) => {
+            section.push(Row::new(Health::Degraded, "listening", "not yet"));
+        }
+    }
+
+    match &dns.publish_error {
+        None if dns.listening.is_some() => {
+            section.push(Row::new(
+                Health::Good,
+                "system resolver",
+                "asking this server for the zone",
+            ));
+        }
+        None => {}
+        Some(err) => {
+            // The server still answers, so this is a degraded overlay and
+            // not a broken one; what is missing is the automatic part.
+            let row = Row::new(Health::Degraded, "system resolver", err.clone());
+            section.push(match (&dns.publish_remedy, &dns.listening) {
+                (Some(remedy), _) => row.with_note(remedy.clone()),
+                (None, Some(address)) => row.with_note(format!(
+                    "resolve names yourself with `dig @{} -p {} <name>.{}`",
+                    address.rsplit_once(':').map_or("", |(host, _)| host),
+                    address.rsplit_once(':').map_or("", |(_, port)| port),
+                    dns.zone
+                )),
+                (None, None) => row,
+            });
+        }
+    }
+    section
 }
 
 /// One member of a network, from every source that knows something about it.
@@ -1611,13 +1902,42 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             agent.endpoint_id()
         );
     }
+    // A local resolver for this network's members. The zone name is the
+    // user's to choose; a name that shadows a public one is reported and
+    // then used, because that is a decision and not a mistake.
+    let dns = if args.dns {
+        let raw = args.dns_zone.clone().unwrap_or_else(|| name.to_string());
+        match tsunagi::dns::ZoneName::new(&raw) {
+            Ok(zone) => {
+                if let Some(warning) = zone.collision() {
+                    tracing::warn!("{warning}");
+                }
+                println!("  dns zone     {}", zone.as_str());
+                Some(spawn_dns(
+                    agent.clone(),
+                    wireguard.clone(),
+                    network,
+                    zone,
+                    args.dns_port,
+                ))
+            }
+            Err(err) => {
+                agent.shutdown().await;
+                return Err(format!("--dns-zone {raw}: {err}").into());
+            }
+        }
+    } else {
+        None
+    };
+
     // Serve `tsunagi status` for as long as this agent runs. Failing to bind
     // is not fatal: the agent itself works fine without it.
     let control = {
         let agent = agent.clone();
         let plugin = wireguard.clone();
+        let dns = dns.as_ref().map(|service| Arc::clone(&service.state));
         let source: Arc<dyn tsunagi::ipc::unix::ReportSource> =
-            Arc::new(AgentControl { agent, plugin });
+            Arc::new(AgentControl { agent, plugin, dns });
         let path = control_socket(&paths, args.control_socket.as_ref());
         match tsunagi::ipc::unix::ControlSocket::bind(path, source).await {
             Ok(socket) => {
@@ -1664,6 +1984,11 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(control) = control {
         control.shutdown().await;
     }
+    // Before the agent, so the resolver stops being pointed at a server
+    // that is about to stop answering.
+    if let Some(dns) = dns {
+        dns.shutdown().await;
+    }
     agent.shutdown().await;
     println!("stopped.");
     Ok(())
@@ -1675,10 +2000,22 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
 async fn build_report(
     agent: &Agent,
     wireguard: Option<&WireguardPlugin>,
+    dns: Option<DnsState>,
 ) -> tsunagi::ipc::StatusReport {
     use tsunagi::ipc::{
-        MemberReport, NetworkReport, OverlayPeerReport, OverlayReport, PeerReport, StatusReport,
+        DnsReport, MemberReport, NetworkReport, OverlayPeerReport, OverlayReport, PeerReport,
+        StatusReport,
     };
+
+    let dns = dns.map(|dns| DnsReport {
+        zone: dns.zone,
+        listening: dns.listening.map(|address| address.to_string()),
+        bind_error: dns.bind_error,
+        publish_error: dns.publish_error,
+        publish_remedy: dns.publish_remedy,
+        zone_warning: dns.zone_warning,
+        names: dns.names,
+    });
 
     let Ok(status) = agent.status().await else {
         return StatusReport::default();
@@ -1789,6 +2126,7 @@ async fn build_report(
             .collect(),
         cache_healthy: status.cache_healthy,
         networks,
+        dns,
     }
 }
 

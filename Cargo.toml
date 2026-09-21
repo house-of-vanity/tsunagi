@@ -13,11 +13,14 @@ categories = ["network-programming"]
 [features]
 default = ["cli"]
 # The `tsunagi` command line binary. Library users can opt out.
-cli = ["dep:clap", "dep:anstream", "dep:anstyle", "dep:tracing-subscriber", "tokio/signal", "tun-device"]
+cli = ["dep:clap", "dep:anstream", "dep:anstyle", "dep:tracing-subscriber", "tokio/signal", "tun-device", "dns-publish"]
 # A real TUN device, so the WireGuard plugin can carry actual IP traffic.
 # Needs CAP_NET_ADMIN at run time; without it the plugin still runs and its
 # in-memory device can be used for tests.
 tun-device = ["dep:tun", "dep:rtnetlink", "dep:caps", "dep:futures-util"]
+# Telling the operating system where to send its questions. Linux only for
+# now; the zone and the server work without it.
+dns-publish = ["dep:zbus"]
 
 [[bin]]
 name = "tsunagi"
@@ -47,6 +50,10 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # zone logic is ours and a full server framework would be a large dependency
 # for answering A records from memory.
 simple-dns = "0.12"
+# The IANA top-level domain list, compiled in: one function, no
+# dependencies, no network. Used only to warn that a zone name shadows a
+# real public domain, never to refuse one.
+tld = "2.40"
 data-encoding = "2.11"
 hex = "0.4"
 thiserror = "2.0"
@@ -66,6 +73,9 @@ tun = { version = "0.8", features = ["async"], optional = true }
 # out of the effective set except during the moments it is used.
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = { version = "0.23", optional = true }
+# Pure Rust D-Bus, no libdbus to link against. `tokio` rather than the
+# default reactor, because the agent brings its own.
+zbus = { version = "5.19", default-features = false, features = ["tokio"], optional = true }
 caps = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
 

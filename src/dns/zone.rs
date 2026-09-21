@@ -100,6 +100,49 @@ impl ZoneName {
         self.0.rsplit('.').next().unwrap_or(&self.0)
     }
 
+    /// What is worrying about this zone name, if anything.
+    ///
+    /// A warning and never a refusal: the name is the user's to choose, and
+    /// a private zone that shadows a public one is a decision, not a
+    /// mistake. Saying nothing would let it be an accident.
+    pub fn collision(&self) -> Option<String> {
+        let top = self.top_label();
+        // Reserved for exactly this use and never delegated, so nothing to
+        // say. See RFC 6761 and RFC 8375.
+        const RESERVED: &[&str] = &[
+            "internal",
+            "home",
+            "test",
+            "example",
+            "invalid",
+            "localhost",
+        ];
+        if RESERVED.contains(&top) {
+            return None;
+        }
+        if top == "local" {
+            return Some(
+                "`.local` belongs to multicast DNS: on a host running Avahi or \
+                 systemd-resolved's mDNS, names under it are resolved by that and \
+                 not by this agent"
+                    .to_string(),
+            );
+        }
+        if tld::exist_case_insensitive(top) {
+            return Some(format!(
+                "`.{top}` is a real top-level domain, so every public name under it \
+                 becomes unreachable from this host while the overlay is up"
+            ));
+        }
+        // Not delegated today is not a promise about tomorrow.
+        (!self.0.contains('.')).then(|| {
+            format!(
+                "`.{top}` is not a delegated top-level domain today, but it could \
+                 become one; `.internal` is reserved for private use and never will"
+            )
+        })
+    }
+
     /// Whether `name` is this zone or sits under it.
     ///
     /// Compared label-wise, so `evilzone` does not count as being under
@@ -372,6 +415,32 @@ mod tests {
             ZoneName::new(&"x".repeat(64)).unwrap_err(),
             ZoneError::Label { .. }
         ));
+    }
+
+    #[test]
+    fn a_zone_name_that_shadows_a_public_one_is_flagged_but_allowed() {
+        // Flagged, never refused: shadowing is the user's decision to make.
+        let ru = ZoneName::new("ru").unwrap();
+        let warning = ru.collision().expect("a real TLD is worth mentioning");
+        assert!(warning.contains("real top-level domain"), "{warning}");
+
+        assert!(ZoneName::new("com").unwrap().collision().is_some());
+        assert!(ZoneName::new("lab.com").unwrap().collision().is_some());
+
+        // Reserved for private use, so nothing to say.
+        for quiet in ["internal", "lab.internal", "home", "test", "invalid"] {
+            assert_eq!(ZoneName::new(quiet).unwrap().collision(), None, "{quiet}");
+        }
+
+        // `.local` is not a delegated TLD, but it is not free either.
+        let local = ZoneName::new("local").unwrap().collision().unwrap();
+        assert!(local.contains("multicast DNS"), "{local}");
+
+        // An undelegated single label is a maybe, not a yes.
+        let lab = ZoneName::new("lab").unwrap().collision().unwrap();
+        assert!(lab.contains("could"), "{lab}");
+        // A multi-label name under something undelegated is not worth a word.
+        assert_eq!(ZoneName::new("a.lab").unwrap().collision(), None);
     }
 
     #[test]

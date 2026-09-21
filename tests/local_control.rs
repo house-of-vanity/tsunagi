@@ -81,6 +81,7 @@ fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::u
                     .collect(),
                 cache_healthy: status.cache_healthy,
                 networks,
+                dns: None,
             }
         })
     })

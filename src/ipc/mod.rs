@@ -99,6 +99,30 @@ pub struct StatusReport {
     pub cache_healthy: bool,
     /// One entry per configured network.
     pub networks: Vec<NetworkReport>,
+    /// The local DNS service, when one was asked for.
+    pub dns: Option<DnsReport>,
+}
+
+/// The local DNS service.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsReport {
+    /// The zone it answers for.
+    pub zone: String,
+    /// Where it is listening, if it managed to bind.
+    pub listening: Option<String>,
+    /// Why it could not bind, if it did not.
+    pub bind_error: Option<String>,
+    /// Why the system resolver was not told, if it was not.
+    ///
+    /// `None` means it was told. The server answers either way, so this is a
+    /// degraded overlay rather than a broken one.
+    pub publish_error: Option<String>,
+    /// What to do about that, when there is something.
+    pub publish_remedy: Option<String>,
+    /// Something worth saying about the zone name itself.
+    pub zone_warning: Option<String>,
+    /// How many names it answers for.
+    pub names: u32,
 }
 
 /// One network.

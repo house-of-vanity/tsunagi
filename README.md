@@ -149,6 +149,45 @@ Because the address is allocated at run time rather than derived, it is not
 known until the agent has started and agreed with its peers. The agent then
 assigns it to the interface itself.
 
+## Names
+
+`--dns` serves a local DNS zone for the network's members, so they can be
+reached by name instead of by address:
+
+```bash
+tsunagi up --network lab --secret "$SECRET" --wireguard --dns
+dig @10.13.37.69 -p 5354 music.lab
+```
+
+Names come from signed state, which is the point: **a member that is
+switched off still resolves**, because its claim outlived the session. IPv4
+only — the IPv6 overlay address derives from a key that travels in live
+announcements, so it cannot be answered for a member that is away, and
+answering for some members and not others depending on who is online is
+worse than not answering.
+
+The zone is the network name unless `--dns-zone` says otherwise. It is
+yours to choose, so a name that shadows a real public domain is reported and
+then used: `--dns-zone ru` warns that every public `.ru` name becomes
+unreachable from this host, and then does it. `.internal` is reserved for
+exactly this and is never mentioned.
+
+On Linux the agent tells systemd-resolved to send questions for that suffix
+here, over D-Bus, scoped to the overlay interface and as a *routing* domain
+so it never becomes the resolver for anything else. resolved drops the whole
+setting when the interface goes, and the interface goes with the agent.
+
+That last step needs permission that `CAP_NET_ADMIN` does not give:
+systemd-resolved asks polkit, and polkit decides by user. Running as a
+system service is enough; so is a polkit rule granting this user the
+`org.freedesktop.resolve1.set-*` actions. **Without it the server still
+runs** — `tsunagi status` prints where it is listening and the exact `dig`
+line — so the automatic part is missing, not the feature.
+
+The server is authoritative for its zone and nothing else. No recursion, no
+forwarding, no cache: pointing a resolver at it can never make it a route to
+the outside.
+
 ## Privileges
 
 On Linux the agent **manages its own overlay interface**. It creates the TUN
