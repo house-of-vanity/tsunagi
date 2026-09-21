@@ -207,15 +207,12 @@ impl Interface {
             }
         }
 
-        // One address per network, so at most a handful; the request carries
-        // the first and the provisioner reconciles the rest.
+        // Every address this agent holds, in every network it is in. The
+        // plan is exhaustive by contract, so this is also what takes an
+        // address off the interface when a network is left or stopped.
         let request = TunRequest {
             name: self.name.clone(),
-            address: wanted.first().and_then(|cidr| match cidr.addr {
-                IpAddr::V4(address) => Some(address),
-                IpAddr::V6(_) => None,
-            }),
-            prefix_len: wanted.first().map_or(0, |cidr| cidr.prefix_len),
+            addresses: wanted.clone(),
             mtu: self.mtu,
         };
         self.factory.reconfigure(request).await?;

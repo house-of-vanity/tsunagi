@@ -25,13 +25,18 @@ use crate::overlay::OverlayError;
 pub struct TunRequest {
     /// Interface name to ask for.
     pub name: String,
-    /// The overlay address this host answers to, and its prefix length.
+    /// Every overlay address this host answers to, and no others.
+    ///
+    /// One per network the agent is in — one agent has one interface, and
+    /// it carries them all. A list rather than one address because
+    /// carrying only the first is carrying only the first network: the
+    /// others have addresses the operating system has never heard of, and
+    /// their traffic goes nowhere.
     ///
     /// Allocated and signed at the system level, never derived from a
-    /// protocol's key: every protocol carries traffic for the same address.
-    pub address: Option<std::net::Ipv4Addr>,
-    /// Prefix length of the overlay range.
-    pub prefix_len: u8,
+    /// protocol's key: every protocol carries traffic for the same
+    /// addresses.
+    pub addresses: Vec<super::Cidr>,
     /// Interface MTU.
     pub mtu: u32,
 }
@@ -44,8 +49,7 @@ impl TunRequest {
     pub fn bare(name: impl Into<String>, mtu: u32) -> Self {
         Self {
             name: name.into(),
-            address: None,
-            prefix_len: 0,
+            addresses: Vec::new(),
             mtu,
         }
     }

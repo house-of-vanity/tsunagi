@@ -58,31 +58,22 @@ fn start_bare(port: u16) -> Running {
     Running { child, dir }
 }
 
+/// An agent already in one network, the way most of these start.
 fn start(network: &str, port: u16) -> Running {
-    let dir = TempDir::new().unwrap();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
-        .args([
-            "up",
-            "--network",
-            network,
-            "--secret",
-            "a-secret-for-the-cli-test",
-        ])
-        .arg("--state-dir")
-        .arg(dir.path().join("state"))
-        .arg("--cache-dir")
-        .arg(dir.path().join("cache"))
-        .args(["--reach", "local", "--no-tun"])
-        .arg("--bind")
-        .arg(format!("127.0.0.1:{port}"))
-        .args(["--log", "error", "--status-interval", "0"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("the agent binary starts");
-    // Long enough for the control socket to be there to talk to.
-    std::thread::sleep(Duration::from_secs(2));
-    Running { child, dir }
+    let agent = start_bare(port);
+    let joined = agent.run(&[
+        "join",
+        "--network",
+        network,
+        "--secret",
+        "a-secret-for-the-cli-test",
+    ]);
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    agent
 }
 
 #[test]
@@ -109,26 +100,24 @@ fn joining_with_no_secret_makes_one_and_prints_what_to_send() {
     assert!(secret.starts_with("tsn1"), "{out}");
     let command = out
         .lines()
-        .find(|line| line.contains("tsunagi up --network spontaneous"))
+        .find(|line| line.contains("tsunagi join --network spontaneous"))
         .expect("a command to send");
     assert!(command.contains(secret), "with the secret in it: {out}");
-    assert!(
-        command.contains("--peer "),
-        "and somewhere to find us: {out}"
-    );
+    // And where to find this device, for an agent that is not up yet.
+    assert!(out.contains("--peer "), "somewhere to find us: {out}");
 
     // Joining the same name again resumes it rather than making another
     // network that merely looks the same.
     let again = agent.run(&["network", "join", "--network", "spontaneous"]);
     let out = String::from_utf8_lossy(&again.stdout);
     assert!(again.status.success());
-    assert!(out.contains("already configured"), "{out}");
+    assert!(out.contains("already here"), "{out}");
     assert!(!out.contains("secret  tsn1"), "no second secret: {out}");
 }
 
 #[test]
 fn a_bare_name_resumes_the_network_of_that_name_rather_than_inventing_one() {
-    // `up --network resident` with no secret is the same rule: this device
+    // `join --network resident` with no secret is the same rule: this device
     // has exactly one network of that name, so that is the one meant.
     let agent = start("resident", 45072);
     let listed = agent.run(&["network"]);
@@ -144,7 +133,7 @@ fn a_bare_name_resumes_the_network_of_that_name_rather_than_inventing_one() {
     assert!(joined.status.success());
     let out = String::from_utf8_lossy(&joined.stdout);
     assert!(out.contains(&id), "the same network, not a new one: {out}");
-    assert!(out.contains("already configured"), "{out}");
+    assert!(out.contains("already here"), "{out}");
 }
 
 #[test]
@@ -238,17 +227,26 @@ fn an_agent_starts_with_no_network_and_takes_one_later() {
 }
 
 #[test]
-fn a_secret_with_no_network_is_refused_rather_than_ignored() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
-        .args(["up", "--secret", "tsn1whatever"])
-        .arg("--state-dir")
-        .arg(TempDir::new().unwrap().path().join("state"))
-        .output()
-        .expect("the agent binary runs");
-    assert!(!out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("says nothing without a network"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+fn up_is_the_agent_and_takes_no_network_at_all() {
+    // The two commands are separate on purpose: `up` runs the device's
+    // agent, `join` decides what it is in. A network on `up` would be a
+    // second way to do the same thing, and the one that cannot be undone
+    // without a restart.
+    for argument in ["--network", "--secret"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+            .args(["up", argument, "whatever"])
+            .arg("--state-dir")
+            .arg(TempDir::new().unwrap().path().join("state"))
+            .output()
+            .expect("the agent binary runs");
+        assert!(
+            !out.status.success(),
+            "`up {argument}` should not be a thing"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

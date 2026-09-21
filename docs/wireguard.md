@@ -206,8 +206,9 @@ edit. Reconciliation is purely "do the running tunnels match what is known".
 ## Using it
 
 ```bash
-# On both machines
-tsunagi up --network lab --secret "$SECRET" --wireguard
+# On both machines: the agent, then the network
+tsunagi up
+tsunagi join --network lab --secret "$SECRET"
 ```
 
 See the two-machine walkthrough in [../README.md](../README.md#trying-it-on-two-machines).

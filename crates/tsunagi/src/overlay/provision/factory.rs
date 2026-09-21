@@ -11,20 +11,18 @@ use std::sync::Arc;
 use crate::BoxFuture;
 use crate::overlay::OverlayError;
 
-use super::super::config::Cidr;
 use super::super::tun::{TunDevice, TunFactory, TunRequest};
 use super::{InterfacePlan, InterfaceProvisioner};
 
 /// Turns a [`TunRequest`] into the plan for a host interface.
 fn plan_for(request: &TunRequest) -> Result<InterfacePlan, OverlayError> {
-    let mut addresses = Vec::new();
-    if let Some(address) = request.address {
-        addresses.push(Cidr::new(address.into(), request.prefix_len)?);
-    }
+    // Every address, because the plan is exhaustive: the provisioner adds
+    // what is missing and removes what is not in it. Passing one network's
+    // address would take every other network's off the host.
     Ok(InterfacePlan::new(
         request.name.clone(),
         request.mtu,
-        addresses,
+        request.addresses.clone(),
     ))
 }
 
@@ -113,14 +111,21 @@ mod tests {
 
     use std::net::Ipv4Addr;
 
+    use super::super::super::config::Cidr;
     use super::super::{LinkKind, MockHost, MockProvisioner};
     use super::*;
 
     fn request(v4: Option<Ipv4Addr>) -> TunRequest {
+        addressed(v4.into_iter().collect())
+    }
+
+    fn addressed(v4: Vec<Ipv4Addr>) -> TunRequest {
         TunRequest {
             name: "tsunfactory".into(),
-            address: v4,
-            prefix_len: 24,
+            addresses: v4
+                .into_iter()
+                .map(|address| Cidr::new(address.into(), 24).unwrap())
+                .collect(),
             mtu: 1280,
         }
     }
@@ -200,5 +205,51 @@ mod tests {
         let factory = ManagedTunFactory::new(Arc::new(MockProvisioner::new(host)));
         let err = factory.create(request(None)).await.unwrap_err();
         assert!(err.to_string().contains("bridge"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn every_network_s_address_reaches_the_host_not_just_the_first() {
+        // One agent has one interface and a network apiece on it. Carrying
+        // only the first address is carrying only the first network: the
+        // rest have addresses the operating system has never heard of, and
+        // their traffic goes nowhere while the status says all is well.
+        let provisioner = Arc::new(MockProvisioner::default());
+        let factory = ManagedTunFactory::new(provisioner.clone());
+        factory
+            .create(addressed(vec![
+                Ipv4Addr::new(10, 13, 37, 69),
+                Ipv4Addr::new(10, 156, 200, 116),
+            ]))
+            .await
+            .unwrap();
+
+        let state = provisioner.host().get("tsunfactory").unwrap();
+        let addresses: Vec<String> = state
+            .addresses
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        assert!(
+            addresses.contains(&"10.13.37.69/24".to_string()),
+            "{addresses:?}"
+        );
+        assert!(
+            addresses.contains(&"10.156.200.116/24".to_string()),
+            "{addresses:?}"
+        );
+
+        // And leaving one network takes its address off, because the plan
+        // is what the interface should carry and nothing else.
+        factory
+            .reconfigure(addressed(vec![Ipv4Addr::new(10, 13, 37, 69)]))
+            .await
+            .unwrap();
+        let state = provisioner.host().get("tsunfactory").unwrap();
+        let addresses: Vec<String> = state
+            .addresses
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        assert_eq!(addresses, vec!["10.13.37.69/24".to_string()]);
     }
 }

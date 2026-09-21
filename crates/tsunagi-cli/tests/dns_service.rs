@@ -98,51 +98,63 @@ impl Drop for Running {
 /// There is no separate zone setting: an agent serves a zone per network,
 /// named after it, so the network name is the zone name.
 fn start(zone: &str, port: u16) -> Running {
+    let agent = start_without_dns_at(zone, Some(port));
+    let joined = agent.run(&[
+        "join",
+        "--network",
+        zone,
+        "--secret",
+        "a-secret-for-the-dns-test",
+    ]);
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    agent
+}
+
+/// Starts an agent in one network with the resolver off, to switch on later.
+fn start_without_dns(network: &str) -> Running {
+    let agent = start_without_dns_at(network, None);
+    let joined = agent.run(&[
+        "join",
+        "--network",
+        network,
+        "--secret",
+        "a-secret-for-the-dns-test",
+    ]);
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    agent
+}
+
+/// The agent alone: `up` runs it, and what it belongs to is decided after.
+fn start_without_dns_at(_network: &str, dns_port: Option<u16>) -> Running {
     let dir = TempDir::new().unwrap();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
-        .args([
-            "up",
-            "--network",
-            zone,
-            "--secret",
-            "a-secret-for-the-dns-test",
-        ])
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"));
+    command
+        .arg("up")
         .arg("--state-dir")
         .arg(dir.path().join("state"))
         .arg("--cache-dir")
         .arg(dir.path().join("cache"))
         // No real interface and no internet: this is about the wiring.
-        .args(["--reach", "local", "--no-tun", "--dns"])
-        .args(["--dns-port", &port.to_string()])
+        .args(["--reach", "local", "--no-tun"]);
+    if let Some(port) = dns_port {
+        command.arg("--dns").args(["--dns-port", &port.to_string()]);
+    }
+    let child = command
         .args(["--log", "error", "--status-interval", "0"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("the agent binary starts");
-    Running { child, dir }
-}
-
-/// Starts an agent with the resolver off, to be switched on later.
-fn start_without_dns(network: &str) -> Running {
-    let dir = TempDir::new().unwrap();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
-        .args([
-            "up",
-            "--network",
-            network,
-            "--secret",
-            "a-secret-for-the-dns-test",
-        ])
-        .arg("--state-dir")
-        .arg(dir.path().join("state"))
-        .arg("--cache-dir")
-        .arg(dir.path().join("cache"))
-        .args(["--reach", "local", "--no-tun"])
-        .args(["--log", "error", "--status-interval", "0"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("the agent binary starts");
+    // Long enough for the control socket to be there to talk to.
+    std::thread::sleep(Duration::from_secs(2));
     Running { child, dir }
 }
 
@@ -213,7 +225,6 @@ fn every_network_gets_a_zone_of_its_own() {
     wait_for_answer(server, &format!("{host}.first.internal"));
 
     let joined = agent.run(&[
-        "network",
         "join",
         "--network",
         "second.internal",

@@ -70,18 +70,29 @@ On the first machine:
 
 ```bash
 cargo build --release
-./target/release/tsunagi network secret generate   # prints tsn1...; share it privately
 ./target/release/tsunagi status          # this device, the agent, and this host
 ./target/release/tsunagi network         # the networks this device belongs to
-
-./target/release/tsunagi up --network lab --secret "$SECRET"
 ```
 
-It prints its endpoint id and then waits. On the second machine, pass that id:
+Two commands do the work, and they are separate on purpose: `up` runs the
+agent — one per device, for as long as you want it — and `join` decides
+what it belongs to, at any time, while it runs.
 
 ```bash
-./target/release/tsunagi up --network lab --secret "$SECRET" \
-  --peer <endpoint-id-from-the-first-machine>
+# Terminal one: the agent. It prints its endpoint id and then serves.
+./target/release/tsunagi up
+
+# Terminal two: make a network. With no --secret it invents one and prints
+# it, along with the line to send the other machine.
+./target/release/tsunagi join --network lab
+```
+
+On the second machine, start its agent with the first machine's endpoint id
+and join the same network with the secret that was printed:
+
+```bash
+./target/release/tsunagi up --peer <endpoint-id-from-the-first-machine>
+./target/release/tsunagi join --network lab --secret tsn1...
 ```
 
 Within a few seconds both print something like:
@@ -132,8 +143,8 @@ ping  100.65.243.53
 what they find, so `--ipv4-range` only matters for whoever starts the network:
 
 ```bash
-tsunagi up --network lab --secret "$SECRET"  --ipv4-range 10.44.0.0/16
-tsunagi up --network lab --secret "$SECRET"  --ipv4-range none   # no data plane
+tsunagi up --ipv4-range 10.44.0.0/16
+tsunagi up --ipv4-range none   # no data plane at all
 ```
 
 One agent has one interface, so two of its networks cannot both use that
@@ -195,7 +206,7 @@ each named after the network, so members can be reached by name instead of
 by address:
 
 ```bash
-tsunagi up --network lab --secret "$SECRET" --dns
+tsunagi up --dns          # or `tsunagi dns on` against a running agent
 dig @127.0.0.1 -p 5354 music.lab
 ```
 
@@ -336,29 +347,29 @@ tsunagi dns on                  start it, now and after every restart
 tsunagi dns off                 stop it, now and after every restart
 ```
 
-**A network without a secret makes one.** `tsunagi up --network lab` and
-`tsunagi network join --network lab` both resolve a bare name the same way: if this device is already in exactly
-one network called `lab`, that one — so the name alone resumes what you have;
-if it is in none, a fresh random secret, printed in full along with the one
-line to send the others:
+**A network without a secret makes one.** `tsunagi join --network lab`
+resolves a bare name in the obvious way: if this device is already in
+exactly one network called `lab`, that one — so the name alone resumes what
+you have; if it is in none, a fresh random secret, printed in full with the
+line to send the other machine:
 
 ```
-tsunagi is up
-  network      lab (k2on43wadb…)
-  secret       tsn1u7c…
+joined `lab` (k2on43wadbi5x267vp6z3ogkm7nbjedfdoxyauxhtxhwqrprylba)
+  secret  tsn1u7c…
 
-No --peer was given, so this agent waits to be contacted. Run this on the
-other machine:
+Run this on the other machine:
 
-  tsunagi up --network lab --secret tsn1u7c… --peer 91e83a6e2b7a…
+  tsunagi join --network lab --secret tsn1u7c…
+
+Its agent has to be running. If it is not:
+
+  tsunagi up --peer 91e83a6e2b7a…
 ```
 
-`up` says which of the two happened — `· new` or `· already here` beside
-the network — and warns when the name is one another configured network
-also answers to, because a name is a label and the id is the identity. A
-command line with a different secret makes a *different* network of the
-same name, and that is how a network you left comes back: the secret on the
-command line is what decides which network it is.
+Two networks of one name is a thing that happens — a mistyped secret makes
+one — so joining says whether the network was already here, and warns when
+another configured network answers to the same name. A name is a label and
+the id is the identity.
 
 That is the ad-hoc case: one person makes a network and sends the command
 round. The secret is printed *only* when the agent invented it — there is
