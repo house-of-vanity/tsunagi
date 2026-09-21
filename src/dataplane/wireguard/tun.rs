@@ -337,12 +337,20 @@ mod system {
 
                 let mut config = tun::Configuration::default();
                 config.tun_name(&request.name);
-                if !existed {
-                    // Only configure what we are creating ourselves.
-                    // Reconfiguring somebody else's prepared interface would
-                    // need privileges we are trying not to require.
+                if existed {
+                    // Attach only. Reconfiguring an interface somebody
+                    // prepared for us would need exactly the privileges we
+                    // are avoiding, so no ioctl beyond TUNSETIFF is issued.
+                    config.platform_config(|platform| {
+                        platform.ensure_root_privileges(false);
+                    });
+                } else {
+                    // We are creating it, so we configure it.
                     config.mtu(request.mtu as u16).up();
                 }
+                // Packet information stays off, so reads and writes are raw IP
+                // packets. `ip tuntap add ... mode tun` also defaults to no
+                // packet information, so the flags match when attaching.
 
                 let device = tun::create_as_async(&config).map_err(|err| {
                     let hint = if existed {
