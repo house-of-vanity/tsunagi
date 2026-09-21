@@ -370,6 +370,11 @@ A secret is printed by `network secret` and nowhere else — not by `id`, not
 by `status`, not in a log, a `Debug` rendering or anything sent to a peer.
 Asking for it is deliberate, because these reports get pasted into chats.
 
+**`up` takes no network at all** if you would rather decide later: it
+brings up the agent and whatever it is already configured for, and waits.
+That is the shape of a daemon in one terminal and `tsunagi network join`
+in another.
+
 `network join` is also the answer to a question `up` cannot: a state
 directory belongs to one live agent, so a second `tsunagi up` cannot add a
 network to the one already running. This adds it over the control socket and

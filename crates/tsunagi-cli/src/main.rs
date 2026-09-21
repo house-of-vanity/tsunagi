@@ -312,8 +312,13 @@ struct UpArgs {
     paths: PathArgs,
 
     /// Network name. Must be identical on every participant.
+    ///
+    /// Optional: with no network this starts the agent and whatever it is
+    /// already configured for, and `tsunagi network join` adds networks to
+    /// it while it runs. One agent, one identity, as many networks as you
+    /// like.
     #[arg(long, short = 'n')]
-    network: String,
+    network: Option<String>,
 
     /// The shared secret, as printed by `tsunagi secret`.
     #[arg(
@@ -3154,19 +3159,36 @@ async fn netwatch_addresses() -> Vec<std::net::IpAddr> {
 }
 
 async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let name = NetworkName::new(args.network.clone())?;
     let paths = args.paths.resolve()?;
-    let (secret, secret_origin) = resolve_secret(
-        &paths,
-        &name,
-        args.secret.as_deref(),
-        args.secret_file.as_deref(),
-    )?;
-    // Read before anything joins, because afterwards everything is
-    // configured and the difference is what the user needs to see.
-    let network_id = tsunagi::identity::NetworkKeys::derive(&name, &secret).network_id();
-    let (known_before, name_shared_with) =
-        network_context(&stored_networks(&paths), &name, network_id);
+    // A network on the command line is joined at start; without one the
+    // agent brings up whatever it is already configured for and waits for
+    // `tsunagi network join`.
+    let joining = match &args.network {
+        Some(network) => {
+            let name = NetworkName::new(network.clone())?;
+            let (secret, origin) = resolve_secret(
+                &paths,
+                &name,
+                args.secret.as_deref(),
+                args.secret_file.as_deref(),
+            )?;
+            // Read before anything joins, because afterwards everything is
+            // configured and the difference is what the user needs to see.
+            let network_id = tsunagi::identity::NetworkKeys::derive(&name, &secret).network_id();
+            let (standing, shared) = network_context(&stored_networks(&paths), &name, network_id);
+            Some((name, secret, origin, standing, shared))
+        }
+        None => {
+            if args.secret.is_some() || args.secret_file.is_some() {
+                return Err(
+                    "a secret says nothing without a network: add --network, or leave both \
+                     out to start the agent with what it is already configured for"
+                        .into(),
+                );
+            }
+            None
+        }
+    };
 
     // Parsed up front so a typo is reported immediately, and so the option is
     // never silently ignored when the data plane is off.
@@ -3291,15 +3313,19 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         Err(tsunagi::Error::StateLocked { path }) => {
             let socket = control_socket(&paths, args.control_socket.as_ref());
             if socket.exists() {
+                let named = joining
+                    .as_ref()
+                    .map_or_else(|| "<name>".to_string(), |(name, ..)| name.to_string());
                 return Err(format!(
                     "an agent is already running for {}, and one state directory is one \
                      agent.\n\n\
-                     To add `{name}` to it — same device, same interface, another network:\n\n  \
-                     tsunagi network join --network {name} --secret <secret>\n\n\
+                     To add `{named}` to it — same device, same interface, another \
+                     network:\n\n  \
+                     tsunagi network join --network {named}\n\n\
                      To run a second, separate agent instead, give it everything of its \
                      own:\n\n  \
                      tsunagi up --state-dir <dir> --cache-dir <dir> --interface tsun1 \
-                     --ipv4-range <cidr> --network {name} --secret <secret>\n\n\
+                     --ipv4-range <cidr> --network {named}\n\n\
                      That is a different identity with its own interface, not this one \
                      with another network. `tsunagi network` lists what this one has.",
                     path.display()
@@ -3313,36 +3339,49 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // From here on every exit goes through `agent.shutdown()`, so the endpoint
     // is never dropped without being closed.
     let mut events = agent.subscribe();
-    let network = match agent.join_network(&name, &secret).await {
-        Ok(network) => network,
-        Err(err) => {
-            agent.shutdown().await;
-            return Err(err.into());
-        }
+    let joined = match &joining {
+        Some((name, secret, _, _, _)) => match agent.join_network(name, secret).await {
+            Ok(network) => Some(network),
+            Err(err) => {
+                agent.shutdown().await;
+                return Err(err.into());
+            }
+        },
+        None => None,
     };
 
     println!("tsunagi is up");
     println!("  endpoint id  {}", agent.endpoint_id());
     println!("  hostname     {}", agent.hostname());
-    // Whether this command line just made a network or picked up one that
-    // was already here. Without it, a secret that has quietly created a
-    // second network of the same name — or recreated one that was left —
-    // looks exactly like the network you meant.
-    println!(
-        "  network      {name} ({network})  ·  {}",
-        known_before.label()
-    );
+    match (&joining, joined) {
+        // Whether this command line just made a network or picked up one
+        // that was already here. Without it, a secret that has quietly
+        // created a second network of the same name — or recreated one
+        // that was left — looks exactly like the network you meant.
+        (Some((name, _, _, standing, _)), Some(network)) => {
+            println!("  network      {name} ({network})  ·  {}", standing.label())
+        }
+        _ => {
+            let configured = agent.list_networks().await.unwrap_or_default();
+            let running = configured.iter().filter(|network| network.active).count();
+            println!(
+                "  networks     {}",
+                match configured.len() {
+                    0 =>
+                        "none yet  ·  `tsunagi network join --network <name>` adds one".to_string(),
+                    total =>
+                        format!("{running} of {total} running  ·  `tsunagi network` lists them"),
+                }
+            );
+        }
+    }
     println!("  state        {}", paths.state_dir.display());
     // One line, everything the other side needs, ready to paste. The
     // secret is printed in full only when this agent invented it: then
     // there is nowhere else to read it from, and an ad-hoc network is
     // exactly "one person made it and sent the command round". A secret
     // the user supplied is theirs already and is not echoed.
-    let shareable = match secret_origin {
-        SecretOrigin::Generated => secret.encode().as_str().to_string(),
-        SecretOrigin::Given | SecretOrigin::Stored => "<secret>".to_string(),
-    };
-    if secret_origin == SecretOrigin::Generated {
+    if let Some((_, secret, SecretOrigin::Generated, _, _)) = &joining {
         println!("  secret       {}", secret.encode().as_str());
     }
     // A local resolver for every network this agent is in, each a zone
@@ -3383,7 +3422,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // A name is a label and an id is the identity, so two networks can be
     // called the same thing and share nothing. Almost always a mistyped
     // secret, and the one mistake that makes a report unreadable.
-    if let Some(other) = &name_shared_with {
+    if let Some((name, _, _, _, Some(other))) = &joining {
         eprintln!(
             "\nwarning: `{name}` is also configured here with a different secret, as {}.\n\
              A network is its name *and* its secret, so these two share nothing. If that\n\
@@ -3394,8 +3433,15 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Last, after the facts, because it is the line to act on: one
-    // command with everything the other side needs.
-    if args.peers.is_empty() {
+    // command with everything the other side needs. Only when a network
+    // was named — with none there is nothing to invite anybody to.
+    if args.peers.is_empty()
+        && let Some((name, secret, origin, _, _)) = &joining
+    {
+        let shareable = match origin {
+            SecretOrigin::Generated => secret.encode().as_str().to_string(),
+            SecretOrigin::Given | SecretOrigin::Stored => "<secret>".to_string(),
+        };
         println!(
             "\nNo --peer was given, so this agent waits to be contacted. \
              Run this on the other machine:\n\n  \
@@ -3428,7 +3474,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                     None => std::future::pending::<()>().await,
                 }
             }, if ticker.is_some() => {
-                print_status(&agent, network, wireguard.as_deref()).await;
+                print_status(&agent, joined, wireguard.as_deref()).await;
             }
         }
     }
@@ -3689,7 +3735,24 @@ fn print_event(event: &Event) {
     }
 }
 
-async fn print_status(agent: &Agent, network: NetworkId, wireguard: Option<&WireguardPlugin>) {
+async fn print_status(
+    agent: &Agent,
+    network: Option<NetworkId>,
+    wireguard: Option<&WireguardPlugin>,
+) {
+    // The network this command line named, or — when it named none — the
+    // first one the agent has, since there is no other candidate for "the"
+    // network and `tsunagi status` covers the whole picture anyway.
+    let network = match network {
+        Some(network) => network,
+        None => match agent.list_networks().await {
+            Ok(networks) => match networks.iter().find(|network| network.active) {
+                Some(network) => network.network_id,
+                None => return,
+            },
+            Err(_) => return,
+        },
+    };
     let Ok(status) = agent.network_status(network).await else {
         return;
     };

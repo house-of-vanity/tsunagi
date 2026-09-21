@@ -36,6 +36,28 @@ impl Running {
     }
 }
 
+/// An agent with no network at all, the way a daemon is started before
+/// anything has been decided.
+fn start_bare(port: u16) -> Running {
+    let dir = TempDir::new().unwrap();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+        .arg("up")
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--cache-dir")
+        .arg(dir.path().join("cache"))
+        .args(["--reach", "local", "--no-tun"])
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .args(["--log", "error", "--status-interval", "0"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the agent binary starts");
+    std::thread::sleep(Duration::from_secs(2));
+    Running { child, dir }
+}
+
 fn start(network: &str, port: u16) -> Running {
     let dir = TempDir::new().unwrap();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
@@ -186,5 +208,47 @@ fn a_network_can_be_stopped_and_resumed_without_losing_anything() {
         String::from_utf8_lossy(&secret_after.stdout).trim(),
         secret_before,
         "the secret is kept, so this is the same network"
+    );
+}
+
+#[test]
+fn an_agent_starts_with_no_network_and_takes_one_later() {
+    // A daemon in one terminal and the deciding done in another: the
+    // agent is the identity, and which networks it is in is a separate
+    // question it can answer at any time.
+    let agent = start_bare(45074);
+
+    let listed = agent.run(&["network"]);
+    assert!(listed.status.success());
+    assert!(
+        String::from_utf8_lossy(&listed.stderr).contains("no network has been joined"),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+
+    let joined = agent.run(&["network", "join", "--network", "afterwards"]);
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    let listed = String::from_utf8_lossy(&agent.run(&["network"]).stdout).to_string();
+    assert!(listed.contains("afterwards"), "{listed}");
+    assert!(listed.contains("running"), "and it is live: {listed}");
+}
+
+#[test]
+fn a_secret_with_no_network_is_refused_rather_than_ignored() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+        .args(["up", "--secret", "tsn1whatever"])
+        .arg("--state-dir")
+        .arg(TempDir::new().unwrap().path().join("state"))
+        .output()
+        .expect("the agent binary runs");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("says nothing without a network"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
