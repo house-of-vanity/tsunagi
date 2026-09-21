@@ -13,7 +13,6 @@
 //!   Creating one needs `CAP_NET_ADMIN`, and it is
 //!   [`provision`](super::provision) that holds that and creates it.
 
-use std::net::Ipv6Addr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -26,14 +25,13 @@ use crate::overlay::OverlayError;
 pub struct TunRequest {
     /// Interface name to ask for.
     pub name: String,
-    /// The overlay address this host answers to.
-    pub address: Ipv6Addr,
-    /// Prefix length of the overlay subnet, so the OS routes it here.
+    /// The overlay address this host answers to, and its prefix length.
+    ///
+    /// Allocated and signed at the system level, never derived from a
+    /// protocol's key: every protocol carries traffic for the same address.
+    pub address: Option<std::net::Ipv4Addr>,
+    /// Prefix length of the overlay range.
     pub prefix_len: u8,
-    /// The IPv4 overlay address this host answers to, when dual stack.
-    pub address_v4: Option<std::net::Ipv4Addr>,
-    /// Prefix length of the IPv4 overlay range.
-    pub prefix_len_v4: u8,
     /// Interface MTU.
     pub mtu: u32,
 }
@@ -46,10 +44,8 @@ impl TunRequest {
     pub fn bare(name: impl Into<String>, mtu: u32) -> Self {
         Self {
             name: name.into(),
-            address: Ipv6Addr::UNSPECIFIED,
+            address: None,
             prefix_len: 0,
-            address_v4: None,
-            prefix_len_v4: 0,
             mtu,
         }
     }

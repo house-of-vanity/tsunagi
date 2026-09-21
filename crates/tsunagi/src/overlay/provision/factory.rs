@@ -17,9 +17,9 @@ use super::{InterfacePlan, InterfaceProvisioner};
 
 /// Turns a [`TunRequest`] into the plan for a host interface.
 fn plan_for(request: &TunRequest) -> Result<InterfacePlan, OverlayError> {
-    let mut addresses = vec![Cidr::new(request.address.into(), request.prefix_len)?];
-    if let Some(address) = request.address_v4 {
-        addresses.push(Cidr::new(address.into(), request.prefix_len_v4)?);
+    let mut addresses = Vec::new();
+    if let Some(address) = request.address {
+        addresses.push(Cidr::new(address.into(), request.prefix_len)?);
     }
     Ok(InterfacePlan::new(
         request.name.clone(),
@@ -106,7 +106,7 @@ impl TunFactory for ManagedTunFactory {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::Ipv4Addr;
 
     use super::super::{LinkKind, MockHost, MockProvisioner};
     use super::*;
@@ -114,10 +114,8 @@ mod tests {
     fn request(v4: Option<Ipv4Addr>) -> TunRequest {
         TunRequest {
             name: "tsunfactory".into(),
-            address: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
-            prefix_len: 64,
-            address_v4: v4,
-            prefix_len_v4: 24,
+            address: v4,
+            prefix_len: 24,
             mtu: 1280,
         }
     }
@@ -137,7 +135,7 @@ mod tests {
         let state = provisioner.host().get("tsunfactory").unwrap();
         assert_eq!(state.kind, LinkKind::Tun);
         assert_eq!(state.mtu, 1280);
-        assert_eq!(state.addresses.len(), 2, "both families are assigned");
+        assert_eq!(state.addresses.len(), 1, "the overlay address is assigned");
     }
 
     #[tokio::test]

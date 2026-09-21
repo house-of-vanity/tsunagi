@@ -185,13 +185,9 @@ pub struct OverlayReport {
     pub interface: String,
     /// Interface MTU.
     pub mtu: u32,
-    /// This agent's overlay address.
-    pub address: String,
-    /// This agent's IPv4 overlay address, when the overlay is dual stack.
-    pub address_v4: Option<String>,
-    /// The subnet every member shares.
-    pub prefix: String,
-    /// Prefix length of that subnet.
+    /// This agent's overlay address, once the network has agreed one.
+    pub address: Option<String>,
+    /// Prefix length of the overlay range every member shares.
     pub prefix_len: u8,
     /// One entry per overlay peer.
     pub peers: Vec<OverlayPeerReport>,
@@ -211,10 +207,8 @@ pub struct OverlayPeerReport {
     pub endpoint_id: String,
     /// The peer's WireGuard public key.
     pub public_key: String,
-    /// Its overlay address.
-    pub address: String,
-    /// Its IPv4 overlay address, when it has one.
-    pub address_v4: Option<String>,
+    /// The overlay address the network agreed it holds.
+    pub address: Option<String>,
     /// Seconds since the last WireGuard handshake.
     ///
     /// `None` means the tunnel has never handshaken and cannot carry traffic.

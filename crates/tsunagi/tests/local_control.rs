@@ -48,15 +48,14 @@ fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::u
                         tsunagi::ipc::OverlayReport {
                             interface: view.interface.clone(),
                             mtu: view.mtu,
-                            address: view.overlay_address.to_string(),
-                            prefix: view.overlay_prefix.to_string(),
-                            prefix_len: view.overlay_prefix_len,
+                            address: view.overlay_address_v4.map(|a| a.to_string()),
+                            prefix_len: view.ipv4_range.map_or(0, |range| range.prefix_len),
                             peers: view
                                 .peers
                                 .iter()
                                 .map(|peer| tsunagi::ipc::OverlayPeerReport {
                                     public_key: peer.public_key.to_string(),
-                                    address: peer.overlay_address.to_string(),
+                                    address: peer.overlay_address_v4.map(|a| a.to_string()),
                                     handshake_secs_ago: peer
                                         .tunnel
                                         .as_ref()
@@ -168,7 +167,7 @@ async fn a_client_sees_the_agent_and_its_overlay() {
         "the tunnel is up: {:?}",
         overlay.peers
     );
-    assert!(!overlay.address.is_empty());
+    assert!(overlay.address.is_some());
 
     control.shutdown().await;
     assert!(!socket_path.exists(), "the socket is removed on shutdown");

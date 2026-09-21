@@ -44,7 +44,6 @@
 pub mod announcement;
 pub mod device;
 pub mod keys;
-pub mod overlay;
 pub mod plugin;
 pub mod store;
 
@@ -64,7 +63,6 @@ pub use crate::overlay::{
 };
 pub use device::{PeerHealth, PeerStats, PeerSummary, WireguardDevice};
 pub use keys::{WgPublicKey, WgSecretKey};
-pub use overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_address_v4, overlay_prefix};
 pub use plugin::{
     DEFAULT_MTU, MIN_MTU, NetworkOverview, PeerOverview, WIREGUARD_OVERHEAD, WIREGUARD_PROTOCOL,
     WireguardConfig, WireguardPlugin,

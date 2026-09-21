@@ -94,11 +94,12 @@ fn v4(state: &InterfaceState) -> Vec<Ipv4Addr> {
         .collect()
 }
 
-fn has_v6(state: &InterfaceState) -> bool {
-    state
-        .addresses
-        .iter()
-        .any(|cidr| matches!(cidr.addr, IpAddr::V6(_)))
+/// Whether the overlay address has been put on the interface yet.
+///
+/// It is allocated and signed at the system level, so it arrives on a later
+/// reconciliation than the interface itself rather than with it.
+fn addressed(state: &InterfaceState) -> bool {
+    !state.addresses.is_empty()
 }
 
 #[tokio::test]
@@ -111,18 +112,13 @@ async fn an_agent_creates_and_configures_its_own_overlay_interface() {
     let interface = agent.interface(network_id).await;
 
     let state = agent
-        .wait_for_host("the interface to be created", &interface, |state| {
-            state.filter(|state| !state.addresses.is_empty())
-        })
+        .wait_for_host("the interface to be created", &interface, |state| state)
         .await;
 
     assert_eq!(state.kind, LinkKind::Tun);
     assert!(state.up, "the agent brought the link up itself");
     assert_eq!(state.mtu, 1280);
-    assert!(has_v6(&state), "the derived overlay address is assigned");
 
-    // The IPv4 address is allocated at run time, so it arrives on a later
-    // reconciliation than the interface itself.
     let addresses = agent
         .wait_for_host("the allocated IPv4 address", &interface, |state| {
             state.map(|state| v4(&state)).filter(|v4| !v4.is_empty())
@@ -160,9 +156,14 @@ async fn an_interface_left_by_a_crashed_run_is_replaced_rather_than_tripped_over
     let network_id = agent.agent.join_network(&name, &secret).await.unwrap();
     assert_eq!(agent.interface(network_id).await, interface);
 
+    // Waited on directly rather than on "it has some address": the address
+    // this agent was allocated arrives a reconciliation after the interface
+    // does, and in between the leftover is still the only one there.
     let state = agent
-        .wait_for_host("the interface to be rebuilt", &interface, |state| {
-            state.filter(|state| state.attached && has_v6(state))
+        .wait_for_host("the stale address to be replaced", &interface, |state| {
+            state.filter(|state| {
+                state.attached && addressed(state) && !state.addresses.contains(&stale)
+            })
         })
         .await;
     assert!(

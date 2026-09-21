@@ -1152,7 +1152,7 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
             let row = entry(&mut rows, &peer.endpoint_id);
             row.tunnel = Some(peer);
             if row.overlay_address_v4.is_none() {
-                row.overlay_address_v4 = peer.address_v4.as_deref();
+                row.overlay_address_v4 = peer.address.as_deref();
             }
         }
     }
@@ -1197,13 +1197,11 @@ fn network_section(network: &tsunagi::ipc::NetworkReport, own_id: &str) -> repor
             Health::Info,
             "overlay",
             format!(
-                "{}  {}/{}{}  mtu {}",
+                "{}  {}  mtu {}",
                 overlay.interface,
-                overlay.address,
-                overlay.prefix_len,
-                match &overlay.address_v4 {
-                    Some(v4) => format!(" and {v4}"),
-                    None => String::new(),
+                match &overlay.address {
+                    Some(address) => format!("{address}/{}", overlay.prefix_len),
+                    None => "no address agreed yet".to_string(),
                 },
                 overlay.mtu
             ),
@@ -2055,18 +2053,15 @@ async fn build_report(
                 .map(|view| OverlayReport {
                     interface: view.interface.clone(),
                     mtu: view.mtu,
-                    address: view.overlay_address.to_string(),
-                    address_v4: view.overlay_address_v4.map(|addr| addr.to_string()),
-                    prefix: view.overlay_prefix.to_string(),
-                    prefix_len: view.overlay_prefix_len,
+                    address: view.overlay_address_v4.map(|addr| addr.to_string()),
+                    prefix_len: view.ipv4_range.map_or(0, |range| range.prefix_len),
                     peers: view
                         .peers
                         .iter()
                         .map(|peer| OverlayPeerReport {
                             endpoint_id: peer.endpoint_id.to_string(),
                             public_key: peer.public_key.to_string(),
-                            address: peer.overlay_address.to_string(),
-                            address_v4: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                            address: peer.overlay_address_v4.map(|addr| addr.to_string()),
                             handshake_secs_ago: peer
                                 .tunnel
                                 .as_ref()
@@ -2283,8 +2278,9 @@ async fn print_status(agent: &Agent, network: NetworkId, wireguard: Option<&Wire
         println!(
             "wireguard: {} on {}/{} mtu {}, {}/{} tunnel(s) established",
             view.interface,
-            view.overlay_address,
-            view.overlay_prefix_len,
+            view.overlay_address_v4
+                .map_or_else(|| "no address yet".to_string(), |addr| addr.to_string()),
+            view.ipv4_range.map_or(0, |range| range.prefix_len),
             view.mtu,
             view.established_peers(),
             view.peers.len()
@@ -2294,7 +2290,8 @@ async fn print_status(agent: &Agent, network: NetworkId, wireguard: Option<&Wire
                 Some(tunnel) => println!(
                     "  {} {} {} tx={} rx={} dropped={} path={}",
                     peer.public_key.fmt_short(),
-                    peer.overlay_address,
+                    peer.overlay_address_v4
+                        .map_or_else(|| "no address".to_string(), |addr| addr.to_string()),
                     match tunnel.health.since_handshake {
                         Some(since) => format!("handshake {}s ago", since.as_secs()),
                         None => "NOT HANDSHAKEN".to_string(),
@@ -2307,7 +2304,8 @@ async fn print_status(agent: &Agent, network: NetworkId, wireguard: Option<&Wire
                 None => println!(
                     "  {} {} waiting for a data link",
                     peer.public_key.fmt_short(),
-                    peer.overlay_address
+                    peer.overlay_address_v4
+                        .map_or_else(|| "no address".to_string(), |addr| addr.to_string())
                 ),
             }
         }
@@ -2337,10 +2335,8 @@ mod status_tests {
         OverlayReport {
             interface: "tsundemo".into(),
             mtu: 1280,
-            address: "fd55::1".into(),
-            address_v4: Some("10.13.37.69".into()),
-            prefix: "fd55::".into(),
-            prefix_len: 64,
+            address: Some("10.13.37.69".into()),
+            prefix_len: 24,
             peers,
             ..Default::default()
         }
@@ -2350,8 +2346,7 @@ mod status_tests {
         OverlayPeerReport {
             endpoint_id: endpoint_id.into(),
             public_key: "keykeykey".into(),
-            address: "fd55::2".into(),
-            address_v4: Some("10.13.37.237".into()),
+            address: Some("10.13.37.237".into()),
             handshake_secs_ago: handshake,
             tx_packets: 32,
             rx_packets: 887,

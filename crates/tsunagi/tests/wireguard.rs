@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use tsunagi::agent::Event;
 use tsunagi::dataplane::IpPlugin;
 use tsunagi::dataplane::wireguard::{
     Ipv4Range, MemoryTun, MemoryTunFactory, WIREGUARD_PROTOCOL, WgAnnouncement, WgSecretKey,
-    WireguardConfig, WireguardPlugin, overlay_address, overlay_prefix,
+    WireguardConfig, WireguardPlugin,
 };
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::{NetworkId, NetworkName, NetworkSecret};
@@ -127,15 +127,14 @@ impl WgAgent {
     }
 
     /// This agent's overlay address in a network.
-    async fn overlay(&self, network: NetworkId) -> Ipv6Addr {
-        let view = wait_until("the plugin prepared the network", || async {
-            self.plugin.overview(network)
+    ///
+    /// Allocated and signed at the system level, so it appears once the
+    /// network has agreed on it rather than the moment the plugin starts.
+    async fn overlay(&self, network: NetworkId) -> Ipv4Addr {
+        wait_until("the network agreed an overlay address", || async {
+            self.plugin.overview(network)?.overlay_address_v4
         })
-        .await;
-        match view.overlay_address {
-            IpAddr::V6(addr) => addr,
-            IpAddr::V4(_) => panic!("the overlay is IPv6"),
-        }
+        .await
     }
 
     /// The in-memory packet interface for a network.
@@ -184,20 +183,6 @@ fn ipv4_packet(source: Ipv4Addr, destination: Ipv4Addr, payload: &[u8]) -> Bytes
     Bytes::from(packet)
 }
 
-/// Builds a minimal well-formed IPv6 packet.
-fn ipv6_packet(source: Ipv6Addr, destination: Ipv6Addr, payload: &[u8]) -> Bytes {
-    let mut packet = Vec::with_capacity(40 + payload.len());
-    packet.push(6 << 4); // version 6
-    packet.extend_from_slice(&[0, 0, 0]); // traffic class and flow label
-    packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    packet.push(59); // "no next header"
-    packet.push(64); // hop limit
-    packet.extend_from_slice(&source.octets());
-    packet.extend_from_slice(&destination.octets());
-    packet.extend_from_slice(payload);
-    Bytes::from(packet)
-}
-
 #[tokio::test]
 async fn two_agents_carry_real_ip_packets_through_a_wireguard_tunnel() {
     let discovery = SharedMemoryDiscovery::new();
@@ -217,12 +202,10 @@ async fn two_agents_carry_real_ip_packets_through_a_wireguard_tunnel() {
     let addr_a = a.overlay(network_id).await;
     let addr_b = b.overlay(network_id).await;
     assert_ne!(addr_a, addr_b);
-    // One shared /64, derived by both sides independently.
-    assert_eq!(addr_a.octets()[0..8], addr_b.octets()[0..8]);
-    assert_eq!(
-        &overlay_prefix(network_id).octets()[0..8],
-        &addr_a.octets()[0..8]
-    );
+    // One shared range, agreed at the system level and signed by each
+    // member, not derived from anything either protocol holds.
+    let range = a.plugin.overview(network_id).unwrap().ipv4_range.unwrap();
+    assert!(range.contains(addr_a) && range.contains(addr_b));
 
     let tun_a = a.tun(network_id).await;
     let tun_b = b.tun(network_id).await;
@@ -230,23 +213,23 @@ async fn two_agents_carry_real_ip_packets_through_a_wireguard_tunnel() {
     // A real IP packet, encrypted by WireGuard, carried over iroh, decrypted
     // on the other side and handed to that host's packet interface.
     let payload = b"hello over the overlay";
-    tun_a.push_from_os(ipv6_packet(addr_a, addr_b, payload));
+    tun_a.push_from_os(ipv4_packet(addr_a, addr_b, payload));
 
     let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
         .await
         .expect("the packet should arrive")
         .expect("the interface should still be open");
-    assert_eq!(&received[40..], payload);
-    assert_eq!(&received[8..24], &addr_a.octets(), "source preserved");
-    assert_eq!(&received[24..40], &addr_b.octets(), "destination preserved");
+    assert_eq!(&received[20..], payload);
+    assert_eq!(&received[12..16], &addr_a.octets(), "source preserved");
+    assert_eq!(&received[16..20], &addr_b.octets(), "destination preserved");
 
     // And back the other way.
-    tun_b.push_from_os(ipv6_packet(addr_b, addr_a, b"and back"));
+    tun_b.push_from_os(ipv4_packet(addr_b, addr_a, b"and back"));
     let back = tokio::time::timeout(common::DEADLINE, tun_a.pop_to_os())
         .await
         .expect("the reply should arrive")
         .unwrap();
-    assert_eq!(&back[40..], b"and back");
+    assert_eq!(&back[20..], b"and back");
 
     let view = a.plugin.overview(network_id).unwrap();
     let tunnel = view.peers[0].tunnel.as_ref().unwrap();
@@ -278,14 +261,14 @@ async fn a_peer_cannot_send_from_an_address_it_does_not_own() {
     let tun_b = b.tun(network_id).await;
 
     // A sends a packet claiming to come from a third party's address.
-    let someone_else: Ipv6Addr = {
+    let someone_else = {
         let mut octets = addr_a.octets();
-        octets[15] ^= 0xff;
-        Ipv6Addr::from(octets)
+        octets[3] ^= 0xff;
+        Ipv4Addr::from(octets)
     };
-    tun_a.push_from_os(ipv6_packet(someone_else, addr_b, b"spoofed"));
+    tun_a.push_from_os(ipv4_packet(someone_else, addr_b, b"spoofed"));
 
-    // B must drop it: the source is not the address derived for A's key.
+    // B must drop it: the source is not the address A holds.
     wait_until("the spoofed packet is dropped", || async {
         let view = b.plugin.overview(network_id)?;
         let tunnel = view.peers.first()?.tunnel.as_ref()?;
@@ -294,19 +277,19 @@ async fn a_peer_cannot_send_from_an_address_it_does_not_own() {
     .await;
 
     // A legitimate packet still goes through, so the tunnel is not broken.
-    tun_a.push_from_os(ipv6_packet(addr_a, addr_b, b"honest"));
+    tun_a.push_from_os(ipv4_packet(addr_a, addr_b, b"honest"));
     let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
         .await
         .expect("the honest packet should arrive")
         .unwrap();
-    assert_eq!(&received[40..], b"honest");
+    assert_eq!(&received[20..], b"honest");
 
     a.shutdown().await;
     b.shutdown().await;
 }
 
 #[tokio::test]
-async fn the_overlay_carries_ipv4_alongside_ipv6() {
+async fn the_overlay_uses_a_range_the_network_was_told_to_use() {
     let discovery = SharedMemoryDiscovery::new();
     let (name, secret) = network("wg-dual-stack");
 
@@ -332,10 +315,9 @@ async fn the_overlay_carries_ipv4_alongside_ipv6() {
             u32::from(Ipv4Addr::new(10, 77, 0, 0))
         );
     }
-    // Each side derived the other's address identically.
+    // Each side learned the other's address from the same signed state.
     assert_eq!(view_a.peers[0].overlay_address_v4, Some(v4_b));
     assert_eq!(view_b.peers[0].overlay_address_v4, Some(v4_a));
-    assert!(!view_a.peers[0].tunnel.as_ref().unwrap().ipv4_conflict);
 
     let tun_a = a.tun(network_id).await;
     let tun_b = b.tun(network_id).await;
@@ -350,17 +332,6 @@ async fn the_overlay_carries_ipv4_alongside_ipv6() {
     assert_eq!(&received[12..16], &v4_a.octets());
     assert_eq!(&received[16..20], &v4_b.octets());
     assert_eq!(&received[20..], b"ipv4 over the overlay");
-
-    // IPv6 keeps working on the same tunnel.
-    let addr_a = a.overlay(network_id).await;
-    let addr_b = b.overlay(network_id).await;
-    tun_a.push_from_os(ipv6_packet(addr_a, addr_b, b"and ipv6 too"));
-    let received = tokio::time::timeout(common::DEADLINE, tun_b.pop_to_os())
-        .await
-        .expect("the IPv6 packet should arrive")
-        .unwrap();
-    assert_eq!(received[0] >> 4, 6);
-    assert_eq!(&received[40..], b"and ipv6 too");
 
     a.shutdown().await;
     b.shutdown().await;
@@ -412,41 +383,6 @@ async fn an_ipv4_source_a_peer_does_not_own_is_dropped() {
         .expect("the honest packet should arrive")
         .unwrap();
     assert_eq!(&received[20..], b"honest v4");
-
-    a.shutdown().await;
-    b.shutdown().await;
-}
-
-#[tokio::test]
-async fn an_ipv6_only_overlay_can_be_asked_for() {
-    let discovery = SharedMemoryDiscovery::new();
-    let (name, secret) = network("wg-v6-only");
-
-    let a = WgAgent::spawn_range(&discovery, "ta", None).await;
-    let b = WgAgent::spawn_range(&discovery, "tb", None).await;
-
-    let network_id = a.agent.join_network(&name, &secret).await.unwrap();
-    b.agent.join_network(&name, &secret).await.unwrap();
-    a.wait_for_tunnels(network_id, 1).await;
-
-    let view = a.plugin.overview(network_id).unwrap();
-    assert_eq!(view.overlay_address_v4, None);
-    assert_eq!(view.ipv4_range, None);
-    assert_eq!(view.peers[0].overlay_address_v4, None);
-    // No IPv4 configured is not a conflict.
-    assert!(!view.peers[0].tunnel.as_ref().unwrap().ipv4_conflict);
-
-    // IPv6 is unaffected.
-    let addr_a = a.overlay(network_id).await;
-    let addr_b = b.overlay(network_id).await;
-    a.tun(network_id)
-        .await
-        .push_from_os(ipv6_packet(addr_a, addr_b, b"v6 only"));
-    let received = tokio::time::timeout(common::DEADLINE, b.tun(network_id).await.pop_to_os())
-        .await
-        .expect("the packet should arrive")
-        .unwrap();
-    assert_eq!(&received[40..], b"v6 only");
 
     a.shutdown().await;
     b.shutdown().await;
@@ -670,8 +606,8 @@ async fn packets_for_an_unknown_address_are_counted_not_broadcast() {
     let tun_b = b.tun(network_id).await;
 
     // Nobody owns this address, so it must not be sent to anybody.
-    let nowhere: Ipv6Addr = "fd00:dead:beef::1".parse().unwrap();
-    tun_a.push_from_os(ipv6_packet(addr_a, nowhere, b"lost"));
+    let nowhere: Ipv4Addr = "192.0.2.111".parse().unwrap();
+    tun_a.push_from_os(ipv4_packet(addr_a, nowhere, b"lost"));
 
     wait_until("the packet is counted as unroutable", || async {
         let view = a.plugin.overview(network_id)?;
@@ -714,13 +650,12 @@ async fn a_mesh_of_three_establishes_every_tunnel() {
     let mut addresses = Vec::new();
     for agent in [&a, &b, &c] {
         let view = agent.plugin.overview(network_id).unwrap();
-        assert_eq!(view.overlay_prefix, IpAddr::V6(overlay_prefix(network_id)));
         assert!(
             view.peers
                 .iter()
                 .all(|peer| peer.public_key != view.public_key)
         );
-        addresses.push(view.overlay_address);
+        addresses.push(agent.overlay(network_id).await);
     }
     addresses.sort();
     addresses.dedup();
@@ -731,12 +666,12 @@ async fn a_mesh_of_three_establishes_every_tunnel() {
     let addr_c = c.overlay(network_id).await;
     a.tun(network_id)
         .await
-        .push_from_os(ipv6_packet(addr_a, addr_c, b"a to c"));
+        .push_from_os(ipv4_packet(addr_a, addr_c, b"a to c"));
     let received = tokio::time::timeout(common::DEADLINE, c.tun(network_id).await.pop_to_os())
         .await
         .expect("the packet should arrive")
         .unwrap();
-    assert_eq!(&received[40..], b"a to c");
+    assert_eq!(&received[20..], b"a to c");
 
     a.shutdown().await;
     b.shutdown().await;
@@ -801,23 +736,19 @@ async fn two_networks_get_separate_interfaces_keys_and_overlays() {
         view_alpha.public_key, view_beta.public_key,
         "one WireGuard identity per network, not one per host"
     );
-    assert_ne!(view_alpha.overlay_prefix, view_beta.overlay_prefix);
     assert_eq!(hub.tuns.devices().len(), 2);
 
     // Traffic in one overlay never surfaces in the other.
-    let hub_alpha = match view_alpha.overlay_address {
-        IpAddr::V6(addr) => addr,
-        IpAddr::V4(_) => panic!("ipv6"),
-    };
+    let hub_alpha = hub.overlay(alpha).await;
     let left_addr = left.overlay(alpha).await;
     hub.tun(alpha)
         .await
-        .push_from_os(ipv6_packet(hub_alpha, left_addr, b"alpha only"));
+        .push_from_os(ipv4_packet(hub_alpha, left_addr, b"alpha only"));
     let seen = tokio::time::timeout(common::DEADLINE, left.tun(alpha).await.pop_to_os())
         .await
         .expect("the packet should arrive")
         .unwrap();
-    assert_eq!(&seen[40..], b"alpha only");
+    assert_eq!(&seen[20..], b"alpha only");
     assert!(
         tokio::time::timeout(
             Duration::from_millis(200),
@@ -863,7 +794,6 @@ async fn restarting_keeps_the_wireguard_identity_and_overlay_address() {
     })
     .await;
     assert_eq!(after.public_key, before.public_key);
-    assert_eq!(after.overlay_address, before.overlay_address);
     assert_eq!(after.interface, before.interface);
 
     // The tunnel comes back on its own.
@@ -930,20 +860,25 @@ async fn the_core_carries_the_payload_without_interpreting_it() {
 }
 
 #[tokio::test]
-async fn a_forged_overlay_claim_is_rejected_and_never_reaches_a_tunnel() {
+async fn an_announcement_for_another_network_never_reaches_a_tunnel() {
     let discovery = SharedMemoryDiscovery::new();
     let name = NetworkName::new("wg-hijack").unwrap();
     let secret = NetworkSecret::generate();
 
     let victim = WgAgent::spawn(&discovery, "tv").await;
     let network_id = victim.agent.join_network(&name, &secret).await.unwrap();
-    let victim_address = victim.overlay(network_id).await;
 
-    // A legitimate member — it knows the secret — claims the victim's overlay
-    // address with its own WireGuard key.
+    // Addresses are not in an announcement any more, so there is no address
+    // to forge. What is left to lie about is which network the key is for —
+    // and a capability is scoped to the session it arrived on, so claiming
+    // another network's is the shape a confused or hostile member takes.
     let attacker_key = WgSecretKey::generate().public();
-    let mut forged = WgAnnouncement::new(network_id, &attacker_key);
-    forged.overlay_address = victim_address;
+    let elsewhere = tsunagi::identity::NetworkKeys::derive(
+        &NetworkName::new("somewhere-else").unwrap(),
+        &NetworkSecret::generate(),
+    )
+    .network_id();
+    let forged = WgAnnouncement::new(elsewhere, &attacker_key);
 
     let forger = Arc::new(ForgingPlugin {
         payload: std::sync::Mutex::new(Some(forged.encode().unwrap())),
@@ -960,14 +895,18 @@ async fn a_forged_overlay_claim_is_rejected_and_never_reaches_a_tunnel() {
     attacker.join_network(&name, &secret).await.unwrap();
     wait_for_peers(&victim.agent, network_id, 1).await;
 
+    // Filtered on the reason: this agent reports other things too, and the
+    // first plugin error to arrive is not necessarily this one.
     let reason = wait_event(&mut events, |event| match event {
         Event::PluginError {
             protocol, reason, ..
-        } if protocol == WIREGUARD_PROTOCOL => Some(reason.clone()),
+        } if protocol == WIREGUARD_PROTOCOL && reason.contains("different network") => {
+            Some(reason.clone())
+        }
         _ => None,
     })
     .await;
-    assert!(reason.contains("does not match"), "unexpected: {reason}");
+    assert!(reason.contains("different network"), "unexpected: {reason}");
 
     settle().await;
     let view = victim.plugin.overview(network_id).unwrap();
@@ -977,8 +916,6 @@ async fn a_forged_overlay_claim_is_rejected_and_never_reaches_a_tunnel() {
             .all(|peer| peer.public_key != attacker_key),
         "a rejected announcement must never become a tunnel"
     );
-    assert_eq!(view.overlay_address, IpAddr::V6(victim_address));
-
     attacker.shutdown().await;
     victim.shutdown().await;
     drop(attacker_dir);
@@ -1026,12 +963,13 @@ impl IpPlugin for ForgingPlugin {
 }
 
 #[tokio::test]
-async fn an_mtu_below_the_ipv6_minimum_is_refused() {
+async fn an_mtu_below_what_ipv4_guarantees_is_refused() {
     use tsunagi::dataplane::wireguard::{DEFAULT_MTU, MIN_MTU, WIREGUARD_OVERHEAD};
 
-    // Linux disables IPv6 outright on an interface below 1280 bytes, so the
-    // overlay address could never be assigned. Catch it here rather than as
-    // an obscure RTNETLINK error much later.
+    // 576 bytes is what every IPv4 host must be able to reassemble, so
+    // nothing below it is worth offering. The floor used to be 1280 for
+    // IPv6's sake; the overlay is IPv4 now and a relayed path with small
+    // datagrams can be matched instead of warned about.
     let dir = TempDir::new().unwrap();
     let result = WireguardPlugin::open(
         WireguardConfig::new(dir.path()).with_mtu(MIN_MTU - 1),
@@ -1041,15 +979,14 @@ async fn an_mtu_below_the_ipv6_minimum_is_refused() {
     match result {
         Err(err) => {
             let text = err.to_string();
-            assert!(text.contains("1280"), "unexpected message: {text}");
-            assert!(text.contains("IPv6"), "unexpected message: {text}");
+            assert!(text.contains("576"), "unexpected message: {text}");
         }
-        Ok(_) => panic!("an MTU below the IPv6 minimum must be refused"),
+        Ok(_) => panic!("an MTU below what IPv4 guarantees must be refused"),
     }
 
-    // The default is exactly the minimum, and a link has to carry it plus
-    // WireGuard's own overhead.
-    assert_eq!(DEFAULT_MTU, MIN_MTU);
+    // The default leaves room below it now, which is the point of lowering
+    // the floor, and a link has to carry it plus WireGuard's own overhead.
+    const { assert!(DEFAULT_MTU > MIN_MTU) };
     assert_eq!(WIREGUARD_OVERHEAD, 32);
     assert!(
         WireguardPlugin::open(
@@ -1058,17 +995,5 @@ async fn an_mtu_below_the_ipv6_minimum_is_refused() {
         )
         .await
         .is_ok()
-    );
-}
-
-#[tokio::test]
-async fn the_overlay_address_is_derived_from_the_key_alone() {
-    let (name, secret) = network("wg-derivation");
-    let id = tsunagi::identity::NetworkKeys::derive(&name, &secret).network_id();
-    let key = WgSecretKey::generate().public();
-    assert_eq!(overlay_address(id, &key), overlay_address(id, &key));
-    assert_ne!(
-        overlay_address(id, &key),
-        overlay_address(id, &WgSecretKey::generate().public())
     );
 }

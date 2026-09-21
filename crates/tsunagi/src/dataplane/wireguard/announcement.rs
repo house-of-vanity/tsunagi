@@ -10,15 +10,12 @@
 //! [`crate::dataplane::transport`]. A plugin that also tried to advertise
 //! addresses would be reimplementing NAT traversal badly.
 
-use std::net::Ipv6Addr;
-
 use serde::{Deserialize, Serialize};
 
 use crate::dataplane::PluginError;
 use crate::identity::NetworkId;
 
 use super::keys::WgPublicKey;
-use super::overlay::overlay_address;
 
 /// Version of the announcement format.
 ///
@@ -26,20 +23,27 @@ use super::overlay::overlay_address;
 /// signed records in [`crate::state`], which carry the range and survive a
 /// participant being away. postcard is not self-describing, so an older peer
 /// cannot read a newer announcement; the mismatch is reported, not misparsed.
-pub const ANNOUNCEMENT_VERSION: u16 = 3;
+pub const ANNOUNCEMENT_VERSION: u16 = 4;
 
 /// What one participant advertises for the WireGuard data plane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WgAnnouncement {
     /// Announcement format version.
     pub version: u16,
-    /// The peer's WireGuard public key. Its overlay address is derived from it.
-    pub public_key: [u8; 32],
-    /// The overlay address the peer believes it has.
+    /// The peer's WireGuard public key.
     ///
-    /// Carried for diagnostics and cross-checking only. Addresses are always
-    /// derived locally, never taken from this field.
-    pub overlay_address: Ipv6Addr,
+    /// The whole announcement, now that addresses belong to the system
+    /// level: this says *who* is at the other end of a tunnel, and nothing
+    /// about where.
+    pub public_key: [u8; 32],
+    /// The network this key is for.
+    ///
+    /// Strictly redundant — a capability arrives on a session that already
+    /// proved membership of one network — and kept anyway, because the
+    /// binding used to be a side effect of checking a derived address and
+    /// losing it silently when that check went would be the wrong way to
+    /// lose it.
+    pub network: [u8; 32],
 }
 
 /// A peer announcement that has been validated against a specific network.
@@ -47,8 +51,6 @@ pub struct WgAnnouncement {
 pub struct ValidatedAnnouncement {
     /// The peer's WireGuard public key.
     pub public_key: WgPublicKey,
-    /// The overlay address derived locally for this key. Authoritative.
-    pub overlay_address: Ipv6Addr,
 }
 
 impl WgAnnouncement {
@@ -57,7 +59,7 @@ impl WgAnnouncement {
         Self {
             version: ANNOUNCEMENT_VERSION,
             public_key: *public_key.as_bytes(),
-            overlay_address: overlay_address(network, public_key),
+            network: *network.as_bytes(),
         }
     }
 
@@ -105,20 +107,13 @@ impl WgAnnouncement {
                 "peer announced this agent's own WireGuard key".into(),
             ));
         }
-        // AllowedIPs are derived, never trusted. A mismatch means the peer is
-        // confused or lying, and either way its own claim is discarded.
-        let derived = overlay_address(network, &public_key);
-        if self.overlay_address != derived {
+        if self.network != *network.as_bytes() {
             return Err(PluginError::Rejected(
-                "announced overlay address does not match the one derived from the peer's key"
-                    .into(),
+                "announcement is for a different network".into(),
             ));
         }
 
-        Ok(ValidatedAnnouncement {
-            public_key,
-            overlay_address: derived,
-        })
+        Ok(ValidatedAnnouncement { public_key })
     }
 }
 
@@ -149,7 +144,6 @@ mod tests {
         let validated = WgAnnouncement::decode_and_validate(&payload, id, &local).unwrap();
 
         assert_eq!(validated.public_key, peer);
-        assert_eq!(validated.overlay_address, overlay_address(id, &peer));
     }
 
     #[test]
@@ -167,20 +161,27 @@ mod tests {
     }
 
     #[test]
-    fn allowed_ips_are_derived_not_taken_from_the_peer() {
+    fn there_is_nothing_address_like_to_forge() {
+        // Addresses belong to the system level, are allocated there and are
+        // signed by the member that holds one. A protocol announcement
+        // carries no address at all, so this is not a thing a peer can lie
+        // about here — and a peer sending traffic from an address it does
+        // not hold is rejected by the agreed address, not by anything it
+        // said in this message.
         let id = network("no-hijack");
-        let victim = WgSecretKey::generate().public();
-        let attacker = WgSecretKey::generate().public();
+        let peer = WgSecretKey::generate().public();
         let local = WgSecretKey::generate().public();
 
-        // An attacker claims the victim's overlay address with its own key.
-        let mut forged = WgAnnouncement::new(id, &attacker);
-        forged.overlay_address = overlay_address(id, &victim);
+        let announcement = WgAnnouncement::new(id, &peer);
+        let validated =
+            WgAnnouncement::decode_and_validate(&announcement.encode().unwrap(), id, &local)
+                .unwrap();
+        assert_eq!(validated.public_key, peer);
 
-        let result = WgAnnouncement::decode_and_validate(&forged.encode().unwrap(), id, &local);
-        assert!(
-            matches!(result, Err(PluginError::Rejected(ref reason)) if reason.contains("does not match")),
-            "claiming another member's overlay address must be rejected: {result:?}"
+        // The validated form has one field, and it is an identity.
+        assert_eq!(
+            std::mem::size_of_val(&validated),
+            std::mem::size_of::<WgPublicKey>()
         );
     }
 

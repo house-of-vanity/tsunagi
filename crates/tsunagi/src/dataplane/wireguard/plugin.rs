@@ -42,7 +42,6 @@ use crate::identity::NetworkId;
 use super::announcement::{ValidatedAnnouncement, WgAnnouncement};
 use super::device::{PeerSummary, WireguardDevice};
 use super::keys::{WgPublicKey, WgSecretKey};
-use super::overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_prefix};
 use super::store::WgKeyStore;
 use crate::overlay::config::{DEFAULT_INTERFACE_PREFIX, interface_name};
 use crate::overlay::tun::{TunFactory, TunRequest};
@@ -51,20 +50,20 @@ use crate::state::Ipv4Range;
 /// The protocol identifier this plugin announces.
 pub const WIREGUARD_PROTOCOL: &str = "wireguard";
 
-/// Smallest interface MTU IPv6 permits, from RFC 8200.
+/// Smallest interface MTU the overlay accepts.
 ///
-/// This is not advice, it is a hard limit. Linux tears IPv6 down entirely on
-/// an interface whose MTU is below it — the per-device `/proc/sys/net/ipv6`
-/// entries disappear and `ip -6 address add` fails with `Invalid argument` —
-/// so the overlay address could never be assigned. Anything smaller is
-/// rejected up front instead of failing obscurely later.
-pub const MIN_MTU: u32 = 1280;
+/// 576 bytes is what IPv4 guarantees every host can reassemble (RFC 1122),
+/// so nothing below it is worth offering. The floor used to be 1280 because
+/// Linux tears IPv6 down on an interface below that; the overlay is IPv4
+/// now, so that constraint is gone and a path with small datagrams — a
+/// relay, typically — can be matched instead of warned about.
+pub const MIN_MTU: u32 = 576;
 
 /// Default interface MTU.
 ///
-/// Equal to [`MIN_MTU`], because the overlay is IPv6 and there is no room
-/// below it.
-pub const DEFAULT_MTU: u32 = MIN_MTU;
+/// Comfortably under what a direct path carries, and the same number the
+/// overlay used before, so an existing network does not have to change.
+pub const DEFAULT_MTU: u32 = 1280;
 
 /// Bytes WireGuard adds to a packet: type and reserved, receiver index,
 /// counter and the Poly1305 tag.
@@ -145,13 +144,7 @@ pub struct NetworkOverview {
     pub mtu: u32,
     /// This agent's WireGuard public key in this network.
     pub public_key: WgPublicKey,
-    /// This agent's overlay address.
-    pub overlay_address: IpAddr,
-    /// The overlay subnet every member shares.
-    pub overlay_prefix: IpAddr,
-    /// Prefix length of the overlay subnet.
-    pub overlay_prefix_len: u8,
-    /// This agent's IPv4 overlay address, when the overlay is dual stack.
+    /// This agent's overlay address, once the network has agreed one.
     pub overlay_address_v4: Option<Ipv4Addr>,
     /// The IPv4 overlay range in use.
     pub ipv4_range: Option<Ipv4Range>,
@@ -179,9 +172,7 @@ pub struct PeerOverview {
     pub endpoint_id: EndpointId,
     /// The peer's WireGuard public key.
     pub public_key: WgPublicKey,
-    /// The overlay address derived for it locally.
-    pub overlay_address: IpAddr,
-    /// Its IPv4 overlay address, once a tunnel exists and it won the address.
+    /// The overlay address the network agreed it holds.
     pub overlay_address_v4: Option<Ipv4Addr>,
     /// Whether a data plane link to it exists.
     pub has_link: bool,
@@ -278,9 +269,8 @@ impl WireguardPlugin {
 
         if config.mtu < MIN_MTU {
             return Err(PluginError::Other(format!(
-                "an MTU of {} is below the {MIN_MTU} bytes IPv6 requires (RFC 8200). \
-                 Linux disables IPv6 on an interface below that, so the overlay address \
-                 could never be assigned.",
+                "an MTU of {} is below the {MIN_MTU} bytes every IPv4 host must be able \
+                 to reassemble (RFC 1122)",
                 config.mtu
             )));
         }
@@ -332,7 +322,6 @@ impl WireguardPlugin {
             .map(|(endpoint_id, announcement)| PeerOverview {
                 endpoint_id: *endpoint_id,
                 public_key: announcement.public_key,
-                overlay_address: IpAddr::V6(announcement.overlay_address),
                 overlay_address_v4: state.allocations.get(endpoint_id).copied(),
                 has_link: state.links.contains_key(endpoint_id),
                 tunnel: tunnels.get(&announcement.public_key).cloned(),
@@ -345,9 +334,6 @@ impl WireguardPlugin {
             interface: state.interface.clone(),
             mtu: self.worker.config.mtu,
             public_key: state.key.public(),
-            overlay_address: IpAddr::V6(overlay_address(network, &state.key.public())),
-            overlay_prefix: IpAddr::V6(overlay_prefix(network)),
-            overlay_prefix_len: OVERLAY_PREFIX_LEN,
             overlay_address_v4: state.allocations.get(&self.worker.local_id()).copied(),
             ipv4_range: state.ipv4_range,
             peers,
@@ -464,35 +450,31 @@ impl Worker {
     }
 
     /// What the host interface for a network should look like.
-    fn desired_request(&self, state: &NetworkState, network: NetworkId) -> TunRequest {
+    fn desired_request(&self, state: &NetworkState) -> TunRequest {
         let own_range = state.ipv4_range;
         TunRequest {
             name: state.interface.clone(),
-            address: overlay_address(network, &state.key.public()),
-            prefix_len: OVERLAY_PREFIX_LEN,
-            address_v4: state.allocations.get(&self.local_id()).copied(),
-            prefix_len_v4: own_range.map_or(0, |range| range.prefix_len),
+            address: state.allocations.get(&self.local_id()).copied(),
+            prefix_len: own_range.map_or(0, |range| range.prefix_len),
             mtu: self.config.mtu,
         }
     }
 
     /// Creates the packet interface and starts the WireGuard device.
     async fn ensure_device(&self, network: NetworkId) -> Result<(), PluginError> {
-        let (request, key, own_range) = {
+        let (request, key) = {
             let shared = self.lock_shared();
             match shared.networks.get(&network) {
-                Some(state) if state.device.is_none() => (
-                    self.desired_request(state, network),
-                    state.key.clone(),
-                    state.ipv4_range,
-                ),
+                Some(state) if state.device.is_none() => {
+                    (self.desired_request(state), state.key.clone())
+                }
                 _ => return Ok(()),
             }
         };
 
         let applied = request.clone();
         let tun = self.tun_factory.create(request).await?;
-        let device = Arc::new(WireguardDevice::start(network, key, tun, own_range));
+        let device = Arc::new(WireguardDevice::start(network, key, tun));
 
         let mut shared = self.lock_shared();
         if let Some(state) = shared.networks.get_mut(&network) {
@@ -510,7 +492,7 @@ impl Worker {
             let shared = self.lock_shared();
             match shared.networks.get(&network) {
                 Some(state) if state.device.is_some() => {
-                    let wanted = self.desired_request(state, network);
+                    let wanted = self.desired_request(state);
                     if state.applied.as_ref() == Some(&wanted) {
                         return;
                     }

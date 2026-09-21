@@ -27,7 +27,7 @@
 //! what it announced.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -42,10 +42,8 @@ use crate::dataplane::transport::{SharedLink, TransportError};
 use crate::identity::NetworkId;
 
 use super::keys::{WgPublicKey, WgSecretKey};
-use super::overlay::overlay_address;
 use crate::overlay::packet::IpHeader;
 use crate::overlay::tun::TunDevice;
-use crate::state::Ipv4Range;
 
 /// How often WireGuard's own timers are driven.
 ///
@@ -109,9 +107,11 @@ impl PeerHealth {
 struct Peer {
     endpoint_id: EndpointId,
     public_key: WgPublicKey,
-    overlay: Ipv6Addr,
-    /// The IPv4 address this peer owns, when the overlay is dual stack and
-    /// nobody else derived the same one.
+    /// The overlay address this peer holds, as the control plane agreed it.
+    ///
+    /// Not derived here and not taken from the peer: the system level
+    /// allocates it, the peer signs the claim, and every protocol carries
+    /// traffic for the same address.
     overlay_v4: Mutex<Option<Ipv4Addr>>,
     tunn: Mutex<Tunn>,
     link: SharedLink,
@@ -124,7 +124,6 @@ impl std::fmt::Debug for Peer {
         f.debug_struct("Peer")
             .field("peer", &self.endpoint_id.fmt_short().to_string())
             .field("public_key", &self.public_key)
-            .field("overlay", &self.overlay)
             .finish()
     }
 }
@@ -170,15 +169,8 @@ pub struct PeerSummary {
     pub endpoint_id: EndpointId,
     /// The peer's WireGuard public key.
     pub public_key: WgPublicKey,
-    /// The overlay address this agent derived for it.
-    pub overlay_address: Ipv6Addr,
-    /// Its IPv4 overlay address, when the overlay is dual stack.
-    ///
-    /// `None` with `ipv4_conflict` set means another member derived the same
-    /// address and won it; that peer is still fully reachable over IPv6.
+    /// The overlay address it holds, once the control plane has agreed one.
     pub overlay_address_v4: Option<Ipv4Addr>,
-    /// Whether this peer lost an IPv4 address to a derivation collision.
-    pub ipv4_conflict: bool,
     /// Whether the tunnel has handshaken.
     pub health: PeerHealth,
     /// Traffic counters.
@@ -194,7 +186,6 @@ struct Inner {
     private_key: WgSecretKey,
     tun: Arc<dyn TunDevice>,
     /// The IPv4 overlay range, when the overlay is dual stack.
-    ipv4_range: Option<Ipv4Range>,
     peers: RwLock<HashMap<WgPublicKey, Arc<Peer>>>,
     /// Both families, so one lookup routes any packet.
     routes: RwLock<HashMap<IpAddr, WgPublicKey>>,
@@ -224,17 +215,11 @@ pub struct WireguardDevice {
 
 impl WireguardDevice {
     /// Starts a device on top of `tun`.
-    pub fn start(
-        network: NetworkId,
-        private_key: WgSecretKey,
-        tun: Arc<dyn TunDevice>,
-        ipv4_range: Option<Ipv4Range>,
-    ) -> Self {
+    pub fn start(network: NetworkId, private_key: WgSecretKey, tun: Arc<dyn TunDevice>) -> Self {
         let inner = Arc::new(Inner {
             network,
             private_key,
             tun,
-            ipv4_range,
             peers: RwLock::new(HashMap::new()),
             routes: RwLock::new(HashMap::new()),
             next_index: AtomicU32::new(1),
@@ -292,12 +277,9 @@ impl WireguardDevice {
             None,
         );
 
-        let overlay = overlay_address(self.inner.network, &public_key);
-        let overlay_v4 = self.claim_ipv4(&public_key, overlay_v4);
         let peer = Arc::new(Peer {
             endpoint_id,
             public_key,
-            overlay,
             overlay_v4: Mutex::new(overlay_v4),
             tunn: Mutex::new(tunn),
             link,
@@ -311,7 +293,6 @@ impl WireguardDevice {
         }
 
         write_lock(&self.inner.peers).insert(public_key, Arc::clone(&peer));
-        write_lock(&self.inner.routes).insert(IpAddr::V6(overlay), public_key);
         if let Some(v4) = overlay_v4 {
             write_lock(&self.inner.routes).insert(IpAddr::V4(v4), public_key);
         }
@@ -322,48 +303,10 @@ impl WireguardDevice {
         Ok(())
     }
 
-    /// Decides which IPv4 address a new peer gets, if any.
-    ///
-    /// IPv4 has far too little room for a derived address to be collision
-    /// free. When two members derive the same one, the member whose public
-    /// key sorts lower keeps it — a rule every member computes identically,
-    /// so they all agree on the outcome without talking about it. The other
-    /// member simply has no IPv4 address; it is still fully reachable over
-    /// IPv6, which never collides.
-    fn claim_ipv4(&self, public_key: &WgPublicKey, wanted: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
-        let wanted = wanted?;
-
-        let holder = read_lock(&self.inner.routes)
-            .get(&IpAddr::V4(wanted))
-            .copied();
-        let Some(holder) = holder else {
-            return Some(wanted);
-        };
-        if holder == *public_key {
-            return Some(wanted);
-        }
-
-        self.inner.ipv4_conflicts.fetch_add(1, Ordering::Relaxed);
-        if holder.as_bytes() <= public_key.as_bytes() {
-            // The peer already holding it wins.
-            return None;
-        }
-        // The newcomer wins; take the address away from the other peer.
-        if let Some(loser) = read_lock(&self.inner.peers).get(&holder).cloned() {
-            let mut slot = match loser.overlay_v4.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *slot = None;
-        }
-        Some(wanted)
-    }
-
     /// Removes a peer and stops its tunnel.
     pub fn remove_peer(&self, public_key: &WgPublicKey) {
         if let Some(peer) = write_lock(&self.inner.peers).remove(public_key) {
             let mut routes = write_lock(&self.inner.routes);
-            routes.remove(&IpAddr::V6(peer.overlay));
             let v4 = match peer.overlay_v4.lock() {
                 Ok(guard) => *guard,
                 Err(poisoned) => *poisoned.into_inner(),
@@ -408,9 +351,7 @@ impl WireguardDevice {
                 PeerSummary {
                     endpoint_id: peer.endpoint_id,
                     public_key: peer.public_key,
-                    overlay_address: peer.overlay,
                     overlay_address_v4: overlay_v4,
-                    ipv4_conflict: overlay_v4.is_none() && self.inner.ipv4_range.is_some(),
                     health: peer.health(),
                     stats: peer.stats(),
                     path: peer.link.path_description(),
@@ -623,10 +564,12 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                 }
                 Outcome::ToTunnel(len, source) => {
                     let payload = Bytes::copy_from_slice(&scratch[..len]);
-                    // Enforce address ownership: a peer may only send from an
-                    // address derived for its own key, in either family.
+                    // Enforce address ownership: a peer may only send from
+                    // the address the control plane agreed it holds. An
+                    // overlay address is signed by its holder, so this is
+                    // checked against the agreement and never against
+                    // anything the peer said here.
                     let owned = match source {
-                        IpAddr::V6(addr) => addr == peer.overlay,
                         IpAddr::V4(addr) => {
                             let held = match peer.overlay_v4.lock() {
                                 Ok(guard) => *guard,
@@ -634,6 +577,9 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                             };
                             held == Some(addr)
                         }
+                        // The overlay is IPv4. Anything else has no owner
+                        // here and is dropped rather than guessed at.
+                        IpAddr::V6(_) => false,
                     };
                     if !owned {
                         peer.counters
