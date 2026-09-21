@@ -41,6 +41,12 @@ pub struct CandidateStatus {
 pub struct OverlayStatus {
     /// The interface name the operating system gave.
     pub interface: String,
+    /// Whether that interface exists on the host.
+    ///
+    /// `false` with an in-memory device: the name is real to the agent and
+    /// to nothing else. Reported, because everything that would configure
+    /// the operating system for this interface must not when it is this.
+    pub on_host: bool,
     /// Its MTU.
     pub mtu: u32,
     /// The addresses it should be carrying.

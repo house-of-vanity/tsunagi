@@ -236,6 +236,16 @@ impl Interface {
         self.device.mtu()
     }
 
+    /// Whether this interface exists on the host.
+    ///
+    /// `false` with an in-memory device, where tunnels run and packets move
+    /// but the operating system knows nothing about any of it. Anything that
+    /// would configure the host — a route, a resolver setting, a complaint
+    /// that an address is missing from a link — has to ask first.
+    pub fn on_host(&self) -> bool {
+        self.factory.on_host()
+    }
+
     /// Removes the interface from the host.
     pub async fn remove(&self) {
         // The packet loop holds the device open, and it ends only when the
@@ -332,6 +342,28 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn an_in_memory_interface_says_it_is_not_on_the_host() {
+        // Everything that would configure the operating system for this
+        // interface asks first, and the answer here is no: the name is real
+        // to the agent and to nothing else. A real `tsun0` belonging to
+        // another agent looks identical from here, so acting on the name
+        // alone would configure that one.
+        let interface = Interface::start(
+            Arc::new(crate::overlay::MemoryTunFactory::new()),
+            "tsun0",
+            1280,
+            Arc::new(RoutingTable::new()),
+            Arc::new(Recorder::default()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(interface.name(), "tsun0");
+        assert!(!interface.on_host());
+        interface.remove().await;
+    }
     use crate::identity::{NetworkKeys, NetworkName, NetworkSecret};
     use crate::overlay::router::NetworkRoutes;
     use crate::overlay::tun::{MemoryTun, MemoryTunFactory};

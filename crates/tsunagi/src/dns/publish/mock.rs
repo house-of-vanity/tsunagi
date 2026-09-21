@@ -74,7 +74,10 @@ mod tests {
     fn published() -> Published {
         Published {
             interface: "tsundemo".into(),
-            server: "10.13.37.69:5354".parse().unwrap(),
+            servers: vec![
+                "10.13.37.69:5354".parse().unwrap(),
+                "[::1]:5354".parse().unwrap(),
+            ],
             domains: vec!["lab".into()],
         }
     }

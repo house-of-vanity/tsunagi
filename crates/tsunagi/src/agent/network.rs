@@ -904,8 +904,13 @@ impl Runtime {
         // source and every peer would drop them. Checked rather than
         // assumed, because the assumption is exactly the kind that has been
         // wrong here before. Said once per address, not every round.
+        // An in-memory interface has no addresses to be missing from: with
+        // `--no-tun` this is the arrangement asked for, not a fault.
         let missing = match local {
-            Some(address) if !crate::overlay::address_is_local(std::net::IpAddr::V4(address)) => {
+            Some(address)
+                if interface.on_host()
+                    && !crate::overlay::address_is_local(std::net::IpAddr::V4(address)) =>
+            {
                 let already = self.reported_missing == Some(address);
                 self.reported_missing = Some(address);
                 (!already).then_some(address)

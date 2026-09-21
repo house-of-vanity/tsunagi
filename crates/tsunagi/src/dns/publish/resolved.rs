@@ -135,36 +135,53 @@ impl DnsPublisher for ResolvedPublisher {
                     published.interface
                 ))
             })?;
+            if published.servers.is_empty() {
+                return Err(PublishError::Unavailable(
+                    "there is no listening address to send questions to".to_string(),
+                ));
+            }
             let proxy = Self::proxy().await?;
             let index = ifindex as i32;
-            let (family, octets) = wire_address(published.server.ip());
-            let port = published.server.port();
+            // Every family in one call, because this replaces the link's
+            // whole list: sending them one at a time would leave only the
+            // last. A resolver then picks whichever it can reach.
+            let servers: Vec<(i32, Vec<u8>, u16, String)> = published
+                .servers
+                .iter()
+                .map(|server| {
+                    let (family, octets) = wire_address(server.ip());
+                    (family, octets, server.port(), String::new())
+                })
+                .collect();
 
-            match proxy
-                .set_link_dns_ex(index, &[(family, octets.clone(), port, String::new())])
-                .await
-            {
+            match proxy.set_link_dns_ex(index, &servers).await {
                 Ok(()) => {}
                 Err(err) => {
-                    let classified = classify(err, "setting the link's DNS server");
+                    let classified = classify(err, "setting the link's DNS servers");
                     // Older systemd has no `Ex` form, and the plain one is
                     // always port 53. Falling back to it when the server is
                     // somewhere else would point resolved at nothing.
                     if !matches!(classified, PublishError::Unavailable(_)) {
                         return Err(classified);
                     }
-                    if port != 53 {
+                    if let Some(elsewhere) =
+                        published.servers.iter().find(|server| server.port() != 53)
+                    {
                         return Err(PublishError::Unavailable(format!(
                             "this systemd-resolved cannot be given a port, and the server is on \
-                             {port}. Run the server on port 53, or point your resolver at \
-                             {} yourself.",
-                            published.server
+                             {}. Run the server on port 53, or point your resolver at \
+                             {elsewhere} yourself.",
+                            elsewhere.port()
                         )));
                     }
+                    let plain: Vec<(i32, Vec<u8>)> = servers
+                        .into_iter()
+                        .map(|(family, octets, _, _)| (family, octets))
+                        .collect();
                     proxy
-                        .set_link_dns(index, &[(family, octets)])
+                        .set_link_dns(index, &plain)
                         .await
-                        .map_err(|err| classify(err, "setting the link's DNS server"))?;
+                        .map_err(|err| classify(err, "setting the link's DNS servers"))?;
                 }
             }
 
@@ -243,7 +260,7 @@ mod tests {
         let publisher = ResolvedPublisher::new();
         let published = Published {
             interface: "tsunagi-no-such-interface".into(),
-            server: SocketAddr::from(([10, 13, 37, 69], 5354)),
+            servers: vec![SocketAddr::from(([10, 13, 37, 69], 5354))],
             domains: vec!["lab".into()],
         };
         let err = publisher.apply(&published).await.unwrap_err();

@@ -51,6 +51,11 @@ impl TunFactory for ManagedTunFactory {
         self.provisioner.name()
     }
 
+    /// It creates the interface on the host and holds it open.
+    fn on_host(&self) -> bool {
+        true
+    }
+
     fn create<'a>(
         &'a self,
         request: TunRequest,

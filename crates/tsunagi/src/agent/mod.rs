@@ -381,6 +381,7 @@ impl Agent {
         let interface = self.inner.interface.get()?;
         Some(OverlayStatus {
             interface: interface.name().to_string(),
+            on_host: interface.on_host(),
             mtu: interface.mtu(),
             addresses: interface.wanted_addresses(),
             counters: interface.counters(),

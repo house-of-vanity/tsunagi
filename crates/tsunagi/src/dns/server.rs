@@ -519,6 +519,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_same_zone_is_answered_over_ipv6_as_over_ipv4() {
+        // A question arrives over whichever family the resolver chooses, so
+        // a listener is opened from each list in the plan and both have to
+        // answer the same thing. Answering one family only leaves the other
+        // timing out, which looks like a broken overlay.
+        let shared = SharedZone::new(zone());
+        let plan = crate::dns::listen_plan(None, 0);
+        let mut answered = 0;
+
+        for family in plan.families() {
+            let candidate = family[0];
+            let server = match DnsServer::bind(candidate, shared.clone()).await {
+                Ok(server) => server,
+                // A host with IPv6 switched off in the kernel cannot bind
+                // `::1`, and the agent copes with that by design; so does
+                // this. The other family still has to work.
+                Err(err) if candidate.is_ipv6() => {
+                    eprintln!("no IPv6 loopback on this host ({err}); skipping that family");
+                    continue;
+                }
+                Err(err) => panic!("cannot listen on {candidate}: {err}"),
+            };
+            let addr = server.local_addr();
+            assert_eq!(addr.is_ipv6(), candidate.is_ipv6());
+
+            let client = tokio::net::UdpSocket::bind(if addr.is_ipv6() {
+                "[::1]:0"
+            } else {
+                "127.0.0.1:0"
+            })
+            .await
+            .unwrap();
+            client
+                .send_to(&ask("music.lab", TYPE::A), addr)
+                .await
+                .unwrap();
+            let mut buffer = vec![0u8; MAX_MESSAGE_LEN];
+            let read = client.recv(&mut buffer).await.unwrap();
+            let reply = simple_dns::Packet::parse(&buffer[..read]).unwrap();
+            assert_eq!(reply.rcode(), RCODE::NoError, "over {addr}");
+            match &reply.answers[0].rdata {
+                // The same IPv4 answer either way: the family a question
+                // travelled over says nothing about what the answer is.
+                RData::A(a) => {
+                    assert_eq!(Ipv4Addr::from(a.address), Ipv4Addr::new(10, 13, 37, 237))
+                }
+                other => panic!("expected an A record over {addr}, got {other:?}"),
+            }
+            answered += 1;
+        }
+
+        assert!(answered > 0, "at least one family must have answered");
+    }
+
+    #[tokio::test]
     async fn replacing_the_zone_changes_what_the_running_server_answers() {
         let shared = SharedZone::new(Zone::new(ZoneName::new("lab").unwrap(), []));
         let server = DnsServer::bind("127.0.0.1:0".parse().unwrap(), shared.clone())

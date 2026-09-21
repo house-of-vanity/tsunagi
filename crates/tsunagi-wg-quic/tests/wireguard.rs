@@ -19,13 +19,54 @@ use tsunagi::agent::Event;
 use tsunagi::dataplane::IpPlugin;
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::{NetworkId, NetworkName, NetworkSecret};
-use tsunagi::overlay::{MemoryTun, MemoryTunFactory};
+use tsunagi::overlay::{
+    MemoryTun, MemoryTunFactory, OverlayError, TunDevice, TunFactory, TunRequest,
+};
 use tsunagi::state::Ipv4Range;
 use tsunagi::testing::{config_with, network, settle, wait_event, wait_for_peers, wait_until};
 use tsunagi::{Agent, NetworkStatus};
 use tsunagi_wg_quic::{
     WIREGUARD_PROTOCOL, WgAnnouncement, WgSecretKey, WireguardConfig, WireguardPlugin,
 };
+
+/// A factory that claims the host and puts nothing on it.
+///
+/// This is the case the missing-address report exists for: a provisioner
+/// that returned success without achieving it, or something outside that
+/// removed the address afterwards. An in-memory interface is *not* that
+/// case — it has no host side at all, and treating the two as one is what
+/// had the agent reporting a fault about `--no-tun` working as intended,
+/// and configuring host interfaces it never created.
+#[derive(Debug, Clone)]
+struct PretendHostTuns(MemoryTunFactory);
+
+impl TunFactory for PretendHostTuns {
+    fn name(&self) -> &str {
+        "pretend-host"
+    }
+
+    fn on_host(&self) -> bool {
+        true
+    }
+
+    fn create<'a>(
+        &'a self,
+        request: TunRequest,
+    ) -> tsunagi::BoxFuture<'a, Result<Arc<dyn TunDevice>, OverlayError>> {
+        self.0.create(request)
+    }
+
+    fn reconfigure<'a>(
+        &'a self,
+        request: TunRequest,
+    ) -> tsunagi::BoxFuture<'a, Result<(), OverlayError>> {
+        self.0.reconfigure(request)
+    }
+
+    fn destroy<'a>(&'a self, name: &'a str) -> tsunagi::BoxFuture<'a, ()> {
+        self.0.destroy(name)
+    }
+}
 
 /// An agent with a WireGuard plugin backed by an in-memory packet interface.
 struct WgAgent {
@@ -119,6 +160,35 @@ impl WgAgent {
         .await
         .unwrap();
         (agent, plugin, tuns)
+    }
+
+    /// An agent whose interface claims to be on the host but is not.
+    ///
+    /// Used only by the missing-address test: everywhere else the in-memory
+    /// interface is honest about what it is.
+    async fn spawn_pretending_host(discovery: &SharedMemoryDiscovery, tag: &str) -> Self {
+        let dir = TempDir::new().unwrap();
+        let tuns = MemoryTunFactory::new();
+        let plugin = WireguardPlugin::open(
+            WireguardConfig::new(dir.path().join("wireguard"))
+                .with_reconcile(Duration::from_millis(20), Duration::from_millis(250)),
+        )
+        .await
+        .unwrap();
+        let agent = Agent::spawn(
+            config_with(dir.path(), discovery)
+                .with_overlay_ipv4_range(Some(tsunagi::state::DEFAULT_IPV4_RANGE))
+                .with_interface(Arc::new(PretendHostTuns(tuns.clone())), tag, 1280)
+                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+        )
+        .await
+        .unwrap();
+        Self {
+            dir,
+            agent,
+            plugin,
+            tuns,
+        }
     }
 
     fn endpoint_id(&self) -> EndpointId {
@@ -445,12 +515,13 @@ async fn an_allocated_address_missing_from_the_host_is_reported() {
     let discovery = SharedMemoryDiscovery::new();
     let (name, secret) = network("wg-missing-address");
 
-    // The in-memory interface never carries the address, which is exactly
-    // the situation of a real interface the operator has not configured yet.
-    // Left unsaid, packets leave with the wrong source and every peer drops
-    // them, which looks like a broken network rather than a missing command.
-    let a = WgAgent::spawn(&discovery, "ta").await;
-    let b = WgAgent::spawn(&discovery, "tb").await;
+    // An interface that says it is on the host and never carries the
+    // address: a provisioner that reported a success it did not achieve, or
+    // something outside that took the address away. Left unsaid, packets
+    // leave with the wrong source and every peer drops them, which looks
+    // like a broken network rather than a missing command.
+    let a = WgAgent::spawn_pretending_host(&discovery, "ta").await;
+    let b = WgAgent::spawn_pretending_host(&discovery, "tb").await;
 
     let mut events = a.agent.subscribe();
     let network_id = a.agent.join_network(&name, &secret).await.unwrap();
@@ -479,6 +550,40 @@ async fn an_allocated_address_missing_from_the_host_is_reported() {
         reason.contains(&a.agent.overlay().unwrap().interface),
         "must name the interface: {reason}"
     );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_interface_that_is_only_in_memory_is_not_reported_as_a_fault() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-memory-interface");
+
+    // `--no-tun` is an arrangement, not a failure: the tunnels run and the
+    // packets move between agents, and nothing was ever going to put an
+    // address on a host interface that does not exist. Complaining about it
+    // sent people looking for something that had removed their address.
+    let a = WgAgent::spawn(&discovery, "ta").await;
+    let b = WgAgent::spawn(&discovery, "tb").await;
+
+    let mut events = a.agent.subscribe();
+    let network_id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(network_id, 1).await;
+    // An address was allocated, so the report had every other reason to fire.
+    let address = a.overlay(network_id).await;
+    assert!(tsunagi::state::DEFAULT_IPV4_RANGE.contains(address));
+
+    settle().await;
+    let complaint = std::iter::from_fn(|| events.try_recv().ok()).find(
+        |event| matches!(event, Event::PluginError { reason, .. } if reason.contains("not on any")),
+    );
+    assert!(complaint.is_none(), "unexpected: {complaint:?}");
+
+    // And the interface says plainly what it is, which is what keeps the
+    // resolver setting off a host interface of the same name.
+    assert!(!a.agent.overlay().unwrap().on_host);
 
     a.shutdown().await;
     b.shutdown().await;

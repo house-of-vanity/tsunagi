@@ -62,7 +62,7 @@ mod tests {
         let publisher = UnsupportedPublisher::new();
         let published = Published {
             interface: "tsundemo".into(),
-            server: "10.0.0.1:5354".parse().unwrap(),
+            servers: vec!["10.0.0.1:5354".parse().unwrap()],
             domains: vec!["lab".into()],
         };
         let err = publisher.apply(&published).await.unwrap_err();

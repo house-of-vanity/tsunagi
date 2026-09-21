@@ -237,7 +237,7 @@ async fn exchange(path: &Path, request: &Request, within: Duration) -> Result<Re
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 6]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 7]);
 
 async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let encoded = postcard::to_stdvec(value)

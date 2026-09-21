@@ -75,6 +75,17 @@ pub trait TunFactory: Send + Sync + std::fmt::Debug + 'static {
     /// A short name used in diagnostics.
     fn name(&self) -> &str;
 
+    /// Whether what this factory creates exists on the host.
+    ///
+    /// `false` for an in-memory device: it has a name and an MTU and nothing
+    /// else — no link, no addresses, nothing for the operating system to
+    /// route through or to attach a resolver setting to. Stated rather than
+    /// guessed from the name, because a name is not evidence: an in-memory
+    /// `tsun0` and a real `tsun0` belonging to another agent look identical
+    /// from here, and configuring the operating system for the first would
+    /// land on the second.
+    fn on_host(&self) -> bool;
+
     /// Creates a device.
     fn create<'a>(
         &'a self,
@@ -117,6 +128,16 @@ pub struct MemoryTun {
     from_os_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
     to_os_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     to_os_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Bytes>>,
+    /// Set once the device is gone, so a reader stops rather than waiting
+    /// for a packet that will never come.
+    ///
+    /// A `watch` rather than a `Notify`: closing must be seen by a reader
+    /// that has not started waiting yet as well as by one already waiting —
+    /// a device can be removed before the loop reading it has been polled
+    /// even once. The receiver is kept for the same reason: a `watch` send
+    /// with nobody subscribed does nothing at all.
+    closed: tokio::sync::watch::Sender<bool>,
+    closed_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl MemoryTun {
@@ -124,6 +145,7 @@ impl MemoryTun {
     pub fn new(name: impl Into<String>, mtu: u32) -> Arc<Self> {
         let (from_os_tx, from_os_rx) = tokio::sync::mpsc::unbounded_channel();
         let (to_os_tx, to_os_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (closed, closed_rx) = tokio::sync::watch::channel(false);
         Arc::new(Self {
             name: name.into(),
             mtu,
@@ -131,7 +153,18 @@ impl MemoryTun {
             from_os_rx: tokio::sync::Mutex::new(from_os_rx),
             to_os_tx,
             to_os_rx: tokio::sync::Mutex::new(to_os_rx),
+            closed,
+            closed_rx,
         })
+    }
+
+    /// Marks the device gone, so the packet loop reading it ends.
+    ///
+    /// A real interface reports end of stream when it is removed; this is
+    /// how that happens here. Without it teardown waits out the whole grace
+    /// period for a reader that had no way of knowing.
+    pub fn close(&self) {
+        let _ = self.closed.send(true);
     }
 
     /// Injects a packet as if the operating system had produced it.
@@ -155,7 +188,17 @@ impl TunDevice for MemoryTun {
     }
 
     fn recv(&self) -> BoxFuture<'_, Option<Bytes>> {
-        Box::pin(async move { self.from_os_rx.lock().await.recv().await })
+        Box::pin(async move {
+            let mut closed = self.closed_rx.clone();
+            if *closed.borrow_and_update() {
+                return None;
+            }
+            let mut queue = self.from_os_rx.lock().await;
+            tokio::select! {
+                packet = queue.recv() => packet,
+                _ = closed.changed() => None,
+            }
+        })
     }
 
     fn send<'a>(&'a self, packet: Bytes) -> BoxFuture<'a, Result<(), OverlayError>> {
@@ -214,6 +257,23 @@ impl MemoryTunFactory {
 impl TunFactory for MemoryTunFactory {
     fn name(&self) -> &str {
         "memory"
+    }
+
+    /// Nothing here is on the host, which is the whole point of it.
+    fn on_host(&self) -> bool {
+        false
+    }
+
+    /// Closes the device so whatever is reading it stops.
+    ///
+    /// The device itself is kept, because a test asks what went through it
+    /// after the agent that owned it has gone.
+    fn destroy<'a>(&'a self, name: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(device) = self.device(name) {
+                device.close();
+            }
+        })
     }
 
     fn create<'a>(

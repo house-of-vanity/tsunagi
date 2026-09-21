@@ -108,8 +108,10 @@ pub struct StatusReport {
 pub struct DnsReport {
     /// The zone it answers for.
     pub zone: String,
-    /// Where it is listening, if it managed to bind.
-    pub listening: Option<String>,
+    /// Every address it is listening on, one per family where it could.
+    ///
+    /// Empty means it answers nowhere, and `bind_error` says why.
+    pub listening: Vec<String>,
     /// Why it could not bind, if it did not.
     pub bind_error: Option<String>,
     /// Why the system resolver was not told, if it was not.
@@ -188,6 +190,12 @@ pub struct PeerReport {
 pub struct OverlayReport {
     /// Packet interface name.
     pub interface: String,
+    /// Whether that interface exists on the host.
+    ///
+    /// `false` under `--no-tun`: tunnels run and packets move between
+    /// agents, but the operating system has no interface, no address and no
+    /// route, so nothing local reaches the overlay.
+    pub on_host: bool,
     /// Interface MTU.
     pub mtu: u32,
     /// This agent's overlay address, once the network has agreed one.

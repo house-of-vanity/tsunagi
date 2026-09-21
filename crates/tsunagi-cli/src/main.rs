@@ -282,7 +282,9 @@ struct UpArgs {
     /// Serve a local DNS zone for this network's members.
     ///
     /// Members resolve as `<hostname>.<zone>`, from signed state, so a
-    /// member that is switched off still resolves. IPv4 only.
+    /// member that is switched off still resolves. The answers are the
+    /// overlay's IPv4 addresses; questions are taken over both IPv4 and
+    /// IPv6, on UDP and TCP.
     #[arg(long, help_heading = "System")]
     dns: bool,
 
@@ -290,7 +292,7 @@ struct UpArgs {
     #[arg(long, value_name = "NAME", help_heading = "System")]
     dns_zone: Option<String>,
 
-    /// Port for the local DNS server.
+    /// Port for the local DNS server, on every address it listens on.
     #[arg(long, default_value_t = 5354, help_heading = "System")]
     dns_port: u16,
 
@@ -522,7 +524,7 @@ fn configured_networks_section(paths: &StoragePaths) -> report::Section {
 #[derive(Debug, Clone, Default)]
 struct DnsState {
     zone: String,
-    listening: Option<SocketAddr>,
+    listening: Vec<SocketAddr>,
     bind_error: Option<String>,
     publish_error: Option<String>,
     publish_remedy: Option<String>,
@@ -571,7 +573,7 @@ fn spawn_dns(
     zone: tsunagi::dns::ZoneName,
     port: u16,
 ) -> DnsService {
-    use tsunagi::dns::{DnsServer, SharedZone, Zone, listen_addresses};
+    use tsunagi::dns::{DnsServer, SharedZone, Zone, listen_plan};
 
     let state = Arc::new(std::sync::Mutex::new(DnsState {
         zone: zone.as_str().to_string(),
@@ -585,15 +587,17 @@ fn spawn_dns(
         let publisher = Arc::clone(&publisher);
         tokio::spawn(async move {
             let shared = SharedZone::new(Zone::new(zone.clone(), []));
-            // Held for its `Drop`, which stops the server: the value is
-            // never read, but letting it go is what closes the socket.
-            let mut _server: Option<DnsServer> = None;
-            let mut bound: Option<SocketAddr> = None;
+            // Held for their `Drop`, which stops each server: the values are
+            // never read, but letting them go is what closes the sockets.
+            // One per address family, so a question is answered over
+            // whichever the resolver uses.
+            let mut _servers: Vec<DnsServer> = Vec::new();
+            let mut bound: Vec<SocketAddr> = Vec::new();
             // What was tried last time, not what was got. Comparing against
             // what was got would rebind on every tick whenever the preferred
             // address is one that cannot be bound, closing the port each
             // time for no reason.
-            let mut attempted: Vec<SocketAddr> = Vec::new();
+            let mut attempted: Option<tsunagi::dns::ListenPlan> = None;
             let mut published: Option<tsunagi::dns::Published> = None;
             // A condition that persists is worth saying once, not every
             // pass; and a refusal will not lift without somebody acting, so
@@ -627,65 +631,79 @@ fn spawn_dns(
                     .find(|member| member.endpoint_id == own)
                     .and_then(|member| member.overlay_address_v4);
                 // The interface belongs to the agent, so the resolver
-                // setting attaches to that one and not to a protocol's.
+                // setting attaches to that one and not to a protocol's. Only
+                // one that is really on the host: an in-memory interface has
+                // a name and nothing else, and telling the operating system
+                // about that name would configure whatever else happens to
+                // be called it.
                 let interface = agent
                     .overlay()
+                    .filter(|overlay| overlay.on_host)
                     .map(|overlay| overlay.interface)
                     .filter(|name| !name.is_empty());
-                let wanted = listen_addresses(overlay, port);
-                if attempted != wanted {
-                    attempted = wanted.clone();
-                    // Dropping the old one first releases the port, so the
+                let wanted = listen_plan(overlay, port);
+                if attempted.as_ref() != Some(&wanted) {
+                    attempted = Some(wanted.clone());
+                    // Dropping the old ones first releases the port, so the
                     // rebind is not racing itself.
-                    _server = None;
+                    _servers.clear();
                     let mut last: Option<std::io::Error> = None;
-                    bound = None;
-                    for candidate in &wanted {
-                        match DnsServer::bind(*candidate, shared.clone()).await {
-                            Ok(fresh) => {
-                                tracing::info!(
-                                    address = %fresh.local_addr(),
-                                    zone = %zone.as_str(),
-                                    "dns listening"
-                                );
-                                bound = Some(fresh.local_addr());
-                                _server = Some(fresh);
-                                break;
+                    bound.clear();
+                    // Each family on its own: one of them being unavailable
+                    // — IPv6 switched off, an address not on an interface —
+                    // is no reason to answer on neither.
+                    for family in wanted.families() {
+                        for candidate in family {
+                            match DnsServer::bind(*candidate, shared.clone()).await {
+                                Ok(fresh) => {
+                                    tracing::info!(
+                                        address = %fresh.local_addr(),
+                                        zone = %zone.as_str(),
+                                        "dns listening"
+                                    );
+                                    bound.push(fresh.local_addr());
+                                    _servers.push(fresh);
+                                    break;
+                                }
+                                Err(err) => last = Some(err),
                             }
-                            Err(err) => last = Some(err),
                         }
                     }
-                    let bind_error = bound.is_none().then(|| {
+                    let bind_error = bound.is_empty().then(|| {
                         last.map_or_else(
                             || "no address to listen on".to_string(),
                             |err| err.to_string(),
                         )
                     });
+                    let listening = bound.clone();
                     update(&state, |state| {
-                        state.listening = bound;
+                        state.listening = listening;
                         state.bind_error = bind_error;
                     });
-                    // The address moved, so whatever the resolver was told
+                    // The addresses moved, so whatever the resolver was told
                     // is now wrong.
                     published = None;
                 }
 
-                let Some(address) = bound else { continue };
+                if bound.is_empty() {
+                    continue;
+                }
                 let Some(interface) = interface else {
                     update(&state, |state| {
                         state.publish_error = Some(
-                            "there is no overlay interface to attach the resolver setting to"
+                            "there is no overlay interface on this host to attach the resolver \
+                             setting to"
                                 .to_string(),
                         );
                         state.publish_remedy = None;
+                        state.names = names;
                     });
-                    update(&state, |state| state.names = names);
                     continue;
                 };
 
                 let want_published = tsunagi::dns::Published {
                     interface,
-                    server: address,
+                    servers: bound.clone(),
                     domains: vec![zone.as_str().to_string()],
                 };
                 let due = retry_after.is_none_or(|at| tokio::time::Instant::now() >= at);
@@ -1156,10 +1174,11 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
         Observed::Stored { .. } => out.push(configured_networks_section(&paths)),
     }
 
-    if let Observed::Agent(report) = &observed
-        && let Some(dns) = &report.dns
-    {
-        out.push(dns_section(dns));
+    if let Observed::Agent(report) = &observed {
+        out.push(match &report.dns {
+            Some(dns) => dns_section(dns),
+            None => dns_absent_section(),
+        });
     }
 
     out.push(host_section());
@@ -1181,20 +1200,23 @@ fn dns_section(dns: &tsunagi::ipc::DnsReport) -> report::Section {
         section.push(Row::new(Health::Degraded, "zone name", warning.clone()));
     }
 
-    match (&dns.listening, &dns.bind_error) {
-        (Some(address), _) => {
-            section.push(Row::new(Health::Good, "listening", address.clone()));
-        }
-        (None, Some(err)) => {
+    match (dns.listening.as_slice(), &dns.bind_error) {
+        ([], Some(err)) => {
             section.push(Row::new(Health::Broken, "listening", err.clone()));
         }
-        (None, None) => {
+        ([], None) => {
             section.push(Row::new(Health::Degraded, "listening", "not yet"));
+        }
+        // One address per family it could open. Both is the ordinary case;
+        // one is worth seeing rather than hiding, because then a question
+        // over the other family goes unanswered.
+        (addresses, _) => {
+            section.push(Row::new(Health::Good, "listening", addresses.join(", ")));
         }
     }
 
     match &dns.publish_error {
-        None if dns.listening.is_some() => {
+        None if !dns.listening.is_empty() => {
             section.push(Row::new(
                 Health::Good,
                 "system resolver",
@@ -1206,7 +1228,7 @@ fn dns_section(dns: &tsunagi::ipc::DnsReport) -> report::Section {
             // The server still answers, so this is a degraded overlay and
             // not a broken one; what is missing is the automatic part.
             let row = Row::new(Health::Degraded, "system resolver", err.clone());
-            section.push(match (&dns.publish_remedy, &dns.listening) {
+            section.push(match (&dns.publish_remedy, dns.listening.first()) {
                 (Some(remedy), _) => row.with_note(remedy.clone()),
                 (None, Some(address)) => row.with_note(format!(
                     "resolve names yourself with `dig @{} -p {} <name>.{}`",
@@ -1218,6 +1240,30 @@ fn dns_section(dns: &tsunagi::ipc::DnsReport) -> report::Section {
             });
         }
     }
+    section
+}
+
+/// Says that there is no local resolver, when there is none.
+///
+/// Its absence is why a name does not resolve, and nothing else in the
+/// report says so: a missing section reads as nothing to report rather than
+/// as a feature that was never asked for.
+fn dns_absent_section() -> report::Section {
+    use report::{Health, Row, Section};
+
+    let mut section = Section::new("dns");
+    section.push(
+        Row::new(
+            Health::Info,
+            "not serving",
+            "no local resolver for any network",
+        )
+        .with_note(
+            "members resolve by address only. `tsunagi up --dns` serves \
+             `<hostname>.<network>` from signed state, so a member that is switched \
+             off still resolves.",
+        ),
+    );
     section
 }
 
@@ -1366,12 +1412,23 @@ fn network_section(
     }
 
     if let Some(overlay) = &network.overlay {
+        let interface = if overlay.on_host {
+            overlay.interface.clone()
+        } else {
+            // The name is real to the agent and to nothing else. Said here,
+            // because an address on an interface the operating system does
+            // not have explains every ping that goes nowhere.
+            format!("{} (in memory, --no-tun)", overlay.interface)
+        };
         section.push(Row::new(
-            Health::Info,
+            if overlay.on_host {
+                Health::Info
+            } else {
+                Health::Degraded
+            },
             "overlay",
             format!(
-                "{}  {}  mtu {}",
-                overlay.interface,
+                "{interface}  {}  mtu {}",
                 match &overlay.address {
                     Some(address) => format!("{address}/{}", overlay.prefix_len),
                     None => "no address agreed yet".to_string(),
@@ -2256,7 +2313,11 @@ async fn build_report(
     let overlay = agent.overlay();
     let dns = dns.map(|dns| DnsReport {
         zone: dns.zone,
-        listening: dns.listening.map(|address| address.to_string()),
+        listening: dns
+            .listening
+            .iter()
+            .map(|address| address.to_string())
+            .collect(),
         bind_error: dns.bind_error,
         publish_error: dns.publish_error,
         publish_remedy: dns.publish_remedy,
@@ -2278,6 +2339,7 @@ async fn build_report(
                     interface: overlay
                         .as_ref()
                         .map_or_else(String::new, |overlay| overlay.interface.clone()),
+                    on_host: overlay.as_ref().is_some_and(|overlay| overlay.on_host),
                     mtu: overlay.as_ref().map_or(0, |overlay| overlay.mtu),
                     address: view.overlay_address_v4.map(|addr| addr.to_string()),
                     prefix_len: view.ipv4_range.map_or(0, |range| range.prefix_len),
@@ -2583,6 +2645,9 @@ mod status_tests {
     fn overlay(peers: Vec<OverlayPeerReport>) -> OverlayReport {
         OverlayReport {
             interface: "tsundemo".into(),
+            // A real interface, which is the ordinary case; the in-memory
+            // one has a test of its own.
+            on_host: true,
             mtu: 1280,
             address: Some("10.13.37.69".into()),
             prefix_len: 24,
@@ -2676,6 +2741,74 @@ mod status_tests {
         assert!(text.contains("no range to allocate from"), "{text}");
         assert!(text.contains("another network here already does"), "{text}");
         assert!(text.contains("--ipv4-range"), "the fix is named: {text}");
+    }
+
+    #[test]
+    fn an_in_memory_interface_is_not_presented_as_a_host_interface() {
+        // `--no-tun` runs the tunnels and moves packets between agents, but
+        // the operating system has no interface, no address and no route. An
+        // address printed beside a name the host does not have is what makes
+        // a ping that goes nowhere look like a network fault.
+        let mut network = network_after_a_peer_returned();
+        if let Some(overlay) = &mut network.overlay {
+            overlay.on_host = false;
+        }
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert!(text.contains("in memory"), "{text}");
+        assert!(text.contains("--no-tun"), "the reason is named: {text}");
+        assert_eq!(out.worst(), Health::Degraded, "{text}");
+    }
+
+    #[test]
+    fn with_no_local_resolver_the_report_says_so_rather_than_nothing() {
+        // The absence is the answer to "why does the name not resolve?".
+        // Left out, the report looked the same as one where DNS was running.
+        let mut out = report::Report::new();
+        out.push(dns_absent_section());
+        let text = out.render(false);
+        assert!(text.contains("not serving"), "{text}");
+        assert!(text.contains("--dns"), "the flag that starts it: {text}");
+        // Nothing is wrong with an agent that was never asked to serve DNS.
+        assert_eq!(out.worst(), Health::Good, "{text}");
+    }
+
+    #[test]
+    fn both_families_are_listed_while_only_one_bound_is_still_good() {
+        use tsunagi::ipc::DnsReport;
+
+        let both = DnsReport {
+            zone: "lab".into(),
+            listening: vec!["10.13.37.69:5354".into(), "[::1]:5354".into()],
+            names: 2,
+            ..Default::default()
+        };
+        let mut out = report::Report::new();
+        out.push(dns_section(&both));
+        let text = out.render(false);
+        assert!(text.contains("10.13.37.69:5354, [::1]:5354"), "{text}");
+
+        // One family is worth seeing rather than hiding: a question over the
+        // other one goes unanswered.
+        let one = DnsReport {
+            listening: vec!["127.0.0.1:5354".into()],
+            ..both.clone()
+        };
+        let mut out = report::Report::new();
+        out.push(dns_section(&one));
+        assert!(out.render(false).contains("127.0.0.1:5354"));
+
+        // Neither, with a reason, is broken.
+        let none = DnsReport {
+            listening: Vec::new(),
+            bind_error: Some("address already in use".into()),
+            ..both
+        };
+        let mut out = report::Report::new();
+        out.push(dns_section(&none));
+        assert_eq!(out.worst(), Health::Broken, "{}", out.render(false));
     }
 
     #[test]

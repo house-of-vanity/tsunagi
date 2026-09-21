@@ -32,10 +32,16 @@ pub struct Published {
     /// The interface questions should be sent through.
     ///
     /// The server listens on an overlay address, which is only reachable
-    /// over the overlay interface, so the two travel together.
+    /// over the overlay interface, so the two travel together. It must be an
+    /// interface this agent created: configuring one it did not is
+    /// configuring somebody else's.
     pub interface: String,
-    /// Where the server is listening.
-    pub server: SocketAddr,
+    /// Every address the server is listening on, best first.
+    ///
+    /// One per address family, so a resolver reaches it over whichever it
+    /// uses. All of them are published together and none is preferred by
+    /// this: which one a resolver picks is its business.
+    pub servers: Vec<SocketAddr>,
     /// The suffixes that belong to this server.
     ///
     /// Routing suffixes only: they say *which questions* come here, never

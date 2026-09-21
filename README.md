@@ -195,11 +195,15 @@ dig @10.13.37.69 -p 5354 music.lab
 ```
 
 Names come from signed state, which is the point: **a member that is
-switched off still resolves**, because its claim outlived the session. IPv4
-only — the IPv6 overlay address derives from a key that travels in live
-announcements, so it cannot be answered for a member that is away, and
-answering for some members and not others depending on who is online is
-worse than not answering.
+switched off still resolves**, because its claim outlived the session.
+
+The answers are IPv4 addresses, because that is what the overlay is. The
+*questions* are taken over both families, on UDP and TCP: the server listens
+on the overlay address and on `127.0.0.1`, and on `[::1]` for IPv6, so a
+resolver reaches it over whichever it uses. All of those are published to
+the system resolver together. A listening address is disposable — unlike an
+address a member holds in signed state — so serving one family over the
+overlay and the other over loopback costs nothing.
 
 The zone is the network name unless `--dns-zone` says otherwise. It is
 yours to choose, so a name that shadows a real public domain is reported and
@@ -211,6 +215,11 @@ On Linux the agent tells systemd-resolved to send questions for that suffix
 here, over D-Bus, scoped to the overlay interface and as a *routing* domain
 so it never becomes the resolver for anything else. resolved drops the whole
 setting when the interface goes, and the interface goes with the agent.
+
+Only an interface the agent created, though. Under `--no-tun` there is no
+host interface at all, and the agent says so and serves the zone on
+loopback rather than configuring whatever else on the host happens to share
+the name.
 
 That last step needs permission that `CAP_NET_ADMIN` does not give:
 systemd-resolved asks polkit, and polkit decides by **user**, not by
