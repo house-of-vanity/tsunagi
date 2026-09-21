@@ -211,6 +211,12 @@ struct NetworkState {
     ipv4_range: Option<Ipv4Range>,
     /// The address last reported as missing, so it is said once, not forever.
     reported_missing_v4: Option<Ipv4Addr>,
+    /// What was last applied to the host interface.
+    ///
+    /// The overlay IPv4 address is allocated at run time and can change while
+    /// the agent runs, so the interface has to be brought back in line
+    /// without being recreated — recreating it would drop every tunnel.
+    applied: Option<TunRequest>,
 }
 
 #[derive(Debug, Default)]
@@ -444,6 +450,7 @@ impl Worker {
                 allocations: HashMap::new(),
                 ipv4_range: None,
                 reported_missing_v4: None,
+                applied: None,
             });
         }
 
@@ -456,29 +463,34 @@ impl Worker {
         Ok(true)
     }
 
+    /// What the host interface for a network should look like.
+    fn desired_request(&self, state: &NetworkState, network: NetworkId) -> TunRequest {
+        let own_range = state.ipv4_range;
+        TunRequest {
+            name: state.interface.clone(),
+            address: overlay_address(network, &state.key.public()),
+            prefix_len: OVERLAY_PREFIX_LEN,
+            address_v4: state.allocations.get(&self.local_id()).copied(),
+            prefix_len_v4: own_range.map_or(0, |range| range.prefix_len),
+            mtu: self.config.mtu,
+        }
+    }
+
     /// Creates the packet interface and starts the WireGuard device.
     async fn ensure_device(&self, network: NetworkId) -> Result<(), PluginError> {
-        let (name, key, own_v4, own_range) = {
+        let (request, key, own_range) = {
             let shared = self.lock_shared();
             match shared.networks.get(&network) {
                 Some(state) if state.device.is_none() => (
-                    state.interface.clone(),
+                    self.desired_request(state, network),
                     state.key.clone(),
-                    state.allocations.get(&self.local_id()).copied(),
                     state.ipv4_range,
                 ),
                 _ => return Ok(()),
             }
         };
 
-        let request = TunRequest {
-            name: name.clone(),
-            address: overlay_address(network, &key.public()),
-            prefix_len: OVERLAY_PREFIX_LEN,
-            address_v4: own_v4,
-            prefix_len_v4: own_range.map_or(0, |range| range.prefix_len),
-            mtu: self.config.mtu,
-        };
+        let applied = request.clone();
         let tun = self.tun_factory.create(request).await?;
         let device = Arc::new(WireguardDevice::start(network, key, tun, own_range));
 
@@ -486,8 +498,42 @@ impl Worker {
         if let Some(state) = shared.networks.get_mut(&network) {
             state.interface = device.interface().to_string();
             state.device = Some(device);
+            state.applied = Some(applied);
         }
         Ok(())
+    }
+
+    /// Brings a live interface back in line after the overlay changed its
+    /// mind about this agent's address.
+    async fn ensure_addresses(&self, network: NetworkId) {
+        let wanted = {
+            let shared = self.lock_shared();
+            match shared.networks.get(&network) {
+                Some(state) if state.device.is_some() => {
+                    let wanted = self.desired_request(state, network);
+                    if state.applied.as_ref() == Some(&wanted) {
+                        return;
+                    }
+                    wanted
+                }
+                _ => return,
+            }
+        };
+
+        match self.tun_factory.reconfigure(wanted.clone()).await {
+            Ok(()) => {
+                let mut shared = self.lock_shared();
+                if let Some(state) = shared.networks.get_mut(&network) {
+                    state.applied = Some(wanted);
+                }
+            }
+            Err(err) => {
+                // Not fatal: the tunnels keep running on the addresses that
+                // are there, and the next reconciliation tries again.
+                tracing::warn!(%err, "cannot update the overlay interface addresses");
+                self.report(network, err);
+            }
+        }
     }
 
     /// Brings the running tunnels in line with what is known.
@@ -601,10 +647,17 @@ impl Worker {
     }
 
     /// Removes a network's interface and tunnels, keeping its key.
-    fn teardown(&self, network: NetworkId) {
+    async fn teardown(&self, network: NetworkId) {
         // Dropping the state drops the device, which stops its tasks and
-        // closes the packet interface.
-        self.lock_shared().networks.remove(&network);
+        // closes the packet interface. Closing it is already enough for the
+        // kernel to remove an interface this agent created; the explicit
+        // destroy makes that immediate and definite rather than dependent on
+        // the last reader letting go.
+        let removed = self.lock_shared().networks.remove(&network);
+        if let Some(state) = removed {
+            drop(state.device);
+            self.tun_factory.destroy(&state.interface).await;
+        }
     }
 
     fn known_networks(&self) -> Vec<NetworkId> {
@@ -649,12 +702,12 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
                     }
                     Command::Teardown(network) => {
                         pending.remove(&network);
-                        worker.teardown(network);
+                        worker.teardown(network).await;
                         continue;
                     }
                     Command::Stop(reply) => {
                         for network in worker.known_networks() {
-                            worker.teardown(network);
+                            worker.teardown(network).await;
                         }
                         let _ = reply.send(());
                         return;
@@ -670,6 +723,7 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
             }, if wait_until.is_some() => {
                 deadline = None;
                 for network in std::mem::take(&mut pending) {
+                    worker.ensure_addresses(network).await;
                     worker.sync(network);
                 }
             }
@@ -680,6 +734,7 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
                     if let Err(err) = worker.ensure_device(network).await {
                         tracing::debug!(%err, "packet interface still unavailable");
                     }
+                    worker.ensure_addresses(network).await;
                     worker.sync(network);
                 }
             }

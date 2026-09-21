@@ -267,22 +267,85 @@ async fn main() -> Result<()> {
 * **Userspace costs CPU.** Kernel WireGuard is faster. A kernel backend could
   return behind the same boundary, but it would give up transport-provided NAT
   traversal unless paired with a local proxy.
-* **A persistent TUN interface needs `keep_addr_on_down`.** Without a process
-  attached it has no carrier, and Linux then flushes its IPv6 addresses. The
-  setup printed by `tsunagi tun-setup` sets it; the agent checks the address is
-  present *and usable* — not tentative, not DAD-failed — before attaching, and
-  reports what it actually found. This applies to IPv6 only: IPv4 addresses
-  survive carrier loss, so the overlay IPv4 address is added once and stays.
-* **The overlay IPv4 address is not derivable, so `tun-setup` cannot print it
-  on a fresh state directory.** It is allocated and signed at run time, so the
-  first `tsunagi up` is what names it; afterwards `tun-setup` reads it back
-  from `state.sqlite` — a read that takes no directory lock and so does not
-  disturb a running agent — and includes the `ip address add` line.
-* **The agent cannot assign the overlay address itself.** The `tun` crate sets
-  addresses through an IPv4-only ioctl, so the IPv6 overlay address must come
-  from `ip -6 address add` or an equivalent. The agent verifies the address is
-  present, via `/proc/net/if_inet6`, and refuses with the exact command rather
-  than running an interface that could never receive anything. Doing it
-  in-process would mean speaking netlink, which is not implemented.
+* **The interface is managed, not prepared.** On Linux the agent creates the
+  TUN interface and configures it over netlink, in process. See
+  *Provisioning* below.
+* **No provisioner exists for macOS or Windows yet.** There the agent attaches
+  to an interface prepared by hand and says so.
 * **The system interface path is not exercised by the default suite**, because
   it needs privileges. Everything else about the data plane is.
+
+
+## Provisioning the interface
+
+Everything the printed `ip` recipe used to do happens in process now, over
+netlink. The shape of it is a reconciliation rather than a sequence of
+commands: the agent is handed a plan — name, MTU, the addresses the interface
+should carry and no others — observes what is actually on the host, and
+applies the difference. Running it twice changes nothing the second time.
+
+The decision of *what* to change is
+`dataplane::wireguard::provision::plan_changes`: pure, platform-independent
+and unit-tested on every platform. Only the execution is behind
+`InterfaceProvisioner`, which has three implementations — netlink on Linux, a
+`MockProvisioner` over a pretend host for the tests, and one that refuses with
+an explanation everywhere else.
+
+### Cleanup is the default, not an action
+
+The interface is created by opening `/dev/net/tun` and is **not** made
+persistent, so the kernel destroys it when the last descriptor closes. A clean
+shutdown, a panic, `SIGKILL` and a power cut all leave the same amount behind:
+nothing. There is no path by which a dead agent leaves an interface, because
+keeping one alive is what requires a live process.
+
+This also removes the two settings the manual recipe needed. `keep_addr_on_down`
+existed only because an interface nobody held open lost carrier and had its
+IPv6 addresses flushed; `nodad` only because duplicate address detection
+cannot finish without carrier. An interface held open for its whole life has
+carrier for its whole life.
+
+### Repairing what an older run left
+
+Two things can still be sitting on the name: an interface created persistent
+by the old recipe, and — narrowly — one from a run killed between `TUNSETIFF`
+and the agent recording it. Both are replaced, which discards their stale
+addresses with them.
+
+The two refusals are the interesting part:
+
+* **A link that is not a TUN is never touched.** The name is derived from the
+  network id, so colliding with a real device is unlikely rather than
+  impossible, and deleting somebody's bridge is not a recoverable mistake.
+* **A TUN another process holds open is never deleted.** Carrier is the
+  signal: a TUN has it exactly while something is attached. An attached one is
+  a working overlay, almost certainly a second agent on this host, and it is
+  told to use a different `--wg-prefix` instead.
+
+### Privilege
+
+`CAP_NET_ADMIN` is required and is kept out of the *effective* set except
+around the netlink calls that need it. `setcap cap_net_admin+p` leaves it
+permitted but not effective at exec, which is the resting state; the agent
+raises it for a few milliseconds at startup and again when its address
+allocation changes.
+
+Two facts shape how that is done. Capabilities on Linux are **per thread**,
+and netlink checks the credentials of whichever thread calls `sendmsg` —
+which, with an async client, is the connection task and not the caller. So
+raising a capability around an `await` would be wrong in the way that works
+until the scheduler moves the task.
+
+Therefore: all netlink work runs on one dedicated thread with a current-thread
+runtime, where nothing is polled outside a `block_on`, and the capability is
+raised immediately before that call and lowered immediately after. Opening the
+TUN descriptor is the other privileged act; it is a synchronous call with no
+`await` between the guard and the release, so it stays on its own thread by
+construction.
+
+### What it cannot be told to do
+
+Nothing here takes a name, an address or a command from the network. The
+interface name is derived from the network id, the addresses come from the
+local plugin and the signed allocation records, and no external program is
+executed at any point — there is no `ip`, no shell and no `PATH` involved.

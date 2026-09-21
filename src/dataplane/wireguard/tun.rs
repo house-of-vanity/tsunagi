@@ -10,7 +10,8 @@
 //!   is what the test suite uses, so the entire data plane — handshake,
 //!   encryption, routing — is exercised without touching the host.
 //! * `SystemTun`, behind the `tun-device` feature, is a real TUN interface.
-//!   Creating one needs `CAP_NET_ADMIN` on Linux or the equivalent elsewhere.
+//!   Creating one needs `CAP_NET_ADMIN`; attaching to one somebody else
+//!   prepared needs nothing.
 
 use std::net::Ipv6Addr;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use crate::BoxFuture;
 use crate::dataplane::PluginError;
 
 /// What a device should look like once created.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunRequest {
     /// Interface name to ask for.
     pub name: String,
@@ -35,6 +36,23 @@ pub struct TunRequest {
     pub prefix_len_v4: u8,
     /// Interface MTU.
     pub mtu: u32,
+}
+
+impl TunRequest {
+    /// A request carrying nothing but a name and an MTU.
+    ///
+    /// Used where the addresses have already been applied to the host, so the
+    /// device itself only needs opening.
+    pub fn bare(name: impl Into<String>, mtu: u32) -> Self {
+        Self {
+            name: name.into(),
+            address: Ipv6Addr::UNSPECIFIED,
+            prefix_len: 0,
+            address_v4: None,
+            prefix_len_v4: 0,
+            mtu,
+        }
+    }
 }
 
 /// A packet interface.
@@ -66,6 +84,28 @@ pub trait TunFactory: Send + Sync + std::fmt::Debug + 'static {
         &'a self,
         request: TunRequest,
     ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, PluginError>>;
+
+    /// Applies a changed request to an interface that already exists.
+    ///
+    /// The overlay IPv4 address is allocated at run time, so it can change
+    /// while the agent runs. A factory that manages the host applies that to
+    /// the live interface, without recreating it: recreating would drop every
+    /// tunnel riding on it.
+    ///
+    /// The default does nothing, which is right for a factory that only
+    /// attaches to an interface somebody else prepared.
+    fn reconfigure<'a>(&'a self, _request: TunRequest) -> BoxFuture<'a, Result<(), PluginError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    /// Removes an interface this factory created.
+    ///
+    /// Runs on the teardown path, so it reports rather than fails: there is
+    /// nothing useful to do about a failure at that point, and an interface
+    /// that is already gone is the desired outcome anyway.
+    fn destroy<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {})
+    }
 }
 
 /// An in-memory packet interface.
@@ -197,6 +237,8 @@ impl TunFactory for MemoryTunFactory {
 }
 
 #[cfg(feature = "tun-device")]
+pub(crate) use system::open_tun;
+#[cfg(feature = "tun-device")]
 pub use system::{
     Assigned, SystemTunFactory, interface_addresses, interface_exists, parse_if_inet6,
     setup_commands,
@@ -223,11 +265,16 @@ mod system {
     ///   this user. This is the recommended way to run the agent unprivileged.
     /// * **Create** it here, which needs `CAP_NET_ADMIN`.
     ///
-    /// Either way the overlay address has to be assigned by something
-    /// privileged: assigning an IPv6 address to an interface is not something
-    /// this crate's dependencies can do, so the agent checks that it is there
-    /// and says exactly what to run if it is not, rather than coming up in a
-    /// state where no traffic could ever arrive.
+    /// `SystemTunFactory` is the **attach** path, for a host where the agent
+    /// has no privileges at all: the interface and its addresses were put
+    /// there by something else, so it checks they are present and says
+    /// exactly what to run if they are not, rather than coming up in a state
+    /// where no traffic could ever arrive.
+    ///
+    /// The other path is
+    /// [`ManagedTunFactory`](super::super::provision::ManagedTunFactory),
+    /// where the agent creates and configures the interface itself. That is
+    /// the default on Linux and needs no preparation at all.
     pub struct SystemTun {
         name: String,
         mtu: u32,
@@ -426,6 +473,60 @@ mod system {
         commands
     }
 
+    /// Opens the TUN interface, creating it if it is not already there.
+    ///
+    /// Synchronous, and deliberately so: on the managed path the caller holds
+    /// a capability guard across this call, and a guard must not span an
+    /// `await` because Linux capabilities are per thread.
+    ///
+    /// `attach_only` says the interface already exists and was prepared by
+    /// something else, so nothing beyond `TUNSETIFF` is issued — reconfiguring
+    /// it would need exactly the privileges that path is avoiding.
+    pub(crate) fn open_tun(
+        request: &TunRequest,
+        attach_only: bool,
+    ) -> Result<Arc<dyn TunDevice>, PluginError> {
+        let mut config = tun::Configuration::default();
+        config.tun_name(&request.name);
+        config.platform_config(|platform| {
+            // The crate's own root check is not the check we want: the
+            // managed path holds CAP_NET_ADMIN without being root, and the
+            // attach path needs no privileges at all. Whether the open
+            // succeeds is the honest answer either way.
+            platform.ensure_root_privileges(false);
+        });
+        // Packet information stays off, so reads and writes are raw IP
+        // packets. `ip tuntap add ... mode tun` also defaults to no packet
+        // information, so the flags match when attaching to one.
+
+        let device = tun::create_as_async(&config).map_err(|err| {
+            let hint = if attach_only {
+                format!(
+                    "interface `{}` exists but could not be opened: {err}. \
+                     It must be a persistent TUN interface owned by this user.",
+                    request.name
+                )
+            } else {
+                format!(
+                    "cannot create the TUN interface `{}`: {err}. \
+                     Creating one needs CAP_NET_ADMIN. Either grant it with \
+                     `setcap cap_net_admin+p`, or prepare the interface once as root \
+                     (see `tsunagi tun-setup`) and run unprivileged.",
+                    request.name
+                )
+            };
+            PluginError::Unavailable(hint)
+        })?;
+
+        let (reader, writer) = tokio::io::split(device);
+        Ok(Arc::new(SystemTun {
+            name: request.name.clone(),
+            mtu: request.mtu,
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
+        }) as Arc<dyn TunDevice>)
+    }
+
     fn current_user() -> String {
         std::env::var("SUDO_USER")
             .or_else(|_| std::env::var("USER"))
@@ -468,41 +569,7 @@ mod system {
                     )));
                 }
 
-                let mut config = tun::Configuration::default();
-                config.tun_name(&request.name);
-                if existed {
-                    // Attach only. Reconfiguring an interface somebody
-                    // prepared for us would need exactly the privileges we
-                    // are avoiding, so no ioctl beyond TUNSETIFF is issued.
-                    config.platform_config(|platform| {
-                        platform.ensure_root_privileges(false);
-                    });
-                } else {
-                    // We are creating it, so we configure it.
-                    config.mtu(request.mtu as u16).up();
-                }
-                // Packet information stays off, so reads and writes are raw IP
-                // packets. `ip tuntap add ... mode tun` also defaults to no
-                // packet information, so the flags match when attaching.
-
-                let device = tun::create_as_async(&config).map_err(|err| {
-                    let hint = if existed {
-                        format!(
-                            "interface `{}` exists but could not be opened: {err}. \
-                             It must be a persistent TUN interface owned by this user.",
-                            request.name
-                        )
-                    } else {
-                        format!(
-                            "cannot create the TUN interface `{}`: {err}. \
-                             Creating one needs CAP_NET_ADMIN. Either prepare it once as root \
-                             (see `tsunagi tun-setup`) and run unprivileged, or grant the \
-                             capability.",
-                            request.name
-                        )
-                    };
-                    PluginError::Unavailable(hint)
-                })?;
+                let device = open_tun(&request, existed)?;
 
                 // An interface we just created has no address yet either.
                 if let Err(reason) = check_address(&request.name, request.address) {
@@ -512,13 +579,7 @@ mod system {
                     )));
                 }
 
-                let (reader, writer) = tokio::io::split(device);
-                Ok(Arc::new(SystemTun {
-                    name: request.name,
-                    mtu: request.mtu,
-                    reader: Mutex::new(reader),
-                    writer: Mutex::new(writer),
-                }) as Arc<dyn TunDevice>)
+                Ok(device)
             })
         }
     }

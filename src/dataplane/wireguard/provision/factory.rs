@@ -1,0 +1,201 @@
+//! The adapter between the plugin's view of a packet interface and the
+//! host-management view.
+//!
+//! The plugin asks a [`TunFactory`] for a device and knows nothing else. This
+//! factory answers by reconciling the host — creating the interface, fixing
+//! up whatever an earlier run left behind, assigning the addresses — and
+//! handing back the device that came out of it.
+
+use std::sync::Arc;
+
+use crate::BoxFuture;
+use crate::dataplane::PluginError;
+
+use super::super::config::Cidr;
+use super::super::tun::{TunDevice, TunFactory, TunRequest};
+use super::{InterfacePlan, InterfaceProvisioner};
+
+/// Turns a [`TunRequest`] into the plan for a host interface.
+fn plan_for(request: &TunRequest) -> Result<InterfacePlan, PluginError> {
+    let mut addresses = vec![Cidr::new(request.address.into(), request.prefix_len)?];
+    if let Some(address) = request.address_v4 {
+        addresses.push(Cidr::new(address.into(), request.prefix_len_v4)?);
+    }
+    Ok(InterfacePlan::new(
+        request.name.clone(),
+        request.mtu,
+        addresses,
+    ))
+}
+
+/// A [`TunFactory`] backed by an [`InterfaceProvisioner`].
+#[derive(Debug)]
+pub struct ManagedTunFactory {
+    provisioner: Arc<dyn InterfaceProvisioner>,
+}
+
+impl ManagedTunFactory {
+    /// Wraps a provisioner.
+    pub fn new(provisioner: Arc<dyn InterfaceProvisioner>) -> Self {
+        Self { provisioner }
+    }
+
+    /// The provisioner underneath.
+    pub fn provisioner(&self) -> &Arc<dyn InterfaceProvisioner> {
+        &self.provisioner
+    }
+}
+
+impl TunFactory for ManagedTunFactory {
+    fn name(&self) -> &str {
+        self.provisioner.name()
+    }
+
+    fn create<'a>(
+        &'a self,
+        request: TunRequest,
+    ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, PluginError>> {
+        Box::pin(async move {
+            let plan = plan_for(&request)?;
+            let provisioned = self.provisioner.reconcile(&plan).await?;
+            tracing::info!(
+                interface = %plan.name,
+                changes = %provisioned.changes.summary(),
+                "overlay interface reconciled"
+            );
+            provisioned.device.ok_or_else(|| {
+                // Reaching here would mean the interface already existed and
+                // was held open by us, which cannot be true on the path that
+                // creates a device.
+                PluginError::Other(format!(
+                    "interface `{}` was reconciled but no device came back",
+                    plan.name
+                ))
+            })
+        })
+    }
+
+    fn reconfigure<'a>(&'a self, request: TunRequest) -> BoxFuture<'a, Result<(), PluginError>> {
+        Box::pin(async move {
+            let plan = plan_for(&request)?;
+            let provisioned = self.provisioner.reconcile(&plan).await?;
+            if !provisioned.changes.is_empty() {
+                tracing::info!(
+                    interface = %plan.name,
+                    changes = %provisioned.changes.summary(),
+                    "overlay interface updated"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn destroy<'a>(&'a self, name: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            match self.provisioner.remove(name).await {
+                Ok(()) => tracing::info!(interface = %name, "overlay interface removed"),
+                Err(err) => {
+                    tracing::warn!(interface = %name, %err, "cannot remove the overlay interface")
+                }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::super::{LinkKind, MockHost, MockProvisioner};
+    use super::*;
+
+    fn request(v4: Option<Ipv4Addr>) -> TunRequest {
+        TunRequest {
+            name: "tsunfactory".into(),
+            address: Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            prefix_len: 64,
+            address_v4: v4,
+            prefix_len_v4: 24,
+            mtu: 1280,
+        }
+    }
+
+    #[tokio::test]
+    async fn creating_a_device_provisions_the_host_and_returns_it() {
+        let provisioner = Arc::new(MockProvisioner::default());
+        let factory = ManagedTunFactory::new(provisioner.clone());
+
+        let device = factory
+            .create(request(Some(Ipv4Addr::new(10, 13, 37, 69))))
+            .await
+            .unwrap();
+        assert_eq!(device.name(), "tsunfactory");
+        assert_eq!(device.mtu(), 1280);
+
+        let state = provisioner.host().get("tsunfactory").unwrap();
+        assert_eq!(state.kind, LinkKind::Tun);
+        assert_eq!(state.mtu, 1280);
+        assert_eq!(state.addresses.len(), 2, "both families are assigned");
+    }
+
+    #[tokio::test]
+    async fn a_reallocated_address_is_applied_to_the_live_interface() {
+        let provisioner = Arc::new(MockProvisioner::default());
+        let factory = ManagedTunFactory::new(provisioner.clone());
+        factory
+            .create(request(Some(Ipv4Addr::new(10, 13, 37, 69))))
+            .await
+            .unwrap();
+
+        factory
+            .reconfigure(request(Some(Ipv4Addr::new(10, 13, 37, 70))))
+            .await
+            .unwrap();
+
+        let state = provisioner.host().get("tsunfactory").unwrap();
+        assert!(state.attached, "the interface was not recreated");
+        let addresses: Vec<String> = state
+            .addresses
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        assert!(
+            addresses.contains(&"10.13.37.70/24".to_string()),
+            "{addresses:?}"
+        );
+        assert!(
+            !addresses.contains(&"10.13.37.69/24".to_string()),
+            "{addresses:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroying_takes_the_interface_off_the_host() {
+        let provisioner = Arc::new(MockProvisioner::default());
+        let factory = ManagedTunFactory::new(provisioner.clone());
+        factory.create(request(None)).await.unwrap();
+
+        factory.destroy("tsunfactory").await;
+        assert!(provisioner.host().names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_be_provisioned_fails_the_create() {
+        let host = MockHost::new();
+        host.insert(
+            "tsunfactory",
+            super::super::InterfaceState {
+                kind: LinkKind::Foreign("bridge".into()),
+                attached: true,
+                up: true,
+                mtu: 1500,
+                addresses: Vec::new(),
+            },
+        );
+        let factory = ManagedTunFactory::new(Arc::new(MockProvisioner::new(host)));
+        let err = factory.create(request(None)).await.unwrap_err();
+        assert!(err.to_string().contains("bridge"), "{err}");
+    }
+}

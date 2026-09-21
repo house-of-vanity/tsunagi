@@ -146,19 +146,57 @@ No vote is involved — see
 [docs/sync-model.md](docs/sync-model.md).
 
 Because the address is allocated at run time rather than derived, it is not
-known until the agent has started and agreed with its peers, so
-`tsunagi tun-setup` cannot print it in advance. The agent prints the exact
-`ip address add` command once it has one, and keeps saying so until the
-address is actually on an interface — without it, packets leave with the
-wrong source address and every peer drops them.
+known until the agent has started and agreed with its peers. On Linux the
+agent assigns it itself as soon as it has one; elsewhere `tsunagi tun-setup`
+prints the `ip address add` line once the claim is in `state.sqlite`.
 
-## Running unprivileged
+## Privileges
 
-The agent does not need to run as root. Creating a network interface and
-giving it an address do need privileges, but they are a **one-time setup step**
-that can be done separately.
+On Linux the agent **manages its own overlay interface**. It creates the TUN
+interface, sets the MTU, brings it up and assigns both overlay addresses, all
+over netlink in process — no `ip` invocation, no shell, nothing that a
+remote peer could influence.
 
-Ask the agent what it needs, then run that once as root:
+That needs `CAP_NET_ADMIN`, granted once:
+
+```bash
+sudo setcap cap_net_admin+p /usr/local/bin/tsunagi
+```
+
+`+p` rather than `+ep`: the capability is then *permitted* but not
+*effective*, and the agent raises it only around the handful of netlink calls
+that need it — a few milliseconds at startup, and again if its address
+allocation changes. Everything else, including every byte from the network,
+is handled with it lowered. `+ep` works too; the agent lowers it on the way
+in.
+
+`tsunagi doctor` says which of these applies on the host it runs on.
+
+### It cleans up after itself
+
+The interface is tied to an open file descriptor and is deliberately **not**
+made persistent, so the kernel removes it when the agent exits — on a clean
+shutdown, on a panic, on `SIGKILL`, on power loss alike. Keeping it is what
+would take an action; removing it is the default.
+
+If something is left behind anyway — an interface made by an older version's
+manual recipe, or one from a run killed in the instant between creating it and
+recording it — the next start **replaces it**, along with any stale addresses
+it carried. Two things are never touched:
+
+* an interface that is not a TUN, because the name colliding with somebody's
+  bridge is not a reason to destroy the bridge;
+* a TUN that another process is holding open, because that is a working
+  overlay belonging to somebody else — most likely a second agent on this
+  host, which should be given a different `--wg-prefix`.
+
+Both of those refuse with an explanation rather than guessing.
+
+### Running without the capability
+
+`--interface attach` (or `auto`, which falls back on its own) opens an
+interface prepared beforehand and needs **no privileges at all**. Ask the
+agent what to run:
 
 ```bash
 tsunagi tun-setup --network lab --secret "$SECRET"
@@ -174,55 +212,44 @@ sudo sysctl -qw net.ipv6.conf.tsunjwc6dcrtmo5.keep_addr_on_down=1
 sudo ip -6 address add fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64 dev tsunjwc6dcrtmo5 nodad
 ```
 
-With IPv4 enabled, `tun-setup` adds an `ip address add` line for the overlay
-IPv4 address too — but only once there is one to print. Unlike the IPv6
-address, the IPv4 address is not derived from the keys: it is allocated at run
-time and signed (see [docs/sync-model.md](docs/sync-model.md)), so it exists
-only after the agent has run once. `tun-setup` then reads it back out of
-`state.sqlite`, which does not disturb a running agent, and includes it from
-then on. Until then the first `tsunagi up` prints the exact command for the
-address it was given.
+`user ab` is the point: the interface is persistent and owned by that user, so
+`tsunagi up` afterwards opens it with no privileges and no capabilities.
 
-That IPv4 line needs no `keep_addr_on_down` and no `nodad`: Linux keeps IPv4
-addresses on an interface that loses carrier, and IPv4 has no duplicate
-address detection to stall. Adding it once is enough.
+The last two settings are what the managed path does not need. A persistent
+TUN has **no carrier** until a process attaches to it; Linux flushes IPv6
+addresses from an interface that loses carrier unless `keep_addr_on_down` is
+set, and duplicate address detection can never finish without carrier, so the
+address would sit there tentative and unusable without `nodad`. An interface
+the agent creates and holds open has carrier for its whole life, so neither
+applies. IPv4 needs neither in either case: Linux keeps IPv4 addresses across
+carrier loss and IPv4 has no duplicate address detection.
+
+With IPv4 enabled, `tun-setup` adds an `ip address add` line once there is an
+address to print — it reads the signed claim back out of `state.sqlite`, which
+does not disturb a running agent.
 
 The MTU is 1280 because that is the minimum IPv6 requires (RFC 8200). Linux
 disables IPv6 entirely on an interface below it — the per-device
-`/proc/sys/net/ipv6` entries vanish and `ip -6 address add` fails with
+`/proc/sys/net/ipv6` entries vanish and adding an address fails with
 `Invalid argument` — so a smaller MTU cannot work at all. The agent refuses
 one rather than letting it fail later.
 
-The order and the last two lines are not decoration. A persistent TUN
-interface has **no carrier** until a process attaches to it, and Linux flushes
-IPv6 addresses from an interface that loses carrier unless
-`keep_addr_on_down` is set — so an address added without it disappears before
-the agent ever starts. `nodad` is needed for the same reason: duplicate
-address detection cannot finish without a carrier, and the address would sit
-there tentative and unusable.
-
-`user ab` is the point: the interface is persistent and owned by that user, so
-`tsunagi up` afterwards opens it with **no privileges and no capabilities at
-all**. The interface name and address are derived, so they are stable — the
-setup survives restarts and only has to be redone if the network name, the
-secret or this agent's WireGuard key changes.
-
-Other ways, and their trade-offs:
+### Summary
 
 | approach | agent runs as | notes |
 |---|---|---|
-| `tsunagi tun-setup` (above) | ordinary user, no capabilities | recommended |
-| `sudo setcap cap_net_admin+ep ./tsunagi` | ordinary user, one capability | the agent can then create the interface itself, but **still cannot assign the IPv6 address** (see below), so the `ip -6 address add` line is needed anyway. The capability is lost on every rebuild or copy. |
-| systemd service | `User=`, `AmbientCapabilities=CAP_NET_ADMIN` | same caveat about the address |
-| plain `sudo tsunagi up` | root | everything works, nothing is isolated |
+| `setcap cap_net_admin+p` | ordinary user, one capability | recommended on Linux: nothing to prepare, nothing left behind. Lost on every rebuild or copy of the binary. |
+| systemd service | `User=`, `AmbientCapabilities=CAP_NET_ADMIN` | the same, for an installed service |
+| `tsunagi tun-setup` then `--interface attach` | ordinary user, no capabilities | one privileged setup per host; needed on macOS and Windows, where no provisioner is implemented yet |
+| `sudo tsunagi up` | root | everything works, nothing is isolated |
+| `--no-tun` | ordinary user, no capabilities | tunnels run and handshake, traffic never reaches the OS |
 
-**Known limitation.** The agent cannot assign the IPv6 overlay address itself:
-the `tun` crate sets addresses through an IPv4-only ioctl, so an IPv6 address
-has to come from `ip -6 address add` or an equivalent. Rather than start with
-an interface that could never receive anything, the agent checks for the
-address in `/proc/net/if_inet6` and refuses with the exact command to run.
-Doing it in-process would mean talking netlink directly, which is possible but
-not implemented.
+**Not implemented yet.** macOS and Windows have no provisioner: both need
+real platform work — `utun` and `SystemConfiguration` on one, the IP Helper
+API and a Wintun adapter on the other. On those the agent says so and falls
+back to attaching to a prepared interface. The decision logic that says *what*
+to change is shared and tested on every platform; only the execution is
+per-platform.
 
 ## Checks
 

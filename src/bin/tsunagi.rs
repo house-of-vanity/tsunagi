@@ -224,6 +224,15 @@ struct UpArgs {
     #[arg(long)]
     no_tun: bool,
 
+    /// How the overlay interface is obtained.
+    ///
+    /// `managed` has the agent create and configure it itself, which needs
+    /// CAP_NET_ADMIN and cleans up on exit. `attach` opens an interface that
+    /// was prepared beforehand (see `tsunagi tun-setup`) and needs no
+    /// privileges. `auto` manages it when it can and attaches when it cannot.
+    #[arg(long, value_enum, default_value_t = InterfaceMode::Auto)]
+    interface: InterfaceMode,
+
     /// Interface name prefix for the WireGuard data plane.
     #[arg(long, default_value = "tsun")]
     wg_prefix: String,
@@ -533,16 +542,33 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "tun-device"))]
     println!("  interfaces     not built in (enable the `tun-device` feature)");
 
-    #[cfg(unix)]
+    #[cfg(feature = "tun-device")]
     {
-        // Creating a network interface needs CAP_NET_ADMIN, which in practice
-        // means root unless capabilities were granted explicitly.
-        let euid = std::fs::metadata("/proc/self").ok().map(|_| ());
-        let _ = euid;
-        println!(
-            "  privileges     creating an interface needs CAP_NET_ADMIN; \
-             use --no-tun to run without it"
-        );
+        use tsunagi::dataplane::wireguard::{Privilege, probe_net_admin};
+        match probe_net_admin() {
+            Privilege::Available => {
+                println!("  privileges     CAP_NET_ADMIN held");
+                println!(
+                    "  interface      managed by the agent: created on start, \
+                     removed on exit"
+                );
+            }
+            Privilege::Missing(reason) => {
+                println!("  privileges     no CAP_NET_ADMIN ({reason})");
+                println!("  interface      must be prepared first; run `tsunagi tun-setup`");
+                println!(
+                    "  to manage it   {}",
+                    Privilege::how_to_grant(&program_path())
+                );
+            }
+            Privilege::Unsupported => {
+                println!(
+                    "  privileges     managing interfaces is not implemented on {} yet",
+                    std::env::consts::OS
+                );
+                println!("  interface      must be prepared first; run `tsunagi tun-setup`");
+            }
+        }
     }
 
     println!("\nlocal addresses");
@@ -554,6 +580,14 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
         println!("  {addr}");
     }
     Ok(())
+}
+
+/// This program's path, for an instruction the user can paste.
+fn program_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_string))
+        .unwrap_or_else(|| "tsunagi".to_string())
 }
 
 async fn netwatch_addresses() -> Vec<std::net::IpAddr> {
@@ -600,7 +634,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
         } else {
-            system_tun_factory()?
+            system_tun_factory(args.interface)?
         };
         let mut wg = WireguardConfig::new(paths.state_dir.join("wireguard"))
             .with_interface_prefix(args.wg_prefix.clone());
@@ -832,14 +866,69 @@ async fn stop_signal() -> &'static str {
     }
 }
 
+/// How the overlay interface is obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum InterfaceMode {
+    /// Manage it when possible, attach to a prepared one otherwise.
+    Auto,
+    /// Create and configure it in process. Needs CAP_NET_ADMIN.
+    Managed,
+    /// Open an interface prepared beforehand. Needs no privileges.
+    Attach,
+}
+
+/// Builds the interface factory for the chosen mode.
+///
+/// The managed path is preferred because it is the one that cleans up after
+/// itself: the interface is tied to an open file descriptor, so it goes away
+/// when the agent does, however the agent goes away.
 #[cfg(feature = "tun-device")]
-fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+fn system_tun_factory(
+    mode: InterfaceMode,
+) -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     use tsunagi::dataplane::wireguard::SystemTunFactory;
-    Ok(Arc::new(SystemTunFactory::new()))
+
+    if mode == InterfaceMode::Attach {
+        return Ok(Arc::new(SystemTunFactory::new()));
+    }
+
+    match managed_tun_factory() {
+        Ok(factory) => Ok(factory),
+        Err(err) if mode == InterfaceMode::Managed => Err(err),
+        Err(err) => {
+            tracing::warn!(
+                "{err} Falling back to attaching to a prepared interface; \
+                 `tsunagi tun-setup` prints how to make one."
+            );
+            Ok(Arc::new(SystemTunFactory::new()))
+        }
+    }
+}
+
+#[cfg(all(feature = "tun-device", target_os = "linux"))]
+fn managed_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+    use tsunagi::dataplane::wireguard::{ManagedTunFactory, NetlinkProvisioner};
+    let provisioner = NetlinkProvisioner::new()?;
+    Ok(Arc::new(ManagedTunFactory::new(Arc::new(provisioner))))
+}
+
+/// There is no provisioner for this platform yet.
+///
+/// Refused here rather than at the first packet, so `auto` falls back to
+/// attaching and `--interface managed` says plainly why it cannot.
+#[cfg(all(feature = "tun-device", not(target_os = "linux")))]
+fn managed_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+    Err(format!(
+        "managing the overlay interface is not implemented on {} yet.",
+        std::env::consts::OS
+    )
+    .into())
 }
 
 #[cfg(not(feature = "tun-device"))]
-fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+fn system_tun_factory(
+    _mode: InterfaceMode,
+) -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     Err("this build has no interface support; rebuild with the `tun-device` feature or pass --no-tun".into())
 }
 

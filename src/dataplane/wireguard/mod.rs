@@ -34,9 +34,11 @@
 //!
 //! The only part that needs privileges is the packet interface. With
 //! [`tun::MemoryTunFactory`] the whole data plane — handshake, encryption,
-//! routing, address ownership — runs and is tested with no privileges at all;
-//! `SystemTunFactory` swaps in a real interface when you want traffic to
-//! reach the operating system.
+//! routing, address ownership — runs and is tested with no privileges at all.
+//! For real traffic there are two ways in: [`provision::ManagedTunFactory`],
+//! where the agent creates and configures the interface itself over netlink
+//! and removes it again on exit, and `SystemTunFactory`, which attaches to an
+//! interface somebody else prepared and needs no privileges.
 //!
 //! See `docs/wireguard.md` for the full picture.
 
@@ -47,6 +49,7 @@ pub mod keys;
 pub mod overlay;
 pub mod packet;
 pub mod plugin;
+pub mod provision;
 pub mod store;
 pub mod tun;
 
@@ -61,8 +64,16 @@ pub use plugin::{
     DEFAULT_MTU, MIN_MTU, NetworkOverview, PeerOverview, WIREGUARD_OVERHEAD, WIREGUARD_PROTOCOL,
     WireguardConfig, WireguardPlugin,
 };
+pub use provision::{
+    Changes, InterfacePlan, InterfaceProvisioner, InterfaceState, LinkKind, ManagedTunFactory,
+    MockHost, MockProvisioner, Privilege, Provisioned, UnsupportedProvisioner, plan_changes,
+    probe_net_admin,
+};
 pub use store::WgKeyStore;
 pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest, address_is_local};
+
+#[cfg(all(feature = "tun-device", target_os = "linux"))]
+pub use provision::NetlinkProvisioner;
 
 #[cfg(feature = "tun-device")]
 pub use tun::{
