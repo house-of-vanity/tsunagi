@@ -22,13 +22,13 @@ system can hand us IP packets, and even that is behind a trait
 | | needs privileges | what it proves |
 |---|---|---|
 | `MemoryTunFactory` | no | handshake, encryption, routing, address ownership |
-| `SystemTunFactory`, attaching | none, if the interface was prepared | traffic actually reaches the OS |
-| `SystemTunFactory`, creating | `CAP_NET_ADMIN` | the same, at the cost of a capability |
+| `MockProvisioner` | no | the above, plus what would have been done to the host |
+| `ManagedTunFactory` | `CAP_NET_ADMIN` | traffic actually reaches the OS |
 
-`SystemTunFactory` attaches to an interface that already exists and only
-creates one when it does not. A persistent interface created by root and owned
-by the user lets the agent run with no privileges at all; see *Running
-unprivileged* in [../README.md](../README.md#running-unprivileged).
+`ManagedTunFactory` creates the interface and configures it; see
+*Provisioning the interface* below and *Privileges* in
+[../README.md](../README.md#privileges). With no capability the agent runs
+with `--no-tun`: everything but the last hop into the kernel still works.
 
 [boringtun]: https://docs.rs/boringtun
 [`TunFactory`]: https://docs.rs/tsunagi
@@ -126,14 +126,16 @@ wins, and the agent adopts it. So the flag matters for whoever starts the
 network and is harmless afterwards. Pass `--ipv4-range none` for an IPv6-only
 overlay.
 
-Putting the address on the interface still needs privileges, and the agent
-cannot do it. Since the address is only known once the agent has agreed with
-its peers, `tsunagi tun-setup` cannot print it up front either. So the agent
-checks whether the address is assigned anywhere on the host — by binding a UDP
-socket to it, which needs no privileges — and reports the exact command until
-it is. This matters: with the wrong address on the interface, packets leave
-with the wrong source and every peer drops them as not belonging to us, which
-looks like a broken network rather than a missing command.
+The agent puts the address on the interface itself, as soon as the network has
+agreed on it — no restart, and the interface is not recreated, which would
+drop every tunnel riding on it.
+
+It then checks that it is really there, by binding a UDP socket to it, which
+needs no privileges. That check is deliberately independent of the code that
+did the assigning: the failure it guards against is a silent one. With the
+wrong address on the interface, packets leave with the wrong source and every
+peer drops them as not belonging to us, which looks like a broken network
+rather than a broken assumption.
 
 A release tombstone exists in the record type and merges correctly, but
 nothing emits one yet, so an address stays claimed until the network is
@@ -224,7 +226,7 @@ use tsunagi::{Agent, Result};
 async fn main() -> Result<()> {
     let paths = StoragePaths::user_default()?;
 
-    // MemoryTunFactory needs no privileges; swap in SystemTunFactory for a
+    // MemoryTunFactory needs no privileges; swap in ManagedTunFactory for a
     // real interface.
     let plugin = WireguardPlugin::open(
         WireguardConfig::new(paths.state_dir.join("wireguard")),

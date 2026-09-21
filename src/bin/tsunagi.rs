@@ -45,15 +45,12 @@ enum Command {
     /// Shows this device's identity without joining anything.
     Id(PathArgs),
     /// Joins a network and runs until interrupted.
-    Up(UpArgs),
+    // Boxed: it is much larger than the other variants, and every command
+    // but this one would otherwise pay for its size. A `//` comment, not a
+    // `///` one, or clap would print it as help.
+    Up(Box<UpArgs>),
     /// Asks a running agent what it is doing.
     Status(StatusArgs),
-    /// Prints the one-time privileged setup for the overlay interface.
-    ///
-    /// Run its output once as root, then run `tsunagi up` as an ordinary
-    /// user: the agent attaches to the prepared interface and needs no
-    /// privileges of its own.
-    TunSetup(TunSetupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -64,45 +61,6 @@ struct StatusArgs {
     /// Control socket to talk to. Derived from the state directory by default.
     #[arg(long)]
     control_socket: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-struct TunSetupArgs {
-    #[command(flatten)]
-    paths: PathArgs,
-
-    /// Network name, exactly as passed to `tsunagi up`.
-    #[arg(long, short = 'n')]
-    network: String,
-
-    /// The shared secret.
-    #[arg(
-        long,
-        short = 's',
-        env = "TSUNAGI_SECRET",
-        conflicts_with = "secret_file"
-    )]
-    secret: Option<String>,
-
-    /// Read the shared secret from a file instead of the command line.
-    #[arg(long)]
-    secret_file: Option<PathBuf>,
-
-    /// The user that should own the interface. Defaults to the current one.
-    #[arg(long)]
-    user: Option<String>,
-
-    /// Interface name prefix, matching `tsunagi up --wg-prefix`.
-    #[arg(long, default_value = "tsun")]
-    wg_prefix: String,
-
-    /// Interface MTU, matching `tsunagi up --wg-mtu`. At least 1280.
-    #[arg(long)]
-    wg_mtu: Option<u32>,
-
-    /// Match `tsunagi up --ipv4-range`.
-    #[arg(long, value_name = "CIDR")]
-    ipv4_range: Option<String>,
 }
 
 /// Resolves the IPv4 overlay range from the flag.
@@ -224,15 +182,6 @@ struct UpArgs {
     #[arg(long)]
     no_tun: bool,
 
-    /// How the overlay interface is obtained.
-    ///
-    /// `managed` has the agent create and configure it itself, which needs
-    /// CAP_NET_ADMIN and cleans up on exit. `attach` opens an interface that
-    /// was prepared beforehand (see `tsunagi tun-setup`) and needs no
-    /// privileges. `auto` manages it when it can and attaches when it cannot.
-    #[arg(long, value_enum, default_value_t = InterfaceMode::Auto)]
-    interface: InterfaceMode,
-
     /// Interface name prefix for the WireGuard data plane.
     #[arg(long, default_value = "tsun")]
     wg_prefix: String,
@@ -347,35 +296,9 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Doctor(paths) => doctor(paths).await,
         Command::Id(paths) => show_id(paths).await,
-        Command::Up(args) => up(args).await,
-        Command::TunSetup(args) => tun_setup(args).await,
+        Command::Up(args) => up(*args).await,
         Command::Status(args) => status(args).await,
     }
-}
-
-/// The IPv4 address this agent has already been allocated, if any.
-///
-/// Read straight from the mandatory state store. Opening it for reading does
-/// not take the directory lock, so this works while the agent is running.
-/// Records are verified here too: the database is not a trust boundary.
-fn allocated_ipv4(
-    paths: &StoragePaths,
-    network: tsunagi::NetworkId,
-) -> Result<Option<(std::net::Ipv4Addr, u8)>, Box<dyn std::error::Error>> {
-    use tsunagi::state::RecordBody;
-    use tsunagi::storage::StateStore;
-
-    let store = StateStore::open(paths.state_db())?;
-    let author = store.load_or_create_device_identity()?.endpoint_id();
-    for record in store.signed_records(network)? {
-        if record.author != *author.as_bytes() || record.verify(network).is_err() {
-            continue;
-        }
-        if let RecordBody::Ipv4Claim { address, range } = record.body {
-            return Ok(Some((address, range.prefix_len)));
-        }
-    }
-    Ok(None)
 }
 
 /// Path of the local control socket for a state directory.
@@ -401,86 +324,6 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|err| format!("cannot reach the agent at {}: {err}", socket.display()))?;
     print!("{}", report.render());
-    Ok(())
-}
-
-/// Works out the interface name and overlay address, then prints the
-/// privileged commands that prepare it.
-///
-/// The address depends on this agent's WireGuard key for the network, so the
-/// key store is opened (and the key created on first use) to compute it.
-async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use tsunagi::dataplane::wireguard::{
-        DEFAULT_MTU, OVERLAY_PREFIX_LEN, WgKeyStore, interface_name, overlay_address,
-    };
-    use tsunagi::identity::NetworkKeys;
-
-    let name = NetworkName::new(args.network.clone())?;
-    let secret = load_secret(args.secret.as_deref(), args.secret_file.as_deref())?;
-    let paths = args.paths.resolve()?;
-    let network = NetworkKeys::derive(&name, &secret).network_id();
-
-    let store_path = paths.state_dir.join("wireguard").join("wireguard.sqlite");
-    let store = tokio::task::spawn_blocking({
-        let store_path = store_path.clone();
-        move || WgKeyStore::open(store_path)
-    })
-    .await??;
-    let key = tokio::task::spawn_blocking(move || store.load_or_create(network)).await??;
-
-    let interface = interface_name(&args.wg_prefix, network)?;
-    let address = overlay_address(network, &key.public());
-    let ipv4_range = resolve_ipv4_range(args.ipv4_range.as_ref())?;
-    let mtu = args.wg_mtu.unwrap_or(DEFAULT_MTU);
-    let user = args.user.unwrap_or_else(|| {
-        std::env::var("SUDO_USER")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_else(|_| "$USER".to_string())
-    });
-
-    println!("# Network  {name} ({network})");
-    println!("# Interface {interface}, address {address}/{OVERLAY_PREFIX_LEN}, mtu {mtu}");
-    // The IPv4 address is allocated at run time, so it can only be shown once
-    // the agent has one. Reading the state store does not disturb a running
-    // agent: the directory lock belongs to the agent, not to this reader.
-    let allocated_v4 = ipv4_range.and_then(|_| allocated_ipv4(&paths, network).ok().flatten());
-    match (ipv4_range, allocated_v4) {
-        (Some(_), Some((address, prefix_len))) => {
-            println!("# IPv4 overlay address {address}/{prefix_len}, allocated and signed");
-        }
-        (Some(_), None) => {
-            println!(
-                "# IPv4 is allocated once the agent runs and agrees with its peers, so\n\
-                 # there is nothing to print yet. Start `tsunagi up`: it prints the exact\n\
-                 # `ip address add` command for the address it was given, and this\n\
-                 # command will include it from then on."
-            );
-        }
-        (None, _) => {}
-    }
-    println!("# Run once as root; then run `tsunagi up` as {user}.");
-    println!(
-        "#\n\
-         # keep_addr_on_down matters: a persistent TUN interface has no carrier\n\
-         # until a process attaches, and Linux flushes IPv6 addresses from an\n\
-         # interface that loses carrier unless it is set. `nodad` matters for the\n\
-         # same reason: duplicate address detection can never finish without a\n\
-         # carrier, leaving the address tentative and unusable.\n"
-    );
-    println!("sudo ip tuntap add dev {interface} mode tun user {user}");
-    println!("sudo ip link set dev {interface} mtu {mtu} up");
-    println!("sudo sysctl -qw net.ipv6.conf.{interface}.keep_addr_on_down=1");
-    println!("sudo ip -6 address add {address}/{OVERLAY_PREFIX_LEN} dev {interface} nodad");
-    if let Some((address, prefix_len)) = allocated_v4 {
-        // IPv4 addresses are not flushed when an interface loses carrier, so
-        // this one needs none of the treatment IPv6 does.
-        println!("sudo ip address add {address}/{prefix_len} dev {interface}");
-    }
-
-    println!("\n# To check it afterwards:");
-    println!("ip addr show dev {interface}");
-    println!("\n# To remove it again:");
-    println!("sudo ip link del dev {interface}");
     Ok(())
 }
 
@@ -555,9 +398,9 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             Privilege::Missing(reason) => {
                 println!("  privileges     no CAP_NET_ADMIN ({reason})");
-                println!("  interface      must be prepared first; run `tsunagi tun-setup`");
+                println!("  interface      cannot be created; run with `--no-tun` meanwhile");
                 println!(
-                    "  to manage it   {}",
+                    "  to grant it    {}",
                     Privilege::how_to_grant(&program_path())
                 );
             }
@@ -566,7 +409,7 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
                     "  privileges     managing interfaces is not implemented on {} yet",
                     std::env::consts::OS
                 );
-                println!("  interface      must be prepared first; run `tsunagi tun-setup`");
+                println!("  interface      cannot be created; run with `--no-tun`");
             }
         }
     }
@@ -634,7 +477,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
         } else {
-            system_tun_factory(args.interface)?
+            system_tun_factory()?
         };
         let mut wg = WireguardConfig::new(paths.state_dir.join("wireguard"))
             .with_interface_prefix(args.wg_prefix.clone());
@@ -866,47 +709,14 @@ async fn stop_signal() -> &'static str {
     }
 }
 
-/// How the overlay interface is obtained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum InterfaceMode {
-    /// Manage it when possible, attach to a prepared one otherwise.
-    Auto,
-    /// Create and configure it in process. Needs CAP_NET_ADMIN.
-    Managed,
-    /// Open an interface prepared beforehand. Needs no privileges.
-    Attach,
-}
-
-/// Builds the interface factory for the chosen mode.
+/// Builds the interface factory.
 ///
-/// The managed path is preferred because it is the one that cleans up after
-/// itself: the interface is tied to an open file descriptor, so it goes away
-/// when the agent does, however the agent goes away.
-#[cfg(feature = "tun-device")]
-fn system_tun_factory(
-    mode: InterfaceMode,
-) -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
-    use tsunagi::dataplane::wireguard::SystemTunFactory;
-
-    if mode == InterfaceMode::Attach {
-        return Ok(Arc::new(SystemTunFactory::new()));
-    }
-
-    match managed_tun_factory() {
-        Ok(factory) => Ok(factory),
-        Err(err) if mode == InterfaceMode::Managed => Err(err),
-        Err(err) => {
-            tracing::warn!(
-                "{err} Falling back to attaching to a prepared interface; \
-                 `tsunagi tun-setup` prints how to make one."
-            );
-            Ok(Arc::new(SystemTunFactory::new()))
-        }
-    }
-}
-
+/// One path: the agent creates and configures the interface itself. It is
+/// also the one that cleans up after itself, because the interface is tied to
+/// an open file descriptor and goes away with the agent, however the agent
+/// goes away.
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
-fn managed_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     use tsunagi::dataplane::wireguard::{ManagedTunFactory, NetlinkProvisioner};
     let provisioner = NetlinkProvisioner::new()?;
     Ok(Arc::new(ManagedTunFactory::new(Arc::new(provisioner))))
@@ -914,21 +724,20 @@ fn managed_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Erro
 
 /// There is no provisioner for this platform yet.
 ///
-/// Refused here rather than at the first packet, so `auto` falls back to
-/// attaching and `--interface managed` says plainly why it cannot.
+/// Refused here rather than at the first packet, and with the one thing that
+/// does work on every platform named.
 #[cfg(all(feature = "tun-device", not(target_os = "linux")))]
-fn managed_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     Err(format!(
-        "managing the overlay interface is not implemented on {} yet.",
+        "managing the overlay interface is not implemented on {} yet. \
+         Run with `--no-tun` to keep the tunnels off the operating system.",
         std::env::consts::OS
     )
     .into())
 }
 
 #[cfg(not(feature = "tun-device"))]
-fn system_tun_factory(
-    _mode: InterfaceMode,
-) -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     Err("this build has no interface support; rebuild with the `tun-device` feature or pass --no-tun".into())
 }
 

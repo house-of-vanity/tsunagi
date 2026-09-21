@@ -594,11 +594,13 @@ impl Worker {
         }
         device.retain_peers(&wanted);
 
-        // The address is allocated at run time, but putting it on the
-        // interface needs privileges we do not have. Without it the kernel
-        // sends our packets with the wrong source address and every peer
-        // drops them, which looks like a broken network rather than a missing
-        // command. So say exactly what is wrong.
+        // The agent assigns this address itself, so finding it absent means
+        // the assignment did not take — something outside removed it, or the
+        // provisioner reported a success it did not achieve. Left unsaid it
+        // looks like a broken network: the kernel would send packets with the
+        // wrong source address and every peer would drop them. So it is
+        // checked rather than assumed, because the assumption is exactly the
+        // kind that has been wrong here before.
         let missing_v4 = match (own_v4, interface.as_deref(), range) {
             (Some(address), Some(interface), Some(range))
                 if !super::tun::address_is_local(IpAddr::V4(address)) =>
@@ -622,11 +624,11 @@ impl Worker {
             self.report(
                 network,
                 format!(
-                    "this agent was allocated {address} but that address is not on any \
+                    "this agent was allocated {address}/{} but the address is not on any \
                      interface, so IPv4 cannot work: packets would leave with the wrong \
-                     source and every peer would drop them. Run:\n  \
-                     sudo ip address add {address}/{} dev {interface}\n  \
-                     and remove any other address of that range from it.",
+                     source and every peer would drop them. It should have been assigned \
+                     to `{interface}` automatically; check whether something else removed \
+                     it.",
                     range.prefix_len
                 ),
             );

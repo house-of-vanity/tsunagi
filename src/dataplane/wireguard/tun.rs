@@ -10,8 +10,8 @@
 //!   is what the test suite uses, so the entire data plane — handshake,
 //!   encryption, routing — is exercised without touching the host.
 //! * `SystemTun`, behind the `tun-device` feature, is a real TUN interface.
-//!   Creating one needs `CAP_NET_ADMIN`; attaching to one somebody else
-//!   prepared needs nothing.
+//!   Creating one needs `CAP_NET_ADMIN`, and it is
+//!   [`provision`](super::provision) that holds that and creates it.
 
 use std::net::Ipv6Addr;
 use std::sync::Arc;
@@ -238,43 +238,27 @@ impl TunFactory for MemoryTunFactory {
 
 #[cfg(feature = "tun-device")]
 pub(crate) use system::open_tun;
-#[cfg(feature = "tun-device")]
-pub use system::{
-    Assigned, SystemTunFactory, interface_addresses, interface_exists, parse_if_inet6,
-    setup_commands,
-};
 
 #[cfg(feature = "tun-device")]
 mod system {
-    use std::net::Ipv6Addr;
     use std::sync::Arc;
 
     use bytes::Bytes;
     use tokio::sync::Mutex;
 
-    use super::{TunDevice, TunFactory, TunRequest};
+    use super::{TunDevice, TunRequest};
     use crate::BoxFuture;
     use crate::dataplane::PluginError;
 
     /// A real TUN interface.
     ///
-    /// Two ways to get one, and the difference is who needs privileges:
+    /// Created by opening `/dev/net/tun`, which needs `CAP_NET_ADMIN` and is
+    /// why [`open_tun`] is only ever called from
+    /// [`provision`](super::super::provision), where that capability is
+    /// raised for the length of the call and no longer.
     ///
-    /// * **Attach** to an interface that already exists. Needs no privileges
-    ///   at all, as long as the interface was created persistent and owned by
-    ///   this user. This is the recommended way to run the agent unprivileged.
-    /// * **Create** it here, which needs `CAP_NET_ADMIN`.
-    ///
-    /// `SystemTunFactory` is the **attach** path, for a host where the agent
-    /// has no privileges at all: the interface and its addresses were put
-    /// there by something else, so it checks they are present and says
-    /// exactly what to run if they are not, rather than coming up in a state
-    /// where no traffic could ever arrive.
-    ///
-    /// The other path is
-    /// [`ManagedTunFactory`](super::super::provision::ManagedTunFactory),
-    /// where the agent creates and configures the interface itself. That is
-    /// the default on Linux and needs no preparation at all.
+    /// It is deliberately **not** made persistent, so the kernel removes the
+    /// interface when this value is dropped — however the process ends.
     pub struct SystemTun {
         name: String,
         mtu: u32,
@@ -331,168 +315,18 @@ mod system {
         }
     }
 
-    /// Whether an interface of this name exists.
-    pub fn interface_exists(name: &str) -> bool {
-        std::path::Path::new(&format!("/sys/class/net/{name}")).exists()
-    }
-
-    /// `IFA_F_TENTATIVE`: the address is not usable until DAD finishes, which
-    /// never happens on an interface with no carrier.
-    const IFA_F_TENTATIVE: u32 = 0x40;
-    /// `IFA_F_DADFAILED`: duplicate address detection rejected it.
-    const IFA_F_DADFAILED: u32 = 0x08;
-
-    /// One IPv6 address assigned to an interface.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Assigned {
-        /// The address.
-        pub address: Ipv6Addr,
-        /// Raw `IFA_F_*` flags as the kernel reports them.
-        pub flags: u32,
-    }
-
-    impl Assigned {
-        /// Whether the address can actually carry traffic.
-        pub fn is_usable(&self) -> bool {
-            self.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED) == 0
-        }
-
-        /// A short explanation when it cannot.
-        pub fn why_unusable(&self) -> Option<&'static str> {
-            if self.flags & IFA_F_DADFAILED != 0 {
-                Some("duplicate address detection failed")
-            } else if self.flags & IFA_F_TENTATIVE != 0 {
-                Some(
-                    "still tentative; duplicate address detection cannot finish \
-                      on an interface with no carrier, so add it with `nodad`",
-                )
-            } else {
-                None
-            }
-        }
-    }
-
-    /// Parses the IPv6 addresses of one interface out of `/proc/net/if_inet6`.
+    /// Creates the TUN interface by opening it.
     ///
-    /// Each line is `<32 hex address> <ifindex> <prefixlen> <scope> <flags>
-    /// <device>`, all hexadecimal.
-    pub fn parse_if_inet6(contents: &str, name: &str) -> Vec<Assigned> {
-        contents
-            .lines()
-            .filter_map(|line| {
-                let fields: Vec<&str> = line.split_whitespace().collect();
-                if fields.len() < 6 || fields[5] != name {
-                    return None;
-                }
-                let raw = <[u8; 16]>::try_from(hex::decode(fields[0]).ok()?.as_slice()).ok()?;
-                Some(Assigned {
-                    address: Ipv6Addr::from(raw),
-                    flags: u32::from_str_radix(fields[4], 16).unwrap_or(0),
-                })
-            })
-            .collect()
-    }
-
-    /// The IPv6 addresses of an interface, or `None` if that cannot be read.
-    ///
-    /// Reads `/proc/net/if_inet6`, which needs no privileges.
-    pub fn interface_addresses(name: &str) -> Option<Vec<Assigned>> {
-        let contents = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
-        Some(parse_if_inet6(&contents, name))
-    }
-
-    /// What is wrong with an interface's addressing, if anything.
-    pub(crate) fn check_address(name: &str, wanted: Ipv6Addr) -> Result<(), String> {
-        let Some(assigned) = interface_addresses(name) else {
-            // Cannot tell. Carry on rather than block on a guess.
-            return Ok(());
-        };
-        match assigned.iter().find(|entry| entry.address == wanted) {
-            Some(entry) if entry.is_usable() => Ok(()),
-            Some(entry) => Err(format!(
-                "interface `{name}` has {wanted} but it is unusable: {}",
-                entry.why_unusable().unwrap_or("unknown reason")
-            )),
-            None => {
-                let present = if assigned.is_empty() {
-                    "it currently has no IPv6 address at all".to_string()
-                } else {
-                    format!(
-                        "it currently has: {}",
-                        assigned
-                            .iter()
-                            .map(|entry| entry.address.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                };
-                Err(format!(
-                    "interface `{name}` has no {wanted} address, {present}"
-                ))
-            }
-        }
-    }
-
-    /// The commands a privileged user runs once to prepare an interface.
-    ///
-    /// The order and the two extra settings matter. A persistent TUN
-    /// interface has no carrier until a process attaches to it, and Linux
-    /// flushes IPv6 addresses from an interface that loses carrier unless
-    /// `keep_addr_on_down` is set — so an address added without it silently
-    /// disappears before the agent ever starts. `nodad` is needed for the same
-    /// reason: duplicate address detection can never finish with no carrier,
-    /// and the address would stay tentative and unusable.
-    pub fn setup_commands(request: &TunRequest, user: &str) -> Vec<String> {
-        let mut commands = vec![
-            format!(
-                "sudo ip tuntap add dev {} mode tun user {user}",
-                request.name
-            ),
-            format!(
-                "sudo ip link set dev {} mtu {} up",
-                request.name, request.mtu
-            ),
-            format!(
-                "sudo sysctl -qw net.ipv6.conf.{}.keep_addr_on_down=1",
-                request.name
-            ),
-            format!(
-                "sudo ip -6 address add {}/{} dev {} nodad",
-                request.address, request.prefix_len, request.name
-            ),
-        ];
-        if let Some(address) = request.address_v4 {
-            let prefix_len = request.prefix_len_v4;
-            // IPv4 is not sensitive to carrier the way IPv6 is, so it needs
-            // no extra settings.
-            commands.push(format!(
-                "sudo ip address add {address}/{prefix_len} dev {}",
-                request.name
-            ));
-        }
-        commands
-    }
-
-    /// Opens the TUN interface, creating it if it is not already there.
-    ///
-    /// Synchronous, and deliberately so: on the managed path the caller holds
-    /// a capability guard across this call, and a guard must not span an
-    /// `await` because Linux capabilities are per thread.
-    ///
-    /// `attach_only` says the interface already exists and was prepared by
-    /// something else, so nothing beyond `TUNSETIFF` is issued — reconfiguring
-    /// it would need exactly the privileges that path is avoiding.
-    pub(crate) fn open_tun(
-        request: &TunRequest,
-        attach_only: bool,
-    ) -> Result<Arc<dyn TunDevice>, PluginError> {
+    /// Synchronous, and deliberately so: the caller holds a capability guard
+    /// across this call, and such a guard must not span an `await` because
+    /// Linux capabilities are per thread.
+    pub(crate) fn open_tun(request: &TunRequest) -> Result<Arc<dyn TunDevice>, PluginError> {
         let mut config = tun::Configuration::default();
         config.tun_name(&request.name);
         config.platform_config(|platform| {
-            // The crate's own root check is not the check we want: the
-            // managed path holds CAP_NET_ADMIN without being root, and the
-            // attach path needs no privileges at all. Whether the open
-            // succeeds is the honest answer either way.
+            // The crate's own root check is not the check we want: this holds
+            // CAP_NET_ADMIN without being root. Whether the open succeeds is
+            // the honest answer.
             platform.ensure_root_privileges(false);
         });
         // Packet information stays off, so reads and writes are raw IP
@@ -500,22 +334,12 @@ mod system {
         // information, so the flags match when attaching to one.
 
         let device = tun::create_as_async(&config).map_err(|err| {
-            let hint = if attach_only {
-                format!(
-                    "interface `{}` exists but could not be opened: {err}. \
-                     It must be a persistent TUN interface owned by this user.",
-                    request.name
-                )
-            } else {
-                format!(
-                    "cannot create the TUN interface `{}`: {err}. \
-                     Creating one needs CAP_NET_ADMIN. Either grant it with \
-                     `setcap cap_net_admin+p`, or prepare the interface once as root \
-                     (see `tsunagi tun-setup`) and run unprivileged.",
-                    request.name
-                )
-            };
-            PluginError::Unavailable(hint)
+            PluginError::Unavailable(format!(
+                "cannot create the TUN interface `{}`: {err}. Creating one needs \
+                 CAP_NET_ADMIN; grant it with `setcap cap_net_admin+p`, or run with \
+                 `--no-tun` to keep the tunnels off the operating system.",
+                request.name
+            ))
         })?;
 
         let (reader, writer) = tokio::io::split(device);
@@ -525,173 +349,5 @@ mod system {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
         }) as Arc<dyn TunDevice>)
-    }
-
-    fn current_user() -> String {
-        std::env::var("SUDO_USER")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_else(|_| "$USER".to_string())
-    }
-
-    /// Opens real TUN interfaces.
-    #[derive(Debug, Clone, Default)]
-    pub struct SystemTunFactory;
-
-    impl SystemTunFactory {
-        /// Creates the factory.
-        pub fn new() -> Self {
-            Self
-        }
-    }
-
-    impl TunFactory for SystemTunFactory {
-        fn name(&self) -> &str {
-            "system"
-        }
-
-        fn create<'a>(
-            &'a self,
-            request: TunRequest,
-        ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, PluginError>> {
-            Box::pin(async move {
-                let existed = interface_exists(&request.name);
-
-                // Check before attaching. Opening and then dropping the
-                // device toggles the carrier, and with the default
-                // `keep_addr_on_down=0` that is enough to flush the very
-                // address we are looking for.
-                if existed && let Err(reason) = check_address(&request.name, request.address) {
-                    let commands = setup_commands(&request, &current_user()).join("\n  ");
-                    return Err(PluginError::Unavailable(format!(
-                        "{reason}.\nAssigning an IPv6 address needs privileges. \
-                         Remove the interface and prepare it again:\n  sudo ip link del dev {}\n  {commands}",
-                        request.name
-                    )));
-                }
-
-                let device = open_tun(&request, existed)?;
-
-                // An interface we just created has no address yet either.
-                if let Err(reason) = check_address(&request.name, request.address) {
-                    let commands = setup_commands(&request, &current_user()).join("\n  ");
-                    return Err(PluginError::Unavailable(format!(
-                        "{reason}.\nAssigning an IPv6 address needs privileges. Run:\n  {commands}"
-                    )));
-                }
-
-                Ok(device)
-            })
-        }
-    }
-}
-
-#[cfg(all(test, feature = "tun-device", target_os = "linux"))]
-mod system_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
-    use std::net::Ipv6Addr;
-
-    use super::TunRequest;
-    use super::system::{interface_addresses, parse_if_inet6, setup_commands};
-
-    const SAMPLE: &str = "\
-fe800000000000008baaeb0c433b635a 04 40 20 80 tailscale0
-00000000000000000000000000000001 01 80 10 80       lo
-fd559caf9652cb86321feac65c73bd82 05 40 00 80 tsun0
-fd559caf9652cb86321feac65c73bd83 05 40 00 40 tsun0
-fd559caf9652cb86321feac65c73bd84 05 40 00 08 tsun0
-";
-
-    #[test]
-    fn addresses_are_read_per_interface_with_their_flags() {
-        let found = parse_if_inet6(SAMPLE, "tsun0");
-        assert_eq!(found.len(), 3);
-        assert_eq!(
-            found[0].address,
-            "fd55:9caf:9652:cb86:321f:eac6:5c73:bd82"
-                .parse::<Ipv6Addr>()
-                .unwrap()
-        );
-        assert!(found[0].is_usable(), "permanent address is usable");
-
-        // Tentative: duplicate address detection never finishes without a
-        // carrier, so the address exists but cannot carry traffic.
-        assert!(!found[1].is_usable());
-        assert!(found[1].why_unusable().unwrap().contains("tentative"));
-
-        // Duplicate address detection failed outright.
-        assert!(!found[2].is_usable());
-        assert!(found[2].why_unusable().unwrap().contains("duplicate"));
-
-        assert!(parse_if_inet6(SAMPLE, "nosuchdev").is_empty());
-        // An interface name that is a prefix of another must not match.
-        assert!(parse_if_inet6(SAMPLE, "tsun").is_empty());
-    }
-
-    #[test]
-    fn malformed_lines_are_skipped_rather_than_panicking() {
-        assert!(parse_if_inet6("", "tsun0").is_empty());
-        assert!(parse_if_inet6("garbage", "tsun0").is_empty());
-        assert!(parse_if_inet6("zz 01 40 00 80 tsun0", "tsun0").is_empty());
-        assert!(parse_if_inet6("00 01 40 00 80 tsun0", "tsun0").is_empty());
-        // Flags that do not parse fall back to zero rather than dropping the
-        // address, so a usable address is never hidden by a formatting change.
-        let odd = parse_if_inet6("00000000000000000000000000000001 01 80 10 zz lo", "lo");
-        assert_eq!(odd.len(), 1);
-        assert!(odd[0].is_usable());
-    }
-
-    #[test]
-    fn loopback_is_found_on_this_host() {
-        // A real read of /proc/net/if_inet6: every Linux host has ::1 on lo.
-        let found = interface_addresses("lo").expect("/proc/net/if_inet6 should be readable");
-        assert!(
-            found
-                .iter()
-                .any(|entry| entry.address == Ipv6Addr::LOCALHOST),
-            "expected ::1 on lo, got {found:?}"
-        );
-        assert!(
-            interface_addresses("definitely-not-an-interface")
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn the_setup_recipe_survives_a_carrier_drop() {
-        let request = TunRequest {
-            name: "tsun0".into(),
-            address: "fd00::1".parse().unwrap(),
-            prefix_len: 64,
-            address_v4: Some("100.64.1.2".parse().unwrap()),
-            prefix_len_v4: 10,
-            mtu: 1280,
-        };
-        let commands = setup_commands(&request, "someone");
-
-        // The interface must be up before the address is added, the address
-        // must survive losing carrier, and it must not wait for duplicate
-        // address detection that can never complete.
-        let joined = commands.join("\n");
-        let up = joined.find("link set dev tsun0 mtu 1280 up").unwrap();
-        let keep = joined.find("keep_addr_on_down=1").unwrap();
-        let add = joined.find("address add fd00::1/64").unwrap();
-        assert!(up < keep && keep < add, "wrong order:\n{joined}");
-        assert!(joined.contains("nodad"));
-        assert!(joined.contains("user someone"));
-        // IPv4 needs no carrier tricks, just the address.
-        assert!(joined.contains("ip address add 100.64.1.2/10 dev tsun0"));
-
-        // An IPv6-only overlay says nothing about IPv4.
-        let v6_only = TunRequest {
-            address_v4: None,
-            ..request
-        };
-        assert!(
-            !setup_commands(&v6_only, "someone")
-                .join("\n")
-                .contains("100.64")
-        );
     }
 }

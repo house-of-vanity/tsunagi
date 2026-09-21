@@ -35,10 +35,9 @@
 //! The only part that needs privileges is the packet interface. With
 //! [`tun::MemoryTunFactory`] the whole data plane — handshake, encryption,
 //! routing, address ownership — runs and is tested with no privileges at all.
-//! For real traffic there are two ways in: [`provision::ManagedTunFactory`],
-//! where the agent creates and configures the interface itself over netlink
-//! and removes it again on exit, and `SystemTunFactory`, which attaches to an
-//! interface somebody else prepared and needs no privileges.
+//! For real traffic there is [`provision::ManagedTunFactory`], where the
+//! agent creates and configures the interface itself over netlink and
+//! removes it again on exit.
 //!
 //! See `docs/wireguard.md` for the full picture.
 
@@ -74,9 +73,3 @@ pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest, ad
 
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 pub use provision::NetlinkProvisioner;
-
-#[cfg(feature = "tun-device")]
-pub use tun::{
-    Assigned, SystemTunFactory, interface_addresses, interface_exists, parse_if_inet6,
-    setup_commands,
-};

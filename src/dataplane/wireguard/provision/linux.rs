@@ -153,7 +153,7 @@ impl NetlinkProvisioner {
     fn create_device(&self, plan: &InterfacePlan) -> Result<Arc<dyn TunDevice>, PluginError> {
         let request = TunRequest::bare(plan.name.clone(), plan.mtu);
         let _guard = NetAdmin::acquire()?;
-        super::super::tun::open_tun(&request, false)
+        super::super::tun::open_tun(&request)
     }
 }
 

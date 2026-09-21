@@ -50,8 +50,9 @@ impl Privilege {
     pub fn how_to_grant(program: &str) -> String {
         format!(
             "Grant it once with `sudo setcap cap_net_admin+p {program}` \
-             and the agent manages its own interface. Without it, prepare the \
-             interface by hand with `tsunagi tun-setup`."
+             and the agent manages its own interface. Without it, run with \
+             `--no-tun`: the tunnels still form, they just do not reach the \
+             operating system."
         )
     }
 }
@@ -153,7 +154,7 @@ mod tests {
     fn the_grant_instructions_name_the_program() {
         let text = Privilege::how_to_grant("/usr/local/bin/tsunagi");
         assert!(text.contains("setcap cap_net_admin+p /usr/local/bin/tsunagi"));
-        assert!(text.contains("tun-setup"), "the fallback is offered too");
+        assert!(text.contains("--no-tun"), "the fallback is offered too");
     }
 
     #[test]

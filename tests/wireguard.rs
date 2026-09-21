@@ -537,9 +537,11 @@ async fn an_allocated_address_missing_from_the_host_is_reported() {
         reason.contains(&allocated.to_string()),
         "unexpected: {reason}"
     );
+    // The agent assigns the address itself, so the report says which
+    // interface should have had it rather than a command to run.
     assert!(
-        reason.contains("ip address add"),
-        "must name the fix: {reason}"
+        reason.contains(&a.plugin.overview(network_id).unwrap().interface),
+        "must name the interface: {reason}"
     );
 
     a.shutdown().await;

@@ -34,8 +34,8 @@ impl UnsupportedProvisioner {
     fn refusal(&self) -> PluginError {
         PluginError::Unavailable(format!(
             "managing the overlay interface is not implemented on {} yet. \
-             Prepare the interface by hand — `tsunagi tun-setup` prints what to run — \
-             and the agent will attach to it.",
+             Run with `--no-tun` until it is: the tunnels still form, they just \
+             do not reach the operating system.",
             self.platform
         ))
     }
@@ -72,7 +72,7 @@ mod tests {
         let plan = InterfacePlan::new("tsuntest", 1280, Vec::new());
         let err = provisioner.reconcile(&plan).await.unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("tun-setup"), "{message}");
+        assert!(message.contains("--no-tun"), "{message}");
         assert!(message.contains(std::env::consts::OS), "{message}");
 
         provisioner.remove("tsuntest").await.unwrap();

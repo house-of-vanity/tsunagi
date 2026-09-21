@@ -146,9 +146,8 @@ No vote is involved — see
 [docs/sync-model.md](docs/sync-model.md).
 
 Because the address is allocated at run time rather than derived, it is not
-known until the agent has started and agreed with its peers. On Linux the
-agent assigns it itself as soon as it has one; elsewhere `tsunagi tun-setup`
-prints the `ip address add` line once the claim is in `state.sqlite`.
+known until the agent has started and agreed with its peers. The agent then
+assigns it to the interface itself.
 
 ## Privileges
 
@@ -192,64 +191,37 @@ it carried. Two things are never touched:
 
 Both of those refuse with an explanation rather than guessing.
 
-### Running without the capability
+Two settings the manual recipe used to need are gone with it.
+`keep_addr_on_down` existed only because an interface nobody held open lost
+carrier and had its IPv6 addresses flushed, and `nodad` only because duplicate
+address detection can never finish without carrier. An interface held open for
+its whole life has carrier for its whole life.
 
-`--interface attach` (or `auto`, which falls back on its own) opens an
-interface prepared beforehand and needs **no privileges at all**. Ask the
-agent what to run:
+### The MTU is 1280
 
-```bash
-tsunagi tun-setup --network lab --secret "$SECRET"
-```
-
-```text
-# Interface tsunjwc6dcrtmo5, address fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64, mtu 1280
-# Run once as root; then run `tsunagi up` as ab.
-
-sudo ip tuntap add dev tsunjwc6dcrtmo5 mode tun user ab
-sudo ip link set dev tsunjwc6dcrtmo5 mtu 1280 up
-sudo sysctl -qw net.ipv6.conf.tsunjwc6dcrtmo5.keep_addr_on_down=1
-sudo ip -6 address add fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64 dev tsunjwc6dcrtmo5 nodad
-```
-
-`user ab` is the point: the interface is persistent and owned by that user, so
-`tsunagi up` afterwards opens it with no privileges and no capabilities.
-
-The last two settings are what the managed path does not need. A persistent
-TUN has **no carrier** until a process attaches to it; Linux flushes IPv6
-addresses from an interface that loses carrier unless `keep_addr_on_down` is
-set, and duplicate address detection can never finish without carrier, so the
-address would sit there tentative and unusable without `nodad`. An interface
-the agent creates and holds open has carrier for its whole life, so neither
-applies. IPv4 needs neither in either case: Linux keeps IPv4 addresses across
-carrier loss and IPv4 has no duplicate address detection.
-
-With IPv4 enabled, `tun-setup` adds an `ip address add` line once there is an
-address to print — it reads the signed claim back out of `state.sqlite`, which
-does not disturb a running agent.
-
-The MTU is 1280 because that is the minimum IPv6 requires (RFC 8200). Linux
-disables IPv6 entirely on an interface below it — the per-device
+That is the minimum IPv6 requires (RFC 8200), and Linux enforces it by
+disabling IPv6 outright on an interface below it — the per-device
 `/proc/sys/net/ipv6` entries vanish and adding an address fails with
-`Invalid argument` — so a smaller MTU cannot work at all. The agent refuses
-one rather than letting it fail later.
+`Invalid argument`. A smaller MTU cannot work at all, so the agent refuses one
+rather than letting it fail later. See
+[docs/wireguard.md](docs/wireguard.md#mtu) for the ceiling that pushes back
+from the other side.
 
 ### Summary
 
 | approach | agent runs as | notes |
 |---|---|---|
-| `setcap cap_net_admin+p` | ordinary user, one capability | recommended on Linux: nothing to prepare, nothing left behind. Lost on every rebuild or copy of the binary. |
+| `setcap cap_net_admin+p` | ordinary user, one capability | recommended: nothing to prepare, nothing left behind. Lost on every rebuild or copy of the binary. |
 | systemd service | `User=`, `AmbientCapabilities=CAP_NET_ADMIN` | the same, for an installed service |
-| `tsunagi tun-setup` then `--interface attach` | ordinary user, no capabilities | one privileged setup per host; needed on macOS and Windows, where no provisioner is implemented yet |
 | `sudo tsunagi up` | root | everything works, nothing is isolated |
 | `--no-tun` | ordinary user, no capabilities | tunnels run and handshake, traffic never reaches the OS |
 
 **Not implemented yet.** macOS and Windows have no provisioner: both need
 real platform work — `utun` and `SystemConfiguration` on one, the IP Helper
-API and a Wintun adapter on the other. On those the agent says so and falls
-back to attaching to a prepared interface. The decision logic that says *what*
-to change is shared and tested on every platform; only the execution is
-per-platform.
+API and a Wintun adapter on the other. There the agent says so and `--no-tun`
+is the way to run it; the control plane and the tunnels are unaffected. The
+decision logic that says *what* to change is shared and tested on every
+platform, so only the execution is left to write.
 
 ## Checks
 
