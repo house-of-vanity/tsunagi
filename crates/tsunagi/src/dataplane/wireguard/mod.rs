@@ -42,7 +42,7 @@ pub mod plugin;
 pub mod store;
 
 pub use crate::state::Ipv4Range;
-pub use announcement::{ValidatedAnnouncement, WgAnnouncement};
+pub use announcement::{ANNOUNCEMENT_VERSION, ValidatedAnnouncement, WgAnnouncement};
 // The interface, its addresses and how it is created belong to the system
 // level now: one agent has one interface, and no protocol owns it. Re-exported
 // here while callers are moved over.

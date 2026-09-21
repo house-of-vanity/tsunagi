@@ -244,6 +244,15 @@ pub struct WireguardPlugin {
 }
 
 impl WireguardPlugin {
+    /// The settings this protocol accepts.
+    pub const OPTIONS: &'static [crate::dataplane::ProtocolOption] =
+        &[crate::dataplane::ProtocolOption {
+            key: "keepalive",
+            value: "SECONDS",
+            help: "persistent keepalive interval; 0 turns it off",
+            default: Some("25"),
+        }];
+
     /// Opens the plugin's key store and starts its reconciliation task.
     ///
     /// Must be called from inside a tokio runtime; the plugin starts no
@@ -656,6 +665,14 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
 impl IpPlugin for WireguardPlugin {
     fn protocol_id(&self) -> &str {
         WIREGUARD_PROTOCOL
+    }
+
+    fn protocol_version(&self) -> u16 {
+        super::announcement::ANNOUNCEMENT_VERSION
+    }
+
+    fn options(&self) -> &'static [crate::dataplane::ProtocolOption] {
+        Self::OPTIONS
     }
 
     fn attach(&self, context: PluginContext) {

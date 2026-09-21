@@ -210,6 +210,9 @@ struct Runtime {
     opening: HashSet<(EndpointId, String)>,
     link_results_tx: mpsc::Sender<LinkOutcome>,
     link_results_rx: mpsc::Receiver<LinkOutcome>,
+    /// Peers already told about a protocol version that cannot match, so it
+    /// is said once rather than on every announcement.
+    reported_mismatch: HashSet<(EndpointId, String)>,
     /// Signed records, merged from every replica we have talked to.
     state: StateSet,
     /// Snapshots received while dispatching, handled on the next loop pass.
@@ -242,6 +245,7 @@ impl Runtime {
             opening: HashSet::new(),
             link_results_tx,
             link_results_rx,
+            reported_mismatch: HashSet::new(),
             state: StateSet::new(),
             pending_state: Vec::new(),
             own_version: 0,
@@ -887,12 +891,12 @@ impl Runtime {
 
     // ------------------------------------------------------------ data plane
 
-    /// Protocol ids this agent has a plugin for.
-    fn served_protocols(&self) -> Vec<String> {
+    /// The protocols this agent speaks, with the version it speaks them at.
+    fn served_protocols(&self) -> Vec<(String, u16)> {
         self.params
             .plugins
             .iter()
-            .map(|plugin| plugin.protocol_id().to_string())
+            .map(|plugin| (plugin.protocol_id().to_string(), plugin.protocol_version()))
             .collect()
     }
 
@@ -925,6 +929,10 @@ impl Runtime {
             });
         }
 
+        // Both the name and the version have to match. A peer offering
+        // `wg-quic` at a version this build does not speak is not a peer to
+        // carry traffic with, and a link opened anyway would fail later and
+        // say less about why.
         let wanted: Vec<(EndpointId, String)> = self
             .sessions
             .values()
@@ -934,9 +942,14 @@ impl Runtime {
                     .capabilities
                     .iter()
                     .filter(|capability| capability.enabled)
-                    .map(move |capability| (peer, capability.protocol.clone()))
+                    .map(move |capability| (peer, capability.protocol.clone(), capability.version))
             })
-            .filter(|(_, protocol)| served.contains(protocol))
+            .filter(|(_, protocol, version)| {
+                served
+                    .iter()
+                    .any(|(name, ours)| name == protocol && ours == version)
+            })
+            .map(|(peer, protocol, _)| (peer, protocol))
             .collect();
 
         for (peer, protocol) in wanted {
@@ -1271,6 +1284,26 @@ impl Runtime {
                 if plugin.protocol_id() != capability.protocol {
                     continue;
                 }
+                if plugin.protocol_version() != capability.version {
+                    // Said once per peer and protocol. A version that will
+                    // not match this build will not match it on the next
+                    // announcement either, and repeating it every round
+                    // would bury everything else.
+                    let key = (peer, capability.protocol.clone());
+                    if self.reported_mismatch.insert(key) {
+                        errors.push((
+                            capability.protocol.clone(),
+                            format!(
+                                "peer speaks {} version {} and this build speaks {}, so there \
+                                 is no data plane with it; the control plane is unaffected",
+                                capability.protocol,
+                                capability.version,
+                                plugin.protocol_version()
+                            ),
+                        ));
+                    }
+                    continue;
+                }
                 // The core hands the opaque payload over without interpreting it.
                 if let Err(err) = plugin.on_peer_capability(self.network_id, peer, capability) {
                     errors.push((plugin.protocol_id().to_string(), err.to_string()));
@@ -1290,6 +1323,7 @@ impl Runtime {
     // ----------------------------------------------------------------- status
 
     fn status(&self) -> NetworkStatus {
+        let served = self.served_protocols();
         let mut peers: Vec<PeerStatus> = self
             .sessions
             .values()
@@ -1299,6 +1333,17 @@ impl Runtime {
                     endpoint_id: session.peer,
                     role: session.role,
                     hostname: session.hostname.clone(),
+                    protocols: session
+                        .capabilities
+                        .iter()
+                        .filter(|capability| capability.enabled)
+                        .filter(|capability| {
+                            served.iter().any(|(name, ours)| {
+                                *name == capability.protocol && *ours == capability.version
+                            })
+                        })
+                        .map(|capability| capability.protocol.clone())
+                        .collect(),
                     capabilities: session.capabilities.clone(),
                     connected_for: session.established.elapsed(),
                     paths: snapshot.paths,

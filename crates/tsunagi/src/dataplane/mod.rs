@@ -84,6 +84,19 @@ impl PacketSink for DiscardPackets {
     }
 }
 
+/// One setting a protocol accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolOption {
+    /// The key, as written in `key=value`.
+    pub key: &'static str,
+    /// A word for the value, for the help line: `BYTES`, `NAME`.
+    pub value: &'static str,
+    /// What it does.
+    pub help: &'static str,
+    /// What happens when it is not given.
+    pub default: Option<&'static str>,
+}
+
 /// Errors a plugin may return. They are recorded, never fatal for the agent.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -241,6 +254,29 @@ pub trait IpPlugin: Send + Sync + std::fmt::Debug + 'static {
     /// Must be non-empty and at most [`MAX_PROTOCOL_ID_LEN`] bytes.
     fn protocol_id(&self) -> &str;
 
+    /// The wire version of this protocol.
+    ///
+    /// Two peers carry traffic for each other only when they have the same
+    /// protocol at the same version. There is no negotiating a middle
+    /// ground: a protocol either speaks the same words at both ends or it
+    /// does not, and pretending otherwise produces a link that fails later
+    /// and less clearly.
+    ///
+    /// **Not the software version.** A plugin crate has its own version and
+    /// it is nobody else's business: two peers on different builds work
+    /// together for as long as the wire between them has not changed. This
+    /// number moves only when the bytes do, so it must never be derived from
+    /// `CARGO_PKG_VERSION` or anything else that moves with a release.
+    fn protocol_version(&self) -> u16;
+
+    /// The settings this protocol accepts, and what they mean.
+    ///
+    /// Declared rather than documented elsewhere, so the agent can list them
+    /// without knowing anything about the protocol.
+    fn options(&self) -> &'static [ProtocolOption] {
+        &[]
+    }
+
     /// Called once, when the agent starts, before any network is activated.
     ///
     /// The plugin keeps the context to ask for re-announcements and to report
@@ -368,6 +404,10 @@ impl TestCapabilityPlugin {
 impl IpPlugin for TestCapabilityPlugin {
     fn protocol_id(&self) -> &str {
         &self.protocol
+    }
+
+    fn protocol_version(&self) -> u16 {
+        1
     }
 
     fn local_capability(

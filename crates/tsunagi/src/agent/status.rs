@@ -83,6 +83,12 @@ pub struct PeerStatus {
     ///
     /// A mutable binding, not an identity.
     pub hostname: Option<String>,
+    /// Protocols agreed with this peer: both sides have them at the same
+    /// version.
+    ///
+    /// Empty means no data plane with that peer, which leaves the control
+    /// plane working — messages and state still flow.
+    pub protocols: Vec<String>,
     /// Capabilities the peer announced. Payloads stay opaque.
     pub capabilities: Vec<PluginCapability>,
     /// How long the session has been up.

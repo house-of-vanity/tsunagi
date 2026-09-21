@@ -942,6 +942,155 @@ async fn an_announcement_for_another_network_never_reaches_a_tunnel() {
     drop(attacker_dir);
 }
 
+#[tokio::test]
+async fn a_peer_at_another_protocol_version_gets_no_data_plane_and_keeps_the_control_plane() {
+    // Both sides must have the protocol at the same version. There is no
+    // middle ground to negotiate: either the words mean the same thing at
+    // both ends or they do not.
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-version");
+
+    let here = WgAgent::spawn(&discovery, "tvh").await;
+    let network_id = here.agent.join_network(&name, &secret).await.unwrap();
+
+    let ahead = Arc::new(FromTheFuture);
+    let dir = TempDir::new().unwrap();
+    let other = Agent::spawn(
+        config_with(dir.path(), &discovery).with_plugin(ahead.clone() as Arc<dyn IpPlugin>),
+    )
+    .await
+    .unwrap();
+
+    let mut events = here.agent.subscribe();
+    other.join_network(&name, &secret).await.unwrap();
+    wait_for_peers(&here.agent, network_id, 1).await;
+
+    let reason = wait_event(&mut events, |event| match event {
+        Event::PluginError { reason, .. } if reason.contains("version") => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(
+        reason.contains("control plane is unaffected"),
+        "the message should say what still works: {reason}"
+    );
+
+    // No tunnel, and no attempt at one.
+    settle().await;
+    assert!(
+        here.plugin.overview(network_id).unwrap().peers.is_empty(),
+        "a version that cannot match must not become a tunnel"
+    );
+    let status = here.agent.network_status(network_id).await.unwrap();
+    assert_eq!(status.peers.len(), 1, "the session is up all the same");
+    assert!(
+        status.peers[0].protocols.is_empty(),
+        "nothing was agreed with it: {:?}",
+        status.peers[0].protocols
+    );
+
+    // And the control plane carries a message to it regardless.
+    assert_eq!(
+        here.agent
+            .broadcast(
+                network_id,
+                tsunagi::proto::ControlMessage::Ping {
+                    seq: 1,
+                    payload: b"still talking".to_vec(),
+                },
+            )
+            .await
+            .unwrap(),
+        1
+    );
+
+    other.shutdown().await;
+    here.shutdown().await;
+    drop(dir);
+}
+
+#[tokio::test]
+async fn agreement_turns_on_the_protocol_version_and_nothing_else() {
+    // A different build is not a different protocol. What is compared is the
+    // wire version and the name; everything else about a peer — its release,
+    // and whatever opaque payload its announcement carries — has no say.
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-same-wire");
+
+    let here = WgAgent::spawn(&discovery, "tsw").await;
+    let network_id = here.agent.join_network(&name, &secret).await.unwrap();
+
+    // Announces the right protocol at the right version, with a payload
+    // this build has never seen.
+    let stranger = Arc::new(ForgingPlugin {
+        payload: std::sync::Mutex::new(Some(b"from some other release".to_vec())),
+    });
+    let dir = TempDir::new().unwrap();
+    let other = Agent::spawn(
+        config_with(dir.path(), &discovery).with_plugin(stranger.clone() as Arc<dyn IpPlugin>),
+    )
+    .await
+    .unwrap();
+    other.join_network(&name, &secret).await.unwrap();
+    wait_for_peers(&here.agent, network_id, 1).await;
+
+    // Agreed, because the wire matches. The payload is rejected by the
+    // protocol afterwards, which is a separate matter and says nothing about
+    // whether the two agreed to talk.
+    wait_until("the protocol is agreed with it", || async {
+        let status = here.agent.network_status(network_id).await.ok()?;
+        status
+            .peers
+            .first()?
+            .protocols
+            .contains(&WIREGUARD_PROTOCOL.to_string())
+            .then_some(())
+    })
+    .await;
+
+    other.shutdown().await;
+    here.shutdown().await;
+    drop(dir);
+}
+
+/// A plugin claiming the same protocol at a version this build does not speak.
+#[derive(Debug)]
+struct FromTheFuture;
+
+impl IpPlugin for FromTheFuture {
+    fn protocol_id(&self) -> &str {
+        WIREGUARD_PROTOCOL
+    }
+
+    fn protocol_version(&self) -> u16 {
+        tsunagi::dataplane::wireguard::ANNOUNCEMENT_VERSION + 1
+    }
+
+    fn local_capability(
+        &self,
+        _network: NetworkId,
+    ) -> Result<Option<tsunagi::dataplane::PluginCapability>, tsunagi::dataplane::PluginError> {
+        Ok(Some(tsunagi::dataplane::PluginCapability {
+            protocol: WIREGUARD_PROTOCOL.to_string(),
+            version: self.protocol_version(),
+            enabled: true,
+            data: Vec::new(),
+        }))
+    }
+
+    fn on_peer_capability(
+        &self,
+        _network: NetworkId,
+        _peer: EndpointId,
+        _capability: &tsunagi::dataplane::PluginCapability,
+    ) -> Result<(), tsunagi::dataplane::PluginError> {
+        Ok(())
+    }
+
+    fn on_peer_gone(&self, _network: NetworkId, _peer: EndpointId) {}
+    fn on_network_deactivated(&self, _network: NetworkId) {}
+}
+
 /// A plugin that announces whatever bytes it is told to, under the WireGuard
 /// protocol id. Used to test what a hostile member can do.
 #[derive(Debug)]
@@ -954,6 +1103,12 @@ impl IpPlugin for ForgingPlugin {
         WIREGUARD_PROTOCOL
     }
 
+    /// The same version, so the announcement is looked at rather than
+    /// dismissed for the wrong reason.
+    fn protocol_version(&self) -> u16 {
+        tsunagi::dataplane::wireguard::ANNOUNCEMENT_VERSION
+    }
+
     fn local_capability(
         &self,
         _network: NetworkId,
@@ -964,7 +1119,9 @@ impl IpPlugin for ForgingPlugin {
         };
         Ok(payload.map(|data| tsunagi::dataplane::PluginCapability {
             protocol: WIREGUARD_PROTOCOL.to_string(),
-            version: 1,
+            // The version it actually speaks, so the payload is examined
+            // rather than set aside for the wrong reason.
+            version: tsunagi::dataplane::wireguard::ANNOUNCEMENT_VERSION,
             enabled: true,
             data,
         }))
