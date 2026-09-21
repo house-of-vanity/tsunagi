@@ -83,7 +83,7 @@ struct TunSetupArgs {
     #[arg(long, default_value = "tsun")]
     wg_prefix: String,
 
-    /// Interface MTU, matching `tsunagi up --wg-mtu`.
+    /// Interface MTU, matching `tsunagi up --wg-mtu`. At least 1280.
     #[arg(long)]
     wg_mtu: Option<u32>,
 }
@@ -195,6 +195,8 @@ struct UpArgs {
     wg_prefix: String,
 
     /// Interface MTU for the WireGuard data plane.
+    ///
+    /// Must be at least 1280, the minimum IPv6 requires.
     #[arg(long)]
     wg_mtu: Option<u32>,
 

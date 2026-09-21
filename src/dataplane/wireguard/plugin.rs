@@ -50,13 +50,27 @@ use super::tun::{TunFactory, TunRequest};
 /// The protocol identifier this plugin announces.
 pub const WIREGUARD_PROTOCOL: &str = "wireguard";
 
+/// Smallest interface MTU IPv6 permits, from RFC 8200.
+///
+/// This is not advice, it is a hard limit. Linux tears IPv6 down entirely on
+/// an interface whose MTU is below it — the per-device `/proc/sys/net/ipv6`
+/// entries disappear and `ip -6 address add` fails with `Invalid argument` —
+/// so the overlay address could never be assigned. Anything smaller is
+/// rejected up front instead of failing obscurely later.
+pub const MIN_MTU: u32 = 1280;
+
 /// Default interface MTU.
 ///
-/// Every packet rides in one transport datagram, and WireGuard adds 32 bytes.
-/// A QUIC datagram on a relayed path can be as small as roughly 1160 bytes, so
-/// 1100 leaves headroom instead of relying on the best case. Packets that do
-/// not fit are dropped and counted, never truncated.
-pub const DEFAULT_MTU: u32 = 1100;
+/// Equal to [`MIN_MTU`], because the overlay is IPv6 and there is no room
+/// below it.
+pub const DEFAULT_MTU: u32 = MIN_MTU;
+
+/// Bytes WireGuard adds to a packet: type and reserved, receiver index,
+/// counter and the Poly1305 tag.
+///
+/// A link therefore has to carry `mtu + WIREGUARD_OVERHEAD` bytes in one
+/// datagram for a full-size packet to get through.
+pub const WIREGUARD_OVERHEAD: u32 = 32;
 
 /// Configuration of the WireGuard plugin.
 #[derive(Debug, Clone)]
@@ -99,6 +113,8 @@ impl WireguardConfig {
     }
 
     /// Sets the interface MTU.
+    ///
+    /// Validated when the plugin is opened; see [`MIN_MTU`].
     pub fn with_mtu(mut self, mtu: u32) -> Self {
         self.mtu = mtu;
         self
@@ -234,6 +250,15 @@ impl WireguardPlugin {
     ) -> Result<Arc<Self>, PluginError> {
         // Validate the prefix once, here, rather than failing per network.
         interface_name(&config.interface_prefix, NetworkId::from_bytes([0u8; 32]))?;
+
+        if config.mtu < MIN_MTU {
+            return Err(PluginError::Other(format!(
+                "an MTU of {} is below the {MIN_MTU} bytes IPv6 requires (RFC 8200). \
+                 Linux disables IPv6 on an interface below that, so the overlay address \
+                 could never be assigned.",
+                config.mtu
+            )));
+        }
 
         let path = config.key_store_path();
         let store = tokio::task::spawn_blocking(move || WgKeyStore::open(path))
@@ -432,6 +457,7 @@ impl Worker {
         };
 
         let mut wanted: Vec<WgPublicKey> = Vec::new();
+        let mut too_small: Vec<(usize, usize)> = Vec::new();
         for (endpoint_id, announcement) in &state.announcements {
             let Some(link) = state.links.get(endpoint_id) else {
                 continue;
@@ -443,6 +469,16 @@ impl Worker {
             if device.has_peer(&announcement.public_key) {
                 continue;
             }
+
+            // A link that cannot carry a full-size packet will silently drop
+            // the large ones, which looks like a broken network rather than a
+            // configuration problem. Say so when the tunnel is set up.
+            let needed = self.config.mtu.saturating_add(WIREGUARD_OVERHEAD) as usize;
+            let available = link.max_datagram_size();
+            if available < needed {
+                too_small.push((available, needed));
+            }
+
             if let Err(err) = device.add_peer(
                 *endpoint_id,
                 announcement.public_key,
@@ -453,6 +489,20 @@ impl Worker {
             }
         }
         device.retain_peers(&wanted);
+        drop(shared);
+
+        for (available, needed) in too_small {
+            self.report(
+                network,
+                format!(
+                    "this path carries only {available} byte datagrams but a {} byte MTU needs \
+                     {needed}; packets larger than {} bytes will be dropped. Lower the MTU only \
+                     if you can stay at or above {MIN_MTU}, which IPv6 requires.",
+                    self.config.mtu,
+                    available.saturating_sub(WIREGUARD_OVERHEAD as usize)
+                ),
+            );
+        }
     }
 
     /// Removes a network's interface and tunnels, keeping its key.

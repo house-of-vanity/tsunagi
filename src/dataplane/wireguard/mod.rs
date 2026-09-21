@@ -57,8 +57,8 @@ pub use keys::{WgPublicKey, WgSecretKey};
 pub use overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_prefix};
 pub use packet::IpHeader;
 pub use plugin::{
-    DEFAULT_MTU, NetworkOverview, PeerOverview, WIREGUARD_PROTOCOL, WireguardConfig,
-    WireguardPlugin,
+    DEFAULT_MTU, MIN_MTU, NetworkOverview, PeerOverview, WIREGUARD_OVERHEAD, WIREGUARD_PROTOCOL,
+    WireguardConfig, WireguardPlugin,
 };
 pub use store::WgKeyStore;
 pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest};

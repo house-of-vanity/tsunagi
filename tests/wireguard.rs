@@ -616,6 +616,42 @@ impl IpPlugin for ForgingPlugin {
 }
 
 #[tokio::test]
+async fn an_mtu_below_the_ipv6_minimum_is_refused() {
+    use tsunagi::dataplane::wireguard::{DEFAULT_MTU, MIN_MTU, WIREGUARD_OVERHEAD};
+
+    // Linux disables IPv6 outright on an interface below 1280 bytes, so the
+    // overlay address could never be assigned. Catch it here rather than as
+    // an obscure RTNETLINK error much later.
+    let dir = TempDir::new().unwrap();
+    let result = WireguardPlugin::open(
+        WireguardConfig::new(dir.path()).with_mtu(MIN_MTU - 1),
+        Arc::new(MemoryTunFactory::new()),
+    )
+    .await;
+    match result {
+        Err(err) => {
+            let text = err.to_string();
+            assert!(text.contains("1280"), "unexpected message: {text}");
+            assert!(text.contains("IPv6"), "unexpected message: {text}");
+        }
+        Ok(_) => panic!("an MTU below the IPv6 minimum must be refused"),
+    }
+
+    // The default is exactly the minimum, and a link has to carry it plus
+    // WireGuard's own overhead.
+    assert_eq!(DEFAULT_MTU, MIN_MTU);
+    assert_eq!(WIREGUARD_OVERHEAD, 32);
+    assert!(
+        WireguardPlugin::open(
+            WireguardConfig::new(dir.path().join("ok")),
+            Arc::new(MemoryTunFactory::new()),
+        )
+        .await
+        .is_ok()
+    );
+}
+
+#[tokio::test]
 async fn the_overlay_address_is_derived_from_the_key_alone() {
     let (name, secret) = network("wg-derivation");
     let id = tsunagi::identity::NetworkKeys::derive(&name, &secret).network_id();

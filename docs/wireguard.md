@@ -101,12 +101,24 @@ than silent non-connectivity.
 
 ## MTU
 
-Every packet rides in one transport datagram, and WireGuard adds 32 bytes. A
-QUIC datagram on a relayed path can be as small as roughly 1160 bytes, so the
-default interface MTU is **1100**, which leaves headroom rather than relying on
-the best case. Packets that do not fit are dropped and counted
-(`dropped_oversize`), never truncated. The observed datagram limit of each link
-is reported in the status output.
+Two constraints pull against each other.
+
+**IPv6 sets a floor of 1280 bytes** (RFC 8200), and Linux enforces it
+brutally: an interface whose MTU drops below 1280 loses IPv6 entirely — its
+`/proc/sys/net/ipv6/conf/<dev>` directory disappears and `ip -6 address add`
+answers `Invalid argument`. So the overlay MTU cannot go below 1280, and the
+plugin refuses a smaller one at startup instead of letting it fail obscurely.
+
+**The transport sets a ceiling.** Every packet rides in one datagram and
+WireGuard adds 32 bytes, so a link must carry `mtu + 32` = 1312 bytes. A direct
+QUIC path typically offers around 1380, which fits. A relayed path can offer
+less, and then full-size packets do not fit: they are dropped and counted as
+`dropped_oversize`, never truncated, and the plugin reports the exact numbers
+when the tunnel is set up.
+
+There is no room left to trade, so the default MTU is exactly 1280.
+Fragmenting a packet across several datagrams would lift the ceiling and is
+not implemented.
 
 ## Lifecycle
 

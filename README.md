@@ -90,7 +90,7 @@ Within a few seconds both print something like:
 
 --- status ---
 control: 1 peer(s), 0 dial failure(s), 0 handshake failure(s)
-wireguard: tsunkkcp43lmdje on fd15:1d9e:fa21:f201:…/64 mtu 1100, 1/1 tunnel(s) established
+wireguard: tsunkkcp43lmdje on fd15:1d9e:fa21:f201:…/64 mtu 1280, 1/1 tunnel(s) established
   4jO4kx9Z fd15:1d9e:fa21:f201:… handshake 3s ago tx=0 rx=0 dropped=0 path=Direct via Ip(…)
 ```
 
@@ -123,14 +123,20 @@ tsunagi tun-setup --network lab --secret "$SECRET"
 ```
 
 ```text
-# Interface tsunjwc6dcrtmo5, address fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64, mtu 1100
+# Interface tsunjwc6dcrtmo5, address fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64, mtu 1280
 # Run once as root; then run `tsunagi up` as ab.
 
 sudo ip tuntap add dev tsunjwc6dcrtmo5 mode tun user ab
-sudo ip link set dev tsunjwc6dcrtmo5 mtu 1100 up
+sudo ip link set dev tsunjwc6dcrtmo5 mtu 1280 up
 sudo sysctl -qw net.ipv6.conf.tsunjwc6dcrtmo5.keep_addr_on_down=1
 sudo ip -6 address add fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64 dev tsunjwc6dcrtmo5 nodad
 ```
+
+The MTU is 1280 because that is the minimum IPv6 requires (RFC 8200). Linux
+disables IPv6 entirely on an interface below it — the per-device
+`/proc/sys/net/ipv6` entries vanish and `ip -6 address add` fails with
+`Invalid argument` — so a smaller MTU cannot work at all. The agent refuses
+one rather than letting it fail later.
 
 The order and the last two lines are not decoration. A persistent TUN
 interface has **no carrier** until a process attaches to it, and Linux flushes
