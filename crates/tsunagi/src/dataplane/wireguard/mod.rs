@@ -42,34 +42,34 @@
 //! See `docs/wireguard.md` for the full picture.
 
 pub mod announcement;
-pub mod config;
 pub mod device;
 pub mod keys;
 pub mod overlay;
-pub mod packet;
 pub mod plugin;
-pub mod provision;
 pub mod store;
-pub mod tun;
 
 pub use crate::state::Ipv4Range;
 pub use announcement::{ValidatedAnnouncement, WgAnnouncement};
-pub use config::{Cidr, DEFAULT_INTERFACE_PREFIX, MAX_INTERFACE_NAME_LEN, interface_name};
-pub use device::{PeerHealth, PeerStats, PeerSummary, WireguardDevice};
-pub use keys::{WgPublicKey, WgSecretKey};
-pub use overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_address_v4, overlay_prefix};
-pub use packet::IpHeader;
-pub use plugin::{
-    DEFAULT_MTU, MIN_MTU, NetworkOverview, PeerOverview, WIREGUARD_OVERHEAD, WIREGUARD_PROTOCOL,
-    WireguardConfig, WireguardPlugin,
-};
-pub use provision::{
+// The interface, its addresses and how it is created belong to the system
+// level now: one agent has one interface, and no protocol owns it. Re-exported
+// here while callers are moved over.
+pub use crate::overlay::provision::{
     Changes, InterfacePlan, InterfaceProvisioner, InterfaceState, LinkKind, ManagedTunFactory,
     MockHost, MockProvisioner, Privilege, Provisioned, UnsupportedProvisioner, plan_changes,
     probe_net_admin,
 };
+pub use crate::overlay::{
+    Cidr, DEFAULT_INTERFACE_PREFIX, IpHeader, MAX_INTERFACE_NAME_LEN, MemoryTun, MemoryTunFactory,
+    TunDevice, TunFactory, TunRequest, address_is_local, interface_name,
+};
+pub use device::{PeerHealth, PeerStats, PeerSummary, WireguardDevice};
+pub use keys::{WgPublicKey, WgSecretKey};
+pub use overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_address_v4, overlay_prefix};
+pub use plugin::{
+    DEFAULT_MTU, MIN_MTU, NetworkOverview, PeerOverview, WIREGUARD_OVERHEAD, WIREGUARD_PROTOCOL,
+    WireguardConfig, WireguardPlugin,
+};
 pub use store::WgKeyStore;
-pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest, address_is_local};
 
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
-pub use provision::NetlinkProvisioner;
+pub use crate::overlay::NetlinkProvisioner;

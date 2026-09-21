@@ -11,10 +11,11 @@
 
 use std::net::{IpAddr, Ipv6Addr};
 
-use crate::dataplane::PluginError;
 use crate::identity::NetworkId;
+use crate::overlay::OverlayError;
 
-use super::overlay::OVERLAY_HOST_PREFIX_LEN;
+/// Prefix length of a single IPv6 host address.
+const HOST_PREFIX_LEN: u8 = 128;
 
 /// Longest interface name Linux accepts, excluding the terminating NUL.
 pub const MAX_INTERFACE_NAME_LEN: usize = 15;
@@ -33,13 +34,13 @@ pub struct Cidr {
 
 impl Cidr {
     /// Builds a CIDR, rejecting an impossible prefix length.
-    pub fn new(addr: IpAddr, prefix_len: u8) -> Result<Self, PluginError> {
+    pub fn new(addr: IpAddr, prefix_len: u8) -> Result<Self, OverlayError> {
         let max = match addr {
             IpAddr::V4(_) => 32,
             IpAddr::V6(_) => 128,
         };
         if prefix_len > max {
-            return Err(PluginError::Other(format!(
+            return Err(OverlayError::Other(format!(
                 "prefix length /{prefix_len} is impossible for {addr}"
             )));
         }
@@ -50,7 +51,7 @@ impl Cidr {
     pub fn host(addr: Ipv6Addr) -> Self {
         Self {
             addr: IpAddr::V6(addr),
-            prefix_len: OVERLAY_HOST_PREFIX_LEN,
+            prefix_len: HOST_PREFIX_LEN,
         }
     }
 }
@@ -66,9 +67,9 @@ impl std::fmt::Display for Cidr {
 /// The name is stable across restarts and short enough for the platform. Two
 /// agents on the same host in the same network must be given different
 /// prefixes, or they would derive the same name.
-pub fn interface_name(prefix: &str, network: NetworkId) -> Result<String, PluginError> {
+pub fn interface_name(prefix: &str, network: NetworkId) -> Result<String, OverlayError> {
     if prefix.is_empty() {
-        return Err(PluginError::Other(
+        return Err(OverlayError::Other(
             "interface prefix must not be empty".into(),
         ));
     }
@@ -76,12 +77,12 @@ pub fn interface_name(prefix: &str, network: NetworkId) -> Result<String, Plugin
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
-        return Err(PluginError::Other(
+        return Err(OverlayError::Other(
             "interface prefix must be lowercase ASCII letters and digits".into(),
         ));
     }
     if prefix.len() >= MAX_INTERFACE_NAME_LEN {
-        return Err(PluginError::Other(format!(
+        return Err(OverlayError::Other(format!(
             "interface prefix must be shorter than {MAX_INTERFACE_NAME_LEN} characters"
         )));
     }

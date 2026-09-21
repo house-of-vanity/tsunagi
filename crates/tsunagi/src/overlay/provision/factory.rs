@@ -9,14 +9,14 @@
 use std::sync::Arc;
 
 use crate::BoxFuture;
-use crate::dataplane::PluginError;
+use crate::overlay::OverlayError;
 
 use super::super::config::Cidr;
 use super::super::tun::{TunDevice, TunFactory, TunRequest};
 use super::{InterfacePlan, InterfaceProvisioner};
 
 /// Turns a [`TunRequest`] into the plan for a host interface.
-fn plan_for(request: &TunRequest) -> Result<InterfacePlan, PluginError> {
+fn plan_for(request: &TunRequest) -> Result<InterfacePlan, OverlayError> {
     let mut addresses = vec![Cidr::new(request.address.into(), request.prefix_len)?];
     if let Some(address) = request.address_v4 {
         addresses.push(Cidr::new(address.into(), request.prefix_len_v4)?);
@@ -54,7 +54,7 @@ impl TunFactory for ManagedTunFactory {
     fn create<'a>(
         &'a self,
         request: TunRequest,
-    ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, PluginError>> {
+    ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, OverlayError>> {
         Box::pin(async move {
             let plan = plan_for(&request)?;
             let provisioned = self.provisioner.reconcile(&plan).await?;
@@ -67,7 +67,7 @@ impl TunFactory for ManagedTunFactory {
                 // Reaching here would mean the interface already existed and
                 // was held open by us, which cannot be true on the path that
                 // creates a device.
-                PluginError::Other(format!(
+                OverlayError::Other(format!(
                     "interface `{}` was reconciled but no device came back",
                     plan.name
                 ))
@@ -75,7 +75,7 @@ impl TunFactory for ManagedTunFactory {
         })
     }
 
-    fn reconfigure<'a>(&'a self, request: TunRequest) -> BoxFuture<'a, Result<(), PluginError>> {
+    fn reconfigure<'a>(&'a self, request: TunRequest) -> BoxFuture<'a, Result<(), OverlayError>> {
         Box::pin(async move {
             let plan = plan_for(&request)?;
             let provisioned = self.provisioner.reconcile(&plan).await?;

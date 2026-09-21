@@ -43,8 +43,8 @@ use crate::identity::NetworkId;
 
 use super::keys::{WgPublicKey, WgSecretKey};
 use super::overlay::overlay_address;
-use super::packet::IpHeader;
-use super::tun::TunDevice;
+use crate::overlay::packet::IpHeader;
+use crate::overlay::tun::TunDevice;
 use crate::state::Ipv4Range;
 
 /// How often WireGuard's own timers are driven.

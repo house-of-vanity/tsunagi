@@ -40,12 +40,12 @@ use crate::dataplane::{IpPlugin, PluginCapability, PluginContext, PluginError};
 use crate::identity::NetworkId;
 
 use super::announcement::{ValidatedAnnouncement, WgAnnouncement};
-use super::config::{DEFAULT_INTERFACE_PREFIX, interface_name};
 use super::device::{PeerSummary, WireguardDevice};
 use super::keys::{WgPublicKey, WgSecretKey};
 use super::overlay::{OVERLAY_PREFIX_LEN, overlay_address, overlay_prefix};
 use super::store::WgKeyStore;
-use super::tun::{TunFactory, TunRequest};
+use crate::overlay::config::{DEFAULT_INTERFACE_PREFIX, interface_name};
+use crate::overlay::tun::{TunFactory, TunRequest};
 use crate::state::Ipv4Range;
 
 /// The protocol identifier this plugin announces.
@@ -603,7 +603,7 @@ impl Worker {
         // kind that has been wrong here before.
         let missing_v4 = match (own_v4, interface.as_deref(), range) {
             (Some(address), Some(interface), Some(range))
-                if !super::tun::address_is_local(IpAddr::V4(address)) =>
+                if !crate::overlay::tun::address_is_local(IpAddr::V4(address)) =>
             {
                 let already = state_reported == Some(address);
                 if let Some(state) = shared.networks.get_mut(&network) {

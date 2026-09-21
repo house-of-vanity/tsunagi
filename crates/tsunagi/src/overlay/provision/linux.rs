@@ -50,7 +50,7 @@ use rtnetlink::packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo
 use rtnetlink::{LinkMessageBuilder, LinkUnspec};
 
 use crate::BoxFuture;
-use crate::dataplane::PluginError;
+use crate::overlay::OverlayError;
 
 use super::super::config::Cidr;
 use super::super::tun::{TunDevice, TunRequest};
@@ -71,7 +71,7 @@ enum Command {
     Stop,
 }
 
-type Reply<T> = mpsc::Sender<Result<T, PluginError>>;
+type Reply<T> = mpsc::Sender<Result<T, OverlayError>>;
 
 /// The configuration half of a reconciliation.
 struct Configure {
@@ -97,17 +97,17 @@ pub struct NetlinkProvisioner {
 
 impl NetlinkProvisioner {
     /// Starts the netlink thread, after checking this process can use it.
-    pub fn new() -> Result<Self, PluginError> {
+    pub fn new() -> Result<Self, OverlayError> {
         match probe_net_admin() {
             Privilege::Available => {}
             Privilege::Missing(reason) => {
-                return Err(PluginError::Unavailable(format!(
+                return Err(OverlayError::Unavailable(format!(
                     "{reason}. {}",
                     Privilege::how_to_grant(&current_program())
                 )));
             }
             Privilege::Unsupported => {
-                return Err(PluginError::Unavailable(
+                return Err(OverlayError::Unavailable(
                     "interface management is not compiled in".to_string(),
                 ));
             }
@@ -118,7 +118,7 @@ impl NetlinkProvisioner {
             .name("tsunagi-netlink".to_string())
             .spawn(move || netlink_thread(requests))
             .map_err(|err| {
-                PluginError::Unavailable(format!("cannot start the netlink thread: {err}"))
+                OverlayError::Unavailable(format!("cannot start the netlink thread: {err}"))
             })?;
 
         Ok(Self {
@@ -132,13 +132,13 @@ impl NetlinkProvisioner {
     fn call<T: Send + 'static>(
         &self,
         make: impl FnOnce(Reply<T>) -> Command,
-    ) -> Result<T, PluginError> {
+    ) -> Result<T, OverlayError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.commands
             .send(make(reply_tx))
-            .map_err(|_| PluginError::Unavailable("the netlink thread has stopped".to_string()))?;
+            .map_err(|_| OverlayError::Unavailable("the netlink thread has stopped".to_string()))?;
         reply_rx.recv().map_err(|_| {
-            PluginError::Unavailable("the netlink thread stopped mid-request".to_string())
+            OverlayError::Unavailable("the netlink thread stopped mid-request".to_string())
         })?
     }
 
@@ -150,7 +150,7 @@ impl NetlinkProvisioner {
     ///
     /// Synchronous on purpose: the capability guard is raised and lowered
     /// without an `await` in between, so it cannot outlive this thread.
-    fn create_device(&self, plan: &InterfacePlan) -> Result<Arc<dyn TunDevice>, PluginError> {
+    fn create_device(&self, plan: &InterfacePlan) -> Result<Arc<dyn TunDevice>, OverlayError> {
         let request = TunRequest::bare(plan.name.clone(), plan.mtu);
         let _guard = NetAdmin::acquire()?;
         super::super::tun::open_tun(&request)
@@ -174,7 +174,7 @@ impl InterfaceProvisioner for NetlinkProvisioner {
     fn reconcile<'a>(
         &'a self,
         plan: &'a InterfacePlan,
-    ) -> BoxFuture<'a, Result<Provisioned, PluginError>> {
+    ) -> BoxFuture<'a, Result<Provisioned, OverlayError>> {
         Box::pin(async move {
             let current = self.call(|reply| Command::Observe(plan.name.clone(), reply))?;
             let changes = plan_changes(&current, plan, self.is_ours(&plan.name))?;
@@ -224,7 +224,7 @@ impl InterfaceProvisioner for NetlinkProvisioner {
         })
     }
 
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), PluginError>> {
+    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), OverlayError>> {
         Box::pin(async move {
             // Dropping the device is what removes the interface; the explicit
             // delete is only so it is gone by the time this returns rather
@@ -271,10 +271,10 @@ fn netlink_thread(requests: mpsc::Receiver<Command>) {
                 let message = format!("the netlink thread has no runtime: {err}");
                 match command {
                     Command::Observe(_, reply) => {
-                        let _ = reply.send(Err(PluginError::Unavailable(message)));
+                        let _ = reply.send(Err(OverlayError::Unavailable(message)));
                     }
                     Command::Delete(_, reply) | Command::Configure(_, reply) => {
-                        let _ = reply.send(Err(PluginError::Unavailable(message)));
+                        let _ = reply.send(Err(OverlayError::Unavailable(message)));
                     }
                     Command::Stop => return,
                 }
@@ -311,12 +311,12 @@ fn netlink_thread(requests: mpsc::Receiver<Command>) {
 }
 
 /// Opens a netlink connection and runs one unit of work over it.
-async fn with_netlink<T, F>(work: impl FnOnce(rtnetlink::Handle) -> F) -> Result<T, PluginError>
+async fn with_netlink<T, F>(work: impl FnOnce(rtnetlink::Handle) -> F) -> Result<T, OverlayError>
 where
-    F: std::future::Future<Output = Result<T, PluginError>>,
+    F: std::future::Future<Output = Result<T, OverlayError>>,
 {
     let (connection, handle, _messages) = rtnetlink::new_connection()
-        .map_err(|err| PluginError::Unavailable(format!("cannot open netlink: {err}")))?;
+        .map_err(|err| OverlayError::Unavailable(format!("cannot open netlink: {err}")))?;
     let pump = tokio::spawn(connection);
     let result = work(handle).await;
     pump.abort();
@@ -361,7 +361,7 @@ fn link_kind(message: &LinkMessage, name: &str) -> LinkKind {
     }
 }
 
-async fn observe(name: &str) -> Result<InterfaceState, PluginError> {
+async fn observe(name: &str) -> Result<InterfaceState, OverlayError> {
     with_netlink(|handle| async move {
         let mut links = handle.link().get().match_name(name.to_string()).execute();
         let message = match links.try_next().await {
@@ -373,7 +373,7 @@ async fn observe(name: &str) -> Result<InterfaceState, PluginError> {
                 if !std::path::Path::new(&format!("/sys/class/net/{name}")).exists() {
                     return Ok(InterfaceState::absent());
                 }
-                return Err(PluginError::Unavailable(format!(
+                return Err(OverlayError::Unavailable(format!(
                     "cannot read interface `{name}`: {err}"
                 )));
             }
@@ -397,7 +397,7 @@ async fn observe(name: &str) -> Result<InterfaceState, PluginError> {
             .set_link_index_filter(index)
             .execute();
         while let Some(message) = stream.try_next().await.map_err(|err| {
-            PluginError::Unavailable(format!("cannot read the addresses of `{name}`: {err}"))
+            OverlayError::Unavailable(format!("cannot read the addresses of `{name}`: {err}"))
         })? {
             if let Some(cidr) = address_of(&message)
                 && !is_link_local(cidr.addr)
@@ -440,7 +440,7 @@ fn cidr(addr: IpAddr, prefix_len: u8) -> Option<Cidr> {
     Cidr::new(addr, prefix_len).ok()
 }
 
-async fn delete_link(name: &str) -> Result<(), PluginError> {
+async fn delete_link(name: &str) -> Result<(), OverlayError> {
     with_netlink(|handle| async move {
         let mut links = handle.link().get().match_name(name.to_string()).execute();
         let index = match links.try_next().await {
@@ -449,13 +449,13 @@ async fn delete_link(name: &str) -> Result<(), PluginError> {
             Ok(None) | Err(_) => return Ok(()),
         };
         handle.link().del(index).execute().await.map_err(|err| {
-            PluginError::Unavailable(format!("cannot remove interface `{name}`: {err}"))
+            OverlayError::Unavailable(format!("cannot remove interface `{name}`: {err}"))
         })
     })
     .await
 }
 
-async fn configure_link(configure: &Configure) -> Result<(), PluginError> {
+async fn configure_link(configure: &Configure) -> Result<(), OverlayError> {
     let name = configure.name.as_str();
     with_netlink(|handle| async move {
         let mut links = handle.link().get().match_name(name.to_string()).execute();
@@ -466,7 +466,7 @@ async fn configure_link(configure: &Configure) -> Result<(), PluginError> {
             .flatten()
             .map(|message| message.header.index)
             .ok_or_else(|| {
-                PluginError::Unavailable(format!(
+                OverlayError::Unavailable(format!(
                     "interface `{name}` disappeared before it could be configured"
                 ))
             })?;
@@ -485,7 +485,7 @@ async fn configure_link(configure: &Configure) -> Result<(), PluginError> {
                 .execute()
                 .await
                 .map_err(|err| {
-                    PluginError::Unavailable(format!("cannot configure interface `{name}`: {err}"))
+                    OverlayError::Unavailable(format!("cannot configure interface `{name}`: {err}"))
                 })?;
         }
 
@@ -512,7 +512,7 @@ async fn configure_link(configure: &Configure) -> Result<(), PluginError> {
                     .execute()
                     .await
                     .map_err(|err| {
-                        PluginError::Unavailable(format!(
+                        OverlayError::Unavailable(format!(
                             "cannot remove {cidr} from interface `{name}`: {err}"
                         ))
                     })?;
@@ -526,7 +526,7 @@ async fn configure_link(configure: &Configure) -> Result<(), PluginError> {
                 .execute()
                 .await
                 .map_err(|err| {
-                    PluginError::Unavailable(format!(
+                    OverlayError::Unavailable(format!(
                         "cannot add {cidr} to interface `{name}`: {err}"
                     ))
                 })?;

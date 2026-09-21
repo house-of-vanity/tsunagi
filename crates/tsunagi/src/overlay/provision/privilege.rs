@@ -78,7 +78,7 @@ mod linux_impl {
     use caps::{CapSet, Capability};
 
     use super::Privilege;
-    use crate::dataplane::PluginError;
+    use crate::overlay::OverlayError;
 
     /// Whether this thread holds `CAP_NET_ADMIN` in its permitted set.
     pub fn probe_net_admin() -> Privilege {
@@ -108,16 +108,16 @@ mod linux_impl {
 
     impl NetAdmin {
         /// Raises `CAP_NET_ADMIN` into the effective set.
-        pub fn acquire() -> Result<Self, PluginError> {
+        pub fn acquire() -> Result<Self, OverlayError> {
             let already = caps::has_cap(None, CapSet::Effective, Capability::CAP_NET_ADMIN)
                 .map_err(|err| {
-                    PluginError::Unavailable(format!("cannot read capabilities: {err}"))
+                    OverlayError::Unavailable(format!("cannot read capabilities: {err}"))
                 })?;
             if already {
                 return Ok(Self { raised: false });
             }
             caps::raise(None, CapSet::Effective, Capability::CAP_NET_ADMIN).map_err(|err| {
-                PluginError::Unavailable(format!(
+                OverlayError::Unavailable(format!(
                     "cannot raise CAP_NET_ADMIN: {err}. {}",
                     Privilege::how_to_grant("tsunagi")
                 ))

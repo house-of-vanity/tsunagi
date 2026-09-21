@@ -67,6 +67,20 @@ pub enum PluginError {
     Other(String),
 }
 
+/// Scaffolding while the interface moves out of the plugin.
+///
+/// The overlay interface belongs to the system level now, so a plugin has no
+/// business failing because of it. This exists only for the callers that
+/// have not been moved over yet and goes when the last of them does.
+impl From<crate::overlay::OverlayError> for PluginError {
+    fn from(err: crate::overlay::OverlayError) -> Self {
+        match err {
+            crate::overlay::OverlayError::Unavailable(reason) => PluginError::Unavailable(reason),
+            crate::overlay::OverlayError::Other(reason) => PluginError::Other(reason),
+        }
+    }
+}
+
 /// A request a plugin makes of the agent that owns it.
 #[derive(Debug)]
 pub(crate) enum PluginRequest {

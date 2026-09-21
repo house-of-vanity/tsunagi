@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::BoxFuture;
-use crate::dataplane::PluginError;
+use crate::overlay::OverlayError;
 
 use super::super::config::Cidr;
 use super::super::tun::{MemoryTun, MemoryTunFactory, TunFactory, TunRequest};
@@ -125,9 +125,9 @@ impl MockProvisioner {
         }
     }
 
-    fn apply(&self, plan: &InterfacePlan) -> Result<Changes, PluginError> {
+    fn apply(&self, plan: &InterfacePlan) -> Result<Changes, OverlayError> {
         if let Some(reason) = &self.failure {
-            return Err(PluginError::Unavailable(reason.clone()));
+            return Err(OverlayError::Unavailable(reason.clone()));
         }
 
         let ours = self.owned().iter().any(|name| name == &plan.name);
@@ -179,7 +179,7 @@ impl InterfaceProvisioner for MockProvisioner {
     fn reconcile<'a>(
         &'a self,
         plan: &'a InterfacePlan,
-    ) -> BoxFuture<'a, Result<Provisioned, PluginError>> {
+    ) -> BoxFuture<'a, Result<Provisioned, OverlayError>> {
         Box::pin(async move {
             let changes = self.apply(plan)?;
             let device = if changes.create_link {
@@ -195,7 +195,7 @@ impl InterfaceProvisioner for MockProvisioner {
         })
     }
 
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), PluginError>> {
+    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), OverlayError>> {
         Box::pin(async move {
             self.host.lock().remove(name);
             self.owned().retain(|owned| owned != name);

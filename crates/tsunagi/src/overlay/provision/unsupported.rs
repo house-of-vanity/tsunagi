@@ -7,7 +7,7 @@
 //! of provisioning and says what to do instead.
 
 use crate::BoxFuture;
-use crate::dataplane::PluginError;
+use crate::overlay::OverlayError;
 
 use super::{InterfacePlan, InterfaceProvisioner, Provisioned};
 
@@ -31,8 +31,8 @@ impl UnsupportedProvisioner {
         }
     }
 
-    fn refusal(&self) -> PluginError {
-        PluginError::Unavailable(format!(
+    fn refusal(&self) -> OverlayError {
+        OverlayError::Unavailable(format!(
             "managing the overlay interface is not implemented on {} yet. \
              Run with `--no-tun` until it is: the tunnels still form, they just \
              do not reach the operating system.",
@@ -49,11 +49,11 @@ impl InterfaceProvisioner for UnsupportedProvisioner {
     fn reconcile<'a>(
         &'a self,
         _plan: &'a InterfacePlan,
-    ) -> BoxFuture<'a, Result<Provisioned, PluginError>> {
+    ) -> BoxFuture<'a, Result<Provisioned, OverlayError>> {
         Box::pin(async move { Err(self.refusal()) })
     }
 
-    fn remove<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, Result<(), PluginError>> {
+    fn remove<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, Result<(), OverlayError>> {
         // Nothing was ever created, so there is nothing to clean up and no
         // reason to fail a shutdown path.
         Box::pin(async move { Ok(()) })

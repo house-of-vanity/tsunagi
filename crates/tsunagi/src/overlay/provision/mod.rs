@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::BoxFuture;
-use crate::dataplane::PluginError;
+use crate::overlay::OverlayError;
 
 use super::config::Cidr;
 use super::tun::TunDevice;
@@ -203,19 +203,19 @@ pub fn plan_changes(
     current: &InterfaceState,
     plan: &InterfacePlan,
     ours: bool,
-) -> Result<Changes, PluginError> {
+) -> Result<Changes, OverlayError> {
     let mut changes = Changes::default();
 
     match &current.kind {
         LinkKind::Foreign(kind) => {
-            return Err(PluginError::Unavailable(format!(
+            return Err(OverlayError::Unavailable(format!(
                 "`{}` already exists and is a {kind} interface, not one of ours. \
                  Refusing to touch it. Run with a different interface prefix.",
                 plan.name
             )));
         }
         LinkKind::Tun if !ours && current.attached => {
-            return Err(PluginError::Unavailable(format!(
+            return Err(OverlayError::Unavailable(format!(
                 "`{}` already exists and another process is attached to it. \
                  That is most likely a second agent on this host in the same \
                  network; give one of them a different interface prefix.",
@@ -293,13 +293,13 @@ pub trait InterfaceProvisioner: Send + Sync + std::fmt::Debug + 'static {
     fn reconcile<'a>(
         &'a self,
         plan: &'a InterfacePlan,
-    ) -> BoxFuture<'a, Result<Provisioned, PluginError>>;
+    ) -> BoxFuture<'a, Result<Provisioned, OverlayError>>;
 
     /// Removes an interface this provisioner created.
     ///
     /// Removing one that is already gone succeeds: this runs on the shutdown
     /// path, where the interface having vanished is the desired outcome.
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), PluginError>>;
+    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), OverlayError>>;
 }
 
 #[cfg(test)]

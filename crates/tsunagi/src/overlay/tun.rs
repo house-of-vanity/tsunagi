@@ -19,7 +19,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::BoxFuture;
-use crate::dataplane::PluginError;
+use crate::overlay::OverlayError;
 
 /// What a device should look like once created.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +71,7 @@ pub trait TunDevice: Send + Sync + std::fmt::Debug + 'static {
     fn recv(&self) -> BoxFuture<'_, Option<Bytes>>;
 
     /// Delivers a packet to the operating system.
-    fn send<'a>(&'a self, packet: Bytes) -> BoxFuture<'a, Result<(), PluginError>>;
+    fn send<'a>(&'a self, packet: Bytes) -> BoxFuture<'a, Result<(), OverlayError>>;
 }
 
 /// Creates packet interfaces.
@@ -83,7 +83,7 @@ pub trait TunFactory: Send + Sync + std::fmt::Debug + 'static {
     fn create<'a>(
         &'a self,
         request: TunRequest,
-    ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, PluginError>>;
+    ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, OverlayError>>;
 
     /// Applies a changed request to an interface that already exists.
     ///
@@ -94,7 +94,7 @@ pub trait TunFactory: Send + Sync + std::fmt::Debug + 'static {
     ///
     /// The default does nothing, which is right for a factory that only
     /// attaches to an interface somebody else prepared.
-    fn reconfigure<'a>(&'a self, _request: TunRequest) -> BoxFuture<'a, Result<(), PluginError>> {
+    fn reconfigure<'a>(&'a self, _request: TunRequest) -> BoxFuture<'a, Result<(), OverlayError>> {
         Box::pin(async move { Ok(()) })
     }
 
@@ -162,7 +162,7 @@ impl TunDevice for MemoryTun {
         Box::pin(async move { self.from_os_rx.lock().await.recv().await })
     }
 
-    fn send<'a>(&'a self, packet: Bytes) -> BoxFuture<'a, Result<(), PluginError>> {
+    fn send<'a>(&'a self, packet: Bytes) -> BoxFuture<'a, Result<(), OverlayError>> {
         Box::pin(async move {
             let _ = self.to_os_tx.send(packet);
             Ok(())
@@ -223,7 +223,7 @@ impl TunFactory for MemoryTunFactory {
     fn create<'a>(
         &'a self,
         request: TunRequest,
-    ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, PluginError>> {
+    ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, OverlayError>> {
         Box::pin(async move {
             let device = MemoryTun::new(request.name, request.mtu);
             let mut guard = match self.created.lock() {
@@ -248,7 +248,7 @@ mod system {
 
     use super::{TunDevice, TunRequest};
     use crate::BoxFuture;
-    use crate::dataplane::PluginError;
+    use crate::overlay::OverlayError;
 
     /// A real TUN interface.
     ///
@@ -303,14 +303,14 @@ mod system {
             })
         }
 
-        fn send<'a>(&'a self, packet: Bytes) -> BoxFuture<'a, Result<(), PluginError>> {
+        fn send<'a>(&'a self, packet: Bytes) -> BoxFuture<'a, Result<(), OverlayError>> {
             Box::pin(async move {
                 use tokio::io::AsyncWriteExt;
                 let mut writer = self.writer.lock().await;
                 writer
                     .write_all(&packet)
                     .await
-                    .map_err(|err| PluginError::Other(format!("tun write failed: {err}")))
+                    .map_err(|err| OverlayError::Other(format!("tun write failed: {err}")))
             })
         }
     }
@@ -320,7 +320,7 @@ mod system {
     /// Synchronous, and deliberately so: the caller holds a capability guard
     /// across this call, and such a guard must not span an `await` because
     /// Linux capabilities are per thread.
-    pub(crate) fn open_tun(request: &TunRequest) -> Result<Arc<dyn TunDevice>, PluginError> {
+    pub(crate) fn open_tun(request: &TunRequest) -> Result<Arc<dyn TunDevice>, OverlayError> {
         let mut config = tun::Configuration::default();
         config.tun_name(&request.name);
         config.platform_config(|platform| {
@@ -334,7 +334,7 @@ mod system {
         // information, so the flags match when attaching to one.
 
         let device = tun::create_as_async(&config).map_err(|err| {
-            PluginError::Unavailable(format!(
+            OverlayError::Unavailable(format!(
                 "cannot create the TUN interface `{}`: {err}. Creating one needs \
                  CAP_NET_ADMIN; grant it with `setcap cap_net_admin+p`, or run with \
                  `--no-tun` to keep the tunnels off the operating system.",

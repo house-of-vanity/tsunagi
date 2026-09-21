@@ -44,6 +44,7 @@ pub mod error;
 pub mod identity;
 pub mod ipc;
 pub mod net;
+pub mod overlay;
 pub mod proto;
 pub mod state;
 pub mod storage;
