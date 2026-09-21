@@ -45,6 +45,47 @@ enum Command {
     Id(PathArgs),
     /// Joins a network and runs until interrupted.
     Up(UpArgs),
+    /// Prints the one-time privileged setup for the overlay interface.
+    ///
+    /// Run its output once as root, then run `tsunagi up` as an ordinary
+    /// user: the agent attaches to the prepared interface and needs no
+    /// privileges of its own.
+    TunSetup(TunSetupArgs),
+}
+
+#[derive(Debug, Args)]
+struct TunSetupArgs {
+    #[command(flatten)]
+    paths: PathArgs,
+
+    /// Network name, exactly as passed to `tsunagi up`.
+    #[arg(long, short = 'n')]
+    network: String,
+
+    /// The shared secret.
+    #[arg(
+        long,
+        short = 's',
+        env = "TSUNAGI_SECRET",
+        conflicts_with = "secret_file"
+    )]
+    secret: Option<String>,
+
+    /// Read the shared secret from a file instead of the command line.
+    #[arg(long)]
+    secret_file: Option<PathBuf>,
+
+    /// The user that should own the interface. Defaults to the current one.
+    #[arg(long)]
+    user: Option<String>,
+
+    /// Interface name prefix, matching `tsunagi up --wg-prefix`.
+    #[arg(long, default_value = "tsun")]
+    wg_prefix: String,
+
+    /// Interface MTU, matching `tsunagi up --wg-mtu`.
+    #[arg(long)]
+    wg_mtu: Option<u32>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -162,22 +203,24 @@ struct UpArgs {
     status_interval: u64,
 }
 
-impl UpArgs {
-    fn load_secret(&self) -> Result<NetworkSecret, Box<dyn std::error::Error>> {
-        let text = match (&self.secret, &self.secret_file) {
-            (Some(secret), _) => secret.clone(),
-            (None, Some(path)) => std::fs::read_to_string(path)?,
-            (None, None) => {
-                return Err("provide --secret, --secret-file or TSUNAGI_SECRET".into());
-            }
-        };
-        let text = text.trim();
-        // The canonical form is preferred, but a raw high-entropy value is
-        // accepted so an existing secret can be reused.
-        match NetworkSecret::decode(text) {
-            Ok(secret) => Ok(secret),
-            Err(_) => Ok(NetworkSecret::from_bytes(text.as_bytes().to_vec())?),
+/// Reads the shared secret from an argument or a file.
+fn load_secret(
+    secret: Option<&str>,
+    secret_file: Option<&std::path::Path>,
+) -> Result<NetworkSecret, Box<dyn std::error::Error>> {
+    let text = match (secret, secret_file) {
+        (Some(secret), _) => secret.to_string(),
+        (None, Some(path)) => std::fs::read_to_string(path)?,
+        (None, None) => {
+            return Err("provide --secret, --secret-file or TSUNAGI_SECRET".into());
         }
+    };
+    let text = text.trim();
+    // The canonical form is preferred, but a raw high-entropy value is
+    // accepted so an existing secret can be reused.
+    match NetworkSecret::decode(text) {
+        Ok(secret) => Ok(secret),
+        Err(_) => Ok(NetworkSecret::from_bytes(text.as_bytes().to_vec())?),
     }
 }
 
@@ -246,7 +289,52 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Doctor(paths) => doctor(paths).await,
         Command::Id(paths) => show_id(paths).await,
         Command::Up(args) => up(args).await,
+        Command::TunSetup(args) => tun_setup(args).await,
     }
+}
+
+/// Works out the interface name and overlay address, then prints the
+/// privileged commands that prepare it.
+///
+/// The address depends on this agent's WireGuard key for the network, so the
+/// key store is opened (and the key created on first use) to compute it.
+async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use tsunagi::dataplane::wireguard::{
+        DEFAULT_MTU, OVERLAY_PREFIX_LEN, WgKeyStore, interface_name, overlay_address,
+    };
+    use tsunagi::identity::NetworkKeys;
+
+    let name = NetworkName::new(args.network.clone())?;
+    let secret = load_secret(args.secret.as_deref(), args.secret_file.as_deref())?;
+    let paths = args.paths.resolve()?;
+    let network = NetworkKeys::derive(&name, &secret).network_id();
+
+    let store_path = paths.state_dir.join("wireguard").join("wireguard.sqlite");
+    let store = tokio::task::spawn_blocking({
+        let store_path = store_path.clone();
+        move || WgKeyStore::open(store_path)
+    })
+    .await??;
+    let key = tokio::task::spawn_blocking(move || store.load_or_create(network)).await??;
+
+    let interface = interface_name(&args.wg_prefix, network)?;
+    let address = overlay_address(network, &key.public());
+    let mtu = args.wg_mtu.unwrap_or(DEFAULT_MTU);
+    let user = args.user.unwrap_or_else(|| {
+        std::env::var("SUDO_USER")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "$USER".to_string())
+    });
+
+    println!("# Network  {name} ({network})");
+    println!("# Interface {interface}, address {address}/{OVERLAY_PREFIX_LEN}, mtu {mtu}");
+    println!("# Run once as root; then run `tsunagi up` as {user}.\n");
+    println!("sudo ip tuntap add dev {interface} mode tun user {user}");
+    println!("sudo ip -6 address add {address}/{OVERLAY_PREFIX_LEN} dev {interface}");
+    println!("sudo ip link set dev {interface} mtu {mtu} up");
+    println!("\n# To remove it again:");
+    println!("sudo ip link del dev {interface}");
+    Ok(())
 }
 
 async fn show_id(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -341,7 +429,7 @@ async fn netwatch_addresses() -> Vec<std::net::IpAddr> {
 
 async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let name = NetworkName::new(args.network.clone())?;
-    let secret = args.load_secret()?;
+    let secret = load_secret(args.secret.as_deref(), args.secret_file.as_deref())?;
     let paths = args.paths.resolve()?;
 
     let mut bootstrap: Vec<EndpointAddr> = Vec::new();

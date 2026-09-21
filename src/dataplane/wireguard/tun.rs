@@ -182,10 +182,11 @@ impl TunFactory for MemoryTunFactory {
 }
 
 #[cfg(feature = "tun-device")]
-pub use system::SystemTunFactory;
+pub use system::{SystemTunFactory, interface_exists, interface_has_address, setup_commands};
 
 #[cfg(feature = "tun-device")]
 mod system {
+    use std::net::Ipv6Addr;
     use std::sync::Arc;
 
     use bytes::Bytes;
@@ -197,8 +198,18 @@ mod system {
 
     /// A real TUN interface.
     ///
-    /// Creating one needs `CAP_NET_ADMIN` on Linux, or the platform
-    /// equivalent. Failure is reported, never fatal for the agent.
+    /// Two ways to get one, and the difference is who needs privileges:
+    ///
+    /// * **Attach** to an interface that already exists. Needs no privileges
+    ///   at all, as long as the interface was created persistent and owned by
+    ///   this user. This is the recommended way to run the agent unprivileged.
+    /// * **Create** it here, which needs `CAP_NET_ADMIN`.
+    ///
+    /// Either way the overlay address has to be assigned by something
+    /// privileged: assigning an IPv6 address to an interface is not something
+    /// this crate's dependencies can do, so the agent checks that it is there
+    /// and says exactly what to run if it is not, rather than coming up in a
+    /// state where no traffic could ever arrive.
     pub struct SystemTun {
         name: String,
         mtu: u32,
@@ -255,7 +266,53 @@ mod system {
         }
     }
 
-    /// Creates real TUN interfaces.
+    /// Whether an interface of this name exists.
+    pub fn interface_exists(name: &str) -> bool {
+        std::path::Path::new(&format!("/sys/class/net/{name}")).exists()
+    }
+
+    /// Whether an interface already carries an IPv6 address.
+    ///
+    /// Reads `/proc/net/if_inet6`, which needs no privileges.
+    pub fn interface_has_address(name: &str, address: Ipv6Addr) -> bool {
+        let Ok(contents) = std::fs::read_to_string("/proc/net/if_inet6") else {
+            // Cannot tell. Assume it is there rather than block on a guess.
+            return true;
+        };
+        let wanted = hex::encode(address.octets());
+        contents.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            let addr = fields.next().unwrap_or_default();
+            let iface = fields.last().unwrap_or_default();
+            addr.eq_ignore_ascii_case(&wanted) && iface == name
+        })
+    }
+
+    /// The commands a privileged user runs once to prepare an interface.
+    pub fn setup_commands(request: &TunRequest, user: &str) -> Vec<String> {
+        vec![
+            format!(
+                "sudo ip tuntap add dev {} mode tun user {user}",
+                request.name
+            ),
+            format!(
+                "sudo ip -6 address add {}/{} dev {}",
+                request.address, request.prefix_len, request.name
+            ),
+            format!(
+                "sudo ip link set dev {} mtu {} up",
+                request.name, request.mtu
+            ),
+        ]
+    }
+
+    fn current_user() -> String {
+        std::env::var("SUDO_USER")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "$USER".to_string())
+    }
+
+    /// Opens real TUN interfaces.
     #[derive(Debug, Clone, Default)]
     pub struct SystemTunFactory;
 
@@ -276,27 +333,50 @@ mod system {
             request: TunRequest,
         ) -> BoxFuture<'a, Result<Arc<dyn TunDevice>, PluginError>> {
             Box::pin(async move {
+                let existed = interface_exists(&request.name);
+
                 let mut config = tun::Configuration::default();
-                config.tun_name(&request.name).mtu(request.mtu as u16).up();
-                // The overlay address and its subnet, so the operating system
-                // routes overlay traffic into this interface.
-                let _ = (&request.address, request.prefix_len);
+                config.tun_name(&request.name);
+                if !existed {
+                    // Only configure what we are creating ourselves.
+                    // Reconfiguring somebody else's prepared interface would
+                    // need privileges we are trying not to require.
+                    config.mtu(request.mtu as u16).up();
+                }
 
                 let device = tun::create_as_async(&config).map_err(|err| {
-                    PluginError::Unavailable(format!(
-                        "cannot create the TUN interface `{}`: {err}. \
-                         This needs CAP_NET_ADMIN (try running as root).",
-                        request.name
-                    ))
+                    let hint = if existed {
+                        format!(
+                            "interface `{}` exists but could not be opened: {err}. \
+                             It must be a persistent TUN interface owned by this user.",
+                            request.name
+                        )
+                    } else {
+                        format!(
+                            "cannot create the TUN interface `{}`: {err}. \
+                             Creating one needs CAP_NET_ADMIN. Either prepare it once as root \
+                             (see `tsunagi tun-setup`) and run unprivileged, or grant the \
+                             capability.",
+                            request.name
+                        )
+                    };
+                    PluginError::Unavailable(hint)
                 })?;
 
-                // The name was requested explicitly; creation fails rather
-                // than silently picking another one.
-                let name = request.name.clone();
-                let (reader, writer) = tokio::io::split(device);
+                // Without its overlay address the interface can never receive
+                // anything, so say so instead of pretending to be up.
+                if !interface_has_address(&request.name, request.address) {
+                    let commands = setup_commands(&request, &current_user()).join("\n  ");
+                    return Err(PluginError::Unavailable(format!(
+                        "interface `{}` has no {} address. Assigning an IPv6 address needs \
+                         privileges. Run:\n  {commands}",
+                        request.name, request.address
+                    )));
+                }
 
+                let (reader, writer) = tokio::io::split(device);
                 Ok(Arc::new(SystemTun {
-                    name,
+                    name: request.name,
                     mtu: request.mtu,
                     reader: Mutex::new(reader),
                     writer: Mutex::new(writer),

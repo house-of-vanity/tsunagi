@@ -22,7 +22,13 @@ system can hand us IP packets, and even that is behind a trait
 | | needs privileges | what it proves |
 |---|---|---|
 | `MemoryTunFactory` | no | handshake, encryption, routing, address ownership |
-| `SystemTunFactory` | `CAP_NET_ADMIN` | traffic actually reaches the OS |
+| `SystemTunFactory`, attaching | none, if the interface was prepared | traffic actually reaches the OS |
+| `SystemTunFactory`, creating | `CAP_NET_ADMIN` | the same, at the cost of a capability |
+
+`SystemTunFactory` attaches to an interface that already exists and only
+creates one when it does not. A persistent interface created by root and owned
+by the user lets the agent run with no privileges at all; see *Running
+unprivileged* in [../README.md](../README.md#running-unprivileged).
 
 [boringtun]: https://docs.rs/boringtun
 [`TunFactory`]: https://docs.rs/tsunagi
@@ -184,5 +190,11 @@ async fn main() -> Result<()> {
 * **Userspace costs CPU.** Kernel WireGuard is faster. A kernel backend could
   return behind the same boundary, but it would give up transport-provided NAT
   traversal unless paired with a local proxy.
-* **The system interface path is barely exercised by the default suite**,
-  because it needs privileges. Everything else about the data plane is.
+* **The agent cannot assign the overlay address itself.** The `tun` crate sets
+  addresses through an IPv4-only ioctl, so the IPv6 overlay address must come
+  from `ip -6 address add` or an equivalent. The agent verifies the address is
+  present, via `/proc/net/if_inet6`, and refuses with the exact command rather
+  than running an interface that could never receive anything. Doing it
+  in-process would mean speaking netlink, which is not implemented.
+* **The system interface path is not exercised by the default suite**, because
+  it needs privileges. Everything else about the data plane is.

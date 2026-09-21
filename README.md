@@ -104,11 +104,56 @@ Notes:
   so two machines behind NAT find each other. `--transport local` keeps everything
   on the local network. See *How peers find each other* below — it is worth
   understanding what gets published.
-- Without `CAP_NET_ADMIN`, add `--no-tun`: the mesh, the data links and the
+- Without a network interface, add `--no-tun`: the mesh, the data links and the
   WireGuard handshakes all still run and are visible in the status output, only
   traffic does not reach the operating system. That is the quickest way to
   confirm the network forms.
-- Run as root (or grant `CAP_NET_ADMIN`) to get a real interface.
+- For real traffic, see *Running unprivileged* below.
+
+## Running unprivileged
+
+The agent does not need to run as root. Creating a network interface and
+giving it an address do need privileges, but they are a **one-time setup step**
+that can be done separately.
+
+Ask the agent what it needs, then run that once as root:
+
+```bash
+tsunagi tun-setup --network lab --secret "$SECRET"
+```
+
+```text
+# Network  lab (jwc6dcrtmo5zzdk7f6wfpkcqrpvqwr6po7vz3q2fvttgolt4ijfa)
+# Interface tsunjwc6dcrtmo5, address fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64, mtu 1100
+# Run once as root; then run `tsunagi up` as ab.
+
+sudo ip tuntap add dev tsunjwc6dcrtmo5 mode tun user ab
+sudo ip -6 address add fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64 dev tsunjwc6dcrtmo5
+sudo ip link set dev tsunjwc6dcrtmo5 mtu 1100 up
+```
+
+`user ab` is the point: the interface is persistent and owned by that user, so
+`tsunagi up` afterwards opens it with **no privileges and no capabilities at
+all**. The interface name and address are derived, so they are stable — the
+setup survives restarts and only has to be redone if the network name, the
+secret or this agent's WireGuard key changes.
+
+Other ways, and their trade-offs:
+
+| approach | agent runs as | notes |
+|---|---|---|
+| `tsunagi tun-setup` (above) | ordinary user, no capabilities | recommended |
+| `sudo setcap cap_net_admin+ep ./tsunagi` | ordinary user, one capability | the agent can then create the interface itself, but **still cannot assign the IPv6 address** (see below), so the `ip -6 address add` line is needed anyway. The capability is lost on every rebuild or copy. |
+| systemd service | `User=`, `AmbientCapabilities=CAP_NET_ADMIN` | same caveat about the address |
+| plain `sudo tsunagi up` | root | everything works, nothing is isolated |
+
+**Known limitation.** The agent cannot assign the IPv6 overlay address itself:
+the `tun` crate sets addresses through an IPv4-only ioctl, so an IPv6 address
+has to come from `ip -6 address add` or an equivalent. Rather than start with
+an interface that could never receive anything, the agent checks for the
+address in `/proc/net/if_inet6` and refuses with the exact command to run.
+Doing it in-process would mean talking netlink directly, which is possible but
+not implemented.
 
 ## Checks
 

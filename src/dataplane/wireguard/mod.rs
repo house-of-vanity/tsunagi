@@ -64,4 +64,4 @@ pub use store::WgKeyStore;
 pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest};
 
 #[cfg(feature = "tun-device")]
-pub use tun::SystemTunFactory;
+pub use tun::{SystemTunFactory, interface_exists, interface_has_address, setup_commands};
