@@ -85,26 +85,49 @@ Two consequences matter:
 
 ## IPv4 alongside IPv6
 
-The overlay is dual stack by default: every member also derives an IPv4
-address, from the same inputs, into `100.64.0.0/10` (RFC 6598 shared address
-space — deliberately not RFC 1918, so it rarely clashes with the network the
-machine is already on). The range is configurable, and IPv4 can be turned off.
+The overlay carries IPv4 as well, but **it is off unless you name a range**,
+and every member must name the same one:
 
-**IPv4 is weaker than IPv6 here, and the difference is not cosmetic.** A 64 bit
-interface identifier makes an IPv6 collision impossible in practice. IPv4 has
-nothing like that much room: in a `/10` with 50 members the chance that two
-derive the same address is roughly 0.03%. Small, but not zero, and a mesh with
-no coordinator cannot simply allocate around it.
+```bash
+tsunagi up --network lab --secret "$SECRET" --wireguard --ipv4-range 10.77.0.0/16
+```
 
-So a collision is detected and resolved rather than assumed away: the member
-whose WireGuard public key sorts lower keeps the address, a rule every member
-computes identically and therefore agrees on without exchanging anything. The
-other member ends up with **no IPv4 address** and is still fully reachable over
-IPv6. The status output flags it.
+Two reasons it has no default.
 
-That is the honest summary: **IPv6 always works; IPv4 almost always works and
-degrades predictably when it does not.** Allocating IPv4 properly needs the
-agreed state described in [sync-model.md](sync-model.md).
+**There is no IPv4 range that is free everywhere.** `100.64.0.0/10` is
+Tailscale's and carrier-grade NAT's, `10.0.0.0/8` and `192.168.0.0/16` are on
+half the networks in the world, `172.17.0.0/16` is Docker. Picking one
+requires knowing what is already in use on every machine that will join, which
+is the operator's knowledge, not ours. IPv6 needs none of this: a ULA derived
+from the network id collides with essentially nothing.
+
+**The range is an input to the derivation.** Each agent computes every peer's
+address itself, so two members configured with different ranges would derive
+different addresses for each other and IPv4 would silently misroute. The range
+therefore travels in the announcement — not as a request, and never trusted,
+but so that a mismatch is *detected*. When it happens, the offending peer gets
+no IPv4 address here, keeps working over IPv6, and the reason is reported:
+
+```text
+! wireguard: peer SDsEb/WF is configured with the IPv4 overlay range
+  10.81.0.0/16 but this agent uses 10.80.0.0/16; every member must use the
+  same one. That peer has no IPv4 address here and is reachable over IPv6 only.
+```
+
+**IPv4 addresses can also collide with each other.** A 64 bit interface
+identifier makes an IPv6 collision impossible in practice; IPv4 has nothing
+like that room. In a `/16` with 50 members the chance that two members derive
+the same address is roughly 2%. A mesh with no coordinator cannot allocate
+around it, so the collision is resolved instead: the member whose WireGuard
+public key sorts lower keeps the address, a rule every member computes
+identically and therefore agrees on without exchanging anything. The other
+member has no IPv4 address and remains reachable over IPv6. Pick a roomy
+range — a `/16` for a handful of machines, larger for more — and the odds stay
+small.
+
+The honest summary: **IPv6 always works. IPv4 is opt-in, needs agreement, and
+degrades predictably when it does not get it.** Allocating IPv4 properly needs
+the agreed state described in [sync-model.md](sync-model.md).
 
 ## Address ownership is enforced, not announced
 
@@ -223,8 +246,8 @@ async fn main() -> Result<()> {
 
 * **Full mesh only.** Every member runs a tunnel to every other member.
   Routing through an intermediate participant is not implemented.
-* **IPv4 addressing can collide.** See above: it is resolved deterministically
-  and the loser keeps IPv6, but a proper allocator needs agreed state.
+* **IPv4 is opt-in, must be agreed, and can collide.** See above. A proper
+  allocator needs agreed state.
 * **No routes, DNS or firewall rules.** The plugin creates its interface and
   nothing else. Anything beyond the overlay `/64` is the operator's business.
 * **Membership is session-scoped.** A peer leaves the overlay when its control

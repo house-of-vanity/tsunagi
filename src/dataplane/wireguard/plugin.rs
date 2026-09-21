@@ -44,7 +44,7 @@ use super::config::{DEFAULT_INTERFACE_PREFIX, interface_name};
 use super::device::{PeerSummary, WireguardDevice};
 use super::keys::{WgPublicKey, WgSecretKey};
 use super::overlay::{
-    DEFAULT_IPV4_RANGE, OVERLAY_PREFIX_LEN, overlay_address, overlay_address_v4, overlay_prefix,
+    Ipv4Range, OVERLAY_PREFIX_LEN, overlay_address, overlay_address_v4, overlay_prefix,
 };
 use super::store::WgKeyStore;
 use super::tun::{TunFactory, TunRequest};
@@ -90,10 +90,19 @@ pub struct WireguardConfig {
     pub mtu: u32,
     /// IPv4 overlay range, or `None` for an IPv6-only overlay.
     ///
-    /// IPv6 addresses are derived collision-free; IPv4 ones cannot be, so a
-    /// collision is detected and resolved deterministically instead. See
-    /// `docs/wireguard.md`.
-    pub ipv4_range: Option<(Ipv4Addr, u8)>,
+    /// **Every member of a network must configure the same range.** Addresses
+    /// are derived from it, so two members configured differently would
+    /// derive different addresses for each other. The range travels in the
+    /// announcement purely so that such a mismatch is detected and reported
+    /// instead of silently misrouting.
+    ///
+    /// There is no default, because no IPv4 range is free on every host:
+    /// `100.64.0.0/10` belongs to Tailscale and to carrier-grade NAT,
+    /// `10.0.0.0/8` and `192.168.0.0/16` are everywhere, `172.17.0.0/16` is
+    /// Docker. Pick one you know is unused on every machine that will join.
+    /// IPv6 needs none of this: its addresses are derived from the network
+    /// id and never collide.
+    pub ipv4_range: Option<Ipv4Range>,
     /// How long to coalesce changes before reconciling.
     pub reconcile_debounce: Duration,
     /// How often to reconcile anyway, which is also when a packet interface
@@ -109,7 +118,9 @@ impl WireguardConfig {
             interface_prefix: DEFAULT_INTERFACE_PREFIX.to_string(),
             keepalive: Some(25),
             mtu: DEFAULT_MTU,
-            ipv4_range: Some(DEFAULT_IPV4_RANGE),
+            // Off by default: no IPv4 range is free on every host. See
+            // `with_ipv4_range`.
+            ipv4_range: None,
             reconcile_debounce: Duration::from_millis(200),
             reconcile_interval: Duration::from_secs(15),
         }
@@ -130,7 +141,9 @@ impl WireguardConfig {
     }
 
     /// Sets the IPv4 overlay range, or disables IPv4 with `None`.
-    pub fn with_ipv4_range(mut self, range: Option<(Ipv4Addr, u8)>) -> Self {
+    ///
+    /// Must match on every member; see the field documentation.
+    pub fn with_ipv4_range(mut self, range: Option<Ipv4Range>) -> Self {
         self.ipv4_range = range;
         self
     }
@@ -168,7 +181,7 @@ pub struct NetworkOverview {
     /// This agent's IPv4 overlay address, when the overlay is dual stack.
     pub overlay_address_v4: Option<Ipv4Addr>,
     /// The IPv4 overlay range in use.
-    pub ipv4_range: Option<(Ipv4Addr, u8)>,
+    pub ipv4_range: Option<Ipv4Range>,
     /// Peers this agent knows about.
     pub peers: Vec<PeerOverview>,
     /// Unicast packets the operating system sent to an address no peer owns.
@@ -467,9 +480,11 @@ impl Worker {
             name: name.clone(),
             address: overlay_address(network, &key.public()),
             prefix_len: OVERLAY_PREFIX_LEN,
-            address_v4: self.config.ipv4_range.and_then(|range| {
-                overlay_address_v4(network, &key.public(), range).map(|address| (address, range.1))
-            }),
+            address_v4: self
+                .config
+                .ipv4_range
+                .and_then(|range| overlay_address_v4(network, &key.public(), range)),
+            prefix_len_v4: self.config.ipv4_range.map_or(0, |range| range.prefix_len),
             mtu: self.config.mtu,
         };
         let tun = self.tun_factory.create(request).await?;
@@ -503,6 +518,7 @@ impl Worker {
 
         let mut wanted: Vec<WgPublicKey> = Vec::new();
         let mut too_small: Vec<(usize, usize)> = Vec::new();
+        let mut mismatched: Vec<(WgPublicKey, Ipv4Range, Ipv4Range)> = Vec::new();
         for (endpoint_id, announcement) in &state.announcements {
             let Some(link) = state.links.get(endpoint_id) else {
                 continue;
@@ -524,9 +540,24 @@ impl Worker {
                 too_small.push((available, needed));
             }
 
+            // A peer only gets an IPv4 address if both sides were configured
+            // with the same range. Otherwise the two would derive different
+            // addresses for each other and IPv4 would silently misroute.
+            let peer_v4 = match (self.config.ipv4_range, announcement.ipv4_range) {
+                (Some(ours), Some(theirs)) if ours == theirs => {
+                    overlay_address_v4(network, &announcement.public_key, ours)
+                }
+                (Some(ours), Some(theirs)) => {
+                    mismatched.push((announcement.public_key, ours, theirs));
+                    None
+                }
+                (Some(_), None) | (None, Some(_)) | (None, None) => None,
+            };
+
             if let Err(err) = device.add_peer(
                 *endpoint_id,
                 announcement.public_key,
+                peer_v4,
                 Arc::clone(link),
                 self.config.keepalive,
             ) {
@@ -535,6 +566,18 @@ impl Worker {
         }
         device.retain_peers(&wanted);
         drop(shared);
+
+        for (key, ours, theirs) in mismatched {
+            self.report(
+                network,
+                format!(
+                    "peer {} is configured with the IPv4 overlay range {theirs} but this agent \
+                     uses {ours}; every member must use the same one. That peer has no IPv4 \
+                     address here and is reachable over IPv6 only.",
+                    key.fmt_short()
+                ),
+            );
+        }
 
         for (available, needed) in too_small {
             self.report(
@@ -664,7 +707,8 @@ impl IpPlugin for WireguardPlugin {
         };
 
         // Identity only. Where to send packets is the transport's business.
-        let announcement = WgAnnouncement::new(network, &state.key.public());
+        let announcement =
+            WgAnnouncement::new(network, &state.key.public(), self.worker.config.ipv4_range);
         Ok(Some(PluginCapability {
             protocol: WIREGUARD_PROTOCOL.to_string(),
             version: super::announcement::ANNOUNCEMENT_VERSION,

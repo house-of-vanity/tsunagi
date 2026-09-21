@@ -12,7 +12,7 @@
 //! * `SystemTun`, behind the `tun-device` feature, is a real TUN interface.
 //!   Creating one needs `CAP_NET_ADMIN` on Linux or the equivalent elsewhere.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -29,8 +29,10 @@ pub struct TunRequest {
     pub address: Ipv6Addr,
     /// Prefix length of the overlay subnet, so the OS routes it here.
     pub prefix_len: u8,
-    /// The IPv4 overlay address and its prefix length, when dual stack.
-    pub address_v4: Option<(Ipv4Addr, u8)>,
+    /// The IPv4 overlay address this host answers to, when dual stack.
+    pub address_v4: Option<std::net::Ipv4Addr>,
+    /// Prefix length of the IPv4 overlay range.
+    pub prefix_len_v4: u8,
     /// Interface MTU.
     pub mtu: u32,
 }
@@ -401,7 +403,8 @@ mod system {
                 request.address, request.prefix_len, request.name
             ),
         ];
-        if let Some((address, prefix_len)) = request.address_v4 {
+        if let Some(address) = request.address_v4 {
+            let prefix_len = request.prefix_len_v4;
             // IPv4 is not sensitive to carrier the way IPv6 is, so it needs
             // no extra settings.
             commands.push(format!(
@@ -589,7 +592,8 @@ fd559caf9652cb86321feac65c73bd84 05 40 00 08 tsun0
             name: "tsun0".into(),
             address: "fd00::1".parse().unwrap(),
             prefix_len: 64,
-            address_v4: Some(("100.64.1.2".parse().unwrap(), 10)),
+            address_v4: Some("100.64.1.2".parse().unwrap()),
+            prefix_len_v4: 10,
             mtu: 1280,
         };
         let commands = setup_commands(&request, "someone");

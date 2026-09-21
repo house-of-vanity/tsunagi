@@ -55,7 +55,8 @@ pub use config::{Cidr, DEFAULT_INTERFACE_PREFIX, MAX_INTERFACE_NAME_LEN, interfa
 pub use device::{PeerHealth, PeerStats, PeerSummary, WireguardDevice};
 pub use keys::{WgPublicKey, WgSecretKey};
 pub use overlay::{
-    DEFAULT_IPV4_RANGE, OVERLAY_PREFIX_LEN, overlay_address, overlay_address_v4, overlay_prefix,
+    Ipv4Range, OVERLAY_PREFIX_LEN, RFC6598_SHARED_RANGE, overlay_address, overlay_address_v4,
+    overlay_prefix,
 };
 pub use packet::IpHeader;
 pub use plugin::{

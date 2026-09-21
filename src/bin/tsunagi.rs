@@ -16,7 +16,7 @@ use tsunagi::agent::Event;
 use tsunagi::config::{AgentConfig, StoragePaths, TransportPolicy};
 use tsunagi::dataplane::IpPlugin;
 use tsunagi::dataplane::wireguard::{
-    MemoryTunFactory, TunFactory, WireguardConfig, WireguardPlugin,
+    Ipv4Range, MemoryTunFactory, TunFactory, WireguardConfig, WireguardPlugin,
 };
 use tsunagi::discovery::{CompositeDiscovery, NetworkDiscovery, StaticBootstrap};
 use tsunagi::identity::{NetworkName, NetworkSecret};
@@ -99,43 +99,29 @@ struct TunSetupArgs {
     #[arg(long)]
     wg_mtu: Option<u32>,
 
-    /// Match `tsunagi up --no-ipv4`.
-    #[arg(long)]
-    no_ipv4: bool,
-
     /// Match `tsunagi up --ipv4-range`.
-    #[arg(long, value_name = "CIDR", conflicts_with = "no_ipv4")]
+    #[arg(long, value_name = "CIDR")]
     ipv4_range: Option<String>,
 }
 
-/// Parses `address/prefix` into an IPv4 range.
-fn parse_ipv4_range(text: &str) -> Result<(std::net::Ipv4Addr, u8), String> {
-    let (address, prefix) = text
-        .split_once('/')
-        .ok_or_else(|| format!("`{text}` is not an address with a prefix, e.g. 100.64.0.0/10"))?;
-    let address = address
-        .parse()
-        .map_err(|err| format!("`{address}` is not an IPv4 address: {err}"))?;
-    let prefix: u8 = prefix
-        .parse()
-        .map_err(|err| format!("`{prefix}` is not a prefix length: {err}"))?;
-    if prefix > 30 {
-        return Err(format!("a /{prefix} has no room for hosts"));
-    }
-    Ok((address, prefix))
+/// Strips the error type's own prefix, which is about peers rather than flags.
+fn plain_reason(err: &tsunagi::dataplane::PluginError) -> String {
+    let text = err.to_string();
+    text.split_once(": ")
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or(text)
 }
 
-/// Resolves the IPv4 overlay range from the flags.
+/// Resolves the IPv4 overlay range from the flag.
 fn resolve_ipv4_range(
-    no_ipv4: bool,
     range: Option<&String>,
-) -> Result<Option<(std::net::Ipv4Addr, u8)>, Box<dyn std::error::Error>> {
-    if no_ipv4 {
-        return Ok(None);
-    }
+) -> Result<Option<Ipv4Range>, Box<dyn std::error::Error>> {
     match range {
-        Some(text) => Ok(Some(parse_ipv4_range(text)?)),
-        None => Ok(Some(tsunagi::dataplane::wireguard::DEFAULT_IPV4_RANGE)),
+        Some(text) => Ok(Some(text.parse::<Ipv4Range>().map_err(|err| {
+            // The underlying error type is about peers; reword it for a flag.
+            format!("--ipv4-range {text}: {}", plain_reason(&err))
+        })?)),
+        None => Ok(None),
     }
 }
 
@@ -251,12 +237,14 @@ struct UpArgs {
     #[arg(long)]
     wg_mtu: Option<u32>,
 
-    /// Run an IPv6-only overlay instead of dual stack.
-    #[arg(long)]
-    no_ipv4: bool,
-
-    /// IPv4 overlay range, as `address/prefix`. Defaults to 100.64.0.0/10.
-    #[arg(long, value_name = "CIDR", conflicts_with = "no_ipv4")]
+    /// Also run an IPv4 overlay in this range, as `address/prefix`.
+    ///
+    /// Off unless given: no IPv4 range is free on every host. Pick one you
+    /// know is unused everywhere — not 100.64.0.0/10, which is Tailscale's
+    /// and carrier-grade NAT's. Every member must pass the same range; a
+    /// mismatch is detected and reported rather than silently misrouted.
+    /// IPv6 needs none of this and is always on.
+    #[arg(long, value_name = "CIDR")]
     ipv4_range: Option<String>,
 
     /// How often to print a status summary, in seconds. Zero disables it.
@@ -412,7 +400,7 @@ async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>>
 
     let interface = interface_name(&args.wg_prefix, network)?;
     let address = overlay_address(network, &key.public());
-    let ipv4_range = resolve_ipv4_range(args.no_ipv4, args.ipv4_range.as_ref())?;
+    let ipv4_range = resolve_ipv4_range(args.ipv4_range.as_ref())?;
     let mtu = args.wg_mtu.unwrap_or(DEFAULT_MTU);
     let user = args.user.unwrap_or_else(|| {
         std::env::var("SUDO_USER")
@@ -422,10 +410,10 @@ async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>>
 
     println!("# Network  {name} ({network})");
     println!("# Interface {interface}, address {address}/{OVERLAY_PREFIX_LEN}, mtu {mtu}");
-    if let Some((base, prefix)) = ipv4_range
-        && let Some(v4) = overlay_address_v4(network, &key.public(), (base, prefix))
+    if let Some(range) = ipv4_range
+        && let Some(v4) = overlay_address_v4(network, &key.public(), range)
     {
-        println!("# IPv4 overlay address {v4}/{prefix}");
+        println!("# IPv4 overlay address {v4}/{}", range.prefix_len);
     }
     println!("# Run once as root; then run `tsunagi up` as {user}.");
     println!(
@@ -440,10 +428,13 @@ async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>>
     println!("sudo ip link set dev {interface} mtu {mtu} up");
     println!("sudo sysctl -qw net.ipv6.conf.{interface}.keep_addr_on_down=1");
     println!("sudo ip -6 address add {address}/{OVERLAY_PREFIX_LEN} dev {interface} nodad");
-    if let Some((base, prefix)) = ipv4_range
-        && let Some(v4) = overlay_address_v4(network, &key.public(), (base, prefix))
+    if let Some(range) = ipv4_range
+        && let Some(v4) = overlay_address_v4(network, &key.public(), range)
     {
-        println!("sudo ip address add {v4}/{prefix} dev {interface}");
+        println!(
+            "sudo ip address add {v4}/{} dev {interface}",
+            range.prefix_len
+        );
     }
     println!("\n# To check it afterwards:");
     println!("ip -6 addr show dev {interface}");
@@ -547,6 +538,13 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let secret = load_secret(args.secret.as_deref(), args.secret_file.as_deref())?;
     let paths = args.paths.resolve()?;
 
+    // Parsed up front so a typo is reported immediately, and so the option is
+    // never silently ignored when the data plane is off.
+    let ipv4_range = resolve_ipv4_range(args.ipv4_range.as_ref())?;
+    if ipv4_range.is_some() && !args.wireguard {
+        return Err("--ipv4-range only applies together with --wireguard".into());
+    }
+
     let mut bootstrap: Vec<EndpointAddr> = Vec::new();
     for peer in &args.peers {
         bootstrap.push(parse_peer(peer)?);
@@ -576,7 +574,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
         let mut wg = WireguardConfig::new(paths.state_dir.join("wireguard"))
             .with_interface_prefix(args.wg_prefix.clone())
-            .with_ipv4_range(resolve_ipv4_range(args.no_ipv4, args.ipv4_range.as_ref())?);
+            .with_ipv4_range(ipv4_range);
         if let Some(mtu) = args.wg_mtu {
             wg = wg.with_mtu(mtu);
         }

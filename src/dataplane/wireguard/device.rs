@@ -42,7 +42,7 @@ use crate::dataplane::transport::{SharedLink, TransportError};
 use crate::identity::NetworkId;
 
 use super::keys::{WgPublicKey, WgSecretKey};
-use super::overlay::{overlay_address, overlay_address_v4};
+use super::overlay::{Ipv4Range, overlay_address};
 use super::packet::IpHeader;
 use super::tun::TunDevice;
 
@@ -193,7 +193,7 @@ struct Inner {
     private_key: WgSecretKey,
     tun: Arc<dyn TunDevice>,
     /// The IPv4 overlay range, when the overlay is dual stack.
-    ipv4_range: Option<(Ipv4Addr, u8)>,
+    ipv4_range: Option<Ipv4Range>,
     peers: RwLock<HashMap<WgPublicKey, Arc<Peer>>>,
     /// Both families, so one lookup routes any packet.
     routes: RwLock<HashMap<IpAddr, WgPublicKey>>,
@@ -225,7 +225,7 @@ impl WireguardDevice {
         network: NetworkId,
         private_key: WgSecretKey,
         tun: Arc<dyn TunDevice>,
-        ipv4_range: Option<(Ipv4Addr, u8)>,
+        ipv4_range: Option<Ipv4Range>,
     ) -> Self {
         let inner = Arc::new(Inner {
             network,
@@ -260,10 +260,15 @@ impl WireguardDevice {
     }
 
     /// Adds or replaces a peer and starts its tunnel.
+    ///
+    /// `overlay_v4` is decided by the caller, because only it knows whether
+    /// both sides agree on an IPv4 range. `None` means this peer is reachable
+    /// over IPv6 only.
     pub fn add_peer(
         &self,
         endpoint_id: EndpointId,
         public_key: WgPublicKey,
+        overlay_v4: Option<Ipv4Addr>,
         link: SharedLink,
         keepalive: Option<u16>,
     ) -> Result<(), PluginError> {
@@ -284,7 +289,7 @@ impl WireguardDevice {
         );
 
         let overlay = overlay_address(self.inner.network, &public_key);
-        let overlay_v4 = self.claim_ipv4(&public_key);
+        let overlay_v4 = self.claim_ipv4(&public_key, overlay_v4);
         let peer = Arc::new(Peer {
             endpoint_id,
             public_key,
@@ -321,9 +326,8 @@ impl WireguardDevice {
     /// so they all agree on the outcome without talking about it. The other
     /// member simply has no IPv4 address; it is still fully reachable over
     /// IPv6, which never collides.
-    fn claim_ipv4(&self, public_key: &WgPublicKey) -> Option<Ipv4Addr> {
-        let range = self.inner.ipv4_range?;
-        let wanted = overlay_address_v4(self.inner.network, public_key, range)?;
+    fn claim_ipv4(&self, public_key: &WgPublicKey, wanted: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+        let wanted = wanted?;
 
         let holder = read_lock(&self.inner.routes)
             .get(&IpAddr::V4(wanted))

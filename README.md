@@ -31,9 +31,10 @@ A working library with **real iroh connections** and integration tests:
 - status snapshots, an event stream and honest diagnostics;
 - configuration restored after a restart;
 - correct behaviour when the disposable cache is missing or corrupt;
-- a **WireGuard data plane**, in userspace: its own key per network, a dual
-  stack overlay with deterministically derived addresses, real tunnels carried
-  over iroh, and address ownership enforced rather than believed;
+- a **WireGuard data plane**, in userspace: its own key per network, an IPv6
+  overlay with deterministically derived addresses and optional IPv4, real
+  tunnels carried over iroh, and address ownership enforced rather than
+  believed;
 - a **command line agent**, `tsunagi`, with a local control socket.
 
 ### What it deliberately does **not** do
@@ -125,10 +126,23 @@ ping  100.65.243.53
 
 `tx` and `rx` in the status should start moving.
 
-The overlay is dual stack: every member derives both an IPv6 address, which
-can never collide, and an IPv4 one in `100.64.0.0/10`, which very rarely can —
-see [docs/wireguard.md](docs/wireguard.md#ipv4-alongside-ipv6). `--no-ipv4`
-runs IPv6 only, `--ipv4-range` moves the range.
+IPv6 works out of the box: each member's address is derived from the network
+id and collides with essentially nothing.
+
+**IPv4 is opt-in**, because no IPv4 range is free on every host —
+`100.64.0.0/10` is Tailscale's, `10.0.0.0/8` and `192.168.0.0/16` are
+everywhere, `172.17.0.0/16` is Docker. Name one you know is unused, the same
+one on every member:
+
+```bash
+tsunagi up --network lab --secret "$SECRET" --wireguard --ipv4-range 10.77.0.0/16
+```
+
+The range is part of how addresses are derived, so members configured
+differently would misroute. It travels in the announcement purely so a
+mismatch is reported instead: the offending peer gets no IPv4 and keeps
+working over IPv6. See
+[docs/wireguard.md](docs/wireguard.md#ipv4-alongside-ipv6).
 
 Notes:
 
@@ -163,8 +177,10 @@ sudo ip tuntap add dev tsunjwc6dcrtmo5 mode tun user ab
 sudo ip link set dev tsunjwc6dcrtmo5 mtu 1280 up
 sudo sysctl -qw net.ipv6.conf.tsunjwc6dcrtmo5.keep_addr_on_down=1
 sudo ip -6 address add fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64 dev tsunjwc6dcrtmo5 nodad
-sudo ip address add 100.110.49.177/10 dev tsunjwc6dcrtmo5
 ```
+
+If you asked for IPv4 with `--ipv4-range`, `tun-setup` adds an `ip address add`
+line for it too.
 
 The MTU is 1280 because that is the minimum IPv6 requires (RFC 8200). Linux
 disables IPv6 entirely on an interface below it — the per-device
