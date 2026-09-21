@@ -490,6 +490,30 @@ fn store_dns_setting(
     Ok(())
 }
 
+/// What this device already knows about the network a command names.
+///
+/// Two things, and both are only knowable *before* joining: whether this
+/// network was already configured here, and whether another one answers to
+/// the same name. A name is a label and an id is the identity, so those two
+/// are different networks that share nothing — almost always a mistyped
+/// secret, and the one mistake that makes a report unreadable. Said at the
+/// moment it happens, it is obvious; discovered later in a status report,
+/// it is a mystery.
+fn network_context(
+    configured: &[tsunagi::storage::StoredNetwork],
+    name: &NetworkName,
+    network_id: tsunagi::NetworkId,
+) -> (bool, Option<String>) {
+    let known = configured
+        .iter()
+        .any(|other| other.network_id == network_id);
+    let shared = configured
+        .iter()
+        .find(|other| other.name == *name && other.network_id != network_id)
+        .map(|other| other.network_id.to_string());
+    (known, shared)
+}
+
 /// Where the secret a command is about to use came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretOrigin {
@@ -1361,8 +1385,13 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
             secret,
             secret_file,
         }) => {
-            let secret = load_secret(secret.as_deref(), secret_file.as_deref())?;
-            join_network(&paths, &socket, &network, secret).await
+            let name = NetworkName::new(network)?;
+            // The same rule as `up`: a name this device already has means
+            // that network, a name nobody has means a new one, and no
+            // secret is needed to make a network with a friend in a hurry.
+            let (secret, origin) =
+                resolve_secret(&paths, &name, secret.as_deref(), secret_file.as_deref())?;
+            join_network(&paths, &socket, &name, secret, origin).await
         }
         Some(NetworkAction::Leave { network, offline }) => {
             leave_network(&paths, &socket, &network, offline).await
@@ -1390,20 +1419,23 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
 async fn join_network(
     paths: &StoragePaths,
     socket: &std::path::Path,
-    name: &str,
+    name: &NetworkName,
     secret: NetworkSecret,
+    origin: SecretOrigin,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The running agent, because a second `up` cannot have the directory
     // and because this way the network starts at once instead of at the
     // next restart.
     if socket.exists() {
         let report =
-            tsunagi::ipc::unix::join_network(socket, name, secret.encode().as_str()).await?;
+            tsunagi::ipc::unix::join_network(socket, name.as_str(), secret.encode().as_str())
+                .await?;
+        // The id in full either way: it is what every other command takes,
+        // and the shortened form in a report is for reading, not copying.
         if report.already_configured {
             println!(
                 "`{}` ({}) was already configured; it is running",
-                report.name,
-                short(&report.network_id, 10)
+                report.name, report.network_id
             );
         } else {
             println!("joined `{}` ({})", report.name, report.network_id);
@@ -1417,13 +1449,15 @@ async fn join_network(
                 short(other, 10)
             );
         }
+        if origin == SecretOrigin::Generated {
+            invite(socket, name, &secret).await;
+        }
         return Ok(());
     }
 
     // No agent: configure it, and say when it will take effect rather than
     // leaving the impression that it is running.
-    let name = NetworkName::new(name)?;
-    let keys = tsunagi::identity::NetworkKeys::derive(&name, &secret);
+    let keys = tsunagi::identity::NetworkKeys::derive(name, &secret);
     let storage = tsunagi::storage::Storage::open(paths)?;
     let existing = storage.list_networks().await.unwrap_or_default();
     let already = existing
@@ -1431,10 +1465,10 @@ async fn join_network(
         .any(|other| other.network_id == keys.network_id());
     let shared = existing
         .iter()
-        .find(|other| other.name == name && other.network_id != keys.network_id())
+        .find(|other| other.name == *name && other.network_id != keys.network_id())
         .map(|other| other.network_id.to_string());
     storage
-        .upsert_network(keys.network_id(), name.clone(), secret, true)
+        .upsert_network(keys.network_id(), name.clone(), secret.clone(), true)
         .await?;
     storage.release_ownership_lock();
 
@@ -1450,8 +1484,40 @@ async fn join_network(
             short(&other, 10)
         );
     }
+    if origin == SecretOrigin::Generated {
+        println!("  secret  {}", secret.encode().as_str());
+    }
     eprintln!("\nNo agent is running here, so it starts with the next `tsunagi up`.");
     Ok(())
+}
+
+/// Prints the one line that gets somebody else into this network.
+///
+/// Only when the secret was invented here: there is nowhere else to read it
+/// from, and the whole point of a network made in a hurry is that the
+/// command can be pasted to the other person as it stands. The endpoint id
+/// comes from the running agent, because without a peer to contact the
+/// other side has nothing to go on.
+async fn invite(socket: &std::path::Path, name: &NetworkName, secret: &NetworkSecret) {
+    let endpoint = tsunagi::ipc::unix::request_status(socket)
+        .await
+        .ok()
+        .map(|report| report.endpoint_id)
+        .filter(|id| !id.is_empty());
+    println!("  secret  {}", secret.encode().as_str());
+    match endpoint {
+        Some(endpoint) => println!(
+            "\nRun this on the other machine:\n\n  \
+             tsunagi up --network {name} --secret {} --peer {endpoint}",
+            secret.encode().as_str()
+        ),
+        None => println!(
+            "\nRun this on the other machine, with this device's endpoint id from \
+             `tsunagi id`:\n\n  \
+             tsunagi up --network {name} --secret {} --peer <endpoint-id>",
+            secret.encode().as_str()
+        ),
+    }
 }
 
 /// Every configured network, live where an agent can say so.
@@ -2924,6 +2990,11 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.secret.as_deref(),
         args.secret_file.as_deref(),
     )?;
+    // Read before anything joins, because afterwards everything is
+    // configured and the difference is what the user needs to see.
+    let network_id = tsunagi::identity::NetworkKeys::derive(&name, &secret).network_id();
+    let (known_before, name_shared_with) =
+        network_context(&stored_networks(&paths), &name, network_id);
 
     // Parsed up front so a typo is reported immediately, and so the option is
     // never silently ignored when the data plane is off.
@@ -3081,7 +3152,14 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("tsunagi is up");
     println!("  endpoint id  {}", agent.endpoint_id());
     println!("  hostname     {}", agent.hostname());
-    println!("  network      {name} ({network})");
+    // Whether this command line just made a network or picked up one that
+    // was already here. Without it, a secret that has quietly created a
+    // second network of the same name — or recreated one that was left —
+    // looks exactly like the network you meant.
+    println!(
+        "  network      {name} ({network})  ·  {}",
+        if known_before { "already here" } else { "new" }
+    );
     println!("  state        {}", paths.state_dir.display());
     // One line, everything the other side needs, ready to paste. The
     // secret is printed in full only when this agent invented it: then
@@ -3129,6 +3207,19 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+
+    // A name is a label and an id is the identity, so two networks can be
+    // called the same thing and share nothing. Almost always a mistyped
+    // secret, and the one mistake that makes a report unreadable.
+    if let Some(other) = &name_shared_with {
+        eprintln!(
+            "\nwarning: `{name}` is also configured here with a different secret, as {}.\n\
+             A network is its name *and* its secret, so these two share nothing. If that\n\
+             was not meant, `tsunagi network leave` removes one — and check the secret on\n\
+             this command line, because it is what decides which network this is.",
+            short(other, 10)
+        );
+    }
 
     // Last, after the facts, because it is the line to act on: one
     // command with everything the other side needs.
@@ -3957,5 +4048,60 @@ mod secret_tests {
         let err = resolve_secret(&paths, &NetworkName::new("lab").unwrap(), None, None)
             .expect_err("it cannot choose");
         assert!(err.to_string().contains("does not say which"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod network_context_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use tsunagi::identity::NetworkKeys;
+    use tsunagi::storage::StoredNetwork;
+
+    fn configured(name: &str, seed: u8) -> StoredNetwork {
+        let name = NetworkName::new(name).unwrap();
+        let secret = NetworkSecret::from_bytes([seed; 32]).unwrap();
+        let keys = NetworkKeys::derive(&name, &secret);
+        StoredNetwork {
+            network_id: keys.network_id(),
+            name,
+            secret,
+            auto_start: true,
+        }
+    }
+
+    #[test]
+    fn a_network_already_here_is_told_from_a_new_one() {
+        // `up` prints which of the two happened. Without it, a command line
+        // that quietly recreates a network somebody just left looks exactly
+        // like the one they meant to start.
+        let known = configured("lab", 1);
+        let name = known.name.clone();
+        let (already, shared) =
+            network_context(std::slice::from_ref(&known), &name, known.network_id);
+        assert!(already);
+        assert_eq!(shared, None);
+
+        let fresh = configured("lab", 2);
+        let (already, shared) =
+            network_context(std::slice::from_ref(&known), &name, fresh.network_id);
+        assert!(!already, "a different secret is a different network");
+        assert_eq!(
+            shared,
+            Some(known.network_id.to_string()),
+            "and the one it shares a name with is named"
+        );
+    }
+
+    #[test]
+    fn a_name_nobody_here_uses_shares_with_nothing() {
+        let (already, shared) = network_context(
+            &[configured("lab", 1)],
+            &NetworkName::new("other").unwrap(),
+            configured("other", 3).network_id,
+        );
+        assert!(!already);
+        assert_eq!(shared, None);
     }
 }

@@ -69,6 +69,11 @@ asking a running agent for status over a real Unix socket, joining and
 leaving a network through it, a leftover socket file being replaced while a
 live one is not, and the derived socket path staying short enough to bind.
 
+`crates/tsunagi-cli/tests/network_cli.rs` runs the real binary too: joining
+with no secret invents one, prints it in full and prints a line the other
+side can paste unchanged, while a bare name this device already knows
+resumes that network instead of inventing another of the same name.
+
 `crates/tsunagi-cli/tests/dns_service.rs` runs the real binary: the resolver
 comes up with no interface to attach it to, the listener is not rebuilt on
 the way past, a name outside every zone is refused, each network gets a zone

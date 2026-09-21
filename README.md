@@ -323,7 +323,7 @@ tsunagi id key rotate           replace that key
 
 tsunagi network                 the networks this device belongs to
 tsunagi network join -n lab -s tsn1…   join one; adds it to a running agent
-tsunagi network join -n lab     join one whose secret this device already has
+tsunagi network join -n lab     resume one this device has, or make it on the spot
 tsunagi network leave <id>      give up the address and name, then forget it
 tsunagi network secret          the secret of each joined network
 tsunagi network secret <id>     just that one, for copying
@@ -334,8 +334,8 @@ tsunagi dns on                  start it, now and after every restart
 tsunagi dns off                 stop it, now and after every restart
 ```
 
-**A network without a secret makes one.** `tsunagi up --network lab` with no
-`--secret` resolves in the obvious way: if this device is already in exactly
+**A network without a secret makes one.** `tsunagi up --network lab` and
+`tsunagi network join --network lab` both resolve a bare name the same way: if this device is already in exactly
 one network called `lab`, that one — so the name alone resumes what you have;
 if it is in none, a fresh random secret, printed in full along with the one
 line to send the others:
@@ -350,6 +350,13 @@ other machine:
 
   tsunagi up --network lab --secret tsn1u7c… --peer 91e83a6e2b7a…
 ```
+
+`up` says which of the two happened — `· new` or `· already here` beside
+the network — and warns when the name is one another configured network
+also answers to, because a name is a label and the id is the identity. A
+command line with a different secret makes a *different* network of the
+same name, and that is how a network you left comes back: the secret on the
+command line is what decides which network it is.
 
 That is the ad-hoc case: one person makes a network and sends the command
 round. The secret is printed *only* when the agent invented it — there is
