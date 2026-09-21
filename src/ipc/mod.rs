@@ -121,7 +121,8 @@ pub struct PeerReport {
     pub endpoint_id: String,
     /// Hostname it announced, if any.
     pub hostname: Option<String>,
-    /// `Direct`, `Relay` or `Unknown`, as the transport reports it.
+    /// How the connection reaches the peer: `direct`, `relay` or `unknown`,
+    /// as the transport reports it.
     pub transport: String,
     /// Round-trip time in milliseconds, when a path is selected.
     pub rtt_ms: Option<u64>,
@@ -184,106 +185,5 @@ impl OverlayPeerReport {
     /// Whether the tunnel has handshaken and can carry traffic.
     pub fn is_up(&self) -> bool {
         self.handshake_secs_ago.is_some()
-    }
-}
-
-impl StatusReport {
-    /// Renders the report the way the command line prints it.
-    pub fn render(&self) -> String {
-        use std::fmt::Write as _;
-        let mut out = String::new();
-        let _ = writeln!(out, "endpoint  {}", self.endpoint_id);
-        let _ = writeln!(out, "hostname  {}", self.hostname);
-        let _ = writeln!(out, "bound     {}", self.bound_sockets.join(", "));
-        if !self.cache_healthy {
-            let _ = writeln!(out, "cache     UNAVAILABLE");
-        }
-
-        for network in &self.networks {
-            let _ = writeln!(
-                out,
-                "\nnetwork {} ({})  {}",
-                network.name,
-                network.network_id,
-                if network.active { "active" } else { "inactive" }
-            );
-            if network.peers.is_empty() {
-                let _ = writeln!(out, "  no peers");
-            }
-            for peer in &network.peers {
-                let _ = writeln!(
-                    out,
-                    "  peer {}  {}  {}{}",
-                    &peer.endpoint_id[..10.min(peer.endpoint_id.len())],
-                    peer.hostname.as_deref().unwrap_or("?"),
-                    peer.transport,
-                    match peer.rtt_ms {
-                        Some(rtt) => format!("  rtt {rtt}ms"),
-                        None => String::new(),
-                    }
-                );
-            }
-            if network.dial_failures > 0 || network.handshake_failures > 0 {
-                let _ = writeln!(
-                    out,
-                    "  {} dial failure(s), {} handshake failure(s)",
-                    network.dial_failures, network.handshake_failures
-                );
-            }
-
-            if let Some(overlay) = &network.overlay {
-                let up = overlay.peers.iter().filter(|peer| peer.is_up()).count();
-                let _ = writeln!(
-                    out,
-                    "  overlay {} {}/{}{} mtu {}  {}/{} tunnel(s) up",
-                    overlay.interface,
-                    overlay.address,
-                    overlay.prefix_len,
-                    match &overlay.address_v4 {
-                        Some(v4) => format!(" and {v4}"),
-                        None => String::new(),
-                    },
-                    overlay.mtu,
-                    up,
-                    overlay.peers.len()
-                );
-                for peer in &overlay.peers {
-                    let _ = writeln!(
-                        out,
-                        "    {}  {}{}  {}  tx {} rx {}{}  {}",
-                        &peer.public_key[..8.min(peer.public_key.len())],
-                        peer.address,
-                        match &peer.address_v4 {
-                            Some(v4) => format!(" / {v4}"),
-                            None => String::new(),
-                        },
-                        match peer.handshake_secs_ago {
-                            Some(secs) => format!("handshake {secs}s ago"),
-                            None => "NOT HANDSHAKEN".to_string(),
-                        },
-                        peer.tx_packets,
-                        peer.rx_packets,
-                        if peer.dropped > 0 {
-                            format!(" DROPPED {}", peer.dropped)
-                        } else {
-                            String::new()
-                        },
-                        peer.path
-                    );
-                }
-                if overlay.unroutable_packets > 0 {
-                    let _ = writeln!(
-                        out,
-                        "    {} packet(s) to addresses nobody owns{}",
-                        overlay.unroutable_packets,
-                        match &overlay.unroutable_sample {
-                            Some(sample) => format!(", most recently {sample}"),
-                            None => String::new(),
-                        }
-                    );
-                }
-            }
-        }
-        out
     }
 }

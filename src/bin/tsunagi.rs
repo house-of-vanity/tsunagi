@@ -40,16 +40,14 @@ struct Cli {
 enum Command {
     /// Generates a fresh network secret and prints it.
     Secret,
-    /// Reports what this machine can and cannot do.
-    Doctor(PathArgs),
     /// Shows this device's identity without joining anything.
-    Id(PathArgs),
+    Id(StatusArgs),
     /// Joins a network and runs until interrupted.
     // Boxed: it is much larger than the other variants, and every command
     // but this one would otherwise pay for its size. A `//` comment, not a
     // `///` one, or clap would print it as help.
     Up(Box<UpArgs>),
-    /// Asks a running agent what it is doing.
+    /// Reports this device, what the agent is doing, and what this host can do.
     Status(StatusArgs),
 }
 
@@ -294,8 +292,7 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
-        Command::Doctor(paths) => doctor(paths).await,
-        Command::Id(paths) => show_id(paths).await,
+        Command::Id(args) => show_id(args).await,
         Command::Up(args) => up(*args).await,
         Command::Status(args) => status(args).await,
     }
@@ -309,111 +306,378 @@ fn control_socket(paths: &StoragePaths, override_path: Option<&PathBuf>) -> Path
     }
 }
 
-async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+/// What could be learned about this device, and from where.
+///
+/// A running agent is authoritative and live, so it is asked first. With no
+/// agent there is still plenty to say: the mandatory state store holds the
+/// identity and the configured networks, and reading it takes no directory
+/// lock — so asking who this device is never collides with the agent that is
+/// being asked about, and never needs one to be running.
+enum Observed {
+    /// A running agent answered over the control socket.
+    Agent(Box<tsunagi::ipc::StatusReport>),
+    /// Read from the state store, with no agent running.
+    Stored {
+        endpoint_id: Option<String>,
+        hostname: Option<String>,
+        networks: Vec<(String, String, bool)>,
+        /// Why there was no agent to ask.
+        why: String,
+    },
+}
+
+/// Asks the agent, and falls back to the state store.
+async fn observe(paths: &StoragePaths, socket: &std::path::Path) -> Observed {
+    let why = if socket.exists() {
+        match tsunagi::ipc::unix::request_status(socket).await {
+            Ok(report) => return Observed::Agent(Box::new(report)),
+            Err(err) => format!("cannot reach the agent at {}: {err}", socket.display()),
+        }
+    } else {
+        "no agent is running for this state directory".to_string()
+    };
+
+    // Read-only, and deliberately tolerant: a state directory that has never
+    // been used is not an error, it just has nothing to report yet.
+    let (endpoint_id, hostname, networks) =
+        match tsunagi::storage::StateStore::open(paths.state_db()) {
+            Ok(store) => (
+                store
+                    .device_identity()
+                    .ok()
+                    .flatten()
+                    .map(|identity| identity.endpoint_id().to_string()),
+                store.hostname().ok().flatten(),
+                store
+                    .list_networks()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|network| {
+                        (
+                            network.name.to_string(),
+                            network.network_id.to_string(),
+                            network.auto_start,
+                        )
+                    })
+                    .collect(),
+            ),
+            Err(_) => (None, None, Vec::new()),
+        };
+    Observed::Stored {
+        endpoint_id,
+        hostname,
+        networks,
+        why,
+    }
+}
+
+/// The `device` section: who this is and where it keeps things.
+fn device_section(paths: &StoragePaths, observed: &Observed) -> report::Section {
+    use report::{Health, Row, Section};
+
+    let mut device = Section::new("device");
+    let (endpoint_id, hostname) = match observed {
+        Observed::Agent(report) => (
+            Some(report.endpoint_id.clone()),
+            Some(report.hostname.clone()),
+        ),
+        Observed::Stored {
+            endpoint_id,
+            hostname,
+            ..
+        } => (endpoint_id.clone(), hostname.clone()),
+    };
+
+    device.push(match endpoint_id {
+        Some(id) => Row::new(Health::Info, "endpoint id", id),
+        None => Row::new(Health::Info, "endpoint id", "not created yet")
+            .with_note("generated the first time an agent starts here"),
+    });
+    if let Some(hostname) = hostname {
+        device.push(Row::new(Health::Info, "hostname", hostname));
+    }
+    device.push(Row::new(
+        Health::Info,
+        "state directory",
+        paths.state_dir.display().to_string(),
+    ));
+    device.push(Row::new(
+        Health::Info,
+        "cache directory",
+        paths.cache_dir.display().to_string(),
+    ));
+    device
+}
+
+/// The `networks` section, as the state store knows them.
+fn stored_networks_section(networks: &[(String, String, bool)]) -> report::Section {
+    use report::{Health, Row, Section};
+
+    let mut section = Section::new("networks");
+    if networks.is_empty() {
+        section.push(Row::new(Health::Info, "none", "no network has been joined"));
+    }
+    for (name, id, auto_start) in networks {
+        section.push(Row::new(
+            Health::Info,
+            name,
+            format!("{id}{}", if *auto_start { "  (auto-start)" } else { "" }),
+        ));
+    }
+    section
+}
+
+async fn show_id(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use report::{Health, Report, Row, Section};
+
     let paths = args.paths.resolve()?;
     let socket = control_socket(&paths, args.control_socket.as_ref());
-    if !socket.exists() {
-        return Err(format!(
-            "no agent is running for {} (no control socket at {})",
-            paths.state_dir.display(),
-            socket.display()
-        )
-        .into());
+    let observed = observe(&paths, &socket).await;
+
+    let mut out = Report::new();
+    out.push(device_section(&paths, &observed));
+    match &observed {
+        Observed::Agent(report) => {
+            let mut section = Section::new("networks");
+            if report.networks.is_empty() {
+                section.push(Row::new(Health::Info, "none", "no network has been joined"));
+            }
+            for network in &report.networks {
+                section.push(Row::new(
+                    Health::Info,
+                    &network.name,
+                    format!(
+                        "{}  ({})",
+                        network.network_id,
+                        if network.active { "active" } else { "inactive" }
+                    ),
+                ));
+            }
+            out.push(section);
+        }
+        Observed::Stored { networks, .. } => out.push(stored_networks_section(networks)),
     }
-    let report = tsunagi::ipc::unix::request_status(&socket)
-        .await
-        .map_err(|err| format!("cannot reach the agent at {}: {err}", socket.display()))?;
-    print!("{}", report.render());
-    Ok(())
+    print_report("tsunagi id", &out)
 }
 
-async fn show_id(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let paths = paths.resolve()?;
-    println!("state directory  {}", paths.state_dir.display());
-    println!("cache directory  {}", paths.cache_dir.display());
-
-    let agent =
-        Agent::spawn(AgentConfig::new(paths).with_transport(TransportPolicy::LocalOnly)).await?;
-    println!("endpoint id      {}", agent.endpoint_id());
-    println!("hostname         {}", agent.hostname());
-    for network in agent.list_networks().await? {
-        println!(
-            "network          {} ({}) auto-start={}",
-            network.name, network.network_id, network.auto_start
-        );
-    }
-    agent.shutdown().await;
-    Ok(())
-}
-
-/// Reports what this machine can and cannot do, and how badly it matters.
+/// Reports this device, what the agent is doing, and what this host can do.
 ///
 /// Three levels, and the distinction between the middle two is deliberate:
 /// *degraded* is something the agent runs without and that the user can fix
 /// from a stated one-liner, *broken* is something it cannot work around.
 /// Getting those the wrong way round makes a diagnostic tool useless, so
 /// each check below says which it is and why.
-async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
+async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     use report::{Health, Report, Row, Section};
 
-    let paths = paths.resolve()?;
-    let mut doctor = Report::new();
+    let paths = args.paths.resolve()?;
+    let socket = control_socket(&paths, args.control_socket.as_ref());
+    let observed = observe(&paths, &socket).await;
 
-    // Storage. The asymmetry here is the point: state is mandatory and cache
-    // is disposable, so the same failure means different things.
-    let mut storage = Section::new("storage");
-    storage.push(match std::fs::create_dir_all(&paths.state_dir) {
-        Ok(()) => Row::new(
+    let mut out = Report::new();
+    out.push(device_section(&paths, &observed));
+
+    let mut agent = Section::new("agent");
+    match &observed {
+        Observed::Agent(report) => {
+            agent.push(Row::new(
+                Health::Good,
+                "running",
+                format!("reachable at {}", socket.display()),
+            ));
+            if !report.bound_sockets.is_empty() {
+                agent.push(Row::new(
+                    Health::Info,
+                    "bound",
+                    report.bound_sockets.join(", "),
+                ));
+            }
+            agent.push(if report.cache_healthy {
+                Row::new(Health::Good, "cache", "usable")
+            } else {
+                Row::new(Health::Degraded, "cache", "unavailable")
+                    .with_note("disposable: the agent runs, rediscovering what it cached")
+            });
+        }
+        Observed::Stored { why, .. } => {
+            agent.push(
+                Row::new(Health::Degraded, "running", "no")
+                    .with_note(format!("{why}; everything below was read from the store")),
+            );
+        }
+    }
+    out.push(agent);
+
+    if let Observed::Agent(report) = &observed {
+        for network in &report.networks {
+            out.push(network_section(network));
+        }
+    }
+
+    out.push(host_section());
+    out.push(addresses_section().await);
+    print_report("tsunagi status", &out)
+}
+
+/// One network's control plane and overlay.
+fn network_section(network: &tsunagi::ipc::NetworkReport) -> report::Section {
+    use report::{Health, Row, Section};
+
+    let mut section = Section::new(format!("network {}", network.name));
+    section.push(if network.active {
+        Row::new(
             Health::Good,
-            "state directory",
-            format!("{} (writable)", paths.state_dir.display()),
-        ),
-        Err(err) => Row::new(
-            Health::Broken,
-            "state directory",
-            format!("{}: {err}", paths.state_dir.display()),
+            "state",
+            format!("active  {}", network.network_id),
         )
-        .with_note("mandatory: the agent will not start without it"),
-    });
-    storage.push(match std::fs::create_dir_all(&paths.cache_dir) {
-        Ok(()) => Row::new(
-            Health::Good,
-            "cache directory",
-            format!("{} (writable)", paths.cache_dir.display()),
-        ),
-        Err(err) => Row::new(
+    } else {
+        Row::new(
             Health::Degraded,
-            "cache directory",
-            format!("{}: {err}", paths.cache_dir.display()),
+            "state",
+            format!("inactive  {}", network.network_id),
         )
-        .with_note("disposable: the agent runs, rediscovering what it cached"),
     });
-    doctor.push(storage);
 
-    // Control plane. Binding a socket is a real check rather than a claim.
-    let mut control = Section::new("control plane");
-    control.push(
-        match std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
-            .or_else(|_| std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)))
-        {
-            Ok(_) => Row::new(Health::Good, "udp socket", "can bind; no privileges needed"),
-            Err(err) => Row::new(Health::Broken, "udp socket", format!("cannot bind: {err}"))
-                .with_note("nothing will reach any peer"),
-        },
-    );
-    doctor.push(control);
+    if network.peers.is_empty() {
+        section.push(Row::new(Health::Degraded, "peers", "none authenticated"));
+    }
+    for peer in &network.peers {
+        // A relayed path works but goes through somebody else's machine and
+        // costs latency, so it is the middle grade rather than a good one.
+        // Compared without regard to case: the agent answering may be a
+        // different build from the client asking, and the spelling of this
+        // field has already changed once.
+        let health = if peer.transport.eq_ignore_ascii_case("direct") {
+            Health::Good
+        } else {
+            Health::Degraded
+        };
+        section.push(Row::new(
+            health,
+            format!("peer {}", short(&peer.endpoint_id, 10)),
+            format!(
+                "{}  {}{}",
+                peer.hostname.as_deref().unwrap_or("unnamed"),
+                peer.transport.to_lowercase(),
+                match peer.rtt_ms {
+                    Some(rtt) => format!("  rtt {rtt}ms"),
+                    None => String::new(),
+                }
+            ),
+        ));
+    }
 
-    let mut data = Section::new("data plane (WireGuard)");
-    data.push(Row::new(
-        Health::Good,
+    let (sent, received) = network.control_messages;
+    section.push(Row::new(
+        Health::Info,
+        "control messages",
+        format!("{sent} sent, {received} received"),
+    ));
+    if network.dial_failures > 0 || network.handshake_failures > 0 {
+        section.push(Row::new(
+            Health::Degraded,
+            "failures",
+            format!(
+                "{} dial, {} handshake",
+                network.dial_failures, network.handshake_failures
+            ),
+        ));
+    }
+
+    if let Some(overlay) = &network.overlay {
+        section.push(Row::new(
+            Health::Info,
+            "overlay",
+            format!(
+                "{} {}/{}{}  mtu {}",
+                overlay.interface,
+                overlay.address,
+                overlay.prefix_len,
+                match &overlay.address_v4 {
+                    Some(v4) => format!(" and {v4}"),
+                    None => String::new(),
+                },
+                overlay.mtu
+            ),
+        ));
+        for peer in &overlay.peers {
+            let row = match peer.handshake_secs_ago {
+                Some(secs) => Row::new(
+                    Health::Good,
+                    format!("tunnel {}", short(&peer.public_key, 8)),
+                    format!(
+                        "{}{}  handshake {secs}s ago  tx {} rx {}  {}",
+                        peer.address,
+                        match &peer.address_v4 {
+                            Some(v4) => format!(" / {v4}"),
+                            None => String::new(),
+                        },
+                        peer.tx_packets,
+                        peer.rx_packets,
+                        peer.path
+                    ),
+                ),
+                // A snapshot cannot tell a tunnel that is still coming up
+                // from one that is stuck, so this is the middle grade with
+                // the consequence spelled out rather than an alarm.
+                None => Row::new(
+                    Health::Degraded,
+                    format!("tunnel {}", short(&peer.public_key, 8)),
+                    format!("{}  no handshake yet", peer.address),
+                )
+                .with_note("the tunnel cannot carry traffic until it handshakes"),
+            };
+            let row = if peer.dropped > 0 {
+                row.with_note(format!("{} packet(s) dropped", peer.dropped))
+            } else {
+                row
+            };
+            section.push(row);
+        }
+        if overlay.unroutable_packets > 0 {
+            section.push(
+                Row::new(
+                    Health::Degraded,
+                    "unroutable",
+                    format!(
+                        "{} packet(s) sent to an address no peer owns",
+                        overlay.unroutable_packets
+                    ),
+                )
+                .with_note(match &overlay.unroutable_sample {
+                    Some(sample) => format!("for example {sample}"),
+                    None => "no sample recorded".to_string(),
+                }),
+            );
+        }
+    }
+    section
+}
+
+/// Shortens an identifier for a column, with an ellipsis when it was cut.
+fn short(text: &str, len: usize) -> String {
+    if text.chars().count() <= len {
+        text.to_string()
+    } else {
+        format!("{}…", text.chars().take(len).collect::<String>())
+    }
+}
+
+/// What this host can and cannot do for the data plane.
+fn host_section() -> report::Section {
+    use report::{Health, Row, Section};
+
+    let mut host = Section::new("host");
+    host.push(Row::new(
+        Health::Info,
         "implementation",
-        "userspace (boringtun); no kernel module needed",
+        "userspace WireGuard (boringtun); no kernel module needed",
     ));
     #[cfg(feature = "tun-device")]
     {
         if cfg!(target_os = "linux") {
             let tun_path = std::path::Path::new("/dev/net/tun");
-            data.push(if !tun_path.exists() {
+            host.push(if !tun_path.exists() {
                 Row::new(Health::Broken, "/dev/net/tun", "missing")
                     .with_note("load the `tun` module; without it there can be no interface")
             } else {
@@ -436,8 +700,8 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
         use tsunagi::dataplane::wireguard::{Privilege, probe_net_admin};
         match probe_net_admin() {
             Privilege::Available => {
-                data.push(Row::new(Health::Good, "privileges", "CAP_NET_ADMIN held"));
-                data.push(Row::new(
+                host.push(Row::new(Health::Good, "privileges", "CAP_NET_ADMIN held"));
+                host.push(Row::new(
                     Health::Good,
                     "interface",
                     "managed by the agent: created on start, removed on exit",
@@ -447,18 +711,18 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
                 // The note is the command and nothing else: a paragraph of
                 // explanation belongs in the runtime error, not in a column
                 // the eye is meant to scan.
-                data.push(
+                host.push(
                     Row::new(Health::Degraded, "privileges", "CAP_NET_ADMIN not held")
                         .with_note(format!("sudo setcap cap_net_admin+p {}", program_path())),
                 );
-                data.push(Row::new(
+                host.push(Row::new(
                     Health::Degraded,
                     "interface",
                     "cannot be created; run with `--no-tun` meanwhile",
                 ));
             }
             Privilege::Unsupported => {
-                data.push(Row::new(
+                host.push(Row::new(
                     Health::Degraded,
                     "privileges",
                     format!(
@@ -466,7 +730,7 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
                         std::env::consts::OS
                     ),
                 ));
-                data.push(Row::new(
+                host.push(Row::new(
                     Health::Degraded,
                     "interface",
                     "cannot be created; run with `--no-tun`",
@@ -475,7 +739,7 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     #[cfg(not(feature = "tun-device"))]
-    data.push(
+    host.push(
         Row::new(
             Health::Degraded,
             "interface",
@@ -483,7 +747,12 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_note("rebuild with the `tun-device` feature, or run with `--no-tun`"),
     );
-    doctor.push(data);
+    host
+}
+
+/// The addresses this host could reach a peer from.
+async fn addresses_section() -> report::Section {
+    use report::{Health, Row, Section};
 
     let mut addresses = Section::new("local addresses");
     let found = netwatch_addresses().await;
@@ -501,21 +770,25 @@ async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
             (false, true) => "ipv4",
             (false, false) => "ipv6",
         };
-        addresses.push(Row::new(Health::Good, kind, addr.to_string()));
+        addresses.push(Row::new(Health::Info, kind, addr.to_string()));
     }
-    doctor.push(addresses);
+    addresses
+}
 
-    // `anstream` decides whether the escapes survive: they are stripped when
-    // stdout is not a terminal, when NO_COLOR is set, and on a Windows console
-    // that cannot render them.
+/// Writes a report to stdout under a title.
+///
+/// `anstream` decides whether the escapes survive: they are stripped when
+/// stdout is not a terminal, when `NO_COLOR` is set, and on a Windows console
+/// that cannot render them.
+fn print_report(title: &str, out: &report::Report) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
-    let mut out = anstream::stdout().lock();
-    writeln!(out, "tsunagi doctor\n")?;
-    write!(out, "{}", doctor.render(true))?;
+    let mut stdout = anstream::stdout().lock();
+    writeln!(stdout, "{title}\n")?;
+    write!(stdout, "{}", out.render(true))?;
     Ok(())
 }
 
-/// The shape of what `tsunagi doctor` reports.
+/// The shape of what `tsunagi status` reports.
 ///
 /// Findings are built first and rendered second, so what is reported is
 /// decided separately from how it looks and can be tested without a
@@ -529,6 +802,12 @@ mod report {
     /// How healthy one finding is.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Health {
+        /// Not a check at all: a fact, such as an identifier or a path.
+        ///
+        /// Grading these would be noise — an endpoint id is neither good nor
+        /// bad — and a column of green `ok` next to plain data teaches the
+        /// eye to ignore the column, which is the opposite of the point.
+        Info,
         /// Works, nothing to do.
         Good,
         /// The agent runs, but something it could do it cannot, and there is
@@ -543,6 +822,7 @@ mod report {
         /// The word printed in the margin. Four characters, so rows line up.
         fn word(self) -> &'static str {
             match self {
+                Health::Info => "    ",
                 Health::Good => "ok  ",
                 Health::Degraded => "warn",
                 Health::Broken => "FAIL",
@@ -551,6 +831,7 @@ mod report {
 
         fn style(self) -> Style {
             let colour = match self {
+                Health::Info => return Style::new(),
                 Health::Good => AnsiColor::Green,
                 Health::Degraded => AnsiColor::Yellow,
                 Health::Broken => AnsiColor::Red,
@@ -647,6 +928,18 @@ mod report {
             }
         }
 
+        /// Whether anything in the report was graded at all.
+        ///
+        /// A report of plain facts — `tsunagi id` — has nothing to summarise,
+        /// and "everything checked out" under a list of identifiers would be
+        /// claiming something that was never checked.
+        fn has_checks(&self) -> bool {
+            self.sections
+                .iter()
+                .flat_map(|section| &section.rows)
+                .any(|row| row.health != Health::Info)
+        }
+
         /// The closing line.
         fn summary(&self) -> String {
             fn checks(count: usize) -> String {
@@ -695,12 +988,17 @@ mod report {
                 out.push_str(&paint(bold, &section.title));
                 out.push('\n');
                 for row in &section.rows {
+                    let label = format!("{:width$}", row.label, width = width);
+                    let label = if row.health == Health::Info {
+                        paint(dim, &label)
+                    } else {
+                        label
+                    };
                     out.push_str(&format!(
-                        "  {}  {:width$}  {}\n",
+                        "  {}  {}  {}\n",
                         paint(row.health.style(), row.health.word()),
-                        row.label,
-                        row.detail,
-                        width = width
+                        label,
+                        row.detail
                     ));
                     if let Some(note) = &row.note {
                         // Indented under the row it belongs to, and dimmed so
@@ -717,9 +1015,16 @@ mod report {
                 out.push('\n');
             }
 
-            let worst = self.worst();
-            out.push_str(&paint(worst.style(), &self.summary()));
-            out.push('\n');
+            if self.has_checks() {
+                let worst = self.worst();
+                out.push_str(&paint(worst.style(), &self.summary()));
+                out.push('\n');
+            } else {
+                // Trim the blank line the last section left behind.
+                while out.ends_with("\n\n") {
+                    out.pop();
+                }
+            }
             out
         }
     }
@@ -827,6 +1132,21 @@ mod report {
             clean.push(section);
             assert_eq!(clean.worst(), Health::Good);
             assert!(clean.render(false).contains("everything checked out"));
+        }
+
+        #[test]
+        fn a_report_of_plain_facts_claims_nothing_at_the_end() {
+            // `tsunagi id` reports identifiers, not checks. Summarising them
+            // as fine would assert something that was never tested.
+            let mut report = Report::new();
+            let mut section = Section::new("device");
+            section.push(Row::new(Health::Info, "endpoint id", "abc123"));
+            report.push(section);
+
+            let text = report.render(false);
+            assert!(!text.contains("everything checked out"), "{text:?}");
+            assert!(!text.contains("degraded") && !text.contains("broken"));
+            assert!(text.ends_with("abc123\n"), "{text:?}");
         }
 
         #[test]
@@ -1066,7 +1386,7 @@ async fn build_report(
                     .map(|peer| PeerReport {
                         endpoint_id: peer.endpoint_id.to_string(),
                         hostname: peer.hostname.clone(),
-                        transport: format!("{:?}", peer.transport),
+                        transport: peer.transport.to_string(),
                         rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
                     })
                     .collect(),

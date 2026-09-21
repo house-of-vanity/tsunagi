@@ -71,7 +71,7 @@ On the first machine:
 ```bash
 cargo build --release
 ./target/release/tsunagi secret          # prints tsn1...; share it privately
-./target/release/tsunagi doctor          # what this host can and cannot do
+./target/release/tsunagi status          # this device, the agent, and this host
 
 ./target/release/tsunagi up --network lab --secret "$SECRET" --wireguard
 ```
@@ -169,12 +169,17 @@ allocation changes. Everything else, including every byte from the network,
 is handled with it lowered. `+ep` works too; the agent lowers it on the way
 in.
 
-`tsunagi doctor` says which of these applies on the host it runs on. It
-grades each finding: **ok** for what works, **warn** for what the agent runs
-without and you can fix from the line it prints, **FAIL** for what it cannot
-work around. The words carry the grade as well as the colour, so the report
-reads the same piped to a file or on a terminal without colour, and it honours
-`NO_COLOR`.
+`tsunagi status` says which of these applies on the host it runs on, along
+with what the agent is doing. It grades each finding: **ok** for what works,
+**warn** for what the agent runs without and you can fix from the line it
+prints, **FAIL** for what it cannot work around. The words carry the grade as
+well as the colour, so the report reads the same piped to a file or on a
+terminal without colour, and it honours `NO_COLOR`.
+
+`status` and `id` both prefer a running agent, which is live and
+authoritative, and fall back to reading the state store when there is none.
+Reading takes no directory lock, so neither has to wait for the agent it is
+asking about — nor does either need one to be running.
 
 ### It cleans up after itself
 

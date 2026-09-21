@@ -137,8 +137,8 @@ impl PacketLink for IrohLink {
         // Report what iroh actually knows, never a guess.
         let snapshot = crate::net::snapshot_connection(&self.conn);
         match snapshot.paths.iter().find(|path| path.is_selected) {
-            Some(path) => format!("{:?} via {:?}", snapshot.transport, path.remote),
-            None => format!("{:?}, no selected path yet", snapshot.transport),
+            Some(path) => format!("{} via {}", snapshot.transport, path.remote),
+            None => format!("{}, no selected path yet", snapshot.transport),
         }
     }
 }

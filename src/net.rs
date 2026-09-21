@@ -45,6 +45,16 @@ pub enum PathAddr {
     Other(String),
 }
 
+impl std::fmt::Display for PathAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PathAddr::Ip(addr) => write!(f, "{addr}"),
+            PathAddr::Relay(url) => write!(f, "relay {url}"),
+            PathAddr::Other(what) => write!(f, "{what}"),
+        }
+    }
+}
+
 /// One verified network path of a connection.
 #[derive(Debug, Clone)]
 pub struct PathInfo {
@@ -79,6 +89,17 @@ pub enum TransportKind {
     Relay,
     /// iroh has not reported a selected path yet.
     Unknown,
+}
+
+impl std::fmt::Display for TransportKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let word = match self {
+            TransportKind::Direct => "direct",
+            TransportKind::Relay => "relay",
+            TransportKind::Unknown => "unknown",
+        };
+        f.write_str(word)
+    }
 }
 
 /// Counters for one connection.

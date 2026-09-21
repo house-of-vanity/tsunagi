@@ -158,11 +158,16 @@ async fn a_client_sees_the_agent_and_its_overlay() {
     assert_eq!(overlay.mtu, 1280);
     assert_eq!(overlay.peers.len(), 1);
 
-    // The rendering a user actually sees mentions the important parts.
-    let rendered = report.render();
-    assert!(rendered.contains(&agent.endpoint_id().to_string()));
-    assert!(rendered.contains("1/1 tunnel(s) up"), "{rendered}");
-    assert!(rendered.contains(&overlay.address));
+    // The report carries what a reader needs, in structured form: how it is
+    // laid out is the CLI's business and is tested there.
+    assert_eq!(report.endpoint_id, agent.endpoint_id().to_string());
+    assert_eq!(
+        overlay.peers.iter().filter(|peer| peer.is_up()).count(),
+        1,
+        "the tunnel is up: {:?}",
+        overlay.peers
+    );
+    assert!(!overlay.address.is_empty());
 
     control.shutdown().await;
     assert!(!socket_path.exists(), "the socket is removed on shutdown");
@@ -225,4 +230,47 @@ fn the_socket_path_is_derived_and_short_enough() {
         path,
         control_socket_path(&std::path::PathBuf::from("/somewhere/else"))
     );
+}
+
+/// Asking who this device is must not need the directory lock.
+///
+/// The lock belongs to the one agent allowed to *write* the state. `id` only
+/// reads, so making it take the lock would mean the question could never be
+/// answered while an agent was running — which is exactly when you want to
+/// ask it.
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn identity_can_be_read_while_an_agent_holds_the_directory() {
+    let dir = TempDir::new().unwrap();
+    let discovery = SharedMemoryDiscovery::new();
+
+    // Hold the directory the way a running agent does.
+    let agent = Agent::spawn(config_with(dir.path(), &discovery))
+        .await
+        .unwrap();
+    let expected = agent.endpoint_id().to_string();
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+        .arg("id")
+        // The same layout `StoragePaths::under` gives the agent above.
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--cache-dir")
+        .arg(dir.path().join("cache"))
+        .output()
+        .await
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "`id` failed while an agent was running:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&expected),
+        "expected {expected} in:\n{stdout}"
+    );
+
+    agent.shutdown().await;
 }

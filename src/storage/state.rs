@@ -175,11 +175,15 @@ impl StateStore {
         Ok(())
     }
 
-    /// Loads the stored device identity, creating one on first use.
+    /// Loads the stored device identity, if there is one.
     ///
-    /// A stored key of the wrong length is a corruption error, never a reason to
-    /// silently mint a new identity.
-    pub fn load_or_create_device_identity(&self) -> Result<DeviceIdentity> {
+    /// Reads and never writes, so asking who this device is does not decide
+    /// it. A store that has never run an agent has no identity yet, which is
+    /// `None` rather than an error.
+    ///
+    /// A stored key of the wrong length is a corruption error, never a reason
+    /// to silently mint a new identity.
+    pub fn device_identity(&self) -> Result<Option<DeviceIdentity>> {
         let stored: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -190,14 +194,22 @@ impl StateStore {
             .optional()
             .map_err(|err| self.corrupt(format!("cannot read device identity: {err}")))?;
 
-        if let Some(bytes) = stored {
-            let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                self.corrupt(format!(
-                    "stored device key has {} bytes, expected 32; refusing to replace it",
-                    bytes.len()
-                ))
-            })?;
-            return Ok(DeviceIdentity::from_secret_bytes(&bytes));
+        let Some(bytes) = stored else {
+            return Ok(None);
+        };
+        let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            self.corrupt(format!(
+                "stored device key has {} bytes, expected 32; refusing to replace it",
+                bytes.len()
+            ))
+        })?;
+        Ok(Some(DeviceIdentity::from_secret_bytes(&bytes)))
+    }
+
+    /// Loads the stored device identity, creating one on first use.
+    pub fn load_or_create_device_identity(&self) -> Result<DeviceIdentity> {
+        if let Some(identity) = self.device_identity()? {
+            return Ok(identity);
         }
 
         let identity = DeviceIdentity::generate();
