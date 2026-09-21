@@ -43,6 +43,10 @@ zeroize = { version = "1.9", features = ["derive"] }
 rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# Already in the tree through iroh. A packet codec, not a DNS server: the
+# zone logic is ours and a full server framework would be a large dependency
+# for answering A records from memory.
+simple-dns = "0.12"
 data-encoding = "2.11"
 hex = "0.4"
 thiserror = "2.0"

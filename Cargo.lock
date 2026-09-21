@@ -3688,6 +3688,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "sha2",
+ "simple-dns",
  "subtle",
  "tempfile",
  "thiserror 2.0.20",

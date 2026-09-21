@@ -39,6 +39,7 @@ pub mod agent;
 pub mod config;
 pub mod dataplane;
 pub mod discovery;
+pub mod dns;
 pub mod error;
 pub mod identity;
 pub mod ipc;
