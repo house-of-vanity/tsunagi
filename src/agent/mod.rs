@@ -26,7 +26,8 @@ mod status;
 
 pub use events::Event;
 pub use status::{
-    AgentStatus, CandidateStatus, NetworkMetrics, NetworkState, NetworkStatus, PeerStatus,
+    AgentStatus, CandidateStatus, MemberStatus, NetworkMetrics, NetworkState, NetworkStatus,
+    PeerStatus,
 };
 
 use std::collections::HashMap;
@@ -451,6 +452,9 @@ impl Agent {
                 state: NetworkState::Inactive,
                 peers: Vec::new(),
                 candidates: Vec::new(),
+                // An inactive network has no runtime to ask; the roster comes
+                // from one. Empty, not invented.
+                members: Vec::new(),
                 metrics: NetworkMetrics::default(),
             });
         }

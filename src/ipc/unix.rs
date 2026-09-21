@@ -157,6 +157,19 @@ pub async fn request_status(path: impl AsRef<Path>) -> Result<StatusReport> {
     }
 }
 
+/// Marks the wire format of the local control socket.
+///
+/// `b"TSN"` followed by the version, so a mismatch is recognised as one
+/// instead of being read as a length. The encoding is postcard, which is not
+/// self-describing: adding a field to a report changes how the bytes parse,
+/// and without this a client one build ahead of its agent reports something
+/// like "Found an Option discriminant that wasn't 0 or 1" — which says
+/// nothing about the actual problem, that the two are different builds.
+///
+/// Bump it whenever [`Request`], [`Response`] or anything they contain
+/// changes shape.
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 2]);
+
 async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let encoded = postcard::to_stdvec(value)
         .map_err(|err| Error::Storage(format!("cannot encode a control message: {err}")))?;
@@ -164,6 +177,10 @@ async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) 
         return Err(Error::Storage("control message is too large".into()));
     }
     let len = encoded.len() as u32;
+    stream
+        .write_all(&CONTROL_PROTOCOL.to_be_bytes())
+        .await
+        .map_err(io_error)?;
     stream
         .write_all(&len.to_be_bytes())
         .await
@@ -174,6 +191,16 @@ async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) 
 
 async fn read_message<T: for<'de> serde::Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
     let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await.map_err(io_error)?;
+    let version = u32::from_be_bytes(header);
+    if version != CONTROL_PROTOCOL {
+        return Err(Error::Storage(format!(
+            "the other end speaks control protocol {version:#010x} and this build speaks \
+             {CONTROL_PROTOCOL:#010x}; they are different builds of tsunagi, so restart the \
+             agent with the binary you are running now"
+        )));
+    }
+
     stream.read_exact(&mut header).await.map_err(io_error)?;
     let len = u32::from_be_bytes(header) as usize;
     // Checked before allocating, exactly as on the network.

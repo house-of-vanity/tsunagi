@@ -30,7 +30,9 @@ use crate::storage::Storage;
 use super::events::Event;
 use super::session::{self, Session, SessionEvent};
 use super::shutdown::Shutdown;
-use super::status::{CandidateStatus, NetworkMetrics, NetworkState, NetworkStatus, PeerStatus};
+use super::status::{
+    CandidateStatus, MemberStatus, NetworkMetrics, NetworkState, NetworkStatus, PeerStatus,
+};
 
 /// An inbound connection that already passed the handshake.
 #[derive(Debug)]
@@ -1224,6 +1226,23 @@ impl Runtime {
             .collect();
         candidates.sort_by(|a, b| a.endpoint_id.as_bytes().cmp(b.endpoint_id.as_bytes()));
 
+        // The durable roster. Every author of a signed record is a member,
+        // including this agent and including members that are not here.
+        let mut members: Vec<MemberStatus> = self
+            .state
+            .records()
+            .into_iter()
+            .filter_map(|record| {
+                let endpoint_id = record.author_id().ok()?;
+                Some(MemberStatus {
+                    endpoint_id,
+                    overlay_address_v4: record.body.claimed_address(),
+                })
+            })
+            .collect();
+        members.sort_by(|a, b| a.endpoint_id.as_bytes().cmp(b.endpoint_id.as_bytes()));
+        members.dedup_by(|a, b| a.endpoint_id == b.endpoint_id);
+
         NetworkStatus {
             descriptor: self.params.keys.descriptor(),
             name: self.params.keys.name().clone(),
@@ -1231,6 +1250,7 @@ impl Runtime {
             state: NetworkState::Active,
             peers,
             candidates,
+            members,
             metrics: self.metrics.clone(),
         }
     }

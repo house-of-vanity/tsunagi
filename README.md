@@ -176,6 +176,14 @@ prints, **FAIL** for what it cannot work around. The words carry the grade as
 well as the colour, so the report reads the same piped to a file or on a
 terminal without colour, and it honours `NO_COLOR`.
 
+Members are listed online first, then the ones that are away. A member that
+is away is reported plainly rather than flagged: in a mesh of laptops it is
+the ordinary condition, not a fault. The signed state is what makes that
+sayable — it remembers who belongs while they are gone, so the report can say
+"offline, 10.13.37.99 still reserved for it" instead of leaving a
+dial-failure counter to imply it. Counters are history and are never graded:
+a peer that left and came back should not leave the report looking broken.
+
 `status` and `id` both prefer a running agent, which is live and
 authoritative, and fall back to reading the state store when there is none.
 Reading takes no directory lock, so neither has to wait for the agent it is

@@ -104,6 +104,13 @@ pub struct NetworkReport {
     pub active: bool,
     /// Authenticated control plane peers.
     pub peers: Vec<PeerReport>,
+    /// Members the signed state knows about, connected or not.
+    ///
+    /// This is what makes "offline" sayable. Without it a member that is away
+    /// is indistinguishable from one that never existed, and the only thing
+    /// left to report is a dial-failure counter — which describes the symptom
+    /// and not the cause.
+    pub members: Vec<MemberReport>,
     /// Outbound dials that failed.
     pub dial_failures: u64,
     /// Handshakes rejected in either direction.
@@ -112,6 +119,17 @@ pub struct NetworkReport {
     pub control_messages: (u64, u64),
     /// The overlay, when an IP plugin is running one.
     pub overlay: Option<OverlayReport>,
+}
+
+/// One member of the network, from signed state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberReport {
+    /// The member's device identity.
+    pub endpoint_id: String,
+    /// The IPv4 overlay address it claimed and signed for.
+    pub overlay_address_v4: Option<String>,
+    /// Consecutive failed dial attempts, when this agent is trying to reach it.
+    pub failed_dials: u32,
 }
 
 /// One control plane peer.
@@ -156,6 +174,9 @@ pub struct OverlayReport {
 /// One overlay peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverlayPeerReport {
+    /// The peer's control plane identity, so a tunnel can be matched to the
+    /// session and the member it belongs to.
+    pub endpoint_id: String,
     /// The peer's WireGuard public key.
     pub public_key: String,
     /// Its overlay address.

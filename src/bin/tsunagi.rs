@@ -316,25 +316,31 @@ fn control_socket(paths: &StoragePaths, override_path: Option<&PathBuf>) -> Path
 enum Observed {
     /// A running agent answered over the control socket.
     Agent(Box<tsunagi::ipc::StatusReport>),
-    /// Read from the state store, with no agent running.
+    /// Read from the state store, because the agent could not be asked.
     Stored {
         endpoint_id: Option<String>,
         hostname: Option<String>,
         networks: Vec<(String, String, bool)>,
-        /// Why there was no agent to ask.
+        /// Why the agent could not be asked.
         why: String,
+        /// Whether a socket was there at all.
+        ///
+        /// Nothing running is an ordinary state and gets said plainly. A
+        /// socket that is there and will not answer is a fault.
+        socket_present: bool,
     },
 }
 
 /// Asks the agent, and falls back to the state store.
 async fn observe(paths: &StoragePaths, socket: &std::path::Path) -> Observed {
-    let why = if socket.exists() {
+    let socket_present = socket.exists();
+    let why = if socket_present {
         match tsunagi::ipc::unix::request_status(socket).await {
             Ok(report) => return Observed::Agent(Box::new(report)),
-            Err(err) => format!("cannot reach the agent at {}: {err}", socket.display()),
+            Err(err) => format!("{err}"),
         }
     } else {
-        "no agent is running for this state directory".to_string()
+        "no control socket for this state directory".to_string()
     };
 
     // Read-only, and deliberately tolerant: a state directory that has never
@@ -368,6 +374,7 @@ async fn observe(paths: &StoragePaths, socket: &std::path::Path) -> Observed {
         hostname,
         networks,
         why,
+        socket_present,
     }
 }
 
@@ -499,18 +506,33 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
                     .with_note("disposable: the agent runs, rediscovering what it cached")
             });
         }
-        Observed::Stored { why, .. } => {
-            agent.push(
-                Row::new(Health::Degraded, "running", "no")
-                    .with_note(format!("{why}; everything below was read from the store")),
-            );
+        Observed::Stored {
+            why,
+            socket_present,
+            ..
+        } => {
+            // Nothing running is an ordinary answer to "what is running", not
+            // a fault; a socket that will not answer is a fault.
+            agent.push(if *socket_present {
+                // The version check in the framing names a mismatch only for
+                // whichever side is newer. An older agent reading a newer
+                // request just drops the connection, so the hint has to be
+                // offered rather than asserted.
+                Row::new(Health::Degraded, "running", "not answering").with_note(format!(
+                    "{why}  ·  it may be an older build: restart it with this binary. \
+                         The rest was read from the store"
+                ))
+            } else {
+                Row::new(Health::Info, "running", "no")
+                    .with_note(format!("{why}  ·  the rest was read from the store"))
+            });
         }
     }
     out.push(agent);
 
     if let Observed::Agent(report) = &observed {
         for network in &report.networks {
-            out.push(network_section(network));
+            out.push(network_section(network, &report.endpoint_id));
         }
     }
 
@@ -519,8 +541,100 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     print_report("tsunagi status", &out)
 }
 
-/// One network's control plane and overlay.
-fn network_section(network: &tsunagi::ipc::NetworkReport) -> report::Section {
+/// One member of a network, from every source that knows something about it.
+///
+/// The three sources answer different questions and none of them answers the
+/// whole one. The signed state says who belongs, and keeps saying it while
+/// they are away. The session list says who is here. The overlay says whose
+/// tunnel is up. Reporting them as three lists is what made a peer being
+/// offline look like three unrelated faults.
+struct MemberRow<'a> {
+    endpoint_id: &'a str,
+    hostname: Option<&'a str>,
+    /// `Some` exactly when there is an authenticated session right now.
+    transport: Option<&'a str>,
+    rtt_ms: Option<u64>,
+    overlay_address_v4: Option<&'a str>,
+    tunnel: Option<&'a tsunagi::ipc::OverlayPeerReport>,
+    failed_dials: u32,
+}
+
+impl MemberRow<'_> {
+    fn online(&self) -> bool {
+        self.transport.is_some()
+    }
+
+    /// What to call it: the name it announced, or a short form of its id.
+    ///
+    /// A member that is away has no hostname, because nothing durable records
+    /// one — only the signed claim survives, and that carries an address.
+    fn label(&self) -> String {
+        match self.hostname {
+            Some(hostname) => hostname.to_string(),
+            None => short(self.endpoint_id, 12),
+        }
+    }
+}
+
+/// Joins the three views of a network into one list, online members first.
+fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Vec<MemberRow<'a>> {
+    use std::collections::BTreeMap;
+
+    fn entry<'a, 'm>(
+        rows: &'m mut BTreeMap<&'a str, MemberRow<'a>>,
+        id: &'a str,
+    ) -> &'m mut MemberRow<'a> {
+        rows.entry(id).or_insert_with(|| MemberRow {
+            endpoint_id: id,
+            hostname: None,
+            transport: None,
+            rtt_ms: None,
+            overlay_address_v4: None,
+            tunnel: None,
+            failed_dials: 0,
+        })
+    }
+
+    let mut rows: BTreeMap<&'a str, MemberRow<'a>> = BTreeMap::new();
+    for member in &network.members {
+        let row = entry(&mut rows, &member.endpoint_id);
+        row.overlay_address_v4 = member.overlay_address_v4.as_deref();
+        row.failed_dials = member.failed_dials;
+    }
+    for peer in &network.peers {
+        let row = entry(&mut rows, &peer.endpoint_id);
+        row.hostname = peer.hostname.as_deref();
+        row.transport = Some(&peer.transport);
+        row.rtt_ms = peer.rtt_ms;
+    }
+    if let Some(overlay) = &network.overlay {
+        for peer in &overlay.peers {
+            let row = entry(&mut rows, &peer.endpoint_id);
+            row.tunnel = Some(peer);
+            if row.overlay_address_v4.is_none() {
+                row.overlay_address_v4 = peer.address_v4.as_deref();
+            }
+        }
+    }
+
+    // This agent is in the roster too — it signs claims like everyone else —
+    // but it is already the subject of the `device` section.
+    let mut rows: Vec<MemberRow<'a>> = rows
+        .into_values()
+        .filter(|row| row.endpoint_id != own_id)
+        .collect();
+    // Online first, as asked, then by name so the order is stable between
+    // runs rather than following whatever the map happened to hold.
+    rows.sort_by(|a, b| {
+        b.online()
+            .cmp(&a.online())
+            .then_with(|| a.label().cmp(&b.label()))
+    });
+    rows
+}
+
+/// One network: what it is, who is in it, and what has happened since start.
+fn network_section(network: &tsunagi::ipc::NetworkReport, own_id: &str) -> report::Section {
     use report::{Health, Row, Section};
 
     let mut section = Section::new(format!("network {}", network.name));
@@ -538,58 +652,12 @@ fn network_section(network: &tsunagi::ipc::NetworkReport) -> report::Section {
         )
     });
 
-    if network.peers.is_empty() {
-        section.push(Row::new(Health::Degraded, "peers", "none authenticated"));
-    }
-    for peer in &network.peers {
-        // A relayed path works but goes through somebody else's machine and
-        // costs latency, so it is the middle grade rather than a good one.
-        // Compared without regard to case: the agent answering may be a
-        // different build from the client asking, and the spelling of this
-        // field has already changed once.
-        let health = if peer.transport.eq_ignore_ascii_case("direct") {
-            Health::Good
-        } else {
-            Health::Degraded
-        };
-        section.push(Row::new(
-            health,
-            format!("peer {}", short(&peer.endpoint_id, 10)),
-            format!(
-                "{}  {}{}",
-                peer.hostname.as_deref().unwrap_or("unnamed"),
-                peer.transport.to_lowercase(),
-                match peer.rtt_ms {
-                    Some(rtt) => format!("  rtt {rtt}ms"),
-                    None => String::new(),
-                }
-            ),
-        ));
-    }
-
-    let (sent, received) = network.control_messages;
-    section.push(Row::new(
-        Health::Info,
-        "control messages",
-        format!("{sent} sent, {received} received"),
-    ));
-    if network.dial_failures > 0 || network.handshake_failures > 0 {
-        section.push(Row::new(
-            Health::Degraded,
-            "failures",
-            format!(
-                "{} dial, {} handshake",
-                network.dial_failures, network.handshake_failures
-            ),
-        ));
-    }
-
     if let Some(overlay) = &network.overlay {
         section.push(Row::new(
             Health::Info,
             "overlay",
             format!(
-                "{} {}/{}{}  mtu {}",
+                "{}  {}/{}{}  mtu {}",
                 overlay.interface,
                 overlay.address,
                 overlay.prefix_len,
@@ -600,58 +668,132 @@ fn network_section(network: &tsunagi::ipc::NetworkReport) -> report::Section {
                 overlay.mtu
             ),
         ));
-        for peer in &overlay.peers {
-            let row = match peer.handshake_secs_ago {
-                Some(secs) => Row::new(
-                    Health::Good,
-                    format!("tunnel {}", short(&peer.public_key, 8)),
-                    format!(
-                        "{}{}  handshake {secs}s ago  tx {} rx {}  {}",
-                        peer.address,
-                        match &peer.address_v4 {
-                            Some(v4) => format!(" / {v4}"),
-                            None => String::new(),
-                        },
-                        peer.tx_packets,
-                        peer.rx_packets,
-                        peer.path
-                    ),
-                ),
-                // A snapshot cannot tell a tunnel that is still coming up
-                // from one that is stuck, so this is the middle grade with
-                // the consequence spelled out rather than an alarm.
-                None => Row::new(
-                    Health::Degraded,
-                    format!("tunnel {}", short(&peer.public_key, 8)),
-                    format!("{}  no handshake yet", peer.address),
-                )
-                .with_note("the tunnel cannot carry traffic until it handshakes"),
-            };
-            let row = if peer.dropped > 0 {
-                row.with_note(format!("{} packet(s) dropped", peer.dropped))
-            } else {
-                row
-            };
-            section.push(row);
-        }
-        if overlay.unroutable_packets > 0 {
-            section.push(
-                Row::new(
-                    Health::Degraded,
-                    "unroutable",
-                    format!(
-                        "{} packet(s) sent to an address no peer owns",
-                        overlay.unroutable_packets
-                    ),
-                )
-                .with_note(match &overlay.unroutable_sample {
-                    Some(sample) => format!("for example {sample}"),
-                    None => "no sample recorded".to_string(),
-                }),
-            );
-        }
     }
+
+    let rows = member_rows(network, own_id);
+    let online = rows.iter().filter(|row| row.online()).count();
+    if rows.is_empty() {
+        section.push(Row::new(
+            Health::Info,
+            "members",
+            "none known yet; nobody else has joined",
+        ));
+    } else {
+        section.push(Row::new(
+            Health::Info,
+            "members",
+            format!("{online} of {} online", rows.len()),
+        ));
+    }
+
+    for row in &rows {
+        section.push(member_row(row));
+    }
+
+    // Counters are history, not health. Grading them keeps a report red long
+    // after whatever caused them has gone away — which is exactly how a peer
+    // coming back still looked like three problems.
+    let (sent, received) = network.control_messages;
+    let mut totals = vec![format!("{sent} sent, {received} received")];
+    if network.dial_failures > 0 {
+        totals.push(format!("{} dial failure(s)", network.dial_failures));
+    }
+    if network.handshake_failures > 0 {
+        totals.push(format!(
+            "{} handshake failure(s)",
+            network.handshake_failures
+        ));
+    }
+    if let Some(overlay) = &network.overlay
+        && overlay.unroutable_packets > 0
+    {
+        totals.push(format!(
+            "{} packet(s) to an address nobody owns{}",
+            overlay.unroutable_packets,
+            match &overlay.unroutable_sample {
+                Some(sample) => format!(" ({sample})"),
+                None => String::new(),
+            }
+        ));
+    }
+    // Repeated handshake failures with nobody connected is the signature of a
+    // mismatched secret, and that *is* a present-tense problem rather than a
+    // number from the past.
+    let health = if network.handshake_failures > 0 && online == 0 {
+        Health::Degraded
+    } else {
+        Health::Info
+    };
+    let totals_row = Row::new(health, "since start", totals.join(", "));
+    section.push(if health == Health::Degraded {
+        totals_row.with_note("handshakes are failing and nobody is connected: check that every member was given the same secret")
+    } else {
+        totals_row
+    });
+
     section
+}
+
+/// One member: connected or not, and what is known either way.
+fn member_row(row: &MemberRow<'_>) -> report::Row {
+    use report::{Health, Row};
+
+    let Some(transport) = row.transport else {
+        // Away. Not a fault of this agent, and in a mesh of laptops it is the
+        // ordinary condition, so it is stated rather than flagged.
+        let mut detail = "offline".to_string();
+        if let Some(v4) = row.overlay_address_v4 {
+            detail.push_str(&format!("  ·  {v4} still reserved for it"));
+        }
+        let out = Row::new(Health::Info, row.label(), detail);
+        return if row.failed_dials > 0 {
+            // Attributed to the member it concerns, rather than left as a
+            // network-wide counter with no explanation attached.
+            out.with_note(format!(
+                "{} dial attempt(s) failed since it was last reachable",
+                row.failed_dials
+            ))
+        } else {
+            out
+        };
+    };
+
+    let direct = transport.eq_ignore_ascii_case("direct");
+    let tunnel_up = row.tunnel.is_some_and(|tunnel| tunnel.is_up());
+    let has_overlay = row.tunnel.is_some();
+
+    let mut detail = transport.to_lowercase();
+    if let Some(rtt) = row.rtt_ms {
+        detail.push_str(&format!("  rtt {rtt}ms"));
+    }
+    if let Some(v4) = row.overlay_address_v4 {
+        detail.push_str(&format!("  ·  {v4}"));
+    }
+
+    let health = if !direct || (has_overlay && !tunnel_up) {
+        Health::Degraded
+    } else {
+        Health::Good
+    };
+
+    let mut out = Row::new(health, row.label(), detail);
+    if let Some(tunnel) = row.tunnel {
+        out = out.with_note(match tunnel.handshake_secs_ago {
+            Some(secs) => format!(
+                "tunnel up, handshake {secs}s ago, tx {} rx {}{}  ·  {}",
+                tunnel.tx_packets,
+                tunnel.rx_packets,
+                if tunnel.dropped > 0 {
+                    format!(", {} dropped", tunnel.dropped)
+                } else {
+                    String::new()
+                },
+                tunnel.path
+            ),
+            None => "no WireGuard handshake yet; the tunnel cannot carry traffic".to_string(),
+        });
+    }
+    out
 }
 
 /// Shortens an identifier for a column, with an ellipsis when it was cut.
@@ -1318,7 +1460,9 @@ async fn build_report(
     agent: &Agent,
     wireguard: Option<&WireguardPlugin>,
 ) -> tsunagi::ipc::StatusReport {
-    use tsunagi::ipc::{NetworkReport, OverlayPeerReport, OverlayReport, PeerReport, StatusReport};
+    use tsunagi::ipc::{
+        MemberReport, NetworkReport, OverlayPeerReport, OverlayReport, PeerReport, StatusReport,
+    };
 
     let Ok(status) = agent.status().await else {
         return StatusReport::default();
@@ -1341,6 +1485,7 @@ async fn build_report(
                         .peers
                         .iter()
                         .map(|peer| OverlayPeerReport {
+                            endpoint_id: peer.endpoint_id.to_string(),
                             public_key: peer.public_key.to_string(),
                             address: peer.overlay_address.to_string(),
                             address_v4: peer.overlay_address_v4.map(|addr| addr.to_string()),
@@ -1388,6 +1533,23 @@ async fn build_report(
                         hostname: peer.hostname.clone(),
                         transport: peer.transport.to_string(),
                         rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
+                    })
+                    .collect(),
+                members: network
+                    .members
+                    .iter()
+                    .map(|member| MemberReport {
+                        endpoint_id: member.endpoint_id.to_string(),
+                        overlay_address_v4: member.overlay_address_v4.map(|addr| addr.to_string()),
+                        // What this agent is currently experiencing trying to
+                        // reach it, so a dial-failure count can be attributed
+                        // to the member it belongs to instead of floating
+                        // free as a network-wide number.
+                        failed_dials: network
+                            .candidates
+                            .iter()
+                            .find(|candidate| candidate.endpoint_id == member.endpoint_id)
+                            .map_or(0, |candidate| candidate.consecutive_failures),
                     })
                     .collect(),
                 dial_failures: network.metrics.dial_failures,
@@ -1583,4 +1745,186 @@ async fn print_status(agent: &Agent, network: NetworkId, wireguard: Option<&Wire
         }
     }
     println!();
+}
+
+#[cfg(test)]
+mod status_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::report::Health;
+    use super::*;
+    use tsunagi::ipc::{MemberReport, NetworkReport, OverlayPeerReport, OverlayReport, PeerReport};
+
+    const OWN: &str = "aaaa0000";
+    const ONLINE: &str = "bbbb1111";
+    const AWAY: &str = "cccc2222";
+
+    fn overlay(peers: Vec<OverlayPeerReport>) -> OverlayReport {
+        OverlayReport {
+            interface: "tsundemo".into(),
+            mtu: 1280,
+            address: "fd55::1".into(),
+            address_v4: Some("10.13.37.69".into()),
+            prefix: "fd55::".into(),
+            prefix_len: 64,
+            peers,
+            ..Default::default()
+        }
+    }
+
+    fn tunnel(endpoint_id: &str, handshake: Option<u64>) -> OverlayPeerReport {
+        OverlayPeerReport {
+            endpoint_id: endpoint_id.into(),
+            public_key: "keykeykey".into(),
+            address: "fd55::2".into(),
+            address_v4: Some("10.13.37.237".into()),
+            handshake_secs_ago: handshake,
+            tx_packets: 32,
+            rx_packets: 887,
+            path: "direct via 192.0.2.1:50303".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The situation that prompted this: one peer left and came back.
+    fn network_after_a_peer_returned() -> NetworkReport {
+        NetworkReport {
+            name: "LAB".into(),
+            network_id: "xa7gyz".into(),
+            active: true,
+            peers: vec![PeerReport {
+                endpoint_id: ONLINE.into(),
+                hostname: Some("music".into()),
+                transport: "direct".into(),
+                rtt_ms: Some(24),
+            }],
+            members: vec![
+                MemberReport {
+                    endpoint_id: OWN.into(),
+                    overlay_address_v4: Some("10.13.37.69".into()),
+                    failed_dials: 0,
+                },
+                MemberReport {
+                    endpoint_id: ONLINE.into(),
+                    overlay_address_v4: Some("10.13.37.237".into()),
+                    failed_dials: 0,
+                },
+            ],
+            // Everything below happened while the peer was away.
+            dial_failures: 9,
+            handshake_failures: 0,
+            control_messages: (2, 2),
+            overlay: Some(OverlayReport {
+                unroutable_packets: 1,
+                unroutable_sample: Some("10.13.37.237".into()),
+                ..overlay(vec![tunnel(ONLINE, Some(29))])
+            }),
+        }
+    }
+
+    #[test]
+    fn counters_from_the_past_do_not_grade_the_present() {
+        // A peer that left and returned leaves dial failures and a packet
+        // sent to an address nobody owned behind it. Once it is back, those
+        // are history: reporting them as current faults made a working
+        // network look broken.
+        let network = network_after_a_peer_returned();
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN));
+
+        assert_eq!(out.worst(), Health::Good, "{}", out.render(false));
+        let text = out.render(false);
+        assert!(text.contains("since start"), "{text}");
+        assert!(
+            text.contains("9 dial failure(s)"),
+            "the history is still shown: {text}"
+        );
+    }
+
+    #[test]
+    fn this_agent_is_not_listed_among_its_own_peers() {
+        let network = network_after_a_peer_returned();
+        let rows = member_rows(&network, OWN);
+        assert_eq!(rows.len(), 1, "only the other member");
+        assert_eq!(rows[0].endpoint_id, ONLINE);
+    }
+
+    #[test]
+    fn offline_members_are_listed_after_online_ones() {
+        let mut network = network_after_a_peer_returned();
+        network.members.push(MemberReport {
+            endpoint_id: AWAY.into(),
+            overlay_address_v4: Some("10.13.37.99".into()),
+            failed_dials: 9,
+        });
+
+        let rows = member_rows(&network, OWN);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].online(), "the connected member comes first");
+        assert!(!rows[1].online());
+        assert_eq!(rows[1].endpoint_id, AWAY);
+    }
+
+    #[test]
+    fn a_member_that_is_away_is_stated_rather_than_flagged() {
+        // In a mesh of laptops a member being away is the ordinary
+        // condition, not a fault of this agent. It is said plainly, with
+        // what the signed state still knows about it, and the failed dials
+        // are attributed to it instead of floating free as a counter.
+        let mut network = network_after_a_peer_returned();
+        network.members.push(MemberReport {
+            endpoint_id: AWAY.into(),
+            overlay_address_v4: Some("10.13.37.99".into()),
+            failed_dials: 9,
+        });
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN));
+        let text = out.render(false);
+
+        assert_eq!(out.worst(), Health::Good, "{text}");
+        assert!(text.contains("offline"), "{text}");
+        assert!(text.contains("10.13.37.99 still reserved for it"), "{text}");
+        assert!(text.contains("9 dial attempt(s) failed"), "{text}");
+        assert!(text.contains("1 of 2 online"), "{text}");
+    }
+
+    #[test]
+    fn a_relayed_peer_is_graded_as_degraded_quality() {
+        let mut network = network_after_a_peer_returned();
+        network.peers[0].transport = "relay".into();
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN));
+        assert_eq!(out.worst(), Health::Degraded, "{}", out.render(false));
+        assert!(out.render(false).contains("relay"));
+    }
+
+    #[test]
+    fn a_tunnel_that_never_handshook_is_flagged_while_the_peer_is_connected() {
+        let mut network = network_after_a_peer_returned();
+        network.overlay = Some(overlay(vec![tunnel(ONLINE, None)]));
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN));
+        let text = out.render(false);
+        assert_eq!(out.worst(), Health::Degraded, "{text}");
+        assert!(text.contains("no WireGuard handshake yet"), "{text}");
+    }
+
+    #[test]
+    fn handshake_failures_with_nobody_connected_point_at_the_secret() {
+        // The classic symptom of one member being given a different secret.
+        // With a peer connected the same counter is just history.
+        let mut network = network_after_a_peer_returned();
+        network.peers.clear();
+        network.overlay = Some(overlay(Vec::new()));
+        network.handshake_failures = 4;
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN));
+        let text = out.render(false);
+        assert_eq!(out.worst(), Health::Degraded, "{text}");
+        assert!(text.contains("same secret"), "{text}");
+    }
 }

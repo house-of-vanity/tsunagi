@@ -36,6 +36,24 @@ pub struct CandidateStatus {
     pub consecutive_failures: u32,
 }
 
+/// A member the signed state knows about, connected or not.
+///
+/// This is the durable roster: it comes from signed records, so a member that
+/// went away last month is still here. That is what makes it possible to say
+/// "this peer is offline" rather than only "nobody is connected".
+///
+/// It is not a complete membership list, and cannot be. A member is in signed
+/// state once it has claimed something — today that means an IPv4 overlay
+/// address. In an IPv6-only network nothing is claimed, so members are
+/// visible only while they are connected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberStatus {
+    /// The member's device identity.
+    pub endpoint_id: EndpointId,
+    /// The IPv4 overlay address it claimed and signed for.
+    pub overlay_address_v4: Option<std::net::Ipv4Addr>,
+}
+
 /// Status of one authenticated session.
 #[derive(Debug, Clone)]
 pub struct PeerStatus {
@@ -115,6 +133,8 @@ pub struct NetworkStatus {
     pub peers: Vec<PeerStatus>,
     /// Unverified candidates currently known. Not peers.
     pub candidates: Vec<CandidateStatus>,
+    /// Members the signed state knows about, whether connected or not.
+    pub members: Vec<MemberStatus>,
     /// Per-network counters.
     pub metrics: NetworkMetrics,
 }
