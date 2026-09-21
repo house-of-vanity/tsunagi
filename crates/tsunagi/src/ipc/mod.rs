@@ -82,6 +82,17 @@ pub enum Request {
     /// only it can publish the release, and only while its sessions are up.
     /// The network is named by its id, in the text form `status` prints.
     Leave(String),
+    /// Stop serving a network, or start serving it again.
+    ///
+    /// Not leaving: the configuration, the secret and the signed state all
+    /// stay, so it can be resumed exactly where it was. The network is
+    /// named by its id, in the text form `status` prints.
+    SetActive {
+        /// Which network.
+        network_id: String,
+        /// Whether it should be running.
+        active: bool,
+    },
     /// Turn the local resolver on or off, now and for future starts.
     Dns {
         /// Whether it should be serving.
@@ -111,6 +122,9 @@ impl std::fmt::Debug for Request {
             Request::Status => f.write_str("Status"),
             Request::SetHostname(name) => write!(f, "SetHostname({name})"),
             Request::Leave(network) => write!(f, "Leave({network})"),
+            Request::SetActive { network_id, active } => {
+                write!(f, "SetActive {{ {network_id}, active: {active} }}")
+            }
             // The name is not a secret; the secret is.
             Request::Dns { enable, port } => {
                 write!(f, "Dns {{ enable: {enable}, port: {port:?} }}")
@@ -132,12 +146,28 @@ pub enum Response {
     Left(LeftReport),
     /// A network was joined, or was already there and is now running.
     Joined(JoinedReport),
+    /// A network was stopped or started.
+    Active(ActiveReport),
     /// What the local resolver is doing, after being changed or asked.
     ///
     /// `None` means it is not serving at all.
     Dns(Option<DnsReport>),
     /// The request could not be served.
     Error(String),
+}
+
+/// What happened when a network was stopped or started.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveReport {
+    /// The network's name, for the message the user reads.
+    pub name: String,
+    /// Whether it is running now.
+    pub active: bool,
+    /// Whether this request is what changed it.
+    ///
+    /// Stopping something already stopped is not an error — it is the state
+    /// asked for — but it is worth saying which happened.
+    pub changed: bool,
 }
 
 /// What happened when a network was joined.

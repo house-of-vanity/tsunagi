@@ -118,11 +118,31 @@ enum NetworkAction {
         #[arg(long, conflicts_with = "secret")]
         secret_file: Option<PathBuf>,
     },
+    /// Stops serving a network, keeping everything so it can be resumed.
+    ///
+    /// Not leaving: the configuration, the secret, the address and the
+    /// signed state all stay. Sessions close and the address comes off the
+    /// interface, and nothing is announced — to the others this device is
+    /// simply away, as if it had been switched off. It stays stopped
+    /// across restarts until `tsunagi network start`.
+    Stop {
+        /// Which network, by id. A unique prefix is enough.
+        network: String,
+    },
+    /// Serves a stopped network again, from where it left off.
+    Start {
+        /// Which network, by id. A unique prefix is enough.
+        network: String,
+    },
     /// Gives up this device's address and name in a network, and forgets it.
     ///
     /// A signed release goes out first, so the address and name are freed
     /// for the others rather than staying reserved to a member that has
     /// gone. That needs the agent running; without it nothing can be sent.
+    ///
+    /// Everything local goes: the configuration, the secret, this
+    /// network's signed records, its cached hints and the protocol key it
+    /// used. `stop` is the one that keeps them.
     Leave {
         /// Which network, by id. A unique prefix is enough; the name is not,
         /// because two networks may share one.
@@ -503,15 +523,47 @@ fn network_context(
     configured: &[tsunagi::storage::StoredNetwork],
     name: &NetworkName,
     network_id: tsunagi::NetworkId,
-) -> (bool, Option<String>) {
+) -> (NetworkStanding, Option<String>) {
     let known = configured
         .iter()
-        .any(|other| other.network_id == network_id);
+        .find(|other| other.network_id == network_id)
+        .map(|other| {
+            if other.auto_start {
+                NetworkStanding::Known
+            } else {
+                NetworkStanding::Stopped
+            }
+        })
+        .unwrap_or(NetworkStanding::New);
     let shared = configured
         .iter()
         .find(|other| other.name == *name && other.network_id != network_id)
         .map(|other| other.network_id.to_string());
     (known, shared)
+}
+
+/// How a network the command line names stood before the command ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkStanding {
+    /// Not configured here at all: this command makes it.
+    New,
+    /// Configured and meant to run.
+    Known,
+    /// Configured and deliberately stopped — which this command undoes,
+    /// because a command line that names a network says to run it. Said
+    /// out loud, or a `stop` quietly comes back at the next restart.
+    Stopped,
+}
+
+impl NetworkStanding {
+    /// What to print beside the network on start-up.
+    fn label(self) -> &'static str {
+        match self {
+            NetworkStanding::New => "new",
+            NetworkStanding::Known => "already here",
+            NetworkStanding::Stopped => "was stopped; this command starts it",
+        }
+    }
 }
 
 /// Where the secret a command is about to use came from.
@@ -1278,6 +1330,49 @@ impl tsunagi::ipc::unix::ReportSource for AgentControl {
         })
     }
 
+    fn set_active(
+        &self,
+        network_id: String,
+        active: bool,
+    ) -> tsunagi::BoxFuture<'_, Result<tsunagi::ipc::ActiveReport, String>> {
+        Box::pin(async move {
+            let wanted: tsunagi::NetworkId = network_id
+                .parse()
+                .map_err(|err| format!("`{network_id}` is not a network id: {err}"))?;
+            let name = self
+                .agent
+                .list_networks()
+                .await
+                .map_err(|err| err.to_string())?
+                .into_iter()
+                .find(|network| network.network_id == wanted)
+                .map(|network| network.name.as_str().to_string())
+                .ok_or_else(|| format!("this agent is not in {wanted}"))?;
+
+            let was = self.agent.is_active(wanted).await;
+            if was != active {
+                // Both of these also remember the answer, so a restart
+                // does what the last instruction said.
+                if active {
+                    self.agent
+                        .activate_network(wanted)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                } else {
+                    self.agent
+                        .deactivate_network(wanted)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
+            }
+            Ok(tsunagi::ipc::ActiveReport {
+                name,
+                active,
+                changed: was != active,
+            })
+        })
+    }
+
     fn leave(
         &self,
         network_id: String,
@@ -1393,6 +1488,8 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
                 resolve_secret(&paths, &name, secret.as_deref(), secret_file.as_deref())?;
             join_network(&paths, &socket, &name, secret, origin).await
         }
+        Some(NetworkAction::Stop { network }) => set_active(&paths, &socket, &network, false).await,
+        Some(NetworkAction::Start { network }) => set_active(&paths, &socket, &network, true).await,
         Some(NetworkAction::Leave { network, offline }) => {
             leave_network(&paths, &socket, &network, offline).await
         }
@@ -1544,15 +1641,40 @@ async fn show_networks(
     for network in &stored {
         let id = network.network_id.to_string();
         let running = live.iter().find(|other| other.network_id == id);
-        let state = match running {
-            Some(live) if live.active => {
+        // Three states, and the difference matters: running, stopped on
+        // purpose and kept, or configured and waiting for an agent.
+        let (state, note) = match running {
+            Some(live) if live.active => (
                 match live.overlay.as_ref().and_then(|o| o.address.clone()) {
                     Some(address) => format!("running  ·  {address}"),
                     None => "running  ·  no address agreed yet".to_string(),
-                }
-            }
-            Some(_) => "configured, not running".to_string(),
-            None => "configured".to_string(),
+                },
+                format!(
+                    "`tsunagi network stop {}` pauses it, `leave` gives it up",
+                    short(&id, 10)
+                ),
+            ),
+            Some(_) => (
+                "stopped".to_string(),
+                format!(
+                    "kept as it was; `tsunagi network start {}` resumes it",
+                    short(&id, 10)
+                ),
+            ),
+            None if network.auto_start => (
+                "configured  ·  starts with the agent".to_string(),
+                format!(
+                    "`tsunagi network stop {}` keeps it from starting",
+                    short(&id, 10)
+                ),
+            ),
+            None => (
+                "stopped".to_string(),
+                format!(
+                    "kept as it was; `tsunagi network start {}` resumes it",
+                    short(&id, 10)
+                ),
+            ),
         };
         section.push(
             Row::new(
@@ -1560,14 +1682,64 @@ async fn show_networks(
                 network.name.as_str().to_string(),
                 format!("{id}  ·  {state}"),
             )
-            .with_note(format!(
-                "leave it with `tsunagi network leave {}`",
-                short(&id, 10)
-            )),
+            .with_note(note),
         );
     }
     out.push(section);
     print_report("tsunagi networks", &out)
+}
+
+/// Stops serving a network, or starts serving it again.
+///
+/// Deliberately not a signed anything: stopping is this device being away,
+/// which is an ordinary condition the others already handle, and the whole
+/// point is that everything is still here when it comes back.
+async fn set_active(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+    wanted: &str,
+    active: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let networks = stored_networks(paths);
+    let network = resolve_network(&networks, wanted)?;
+    let id = network.network_id.to_string();
+    let name = network.name.clone();
+
+    if socket.exists() {
+        let report = tsunagi::ipc::unix::set_active(socket, &id, active).await?;
+        match (report.active, report.changed) {
+            (false, true) => println!(
+                "stopped `{}` ({}); everything it has is kept",
+                report.name,
+                short(&id, 10)
+            ),
+            (false, false) => {
+                println!("`{}` ({}) was already stopped", report.name, short(&id, 10))
+            }
+            (true, true) => println!("started `{}` ({})", report.name, short(&id, 10)),
+            (true, false) => println!("`{}` ({}) was already running", report.name, short(&id, 10)),
+        }
+        if !report.active {
+            eprintln!(
+                "\nNothing was announced: to the others this device is away, and the address \
+                 and name it holds stay reserved for it. `tsunagi network start {}` resumes \
+                 it; `tsunagi network leave` is the one that gives them up.",
+                short(&id, 10)
+            );
+        }
+        return Ok(());
+    }
+
+    // No agent: the stored flag is what the next start reads.
+    let storage = tsunagi::storage::Storage::open(paths)?;
+    storage.set_auto_start(network.network_id, active).await?;
+    storage.release_ownership_lock();
+    println!(
+        "`{name}` ({}) will {} with the next `tsunagi up`",
+        short(&id, 10),
+        if active { "start" } else { "stay stopped" }
+    );
+    Ok(())
 }
 
 /// Leaves one network, announcing it if there is anything to announce with.
@@ -3158,7 +3330,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // looks exactly like the network you meant.
     println!(
         "  network      {name} ({network})  ·  {}",
-        if known_before { "already here" } else { "new" }
+        known_before.label()
     );
     println!("  state        {}", paths.state_dir.display());
     // One line, everything the other side needs, ready to paste. The
@@ -4078,15 +4250,19 @@ mod network_context_tests {
         // like the one they meant to start.
         let known = configured("lab", 1);
         let name = known.name.clone();
-        let (already, shared) =
+        let (standing, shared) =
             network_context(std::slice::from_ref(&known), &name, known.network_id);
-        assert!(already);
+        assert_eq!(standing, NetworkStanding::Known);
         assert_eq!(shared, None);
 
         let fresh = configured("lab", 2);
-        let (already, shared) =
+        let (standing, shared) =
             network_context(std::slice::from_ref(&known), &name, fresh.network_id);
-        assert!(!already, "a different secret is a different network");
+        assert_eq!(
+            standing,
+            NetworkStanding::New,
+            "a different secret is a different network"
+        );
         assert_eq!(
             shared,
             Some(known.network_id.to_string()),
@@ -4096,12 +4272,27 @@ mod network_context_tests {
 
     #[test]
     fn a_name_nobody_here_uses_shares_with_nothing() {
-        let (already, shared) = network_context(
+        let (standing, shared) = network_context(
             &[configured("lab", 1)],
             &NetworkName::new("other").unwrap(),
             configured("other", 3).network_id,
         );
-        assert!(!already);
+        assert_eq!(standing, NetworkStanding::New);
         assert_eq!(shared, None);
+    }
+
+    #[test]
+    fn a_stopped_network_on_the_command_line_says_it_is_being_started() {
+        // A command line naming a network says to run it, so it overrides
+        // a `stop`. Silently, that is a pause that comes back from the
+        // dead at the next restart with nothing to explain it.
+        let mut stopped = configured("lab", 1);
+        stopped.auto_start = false;
+        let name = stopped.name.clone();
+
+        let (standing, _) =
+            network_context(std::slice::from_ref(&stopped), &name, stopped.network_id);
+        assert_eq!(standing, NetworkStanding::Stopped);
+        assert!(standing.label().contains("was stopped"));
     }
 }

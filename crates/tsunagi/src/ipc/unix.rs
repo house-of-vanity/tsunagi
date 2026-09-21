@@ -17,7 +17,8 @@ use crate::BoxFuture;
 use crate::error::{Error, Result};
 
 use super::{
-    DnsReport, JoinedReport, LeftReport, MAX_MESSAGE_LEN, Request, Response, StatusReport,
+    ActiveReport, DnsReport, JoinedReport, LeftReport, MAX_MESSAGE_LEN, Request, Response,
+    StatusReport,
 };
 
 /// Builds the report that answers a status request.
@@ -59,6 +60,17 @@ pub trait ReportSource: Send + Sync + 'static {
         _secret: String,
     ) -> BoxFuture<'_, std::result::Result<JoinedReport, String>> {
         Box::pin(async move { Err("this agent cannot join a network".to_string()) })
+    }
+
+    /// Stops serving a network, or starts serving it again.
+    ///
+    /// Defaulted to a refusal, like the others.
+    fn set_active(
+        &self,
+        _network_id: String,
+        _active: bool,
+    ) -> BoxFuture<'_, std::result::Result<ActiveReport, String>> {
+        Box::pin(async move { Err("this agent cannot stop or start a network".to_string()) })
     }
 
     /// Turns the local resolver on or off while the agent runs.
@@ -207,6 +219,12 @@ async fn handle(mut stream: UnixStream, source: Arc<dyn ReportSource>) -> Result
             Ok(report) => Response::Joined(report),
             Err(reason) => Response::Error(reason),
         },
+        Request::SetActive { network_id, active } => {
+            match source.set_active(network_id, active).await {
+                Ok(report) => Response::Active(report),
+                Err(reason) => Response::Error(reason),
+            }
+        }
         Request::Dns { enable, port } => match source.set_dns(enable, port).await {
             Ok(report) => Response::Dns(report),
             Err(reason) => Response::Error(reason),
@@ -306,6 +324,24 @@ pub async fn join_network(
     }
 }
 
+/// Asks a running agent to stop serving a network, or to serve it again.
+pub async fn set_active(
+    path: impl AsRef<Path>,
+    network_id: &str,
+    active: bool,
+) -> Result<ActiveReport> {
+    let path = path.as_ref();
+    let request = Request::SetActive {
+        network_id: network_id.to_string(),
+        active,
+    };
+    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
+        Response::Active(report) => Ok(report),
+        Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
 /// Turns the running agent's local resolver on or off.
 pub async fn set_dns(
     path: impl AsRef<Path>,
@@ -331,7 +367,7 @@ pub async fn set_dns(
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 10]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 11]);
 
 async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let encoded = postcard::to_stdvec(value)

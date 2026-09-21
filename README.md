@@ -324,6 +324,8 @@ tsunagi id key rotate           replace that key
 tsunagi network                 the networks this device belongs to
 tsunagi network join -n lab -s tsn1…   join one; adds it to a running agent
 tsunagi network join -n lab     resume one this device has, or make it on the spot
+tsunagi network stop <id>       stop serving it, keeping everything
+tsunagi network start <id>      serve it again, from where it left off
 tsunagi network leave <id>      give up the address and name, then forget it
 tsunagi network secret          the secret of each joined network
 tsunagi network secret <id>     just that one, for copying
@@ -577,6 +579,23 @@ tsunagi network                     # what this device belongs to
 tsunagi network leave <network-id>  # give up the address and the name, then forget it
 tsunagi wipe --yes                  # remove everything and be a stranger again
 ```
+
+**Stopping is not leaving.** `stop` closes this network's sessions, takes
+its address off the interface and keeps it from starting again, and that is
+all: the configuration, the secret, the signed state and the protocol key
+stay exactly as they are, nothing is announced, and to the others this
+device is simply away — an ordinary condition they already handle, with its
+address and name still reserved for it. `start` picks it up where it left
+off. A network named on the `up` command line is started by that command
+whatever its stored state, and the start-up banner says so rather than
+letting a `stop` quietly come back.
+
+`leave` is the other one, and it removes, locally: the configuration and
+the secret, this network's signed records, its cached address hints and the
+protocol key it used there. What it keeps is this author's version counter
+for that network — a rejoin has to continue above the release, or every
+replica would treat the new claim as stale. Everything about *other*
+networks, and the device identity itself, is untouched.
 
 `leave` publishes a signed `Release` **first**, while the agent is running and
 its sessions are up, so the address and the name are freed for the others

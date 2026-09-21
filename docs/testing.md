@@ -71,8 +71,9 @@ live one is not, and the derived socket path staying short enough to bind.
 
 `crates/tsunagi-cli/tests/network_cli.rs` runs the real binary too: joining
 with no secret invents one, prints it in full and prints a line the other
-side can paste unchanged, while a bare name this device already knows
-resumes that network instead of inventing another of the same name.
+side can paste unchanged; a bare name this device already knows resumes
+that network instead of inventing another of the same name; and a network
+can be stopped and started again with its secret and its place intact.
 
 `crates/tsunagi-cli/tests/dns_service.rs` runs the real binary: the resolver
 comes up with no interface to attach it to, the listener is not rebuilt on

@@ -124,3 +124,67 @@ fn a_bare_name_resumes_the_network_of_that_name_rather_than_inventing_one() {
     assert!(out.contains(&id), "the same network, not a new one: {out}");
     assert!(out.contains("already configured"), "{out}");
 }
+
+#[test]
+fn a_network_can_be_stopped_and_resumed_without_losing_anything() {
+    // Leaving gives everything up; stopping is being away. The difference
+    // is what somebody wants when they will be back.
+    let agent = start("resident", 45073);
+    let listed = agent.run(&["network"]);
+    let out = String::from_utf8_lossy(&listed.stdout).to_string();
+    let id = out
+        .lines()
+        .find(|line| line.contains("resident"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("the network is listed")
+        .to_string();
+    let secret_before = agent.run(&["network", "secret", &id[..10]]);
+    let secret_before = String::from_utf8_lossy(&secret_before.stdout)
+        .trim()
+        .to_string();
+    assert!(secret_before.starts_with("tsn1"));
+
+    let stopped = agent.run(&["network", "stop", &id[..10]]);
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stopped.stdout).contains("stopped `resident`"),
+        "{}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+
+    // Still configured, and said to be stopped rather than missing.
+    let listed = String::from_utf8_lossy(&agent.run(&["network"]).stdout).to_string();
+    assert!(listed.contains(&id), "still configured: {listed}");
+    assert!(listed.contains("stopped"), "{listed}");
+
+    // Stopping what is stopped is the state asked for, not an error.
+    let again = agent.run(&["network", "stop", &id[..10]]);
+    assert!(again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("already stopped"),
+        "{}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+
+    let started = agent.run(&["network", "start", &id[..10]]);
+    assert!(started.status.success());
+    assert!(
+        String::from_utf8_lossy(&started.stdout).contains("started `resident`"),
+        "{}",
+        String::from_utf8_lossy(&started.stdout)
+    );
+    let listed = String::from_utf8_lossy(&agent.run(&["network"]).stdout).to_string();
+    assert!(listed.contains("running"), "{listed}");
+
+    // And nothing was given up on the way: the same network, same secret.
+    let secret_after = agent.run(&["network", "secret", &id[..10]]);
+    assert_eq!(
+        String::from_utf8_lossy(&secret_after.stdout).trim(),
+        secret_before,
+        "the secret is kept, so this is the same network"
+    );
+}
