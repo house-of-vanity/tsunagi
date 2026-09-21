@@ -505,6 +505,48 @@ async fn a_joining_member_adopts_the_range_the_network_already_uses() {
 }
 
 #[tokio::test]
+async fn an_allocated_address_missing_from_the_host_is_reported() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-missing-address");
+
+    // The in-memory interface never carries the address, which is exactly
+    // the situation of a real interface the operator has not configured yet.
+    // Left unsaid, packets leave with the wrong source and every peer drops
+    // them, which looks like a broken network rather than a missing command.
+    let a = WgAgent::spawn(&discovery, "ta").await;
+    let b = WgAgent::spawn(&discovery, "tb").await;
+
+    let mut events = a.agent.subscribe();
+    let network_id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(network_id, 1).await;
+
+    let reason = wait_event(&mut events, |event| match event {
+        Event::PluginError { reason, .. } if reason.contains("not on any") => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+
+    let allocated = a
+        .plugin
+        .overview(network_id)
+        .unwrap()
+        .overlay_address_v4
+        .unwrap();
+    assert!(
+        reason.contains(&allocated.to_string()),
+        "unexpected: {reason}"
+    );
+    assert!(
+        reason.contains("ip address add"),
+        "must name the fix: {reason}"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_address_is_kept_across_a_restart() {
     let discovery = SharedMemoryDiscovery::new();
     let (name, secret) = network("wg-address-persists");

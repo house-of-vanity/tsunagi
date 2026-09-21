@@ -130,6 +130,17 @@ impl TunDevice for MemoryTun {
     }
 }
 
+/// Whether an address is assigned to some interface on this host.
+///
+/// Binding a UDP socket to a specific address only succeeds when the address
+/// is local, which makes this a cheap check that needs no privileges and no
+/// platform-specific code. It does not say *which* interface has it, which is
+/// enough here: the agent chose the address, so anything else holding it is a
+/// problem in its own right.
+pub fn address_is_local(address: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind((address, 0)).is_ok()
+}
+
 /// Creates [`MemoryTun`] devices.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryTunFactory {

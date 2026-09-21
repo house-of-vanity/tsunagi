@@ -126,6 +126,15 @@ wins, and the agent adopts it. So the flag matters for whoever starts the
 network and is harmless afterwards. Pass `--ipv4-range none` for an IPv6-only
 overlay.
 
+Putting the address on the interface still needs privileges, and the agent
+cannot do it. Since the address is only known once the agent has agreed with
+its peers, `tsunagi tun-setup` cannot print it up front either. So the agent
+checks whether the address is assigned anywhere on the host — by binding a UDP
+socket to it, which needs no privileges — and reports the exact command until
+it is. This matters: with the wrong address on the interface, packets leave
+with the wrong source and every peer drops them as not belonging to us, which
+looks like a broken network rather than a missing command.
+
 A release tombstone exists in the record type and merges correctly, but
 nothing emits one yet, so an address stays claimed until the network is
 forgotten.

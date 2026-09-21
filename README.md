@@ -145,6 +145,13 @@ No vote is involved — see
 [docs/wireguard.md](docs/wireguard.md#ipv4-allocated-signed-and-kept) and
 [docs/sync-model.md](docs/sync-model.md).
 
+Because the address is allocated at run time rather than derived, it is not
+known until the agent has started and agreed with its peers, so
+`tsunagi tun-setup` cannot print it in advance. The agent prints the exact
+`ip address add` command once it has one, and keeps saying so until the
+address is actually on an interface — without it, packets leave with the
+wrong source address and every peer drops them.
+
 ## Running unprivileged
 
 The agent does not need to run as root. Creating a network interface and

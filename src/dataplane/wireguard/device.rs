@@ -200,6 +200,8 @@ struct Inner {
     routes: RwLock<HashMap<IpAddr, WgPublicKey>>,
     next_index: AtomicU32,
     unroutable: AtomicU64,
+    /// One destination nobody owned, kept so the counter can be acted on.
+    unroutable_sample: Mutex<Option<IpAddr>>,
     multicast: AtomicU64,
     ipv4_conflicts: AtomicU64,
 }
@@ -237,6 +239,7 @@ impl WireguardDevice {
             routes: RwLock::new(HashMap::new()),
             next_index: AtomicU32::new(1),
             unroutable: AtomicU64::new(0),
+            unroutable_sample: Mutex::new(None),
             multicast: AtomicU64::new(0),
             ipv4_conflicts: AtomicU64::new(0),
         });
@@ -427,6 +430,17 @@ impl WireguardDevice {
         self.inner.unroutable.load(Ordering::Relaxed)
     }
 
+    /// One destination that nobody owned, if there was one.
+    ///
+    /// A bare count says something is wrong but not what; the address usually
+    /// says it outright.
+    pub fn unroutable_sample(&self) -> Option<IpAddr> {
+        match self.inner.unroutable_sample.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
     /// Multicast packets dropped.
     ///
     /// Expected and harmless: Linux emits multicast listener and router
@@ -518,12 +532,12 @@ async fn read_from_os(inner: Arc<Inner>) {
         }
         let target = read_lock(&inner.routes).get(&destination).copied();
         let Some(target) = target else {
-            inner.unroutable.fetch_add(1, Ordering::Relaxed);
+            note_unroutable(&inner, destination);
             continue;
         };
         let peer = read_lock(&inner.peers).get(&target).cloned();
         let Some(peer) = peer else {
-            inner.unroutable.fetch_add(1, Ordering::Relaxed);
+            note_unroutable(&inner, destination);
             continue;
         };
 
@@ -555,6 +569,16 @@ async fn read_from_os(inner: Arc<Inner>) {
                 .fetch_add(packet.len() as u64, Ordering::Relaxed);
         }
     }
+}
+
+/// Counts a packet nobody owned the destination of, keeping one example.
+fn note_unroutable(inner: &Inner, destination: IpAddr) {
+    inner.unroutable.fetch_add(1, Ordering::Relaxed);
+    let mut sample = match inner.unroutable_sample.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *sample = Some(destination);
 }
 
 /// Peer -> operating system.

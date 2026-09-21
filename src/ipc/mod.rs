@@ -148,6 +148,8 @@ pub struct OverlayReport {
     pub unroutable_packets: u64,
     /// Multicast packets dropped. Expected, not a fault.
     pub multicast_packets: u64,
+    /// One destination nobody owned, if there was one.
+    pub unroutable_sample: Option<String>,
 }
 
 /// One overlay peer.
@@ -272,8 +274,12 @@ impl StatusReport {
                 if overlay.unroutable_packets > 0 {
                     let _ = writeln!(
                         out,
-                        "    {} packet(s) to addresses nobody owns",
-                        overlay.unroutable_packets
+                        "    {} packet(s) to addresses nobody owns{}",
+                        overlay.unroutable_packets,
+                        match &overlay.unroutable_sample {
+                            Some(sample) => format!(", most recently {sample}"),
+                            None => String::new(),
+                        }
                     );
                 }
             }

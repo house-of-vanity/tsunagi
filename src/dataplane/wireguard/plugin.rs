@@ -161,6 +161,8 @@ pub struct NetworkOverview {
     pub unroutable_packets: u64,
     /// Multicast packets dropped. Expected, not a fault.
     pub multicast_packets: u64,
+    /// One destination nobody owned, if there was one.
+    pub unroutable_sample: Option<IpAddr>,
 }
 
 impl NetworkOverview {
@@ -207,6 +209,8 @@ struct NetworkState {
     allocations: HashMap<EndpointId, Ipv4Addr>,
     /// The range those allocations came from.
     ipv4_range: Option<Ipv4Range>,
+    /// The address last reported as missing, so it is said once, not forever.
+    reported_missing_v4: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Default)]
@@ -351,6 +355,10 @@ impl WireguardPlugin {
                 .as_ref()
                 .map(|device| device.multicast_packets())
                 .unwrap_or(0),
+            unroutable_sample: state
+                .device
+                .as_ref()
+                .and_then(|device| device.unroutable_sample()),
         })
     }
 
@@ -435,6 +443,7 @@ impl Worker {
                 links: HashMap::new(),
                 allocations: HashMap::new(),
                 ipv4_range: None,
+                reported_missing_v4: None,
             });
         }
 
@@ -495,6 +504,10 @@ impl Worker {
         };
 
         let allocations = state.allocations.clone();
+        let own_v4 = state.allocations.get(&self.local_id()).copied();
+        let interface = state.device.as_ref().map(|_| state.interface.clone());
+        let range = state.ipv4_range;
+        let state_reported = state.reported_missing_v4;
         let mut wanted: Vec<WgPublicKey> = Vec::new();
         let mut too_small: Vec<(usize, usize)> = Vec::new();
         for (endpoint_id, announcement) in &state.announcements {
@@ -534,7 +547,44 @@ impl Worker {
             }
         }
         device.retain_peers(&wanted);
+
+        // The address is allocated at run time, but putting it on the
+        // interface needs privileges we do not have. Without it the kernel
+        // sends our packets with the wrong source address and every peer
+        // drops them, which looks like a broken network rather than a missing
+        // command. So say exactly what is wrong.
+        let missing_v4 = match (own_v4, interface.as_deref(), range) {
+            (Some(address), Some(interface), Some(range))
+                if !super::tun::address_is_local(IpAddr::V4(address)) =>
+            {
+                let already = state_reported == Some(address);
+                if let Some(state) = shared.networks.get_mut(&network) {
+                    state.reported_missing_v4 = Some(address);
+                }
+                (!already).then_some((address, interface.to_string(), range))
+            }
+            _ => {
+                if let Some(state) = shared.networks.get_mut(&network) {
+                    state.reported_missing_v4 = None;
+                }
+                None
+            }
+        };
         drop(shared);
+
+        if let Some((address, interface, range)) = missing_v4 {
+            self.report(
+                network,
+                format!(
+                    "this agent was allocated {address} but that address is not on any \
+                     interface, so IPv4 cannot work: packets would leave with the wrong \
+                     source and every peer would drop them. Run:\n  \
+                     sudo ip address add {address}/{} dev {interface}\n  \
+                     and remove any other address of that range from it.",
+                    range.prefix_len
+                ),
+            );
+        }
 
         for (available, needed) in too_small {
             self.report(

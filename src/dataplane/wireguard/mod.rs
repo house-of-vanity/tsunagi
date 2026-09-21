@@ -62,7 +62,7 @@ pub use plugin::{
     WireguardConfig, WireguardPlugin,
 };
 pub use store::WgKeyStore;
-pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest};
+pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest, address_is_local};
 
 #[cfg(feature = "tun-device")]
 pub use tun::{

@@ -378,7 +378,6 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
 async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>> {
     use tsunagi::dataplane::wireguard::{
         DEFAULT_MTU, OVERLAY_PREFIX_LEN, WgKeyStore, interface_name, overlay_address,
-        overlay_address_v4,
     };
     use tsunagi::identity::NetworkKeys;
 
@@ -407,10 +406,12 @@ async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>>
 
     println!("# Network  {name} ({network})");
     println!("# Interface {interface}, address {address}/{OVERLAY_PREFIX_LEN}, mtu {mtu}");
-    if let Some(range) = ipv4_range
-        && let Some(v4) = overlay_address_v4(network, &key.public(), range)
-    {
-        println!("# IPv4 overlay address {v4}/{}", range.prefix_len);
+    if ipv4_range.is_some() {
+        println!(
+            "# IPv4 is allocated once the agent runs and agrees with its peers, so it\n\
+             # cannot be printed here. Start `tsunagi up`; it prints the exact\n\
+             # `ip address add` command for the address it was given."
+        );
     }
     println!("# Run once as root; then run `tsunagi up` as {user}.");
     println!(
@@ -425,14 +426,7 @@ async fn tun_setup(args: TunSetupArgs) -> Result<(), Box<dyn std::error::Error>>
     println!("sudo ip link set dev {interface} mtu {mtu} up");
     println!("sudo sysctl -qw net.ipv6.conf.{interface}.keep_addr_on_down=1");
     println!("sudo ip -6 address add {address}/{OVERLAY_PREFIX_LEN} dev {interface} nodad");
-    if let Some(range) = ipv4_range
-        && let Some(v4) = overlay_address_v4(network, &key.public(), range)
-    {
-        println!(
-            "sudo ip address add {v4}/{} dev {interface}",
-            range.prefix_len
-        );
-    }
+
     println!("\n# To check it afterwards:");
     println!("ip -6 addr show dev {interface}");
     println!("\n# To remove it again:");
@@ -728,6 +722,7 @@ async fn build_report(
                         .collect(),
                     unroutable_packets: view.unroutable_packets,
                     multicast_packets: view.multicast_packets,
+                    unroutable_sample: view.unroutable_sample.map(|address| address.to_string()),
                 });
 
             NetworkReport {
