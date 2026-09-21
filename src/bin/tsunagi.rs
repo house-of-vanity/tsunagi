@@ -72,17 +72,19 @@ impl PathArgs {
 
 /// How much external connectivity machinery the endpoint may use.
 ///
-/// `direct` and `n0` publish this endpoint's addresses, keyed by its endpoint
-/// id, to Number 0's public lookup service, and resolve peers through it.
-/// That is what makes `--peer <endpoint-id>` work without an address.
+/// `direct` and `relay` publish this endpoint's addresses, keyed by its
+/// endpoint id, to the public lookup service run by Number 0 — the company
+/// behind iroh — at `dns.iroh.link`, and resolve peers through it. That is
+/// what makes `--peer <endpoint-id>` work without an address.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Transport {
     /// Loopback and the local network only. Publishes nothing.
     Local,
-    /// Public address lookup, but no relays.
+    /// Public address lookup, direct paths only, no relays.
     Direct,
-    /// iroh's defaults: public address lookup plus the public n0 relays.
-    N0,
+    /// Public address lookup plus public relay fallback. The default.
+    #[value(alias = "n0")]
+    Relay,
 }
 
 impl From<Transport> for TransportPolicy {
@@ -90,7 +92,7 @@ impl From<Transport> for TransportPolicy {
         match value {
             Transport::Local => TransportPolicy::LocalOnly,
             Transport::Direct => TransportPolicy::DirectOnly,
-            Transport::N0 => TransportPolicy::N0Defaults,
+            Transport::Relay => TransportPolicy::N0Defaults,
         }
     }
 }
@@ -122,7 +124,7 @@ struct UpArgs {
     hostname: Option<String>,
 
     /// How much external connectivity to use.
-    #[arg(long, value_enum, default_value_t = Transport::N0)]
+    #[arg(long, value_enum, default_value_t = Transport::Relay)]
     transport: Transport,
 
     /// A peer to contact, as `<endpoint-id>` or `<endpoint-id>@<ip:port>,...`.

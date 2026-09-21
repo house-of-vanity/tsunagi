@@ -100,8 +100,8 @@ wireguard: tsunkkcp43lmdje on fd15:1d9e:fa21:f201:…/64 mtu 1100, 1/1 tunnel(s)
 Notes:
 
 - Only one side needs `--peer`; the link is bidirectional.
-- The default `--transport n0` uses iroh's public address lookup and relays, so
-  two machines behind NAT find each other. `--transport local` keeps everything
+- The default `--transport relay` uses iroh's public address lookup and relays,
+  so two machines behind NAT find each other. `--transport local` keeps everything
   on the local network. See *How peers find each other* below — it is worth
   understanding what gets published.
 - Without `CAP_NET_ADMIN`, add `--no-tun`: the mesh, the data links and the
@@ -184,10 +184,10 @@ explicitly.
 Two different lookups are involved, and only one of them is this project's:
 
 **1. Resolving one endpoint's address — iroh's, and it works today.**
-With `--transport n0` or `--transport direct`, iroh publishes a signed record
-of this endpoint's addresses, keyed by its endpoint id, to Number 0's public
-service (`dns.iroh.link`, over pkarr and DNS) and resolves other endpoints the
-same way. That is why `--peer <endpoint-id>` works with no address attached:
+With `--transport relay` or `--transport direct`, iroh publishes a signed
+record of this endpoint's addresses, keyed by its endpoint id, to the public
+service run by Number 0 — "n0", the company behind iroh — at `dns.iroh.link`,
+over pkarr and DNS, and resolves other endpoints the same way. That is why `--peer <endpoint-id>` works with no address attached:
 iroh looks it up. None of that code is ours.
 
 **2. Finding who is in a network — ours, and it is still manual.**
@@ -200,12 +200,13 @@ whatever those agents reach.
 
 What this means in practice:
 
-- With `n0` or `direct`, **your endpoint id and IP addresses are published to a
-  public third-party service.** They are not secret, and the network secret is
+- With `relay` or `direct`, **your endpoint id and IP addresses are published
+  to a public third-party service** (Number 0's, unless you change it). They are not secret, and the network secret is
   never published, but an observer of that service learns that your endpoint
   exists and where it is. `--transport local` publishes nothing.
 - A relay, when one is needed, sees the volume and timing of your traffic — not
-  its contents.
+  its contents. The default relays are Number 0's, in the US, EU and
+  Asia-Pacific.
 
 ## Storage
 

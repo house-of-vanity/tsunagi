@@ -89,12 +89,19 @@ pub enum TransportPolicy {
     /// Suitable for tests and for fully local deployments.
     #[default]
     LocalOnly,
-    /// No relays, but the n0 DNS/pkarr address lookup is enabled.
-    DirectOnly,
-    /// iroh's standard behaviour, including the public n0 relays.
+    /// Public address lookup, but no relays.
     ///
-    /// Public relays are fine for development; they carry no availability
-    /// guarantee.
+    /// Enables iroh's DNS/pkarr address lookup against the public service run
+    /// by Number 0 (the company behind iroh) at `dns.iroh.link`. This endpoint
+    /// publishes a signed record of its own addresses there, so peers can dial
+    /// it by endpoint id alone.
+    DirectOnly,
+    /// iroh's standard behaviour: public address lookup plus public relays.
+    ///
+    /// Maps to iroh's own `presets::N0`. As well as the address lookup above,
+    /// it uses Number 0's public relay servers as a fallback when a direct
+    /// path cannot be hole punched. They are fine for development and carry no
+    /// availability guarantee.
     N0Defaults,
 }
 

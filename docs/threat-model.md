@@ -43,8 +43,9 @@ Read this before relying on anything here. The protocol is in
   handshake. Use `NetworkSecret::generate()`.
 - **Public address publication.** With `TransportPolicy::N0Defaults` or
   `DirectOnly`, iroh publishes a signed record of this endpoint's addresses,
-  keyed by its endpoint id, to Number 0's public pkarr/DNS service, and
-  resolves peers through it. The network secret is never published and
+  keyed by its endpoint id, to the public pkarr/DNS service run by Number 0
+  ("n0", the company behind iroh) at `dns.iroh.link`, and resolves peers
+  through it. The network secret is never published and
   membership cannot be inferred from a single record, but the endpoint's
   existence and its addresses become public. `LocalOnly` publishes nothing.
 - **Addresses and metadata are observable.** Anyone able to watch the network
