@@ -72,6 +72,12 @@ pub enum Request {
     /// the change takes effect and reaches peers immediately instead of
     /// waiting for a restart.
     SetHostname(String),
+    /// Leave a network: give up what was claimed, then forget it.
+    ///
+    /// Asked of the running agent rather than done behind its back, because
+    /// only it can publish the release, and only while its sessions are up.
+    /// The network is named by its id, in the text form `status` prints.
+    Leave(String),
 }
 
 /// What the agent answers.
@@ -82,8 +88,27 @@ pub enum Response {
     Status(Box<StatusReport>),
     /// The name the agent now answers to, after reducing it to canonical form.
     Hostname(String),
+    /// A network was left.
+    Left(LeftReport),
     /// The request could not be served.
     Error(String),
+}
+
+/// What happened when a network was left.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftReport {
+    /// The network's name, for the message the user reads.
+    pub name: String,
+    /// Whether a signed release was published.
+    ///
+    /// `false` when the network was not running: nothing could sign or send
+    /// it, so this was a local removal and the others keep the old claim.
+    pub announced: bool,
+    /// How many connected peers it was handed to.
+    ///
+    /// They pass it on, so this is not the number of members that will
+    /// learn of it — but zero means none of them will.
+    pub peers_told: u32,
 }
 
 /// Everything the agent is doing, in one snapshot.

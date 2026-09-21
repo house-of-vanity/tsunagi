@@ -40,6 +40,7 @@ of several system processes, and is not presented as one.
 | 8 | a dead candidate and a vanished peer do not block the others; retries are bounded and stop when the network is deactivated | `tests/resilience.rs` |
 | 9 | wrong version, a message before authentication, a proof replayed on another connection, an oversized frame and a `Hello` for an inactive network are all rejected without taking the agent down | `tests/authentication.rs` |
 | 10 | a second agent on the same state directory gets a clear error; after a clean stop the directory reopens; shutdown ends background tasks and refuses further work; independent agents coexist in one process | `tests/resilience.rs` |
+| 11 | leaving a network frees the address for the others, says plainly when there was nobody to tell, and rejoining afterwards is not mistaken for a stale record; a wipe empties both directories and the next start is a stranger, while a directory that is not ours is refused | `tests/leaving.rs`, `tests/cache_and_state.rs` |
 
 `tests/wireguard.rs` drives the WireGuard data plane over real iroh
 connections. Everything is real except the packet interface: real agents, real

@@ -65,6 +65,15 @@ pub(crate) enum NetCommand {
     Reannounce,
     /// Answer to a different name from now on.
     SetHostname(String),
+    /// Give up everything this agent claimed here, and tell whoever is
+    /// listening.
+    ///
+    /// The reply is the number of peers the tombstone was queued to. They
+    /// pass it on, so a member that is away learns of it from them rather
+    /// than from an agent that has already gone.
+    Release {
+        reply: oneshot::Sender<usize>,
+    },
     /// An IP plugin reported an error from one of its own tasks.
     PluginError {
         /// Plugin protocol id.
@@ -87,6 +96,7 @@ impl std::fmt::Debug for NetCommand {
             NetCommand::Recheck => f.write_str("Recheck"),
             NetCommand::Reannounce => f.write_str("Reannounce"),
             NetCommand::SetHostname(_) => f.write_str("SetHostname"),
+            NetCommand::Release { .. } => f.write_str("Release"),
             NetCommand::PluginError { protocol, .. } => write!(f, "PluginError({protocol})"),
         }
     }
@@ -357,6 +367,13 @@ impl Runtime {
             }
             NetCommand::Recheck => self.discovery_round().await,
             NetCommand::Reannounce => self.reannounce(),
+            NetCommand::Release { reply } => {
+                // A tombstone, so the address and the name this agent held
+                // are freed for somebody else instead of staying reserved
+                // to a member that has gone.
+                self.publish_record(RecordBody::Release).await;
+                let _ = reply.send(self.sessions.len());
+            }
             NetCommand::SetHostname(hostname) => {
                 if self.params.hostname != hostname {
                     self.params.hostname = hostname;
@@ -1419,11 +1436,16 @@ impl Runtime {
         candidates.sort_by(|a, b| a.endpoint_id.as_bytes().cmp(b.endpoint_id.as_bytes()));
 
         // The durable roster. Every author of a signed record is a member,
-        // including this agent and including members that are not here.
+        // including this agent and including members that are not here —
+        // except one that has released everything. That record is a
+        // tombstone kept so the release cannot be undone by a replica that
+        // has not heard of it; the author is not a member any more, and
+        // listing it as one turns leaving into a peer that looks broken.
         let mut members: Vec<MemberStatus> = self
             .state
             .records()
             .into_iter()
+            .filter(|record| !matches!(record.body, RecordBody::Release))
             .filter_map(|record| {
                 let endpoint_id = record.author_id().ok()?;
                 Some(MemberStatus {

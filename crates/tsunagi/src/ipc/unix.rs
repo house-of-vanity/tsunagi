@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use crate::BoxFuture;
 use crate::error::{Error, Result};
 
-use super::{MAX_MESSAGE_LEN, Request, Response, StatusReport};
+use super::{LeftReport, MAX_MESSAGE_LEN, Request, Response, StatusReport};
 
 /// Builds the report that answers a status request.
 ///
@@ -37,6 +37,14 @@ pub trait ReportSource: Send + Sync + 'static {
         _hostname: String,
     ) -> BoxFuture<'_, std::result::Result<String, String>> {
         Box::pin(async move { Err("this agent cannot change its hostname".to_string()) })
+    }
+
+    /// Leaves a network, publishing a release first.
+    ///
+    /// Defaulted to a refusal for the same reason as the above: a source
+    /// that only reports says so plainly rather than appearing to do it.
+    fn leave(&self, _network_id: String) -> BoxFuture<'_, std::result::Result<LeftReport, String>> {
+        Box::pin(async move { Err("this agent cannot leave a network".to_string()) })
     }
 }
 
@@ -166,6 +174,10 @@ async fn handle(mut stream: UnixStream, source: Arc<dyn ReportSource>) -> Result
             Ok(accepted) => Response::Hostname(accepted),
             Err(reason) => Response::Error(reason),
         },
+        Request::Leave(network_id) => match source.leave(network_id).await {
+            Ok(report) => Response::Left(report),
+            Err(reason) => Response::Error(reason),
+        },
     };
     write_message(&mut stream, &response).await
 }
@@ -226,6 +238,20 @@ async fn exchange(path: &Path, request: &Request, within: Duration) -> Result<Re
     }
 }
 
+/// Asks a running agent to leave a network.
+///
+/// The agent publishes the release and removes the network; this only
+/// carries the request and the outcome.
+pub async fn leave_network(path: impl AsRef<Path>, network_id: &str) -> Result<LeftReport> {
+    let path = path.as_ref();
+    let request = Request::Leave(network_id.to_string());
+    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
+        Response::Left(report) => Ok(report),
+        Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
 /// Marks the wire format of the local control socket.
 ///
 /// `b"TSN"` followed by the version, so a mismatch is recognised as one
@@ -237,7 +263,7 @@ async fn exchange(path: &Path, request: &Request, within: Duration) -> Result<Re
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 7]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 8]);
 
 async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let encoded = postcard::to_stdvec(value)

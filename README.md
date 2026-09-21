@@ -72,6 +72,7 @@ On the first machine:
 cargo build --release
 ./target/release/tsunagi id secret generate   # prints tsn1...; share it privately
 ./target/release/tsunagi status          # this device, the agent, and this host
+./target/release/tsunagi network         # the networks this device belongs to
 
 ./target/release/tsunagi up --network lab --secret "$SECRET"
 ```
@@ -494,6 +495,36 @@ directories by default; `--state-dir` and `--cache-dir` override them.
 
 One state directory belongs to one live agent, enforced with a real OS file
 lock rather than an existence check.
+
+### Leaving, and starting over
+
+Membership outlives a session, so it also has to be possible to end it.
+
+```bash
+tsunagi network                     # what this device belongs to
+tsunagi network leave <network-id>  # give up the address and the name, then forget it
+tsunagi wipe --yes                  # remove everything and be a stranger again
+```
+
+`leave` publishes a signed `Release` **first**, while the agent is running and
+its sessions are up, so the address and the name are freed for the others
+instead of staying reserved to a member that has gone. They pass the tombstone
+on, so a member that was away hears it from them. With no agent running,
+nothing can sign or send it: the command says so and refuses, and `--offline`
+drops the network locally while leaving the others holding the old claim. The
+protocol key for that network goes too — rejoining is joining, not resuming.
+
+A network is named by its id, never by its name: two networks can share a
+name, and choosing between them for the user is how the wrong one gets left. A
+unique prefix is enough.
+
+`wipe` removes both directories' contents: the device identity, every network,
+every signed record and everything a protocol kept beside them. It refuses
+while an agent is running, and refuses a directory with no `state.sqlite` in
+it, so a mistyped `--state-dir` cannot take somebody's documents with it.
+Without `--yes` it only says what it would remove. It is not a goodbye: nobody
+is told, because after it there is no key left to sign anything with. Leave the
+networks first if the addresses should be freed.
 
 ## Documentation
 

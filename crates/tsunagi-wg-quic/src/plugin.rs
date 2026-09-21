@@ -792,6 +792,16 @@ impl IpPlugin for WireguardPlugin {
         self.nudge(Command::Teardown(network));
     }
 
+    fn on_network_forgotten(&self, network: NetworkId) {
+        // The key is this protocol's identity in that network and nothing
+        // else's. Keeping it after leaving would keep a secret for a
+        // network this agent is no longer in — and hand back the same
+        // overlay address on a rejoin that everyone else has moved past.
+        if let Err(err) = self.worker.store.forget(network) {
+            tracing::warn!(%err, "cannot remove the WireGuard key of a network we left");
+        }
+    }
+
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let (reply_tx, reply_rx) = oneshot::channel();

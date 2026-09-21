@@ -282,3 +282,85 @@ async fn secrets_never_appear_in_status_or_debug_output() {
 
     agent.agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_wipe_removes_everything_and_the_next_start_is_a_stranger() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::under(dir.path());
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wiped");
+
+    let agent = Agent::spawn(config_with(dir.path(), &discovery))
+        .await
+        .unwrap();
+    let before = agent.endpoint_id();
+    agent.join_network(&name, &secret).await.unwrap();
+    // Something a plugin keeps beside the state, which a wipe must take too.
+    std::fs::create_dir_all(paths.state_dir.join("wireguard")).unwrap();
+    std::fs::write(paths.state_dir.join("wireguard/keys.sqlite"), b"key").unwrap();
+
+    // Not while an agent owns the directory: a half-wiped state under a
+    // running agent is worse than no wipe at all.
+    let refused = tsunagi::storage::wipe(&paths).unwrap_err();
+    assert!(matches!(refused, Error::StateLocked { .. }), "{refused}");
+    agent.shutdown().await;
+
+    let plan = tsunagi::storage::wipe_plan(&paths).unwrap();
+    assert!(
+        plan.entries().any(|path| path.ends_with("state.sqlite")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.entries().any(|path| path.ends_with("wireguard")),
+        "what a plugin kept is state too: {plan:?}"
+    );
+
+    let wiped = tsunagi::storage::wipe(&paths).unwrap();
+    assert_eq!(wiped, plan);
+    assert!(!paths.state_db().exists());
+    assert!(!paths.state_dir.join("wireguard").exists());
+    assert!(!paths.lock_file().exists(), "no lock is left claiming it");
+
+    // A stranger: new identity, no networks, nothing to be surprised by.
+    let fresh = Agent::spawn(config_with(dir.path(), &discovery))
+        .await
+        .unwrap();
+    assert_ne!(fresh.endpoint_id(), before);
+    assert!(fresh.list_networks().await.unwrap().is_empty());
+    fresh.shutdown().await;
+}
+
+#[tokio::test]
+async fn wiping_twice_is_as_ordinary_as_wiping_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::under(dir.path());
+    let discovery = SharedMemoryDiscovery::new();
+
+    let agent = Agent::spawn(config_with(dir.path(), &discovery))
+        .await
+        .unwrap();
+    agent.shutdown().await;
+
+    assert!(!tsunagi::storage::wipe(&paths).unwrap().is_empty());
+    let again = tsunagi::storage::wipe(&paths).unwrap();
+    assert!(again.is_empty(), "nothing left to remove: {again:?}");
+}
+
+#[tokio::test]
+async fn a_directory_that_is_not_ours_is_refused_rather_than_emptied() {
+    // The mistyped `--state-dir` that would otherwise remove somebody's
+    // documents. A marker decides, not the name of the directory.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::new(dir.path(), dir.path().join("cache"));
+    std::fs::write(dir.path().join("thesis.txt"), b"years of work").unwrap();
+
+    let err = tsunagi::storage::wipe(&paths).unwrap_err();
+    assert!(
+        err.to_string().contains("does not look like a tsunagi"),
+        "{err}"
+    );
+    assert!(
+        dir.path().join("thesis.txt").exists(),
+        "nothing was removed"
+    );
+}

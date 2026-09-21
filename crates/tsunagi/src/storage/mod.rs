@@ -350,3 +350,137 @@ impl Storage {
         guard.take();
     }
 }
+
+/// What a wipe covers: every entry in the two directories.
+///
+/// Reported before anything is removed, and again afterwards, because a
+/// command whose whole job is to destroy state has to be able to say exactly
+/// what it is about to destroy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WipePlan {
+    /// Entries in the state directory, which is the mandatory state and
+    /// anything a plugin keeps beside it.
+    pub state: Vec<std::path::PathBuf>,
+    /// Entries in the cache directory.
+    pub cache: Vec<std::path::PathBuf>,
+}
+
+impl WipePlan {
+    /// Whether there is anything to remove at all.
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty() && self.cache.is_empty()
+    }
+
+    /// Every entry, state first.
+    pub fn entries(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.state
+            .iter()
+            .chain(self.cache.iter())
+            .map(std::path::PathBuf::as_path)
+    }
+}
+
+/// Lists what [`wipe`] would remove, without removing anything.
+pub fn wipe_plan(paths: &StoragePaths) -> Result<WipePlan> {
+    Ok(WipePlan {
+        state: removable(&paths.state_dir, &paths.state_db())?,
+        cache: removable(&paths.cache_dir, &paths.cache_db())?,
+    })
+}
+
+/// Removes everything in both directories, leaving this device a stranger.
+///
+/// The device identity, every network it belongs to, every signed record and
+/// everything a plugin kept beside them. The next start generates a new
+/// identity and knows nothing, which is the point: after this there is no
+/// membership left to be surprised by.
+///
+/// What it is **not** is a goodbye. Other members keep the claims this device
+/// signed, because signed state has no expiry and there is nobody left here
+/// to sign a release. Leaving each network first with
+/// [`crate::Agent::leave_network`] is what frees the address and the name.
+///
+/// Refuses while an agent owns the state directory, and refuses a directory
+/// with no `state.sqlite` in it — a wipe pointed at the wrong place by a
+/// mistyped `--state-dir` would otherwise remove somebody's documents.
+pub fn wipe(paths: &StoragePaths) -> Result<WipePlan> {
+    let plan = wipe_plan(paths)?;
+    // Held across the removal, so an agent cannot start into a directory
+    // that is half gone. The lock file is itself removed at the end: on
+    // Unix the lock lives on the open handle, not on the name.
+    let lock = DirectoryLock::acquire(paths.lock_file())?;
+
+    for entry in plan.entries() {
+        remove_entry(entry)?;
+    }
+    drop(lock);
+    // Created by acquiring the lock a moment ago, so it is ours to remove
+    // and nothing is left behind claiming the directory.
+    let _ = std::fs::remove_file(paths.lock_file());
+    Ok(plan)
+}
+
+/// Every entry of `dir`, once `marker` proves it is one of ours.
+///
+/// An empty or missing directory is nothing to remove rather than an error:
+/// wiping twice must be as ordinary as wiping once.
+fn removable(dir: &Path, marker: &Path) -> Result<Vec<std::path::PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    let read = std::fs::read_dir(dir).map_err(|source| Error::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    for entry in read {
+        let entry = entry.map_err(|source| Error::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        entries.push(entry.path());
+    }
+    if entries.is_empty() {
+        return Ok(entries);
+    }
+
+    // The marker is what tells a state directory from a directory that
+    // merely got named as one. The lock file counts too: an agent that
+    // crashed before writing anything still leaves that.
+    let ours = marker.exists() || dir.join("state.lock").exists();
+    if !ours {
+        return Err(Error::Storage(format!(
+            "{} does not look like a tsunagi directory: no {} in it. Nothing was removed.",
+            dir.display(),
+            marker.file_name().map_or_else(
+                || marker.display().to_string(),
+                |name| name.to_string_lossy().into_owned()
+            )
+        )));
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+fn remove_entry(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        // Gone between the plan and the removal is the outcome asked for.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(Error::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let removed = if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    removed.map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}

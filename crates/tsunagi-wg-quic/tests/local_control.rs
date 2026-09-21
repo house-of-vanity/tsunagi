@@ -233,3 +233,82 @@ fn the_socket_path_is_derived_and_short_enough() {
         control_socket_path(&std::path::PathBuf::from("/somewhere/else"))
     );
 }
+
+/// A source that can also leave, the way the binary's one does.
+#[derive(Debug)]
+struct Control(Agent);
+
+impl tsunagi::ipc::unix::ReportSource for Control {
+    fn report(&self) -> BoxFuture<'_, StatusReport> {
+        Box::pin(async move { StatusReport::default() })
+    }
+
+    fn leave(&self, network_id: String) -> BoxFuture<'_, Result<tsunagi::ipc::LeftReport, String>> {
+        Box::pin(async move {
+            let wanted: tsunagi::NetworkId = network_id.parse().map_err(|_| "not an id")?;
+            let name = self
+                .0
+                .list_networks()
+                .await
+                .map_err(|err| err.to_string())?
+                .into_iter()
+                .find(|network| network.network_id == wanted)
+                .map(|network| network.name.as_str().to_string())
+                .ok_or("not a network this agent is in")?;
+            let outcome = self
+                .0
+                .leave_network(wanted)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(tsunagi::ipc::LeftReport {
+                name,
+                announced: outcome.announced,
+                peers_told: outcome.peers_told as u32,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_client_can_leave_a_network_through_the_running_agent() {
+    // The release can only be published by the agent that is running, and
+    // only while its sessions are up, so leaving goes over this socket
+    // rather than being done behind its back in the state store.
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("control-leave");
+
+    let dir = TempDir::new().unwrap();
+    let agent = Agent::spawn(config_with(dir.path(), &discovery))
+        .await
+        .unwrap();
+    let other = TempDir::new().unwrap();
+    let peer = Agent::spawn(config_with(other.path(), &discovery))
+        .await
+        .unwrap();
+    let network_id = agent.join_network(&name, &secret).await.unwrap();
+    peer.join_network(&name, &secret).await.unwrap();
+    wait_for_peers(&agent, network_id, 1).await;
+
+    let socket_path = dir.path().join("control.sock");
+    let control = ControlSocket::bind(&socket_path, Arc::new(Control(agent.clone())))
+        .await
+        .unwrap();
+
+    let report = tsunagi::ipc::unix::leave_network(&socket_path, &network_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(report.name, name.as_str());
+    assert!(report.announced);
+    assert_eq!(report.peers_told, 1);
+    assert!(agent.list_networks().await.unwrap().is_empty());
+
+    // Asking again names the state it is in rather than failing obscurely.
+    let err = tsunagi::ipc::unix::leave_network(&socket_path, &network_id.to_string())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not a network"), "{err}");
+
+    control.shutdown().await;
+    agent.shutdown().await;
+    peer.shutdown().await;
+}

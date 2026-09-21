@@ -583,11 +583,59 @@ impl Agent {
 
     /// Deactivates a network if it is running and removes it from the state
     /// store together with its cached hints.
+    ///
+    /// Local and silent: nobody is told. [`Agent::leave_network`] is the one
+    /// that says goodbye first, and is what a person means by leaving.
     pub async fn forget_network(&self, network_id: NetworkId) -> Result<()> {
         if self.is_active(network_id).await {
             self.deactivate_network(network_id).await?;
         }
-        self.inner.storage.remove_network(network_id).await
+        self.inner.storage.remove_network(network_id).await?;
+        // Whatever a protocol kept for this network goes with it. The
+        // agent cannot know what that is, only that there is no longer any
+        // reason to hold it.
+        for plugin in &self.inner.config.plugins {
+            plugin.on_network_forgotten(network_id);
+        }
+        Ok(())
+    }
+
+    /// Leaves a network: gives up what was claimed, then forgets it.
+    ///
+    /// The order matters and cannot be improved on. A signed `Release` goes
+    /// out first, while there are still sessions to carry it, so the address
+    /// and name this agent held are freed for somebody else rather than
+    /// staying reserved to a member that has gone. Only then is the network
+    /// deactivated and removed.
+    ///
+    /// Reaching every member is not on offer and never could be: a member
+    /// that is away hears the tombstone from the ones that were here, the
+    /// same way it hears everything else. Leaving with nobody connected
+    /// tells nobody, and says so in the outcome rather than pretending.
+    ///
+    /// The author's version counter is deliberately **kept**. Rejoining the
+    /// same network with the same device key must continue from a higher
+    /// version than the release, or every replica would treat the new claim
+    /// as stale and ignore it.
+    pub async fn leave_network(&self, network_id: NetworkId) -> Result<LeaveOutcome> {
+        let mut outcome = LeaveOutcome::default();
+        if self.is_active(network_id).await {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.command(network_id, NetCommand::Release { reply: reply_tx })
+                .await?;
+            if let Ok(peers) = reply_rx.await {
+                outcome.announced = true;
+                outcome.peers_told = peers;
+            }
+            // The tombstone is queued on each session, not yet written to
+            // the wire. A short pause is the difference between peers
+            // hearing it now and hearing it from somebody else much later.
+            if outcome.peers_told > 0 {
+                tokio::time::sleep(RELEASE_FLUSH).await;
+            }
+        }
+        self.forget_network(network_id).await?;
+        Ok(outcome)
     }
 
     /// Whether a network is currently running.
@@ -805,6 +853,29 @@ impl Agent {
         };
         sender.send(command).await.map_err(|_| Error::Stopped)
     }
+}
+
+/// How long a release is given to reach the sessions it was queued on.
+///
+/// Short: it is one small message on a connection that is already open, and
+/// the alternative to waiting at all is tearing the sessions down underneath
+/// it.
+const RELEASE_FLUSH: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// What happened when an agent left a network.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeaveOutcome {
+    /// Whether a signed release was published at all.
+    ///
+    /// `false` when the network was not running: there was nothing to
+    /// publish it from, so this was a local removal only.
+    pub announced: bool,
+    /// How many connected peers it was sent to.
+    ///
+    /// Zero with `announced` true means the tombstone is in this agent's
+    /// own state and nowhere else, and it is leaving with it — so nobody
+    /// will learn of it.
+    pub peers_told: usize,
 }
 
 /// How long each plugin gets to tear itself down during agent shutdown.

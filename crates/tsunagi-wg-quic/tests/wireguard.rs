@@ -590,6 +590,34 @@ async fn an_interface_that_is_only_in_memory_is_not_reported_as_a_fault() {
 }
 
 #[tokio::test]
+async fn leaving_a_network_takes_its_protocol_key_with_it() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-leave");
+
+    let agent = WgAgent::spawn(&discovery, "ta").await;
+    let network_id = agent.agent.join_network(&name, &secret).await.unwrap();
+    let before = wait_until("the plugin has a key for it", || async {
+        Some(agent.plugin.overview(network_id)?.public_key)
+    })
+    .await;
+
+    agent.agent.leave_network(network_id).await.unwrap();
+
+    // Rejoining is joining, not resuming: the key was this agent's identity
+    // in a network it left, and everyone there was told to let the address
+    // it held go. Coming back with the same key would claim an identity the
+    // network has already released.
+    agent.agent.join_network(&name, &secret).await.unwrap();
+    let after = wait_until("the plugin has a key again", || async {
+        Some(agent.plugin.overview(network_id)?.public_key)
+    })
+    .await;
+    assert_ne!(before, after, "a fresh key, not the released one");
+
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_address_is_kept_across_a_restart() {
     let discovery = SharedMemoryDiscovery::new();
     let (name, secret) = network("wg-address-persists");

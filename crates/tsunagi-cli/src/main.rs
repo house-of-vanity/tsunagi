@@ -51,6 +51,58 @@ enum Command {
     Status(StatusArgs),
     /// Shows the protocols this build can carry packets with.
     Protocols,
+    /// Shows the networks this device belongs to, and leaves them.
+    Network(NetworkArgs),
+    /// Removes everything this device has stored and starts over.
+    Wipe(WipeArgs),
+}
+
+#[derive(Debug, Args)]
+struct NetworkArgs {
+    #[command(flatten)]
+    paths: PathArgs,
+
+    /// Control socket to talk to. Derived from the state directory by default.
+    #[arg(long, global = true)]
+    control_socket: Option<PathBuf>,
+
+    #[command(subcommand)]
+    action: Option<NetworkAction>,
+}
+
+#[derive(Debug, Subcommand)]
+enum NetworkAction {
+    /// Gives up this device's address and name in a network, and forgets it.
+    ///
+    /// A signed release goes out first, so the address and name are freed
+    /// for the others rather than staying reserved to a member that has
+    /// gone. That needs the agent running; without it nothing can be sent.
+    Leave {
+        /// Which network, by id. A unique prefix is enough; the name is not,
+        /// because two networks may share one.
+        network: String,
+
+        /// Remove it without telling anybody.
+        ///
+        /// For a network nobody else is in, or one joined with a mistyped
+        /// secret. The others keep whatever this device claimed.
+        #[arg(long)]
+        offline: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct WipeArgs {
+    #[command(flatten)]
+    paths: PathArgs,
+
+    /// Control socket to check for a running agent.
+    #[arg(long)]
+    control_socket: Option<PathBuf>,
+
+    /// Actually remove it. Without this the command only says what it would.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -383,6 +435,8 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Up(args) => up(*args).await,
         Command::Status(args) => status(args).await,
         Command::Protocols => show_protocols(),
+        Command::Network(args) => network_command(args).await,
+        Command::Wipe(args) => wipe(args).await,
     }
 }
 
@@ -908,6 +962,39 @@ impl tsunagi::ipc::unix::ReportSource for AgentControl {
                 .map_err(|err| err.to_string())
         })
     }
+
+    fn leave(
+        &self,
+        network_id: String,
+    ) -> tsunagi::BoxFuture<'_, Result<tsunagi::ipc::LeftReport, String>> {
+        Box::pin(async move {
+            let wanted: tsunagi::NetworkId = network_id
+                .parse()
+                .map_err(|err| format!("`{network_id}` is not a network id: {err}"))?;
+            // The name is for the message the user reads, and it is only
+            // available while the network is still configured.
+            let name = self
+                .agent
+                .list_networks()
+                .await
+                .map_err(|err| err.to_string())?
+                .into_iter()
+                .find(|network| network.network_id == wanted)
+                .map(|network| network.name.as_str().to_string())
+                .ok_or_else(|| format!("this agent is not in {wanted}"))?;
+
+            let outcome = self
+                .agent
+                .leave_network(wanted)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(tsunagi::ipc::LeftReport {
+                name,
+                announced: outcome.announced,
+                peers_told: outcome.peers_told as u32,
+            })
+        })
+    }
 }
 
 /// The networks this device has joined, read straight from the store.
@@ -918,6 +1005,247 @@ fn stored_networks(paths: &StoragePaths) -> Vec<tsunagi::storage::StoredNetwork>
     tsunagi::storage::StateStore::open(paths.state_db())
         .and_then(|store| store.list_networks())
         .unwrap_or_default()
+}
+
+/// Finds the one configured network whose id starts with `wanted`.
+///
+/// A prefix, because the ids are 52 characters and `status` prints them
+/// shortened; the name is deliberately not accepted, since two networks can
+/// share one and choosing for the user is how the wrong network gets left.
+fn resolve_network<'a>(
+    networks: &'a [tsunagi::storage::StoredNetwork],
+    wanted: &str,
+) -> Result<&'a tsunagi::storage::StoredNetwork, String> {
+    let wanted = wanted.trim().trim_end_matches('…');
+    if wanted.is_empty() {
+        return Err("name a network by its id; `tsunagi network` lists them".to_string());
+    }
+    let matched: Vec<&tsunagi::storage::StoredNetwork> = networks
+        .iter()
+        .filter(|network| network.network_id.to_string().starts_with(wanted))
+        .collect();
+    match matched.as_slice() {
+        [one] => Ok(one),
+        [] => {
+            if networks
+                .iter()
+                .any(|network| network.name.as_str() == wanted)
+            {
+                return Err(format!(
+                    "`{wanted}` is a network name, not an id. Two networks can share a name, \
+                     so this takes the id; `tsunagi network` lists them."
+                ));
+            }
+            Err(format!(
+                "no configured network has an id starting `{wanted}`; \
+                 `tsunagi network` lists them"
+            ))
+        }
+        several => Err(format!(
+            "`{wanted}` matches {} networks; use more of the id",
+            several.len()
+        )),
+    }
+}
+
+/// `tsunagi network`: what this device belongs to, and leaving it.
+async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = args.paths.resolve()?;
+    let socket = control_socket(&paths, args.control_socket.as_ref());
+    match args.action {
+        None => show_networks(&paths, &socket).await,
+        Some(NetworkAction::Leave { network, offline }) => {
+            leave_network(&paths, &socket, &network, offline).await
+        }
+    }
+}
+
+/// Every configured network, live where an agent can say so.
+async fn show_networks(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use report::{Health, Report, Row, Section};
+
+    let stored = stored_networks(paths);
+    if stored.is_empty() {
+        eprintln!("no network has been joined");
+        return Ok(());
+    }
+
+    let observed = observe(paths, socket).await;
+    let live = match &observed {
+        Observed::Agent(report) => report.networks.clone(),
+        Observed::Stored { .. } => Vec::new(),
+    };
+
+    let mut out = Report::new();
+    let mut section = Section::new("networks");
+    for network in &stored {
+        let id = network.network_id.to_string();
+        let running = live.iter().find(|other| other.network_id == id);
+        let state = match running {
+            Some(live) if live.active => {
+                match live.overlay.as_ref().and_then(|o| o.address.clone()) {
+                    Some(address) => format!("running  ·  {address}"),
+                    None => "running  ·  no address agreed yet".to_string(),
+                }
+            }
+            Some(_) => "configured, not running".to_string(),
+            None => "configured".to_string(),
+        };
+        section.push(
+            Row::new(
+                Health::Info,
+                network.name.as_str().to_string(),
+                format!("{id}  ·  {state}"),
+            )
+            .with_note(format!(
+                "leave it with `tsunagi network leave {}`",
+                short(&id, 10)
+            )),
+        );
+    }
+    out.push(section);
+    print_report("tsunagi networks", &out)
+}
+
+/// Leaves one network, announcing it if there is anything to announce with.
+async fn leave_network(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+    wanted: &str,
+    offline: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let networks = stored_networks(paths);
+    let network = resolve_network(&networks, wanted)?;
+    let id = network.network_id.to_string();
+    let name = network.name.clone();
+
+    // The running agent does it, because only it can publish the release
+    // while its sessions are still up.
+    if socket.exists() {
+        let report = tsunagi::ipc::unix::leave_network(socket, &id).await?;
+        println!("left `{}` ({})", report.name, short(&id, 10));
+        match (report.announced, report.peers_told) {
+            (true, 0) => eprintln!(
+                "\nNobody was connected, so nothing was told: the others keep the address \
+                 and name this device claimed until it says otherwise, and it no longer can."
+            ),
+            (true, peers) => eprintln!(
+                "\nThe release went to {peers} connected peer(s); they pass it on, so the \
+                 address and name are freed for the rest as they sync."
+            ),
+            (false, _) => eprintln!(
+                "\nThe network was not running, so nothing was announced: the others keep \
+                 the address and name this device claimed."
+            ),
+        }
+        return Ok(());
+    }
+
+    if !offline {
+        return Err(format!(
+            "no agent is running for this state directory, so nothing can announce that \
+             `{name}` is being left. Start it and run this again to free the address and \
+             name for the others, or pass --offline to drop the network locally and leave \
+             them holding it."
+        )
+        .into());
+    }
+
+    // Local removal. The storage lock makes sure no agent is using it.
+    let storage = tsunagi::storage::Storage::open(paths)?;
+    storage.remove_network(network.network_id).await?;
+    // What a protocol kept for it goes too; there is no plugin loaded here
+    // to be asked, so the one this build has is asked directly.
+    forget_protocol_state(paths, network.network_id);
+    storage.release_ownership_lock();
+    println!("left `{name}` ({}) locally", short(&id, 10));
+    eprintln!(
+        "\nNothing was announced: the others keep the address and name this device \
+         claimed in it."
+    );
+    Ok(())
+}
+
+/// Removes what the compiled-in protocols keep for a network.
+///
+/// The offline path has no agent and so no plugins to ask. Each failure is
+/// reported and none is fatal: the network is already gone from the state.
+fn forget_protocol_state(paths: &StoragePaths, network: tsunagi::NetworkId) {
+    let store = tsunagi_wg_quic::WireguardConfig::new(paths.state_dir.join("wg-quic"));
+    match tsunagi_wg_quic::WgKeyStore::open(store.key_store_path()) {
+        Ok(store) => {
+            if let Err(err) = store.forget(network) {
+                eprintln!("warning: the wg-quic key for it could not be removed: {err}");
+            }
+        }
+        // Never opened means never used, which is nothing to clean up.
+        Err(err) if !store.key_store_path().exists() => {
+            let _ = err;
+        }
+        Err(err) => eprintln!("warning: the wg-quic key store could not be opened: {err}"),
+    }
+}
+
+/// `tsunagi wipe`: back to a device that has never joined anything.
+async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = args.paths.resolve()?;
+    let socket = control_socket(&paths, args.control_socket.as_ref());
+    if socket.exists() {
+        return Err(
+            "stop the agent first: a wipe removes the state it is using, and leaving a \
+             network properly needs it running anyway"
+                .into(),
+        );
+    }
+
+    let plan = tsunagi::storage::wipe_plan(&paths)?;
+    if plan.is_empty() {
+        println!("nothing stored: this device has never joined anything");
+        return Ok(());
+    }
+
+    let networks = stored_networks(&paths);
+    if !args.yes {
+        println!("`tsunagi wipe --yes` would remove:\n");
+        for entry in plan.entries() {
+            println!("  {}", entry.display());
+        }
+        if !networks.is_empty() {
+            println!("\nand with it, membership of:\n");
+            for network in &networks {
+                println!("  {}  {}", network.name, network.network_id);
+            }
+            println!(
+                "\nNobody is told. Leave each network first — start the agent and run\n\
+                 `tsunagi network leave <id>` — to free the address and name it holds\n\
+                 for the others. Afterwards this device is a stranger: a new identity,\n\
+                 no networks, and no way to sign anything for the old ones."
+            );
+        }
+        println!("\nNothing was removed.");
+        return Ok(());
+    }
+
+    let removed = tsunagi::storage::wipe(&paths)?;
+    // A socket file with nothing behind it is a leftover of the same kind.
+    if tokio::net::UnixStream::connect(&socket).await.is_err() {
+        let _ = std::fs::remove_file(&socket);
+    }
+    println!("removed {} item(s):", removed.entries().count());
+    for entry in removed.entries() {
+        println!("  {}", entry.display());
+    }
+    if !networks.is_empty() {
+        eprintln!(
+            "\nThis device left {} network(s) without telling anybody; they keep what it \
+             claimed. The next start generates a new identity and knows nothing.",
+            networks.len()
+        );
+    }
+    Ok(())
 }
 
 /// `tsunagi id`: what this device is, and what changes it.
@@ -2915,5 +3243,85 @@ mod status_tests {
         let text = out.render(false);
         assert_eq!(out.worst(), Health::Degraded, "{text}");
         assert!(text.contains("same secret"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use tsunagi::identity::{NetworkKeys, NetworkName, NetworkSecret};
+    use tsunagi::storage::StoredNetwork;
+
+    fn configured(name: &str, secret: &str) -> StoredNetwork {
+        let name = NetworkName::new(name).unwrap();
+        let secret =
+            NetworkSecret::from_bytes(&[secret.as_bytes(), &[0u8; 32]].concat()[..32]).unwrap();
+        let keys = NetworkKeys::derive(&name, &secret);
+        StoredNetwork {
+            network_id: keys.network_id(),
+            name,
+            secret,
+            auto_start: true,
+        }
+    }
+
+    #[test]
+    fn a_prefix_of_the_id_is_enough_and_an_ambiguous_one_is_refused() {
+        // `status` prints ids shortened, so what a person has to hand is a
+        // prefix. Accepting it is the difference between leaving a network
+        // and copying 52 characters correctly.
+        let networks = vec![configured("lab", "one"), configured("lab", "two")];
+        let full = networks[0].network_id.to_string();
+
+        let picked = resolve_network(&networks, &full[..10]).unwrap();
+        assert_eq!(picked.network_id, networks[0].network_id);
+        // The ellipsis a person copies out of the report is not part of it.
+        let picked = resolve_network(&networks, &format!("{}…", &full[..10])).unwrap();
+        assert_eq!(picked.network_id, networks[0].network_id);
+
+        let err = resolve_network(&networks, "").unwrap_err();
+        assert!(err.contains("by its id"), "{err}");
+    }
+
+    #[test]
+    fn a_name_is_refused_because_two_networks_can_share_one() {
+        // Exactly the situation this command exists for: two networks called
+        // `lab`, one of them joined with a mistyped secret. Choosing for the
+        // user here is how the wrong one gets left.
+        let networks = vec![configured("lab", "one"), configured("lab", "two")];
+        let err = resolve_network(&networks, "lab").unwrap_err();
+        assert!(err.contains("not an id"), "{err}");
+        assert!(
+            err.contains("tsunagi network"),
+            "it says where to look: {err}"
+        );
+    }
+
+    #[test]
+    fn an_id_that_matches_nothing_says_so() {
+        let networks = vec![configured("lab", "one")];
+        let err = resolve_network(&networks, "zzzzzz").unwrap_err();
+        assert!(err.contains("no configured network"), "{err}");
+    }
+
+    #[test]
+    fn a_prefix_shared_by_two_networks_is_refused_rather_than_guessed() {
+        let networks = vec![configured("lab", "one"), configured("other", "two")];
+        let shared = &networks[0].network_id.to_string()[..1];
+        let both = networks
+            .iter()
+            .filter(|network| network.network_id.to_string().starts_with(shared))
+            .count();
+        if both < 2 {
+            // The two derived ids happen not to share a first character;
+            // the empty prefix is the same question with a certain answer.
+            let err = resolve_network(&networks, "").unwrap_err();
+            assert!(err.contains("by its id"), "{err}");
+            return;
+        }
+        let err = resolve_network(&networks, shared).unwrap_err();
+        assert!(err.contains("use more of the id"), "{err}");
     }
 }

@@ -344,6 +344,19 @@ pub trait IpPlugin: Send + Sync + std::fmt::Debug + 'static {
     /// The plugin is expected to remove whatever it created for that network.
     fn on_network_deactivated(&self, network: NetworkId);
 
+    /// Called when this agent has left a network for good.
+    ///
+    /// Deactivation is temporary and keeps everything ready for next time;
+    /// this is the other one. Whatever the plugin holds *durably* for that
+    /// network — a key of its own, a file, a record — goes now, because the
+    /// agent is no longer a member and keeping it is keeping a secret for a
+    /// network it cannot rejoin without being told the secret again.
+    ///
+    /// Always preceded by [`IpPlugin::on_network_deactivated`], so this is
+    /// only about what outlives a session. Defaulted to nothing, for a
+    /// plugin that stores nothing.
+    fn on_network_forgotten(&self, _network: NetworkId) {}
+
     /// Called once when the agent shuts down.
     ///
     /// The plugin removes the system objects it created and stops its tasks.
