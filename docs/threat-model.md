@@ -41,6 +41,12 @@ Read this before relying on anything here. The protocol is in
 - **Weak secrets.** This targets high-entropy secrets. There is no PAKE, so a
   short human passphrase can be guessed offline by anyone who can reach the
   handshake. Use `NetworkSecret::generate()`.
+- **Public address publication.** With `TransportPolicy::N0Defaults` or
+  `DirectOnly`, iroh publishes a signed record of this endpoint's addresses,
+  keyed by its endpoint id, to Number 0's public pkarr/DNS service, and
+  resolves peers through it. The network secret is never published and
+  membership cannot be inferred from a single record, but the endpoint's
+  existence and its addresses become public. `LocalOnly` publishes nothing.
 - **Addresses and metadata are observable.** Anyone able to watch the network
   sees addresses, timing and volume. Discovery backends see the
   `discovery_key` and the addresses published under it, which is enough to map

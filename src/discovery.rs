@@ -8,14 +8,17 @@
 //! A discovery backend must not carry control messages between agents, must not
 //! confirm authentication and must not mutate agent state directly.
 //!
-//! Two concerns are kept apart:
+//! Two concerns are kept apart, and only the first one is this module's:
 //!
 //! * *Finding members of a network* — [`NetworkDiscovery::resolve`], keyed by
-//!   the secret-derived [`DiscoveryKey`].
-//! * *Resolving the address of one iroh endpoint* — an
-//!   [`iroh::EndpointAddr`] either already carries addresses, or iroh's own
-//!   address lookup service must be enabled. Dialling a bare [`EndpointId`]
-//!   with neither is expected to fail.
+//!   the secret-derived [`DiscoveryKey`]. That is what lives here, and today
+//!   it is [`StaticBootstrap`] plus a test backend; a DHT backend is future
+//!   work.
+//! * *Resolving the address of one iroh endpoint* — **iroh's job, not ours**.
+//!   With [`crate::config::TransportPolicy::N0Defaults`] or `DirectOnly`, iroh
+//!   publishes and resolves endpoint addresses through Number 0's public
+//!   service, so dialling a bare [`EndpointId`] works. With `LocalOnly` there
+//!   is no lookup, and a candidate must carry addresses of its own.
 //!
 //! No empty result ever proves a network is empty. It only means "nobody found
 //! yet".

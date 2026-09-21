@@ -71,13 +71,17 @@ impl PathArgs {
 }
 
 /// How much external connectivity machinery the endpoint may use.
+///
+/// `direct` and `n0` publish this endpoint's addresses, keyed by its endpoint
+/// id, to Number 0's public lookup service, and resolve peers through it.
+/// That is what makes `--peer <endpoint-id>` work without an address.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Transport {
-    /// Loopback and the local network only. No relays, no address lookup.
+    /// Loopback and the local network only. Publishes nothing.
     Local,
     /// Public address lookup, but no relays.
     Direct,
-    /// iroh's defaults: address lookup plus the public n0 relays.
+    /// iroh's defaults: public address lookup plus the public n0 relays.
     N0,
 }
 
@@ -378,8 +382,16 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let agent = Agent::spawn(config).await?;
+    // From here on every exit goes through `agent.shutdown()`, so the endpoint
+    // is never dropped without being closed.
     let mut events = agent.subscribe();
-    let network = agent.join_network(&name, &secret).await?;
+    let network = match agent.join_network(&name, &secret).await {
+        Ok(network) => network,
+        Err(err) => {
+            agent.shutdown().await;
+            return Err(err.into());
+        }
+    };
 
     println!("tsunagi is up");
     println!("  endpoint id  {}", agent.endpoint_id());
@@ -401,11 +413,8 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(err) = signal {
-                    eprintln!("cannot listen for Ctrl-C: {err}");
-                }
-                println!("\nstopping...");
+            reason = stop_signal() => {
+                println!("\nstopping ({reason})...");
                 break;
             }
             event = events.recv() => match event {
@@ -429,6 +438,34 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     agent.shutdown().await;
     println!("stopped.");
     Ok(())
+}
+
+/// Resolves when the process is asked to stop.
+///
+/// Both Ctrl-C and `SIGTERM` are handled, so a service manager stopping the
+/// agent gets the same clean shutdown an interactive user does.
+async fn stop_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(err) => {
+                eprintln!("cannot listen for SIGTERM: {err}");
+                let _ = tokio::signal::ctrl_c().await;
+                return "interrupted";
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "interrupted",
+            _ = terminate.recv() => "terminated",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "interrupted"
+    }
 }
 
 #[cfg(feature = "tun-device")]

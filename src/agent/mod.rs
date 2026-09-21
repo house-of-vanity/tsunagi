@@ -242,10 +242,17 @@ impl Agent {
         self.inner.events.subscribe()
     }
 
-    /// Adds a network to the persistent configuration and activates it.
+    /// Makes this agent a member of a network, activating it.
     ///
     /// The same `(name, secret)` always produces the same [`NetworkId`], on
     /// every device.
+    ///
+    /// This is declarative and therefore **idempotent**: joining a network
+    /// that is already active succeeds and changes nothing. That matters
+    /// because a configured network is activated automatically at startup, so
+    /// running the same command twice must not be an error. Use
+    /// [`Agent::activate_network`] when you specifically want to know whether
+    /// an inactive network was started.
     pub async fn join_network(
         &self,
         name: &NetworkName,
@@ -257,11 +264,17 @@ impl Agent {
             .storage
             .upsert_network(network_id, name.clone(), secret.clone(), true)
             .await?;
-        self.activate_with_keys(keys).await?;
-        Ok(network_id)
+        match self.activate_with_keys(keys).await {
+            // Already a member of exactly this network space: nothing to do.
+            Ok(()) | Err(Error::NetworkAlreadyActive(_)) => Ok(network_id),
+            Err(err) => Err(err),
+        }
     }
 
     /// Activates a configured network that is currently inactive.
+    ///
+    /// Fails with [`Error::NetworkAlreadyActive`] if it is already running.
+    /// [`Agent::join_network`] is the forgiving version.
     pub async fn activate_network(&self, network_id: NetworkId) -> Result<()> {
         let stored = self
             .inner

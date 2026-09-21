@@ -79,6 +79,42 @@ async fn a_restarted_agent_keeps_its_identity_and_reconnects() {
 }
 
 #[tokio::test]
+async fn joining_a_network_twice_is_not_an_error() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("idempotent-join");
+
+    let agent = TestAgent::spawn(&discovery).await.unwrap();
+
+    // Joining is declarative: saying it twice in one run must be fine.
+    let first = agent.agent.join_network(&name, &secret).await.unwrap();
+    let again = agent.agent.join_network(&name, &secret).await.unwrap();
+    assert_eq!(first, again);
+    assert_eq!(agent.agent.list_networks().await.unwrap().len(), 1);
+
+    // Activating explicitly is the strict version and does report it.
+    assert!(matches!(
+        agent.agent.activate_network(first).await,
+        Err(Error::NetworkAlreadyActive(_))
+    ));
+
+    // And after a restart, where the network came back up on its own, the
+    // same command must still succeed. This is what running the CLI twice
+    // does.
+    let dir = agent.stop().await;
+    let restarted = Agent::spawn(config_with(dir.path(), &discovery))
+        .await
+        .unwrap();
+    assert!(restarted.is_active(first).await, "auto-start brought it up");
+    let rejoined = restarted.join_network(&name, &secret).await.unwrap();
+    assert_eq!(rejoined, first);
+    assert!(restarted.network_status(first).await.is_ok());
+
+    restarted.shutdown().await;
+    drop(restarted);
+    drop(dir);
+}
+
+#[tokio::test]
 async fn readiness_does_not_wait_for_anyone_else() {
     let discovery = SharedMemoryDiscovery::new();
     let (name, secret) = network("lonely");
