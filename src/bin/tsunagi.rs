@@ -346,83 +346,496 @@ async fn show_id(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Reports what this machine can and cannot do, and how badly it matters.
+///
+/// Three levels, and the distinction between the middle two is deliberate:
+/// *degraded* is something the agent runs without and that the user can fix
+/// from a stated one-liner, *broken* is something it cannot work around.
+/// Getting those the wrong way round makes a diagnostic tool useless, so
+/// each check below says which it is and why.
 async fn doctor(paths: PathArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use report::{Health, Report, Row, Section};
+
     let paths = paths.resolve()?;
-    println!("tsunagi doctor\n");
+    let mut doctor = Report::new();
 
-    println!("state directory  {}", paths.state_dir.display());
-    println!("cache directory  {}", paths.cache_dir.display());
-    match std::fs::create_dir_all(&paths.state_dir) {
-        Ok(()) => println!("  writable       yes"),
-        Err(err) => println!("  writable       NO ({err})"),
-    }
+    // Storage. The asymmetry here is the point: state is mandatory and cache
+    // is disposable, so the same failure means different things.
+    let mut storage = Section::new("storage");
+    storage.push(match std::fs::create_dir_all(&paths.state_dir) {
+        Ok(()) => Row::new(
+            Health::Good,
+            "state directory",
+            format!("{} (writable)", paths.state_dir.display()),
+        ),
+        Err(err) => Row::new(
+            Health::Broken,
+            "state directory",
+            format!("{}: {err}", paths.state_dir.display()),
+        )
+        .with_note("mandatory: the agent will not start without it"),
+    });
+    storage.push(match std::fs::create_dir_all(&paths.cache_dir) {
+        Ok(()) => Row::new(
+            Health::Good,
+            "cache directory",
+            format!("{} (writable)", paths.cache_dir.display()),
+        ),
+        Err(err) => Row::new(
+            Health::Degraded,
+            "cache directory",
+            format!("{}: {err}", paths.cache_dir.display()),
+        )
+        .with_note("disposable: the agent runs, rediscovering what it cached"),
+    });
+    doctor.push(storage);
 
-    println!("\ncontrol plane");
-    println!("  needs         outbound UDP; no privileges");
-    println!("  status        always available");
+    // Control plane. Binding a socket is a real check rather than a claim.
+    let mut control = Section::new("control plane");
+    control.push(
+        match std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            .or_else(|_| std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)))
+        {
+            Ok(_) => Row::new(Health::Good, "udp socket", "can bind; no privileges needed"),
+            Err(err) => Row::new(Health::Broken, "udp socket", format!("cannot bind: {err}"))
+                .with_note("nothing will reach any peer"),
+        },
+    );
+    doctor.push(control);
 
-    println!("\ndata plane (WireGuard)");
-    println!("  implementation userspace (boringtun); no kernel module needed");
+    let mut data = Section::new("data plane (WireGuard)");
+    data.push(Row::new(
+        Health::Good,
+        "implementation",
+        "userspace (boringtun); no kernel module needed",
+    ));
     #[cfg(feature = "tun-device")]
     {
-        let tun_path = std::path::Path::new("/dev/net/tun");
         if cfg!(target_os = "linux") {
-            if tun_path.exists() {
+            let tun_path = std::path::Path::new("/dev/net/tun");
+            data.push(if !tun_path.exists() {
+                Row::new(Health::Broken, "/dev/net/tun", "missing")
+                    .with_note("load the `tun` module; without it there can be no interface")
+            } else {
                 match std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(tun_path)
                 {
-                    Ok(_) => println!("  /dev/net/tun   openable"),
-                    Err(err) => println!("  /dev/net/tun   present but not openable ({err})"),
+                    Ok(_) => Row::new(Health::Good, "/dev/net/tun", "openable"),
+                    Err(err) => Row::new(
+                        Health::Broken,
+                        "/dev/net/tun",
+                        format!("not openable: {err}"),
+                    )
+                    .with_note("the device node must be readable and writable by this user"),
                 }
-            } else {
-                println!("  /dev/net/tun   missing (load the `tun` module)");
-            }
+            });
         }
-        println!("  interfaces     supported on this build");
-    }
-    #[cfg(not(feature = "tun-device"))]
-    println!("  interfaces     not built in (enable the `tun-device` feature)");
 
-    #[cfg(feature = "tun-device")]
-    {
         use tsunagi::dataplane::wireguard::{Privilege, probe_net_admin};
         match probe_net_admin() {
             Privilege::Available => {
-                println!("  privileges     CAP_NET_ADMIN held");
-                println!(
-                    "  interface      managed by the agent: created on start, \
-                     removed on exit"
-                );
+                data.push(Row::new(Health::Good, "privileges", "CAP_NET_ADMIN held"));
+                data.push(Row::new(
+                    Health::Good,
+                    "interface",
+                    "managed by the agent: created on start, removed on exit",
+                ));
             }
-            Privilege::Missing(reason) => {
-                println!("  privileges     no CAP_NET_ADMIN ({reason})");
-                println!("  interface      cannot be created; run with `--no-tun` meanwhile");
-                println!(
-                    "  to grant it    {}",
-                    Privilege::how_to_grant(&program_path())
+            Privilege::Missing(_) => {
+                // The note is the command and nothing else: a paragraph of
+                // explanation belongs in the runtime error, not in a column
+                // the eye is meant to scan.
+                data.push(
+                    Row::new(Health::Degraded, "privileges", "CAP_NET_ADMIN not held")
+                        .with_note(format!("sudo setcap cap_net_admin+p {}", program_path())),
                 );
+                data.push(Row::new(
+                    Health::Degraded,
+                    "interface",
+                    "cannot be created; run with `--no-tun` meanwhile",
+                ));
             }
             Privilege::Unsupported => {
-                println!(
-                    "  privileges     managing interfaces is not implemented on {} yet",
-                    std::env::consts::OS
-                );
-                println!("  interface      cannot be created; run with `--no-tun`");
+                data.push(Row::new(
+                    Health::Degraded,
+                    "privileges",
+                    format!(
+                        "managing interfaces is not implemented on {} yet",
+                        std::env::consts::OS
+                    ),
+                ));
+                data.push(Row::new(
+                    Health::Degraded,
+                    "interface",
+                    "cannot be created; run with `--no-tun`",
+                ));
             }
         }
     }
+    #[cfg(not(feature = "tun-device"))]
+    data.push(
+        Row::new(
+            Health::Degraded,
+            "interface",
+            "not built in; the tunnels run but cannot reach the OS",
+        )
+        .with_note("rebuild with the `tun-device` feature, or run with `--no-tun`"),
+    );
+    doctor.push(data);
 
-    println!("\nlocal addresses");
-    let state = netwatch_addresses().await;
-    if state.is_empty() {
-        println!("  none found");
+    let mut addresses = Section::new("local addresses");
+    let found = netwatch_addresses().await;
+    if found.is_empty() {
+        addresses.push(
+            Row::new(Health::Degraded, "interfaces", "none found")
+                .with_note("best effort; the agent may still find a way out"),
+        );
     }
-    for addr in state {
-        println!("  {addr}");
+    for addr in found {
+        // Loopback alone reaches nobody, but on a host that also has a real
+        // address it is unremarkable, so it is labelled rather than flagged.
+        let kind = match (addr.is_loopback(), addr.is_ipv4()) {
+            (true, _) => "loopback",
+            (false, true) => "ipv4",
+            (false, false) => "ipv6",
+        };
+        addresses.push(Row::new(Health::Good, kind, addr.to_string()));
     }
+    doctor.push(addresses);
+
+    // `anstream` decides whether the escapes survive: they are stripped when
+    // stdout is not a terminal, when NO_COLOR is set, and on a Windows console
+    // that cannot render them.
+    use std::io::Write;
+    let mut out = anstream::stdout().lock();
+    writeln!(out, "tsunagi doctor\n")?;
+    write!(out, "{}", doctor.render(true))?;
     Ok(())
+}
+
+/// The shape of what `tsunagi doctor` reports.
+///
+/// Findings are built first and rendered second, so what is reported is
+/// decided separately from how it looks and can be tested without a
+/// terminal. Colour is deliberately *redundant*: every row carries a word as
+/// well, so the report reads the same when the escapes are stripped — piped
+/// to a file, on a dumb terminal, or by someone who cannot distinguish the
+/// colours.
+mod report {
+    use anstyle::{AnsiColor, Color, Style};
+
+    /// How healthy one finding is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Health {
+        /// Works, nothing to do.
+        Good,
+        /// The agent runs, but something it could do it cannot, and there is
+        /// a remedy. A missing capability with a one-line fix lands here.
+        Degraded,
+        /// Something the agent needs is unavailable and the function it
+        /// serves will not work at all.
+        Broken,
+    }
+
+    impl Health {
+        /// The word printed in the margin. Four characters, so rows line up.
+        fn word(self) -> &'static str {
+            match self {
+                Health::Good => "ok  ",
+                Health::Degraded => "warn",
+                Health::Broken => "FAIL",
+            }
+        }
+
+        fn style(self) -> Style {
+            let colour = match self {
+                Health::Good => AnsiColor::Green,
+                Health::Degraded => AnsiColor::Yellow,
+                Health::Broken => AnsiColor::Red,
+            };
+            Style::new().fg_color(Some(Color::Ansi(colour)))
+        }
+    }
+
+    /// One finding.
+    #[derive(Debug, Clone)]
+    pub struct Row {
+        health: Health,
+        label: String,
+        detail: String,
+        /// What to do about it, when there is something to do.
+        note: Option<String>,
+    }
+
+    impl Row {
+        /// A finding with no remedy attached.
+        pub fn new(health: Health, label: impl Into<String>, detail: impl Into<String>) -> Self {
+            Self {
+                health,
+                label: label.into(),
+                detail: detail.into(),
+                note: None,
+            }
+        }
+
+        /// Adds the remedy shown under the row.
+        pub fn with_note(mut self, note: impl Into<String>) -> Self {
+            self.note = Some(note.into());
+            self
+        }
+    }
+
+    /// A group of findings under a heading.
+    #[derive(Debug, Clone)]
+    pub struct Section {
+        title: String,
+        rows: Vec<Row>,
+    }
+
+    impl Section {
+        /// An empty section.
+        pub fn new(title: impl Into<String>) -> Self {
+            Self {
+                title: title.into(),
+                rows: Vec::new(),
+            }
+        }
+
+        /// Adds a finding.
+        pub fn push(&mut self, row: Row) {
+            self.rows.push(row);
+        }
+    }
+
+    /// Everything `doctor` found.
+    #[derive(Debug, Clone, Default)]
+    pub struct Report {
+        sections: Vec<Section>,
+    }
+
+    impl Report {
+        /// An empty report.
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Adds a section, dropping it if it has no findings.
+        pub fn push(&mut self, section: Section) {
+            if !section.rows.is_empty() {
+                self.sections.push(section);
+            }
+        }
+
+        fn count(&self, health: Health) -> usize {
+            self.sections
+                .iter()
+                .flat_map(|section| &section.rows)
+                .filter(|row| row.health == health)
+                .count()
+        }
+
+        /// The worst thing in the report.
+        pub fn worst(&self) -> Health {
+            if self.count(Health::Broken) > 0 {
+                Health::Broken
+            } else if self.count(Health::Degraded) > 0 {
+                Health::Degraded
+            } else {
+                Health::Good
+            }
+        }
+
+        /// The closing line.
+        fn summary(&self) -> String {
+            fn checks(count: usize) -> String {
+                if count == 1 {
+                    "1 check".to_string()
+                } else {
+                    format!("{count} checks")
+                }
+            }
+            let (degraded, broken) = (self.count(Health::Degraded), self.count(Health::Broken));
+            match (degraded, broken) {
+                (0, 0) => "everything checked out".to_string(),
+                (0, broken) => format!("{} broken", checks(broken)),
+                (degraded, 0) => format!("{} degraded", checks(degraded)),
+                (degraded, broken) => {
+                    format!("{} degraded, {} broken", checks(degraded), checks(broken))
+                }
+            }
+        }
+
+        /// Renders the report.
+        ///
+        /// `styled` false leaves out every escape sequence, which is what a
+        /// test asserts against and what a redirected stdout gets.
+        pub fn render(&self, styled: bool) -> String {
+            let width = self
+                .sections
+                .iter()
+                .flat_map(|section| &section.rows)
+                .map(|row| row.label.chars().count())
+                .max()
+                .unwrap_or(0);
+
+            let paint = |style: Style, text: &str| {
+                if styled {
+                    format!("{style}{text}{style:#}")
+                } else {
+                    text.to_string()
+                }
+            };
+            let bold = Style::new().bold();
+            let dim = Style::new().dimmed();
+
+            let mut out = String::new();
+            for section in &self.sections {
+                out.push_str(&paint(bold, &section.title));
+                out.push('\n');
+                for row in &section.rows {
+                    out.push_str(&format!(
+                        "  {}  {:width$}  {}\n",
+                        paint(row.health.style(), row.health.word()),
+                        row.label,
+                        row.detail,
+                        width = width
+                    ));
+                    if let Some(note) = &row.note {
+                        // Indented under the row it belongs to, and dimmed so
+                        // the findings stay the thing the eye lands on.
+                        out.push_str(&format!(
+                            "  {:4}  {:width$}  {}\n",
+                            "",
+                            "",
+                            paint(dim, note),
+                            width = width
+                        ));
+                    }
+                }
+                out.push('\n');
+            }
+
+            let worst = self.worst();
+            out.push_str(&paint(worst.style(), &self.summary()));
+            out.push('\n');
+            out
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+        use super::*;
+
+        fn sample() -> Report {
+            let mut report = Report::new();
+            let mut storage = Section::new("storage");
+            storage.push(Row::new(Health::Good, "state", "/var/lib/tsunagi"));
+            storage.push(
+                Row::new(Health::Degraded, "cache directory", "not writable")
+                    .with_note("disposable; the agent runs without it"),
+            );
+            report.push(storage);
+            let mut plane = Section::new("data plane");
+            plane.push(Row::new(Health::Broken, "/dev/net/tun", "missing"));
+            report.push(plane);
+            report
+        }
+
+        /// Drops every CSI sequence, so a styled render can be compared with
+        /// a plain one.
+        fn strip(text: &str) -> String {
+            let mut out = String::new();
+            let mut chars = text.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\u{1b}' {
+                    for ch in chars.by_ref() {
+                        if ch == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn an_unstyled_report_carries_no_escape_sequences() {
+            // Colour must never be the only signal: this is what lands in a
+            // file, a pipe, or a terminal that cannot do colour.
+            let text = sample().render(false);
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(text.contains("ok  "));
+            assert!(text.contains("warn"));
+            assert!(text.contains("FAIL"));
+        }
+
+        #[test]
+        fn a_styled_report_says_the_same_thing_with_escapes_added() {
+            let styled = sample().render(true);
+            assert!(styled.contains('\u{1b}'));
+            assert_eq!(strip(&styled), sample().render(false));
+        }
+
+        #[test]
+        fn the_detail_column_starts_at_the_same_offset_on_every_row() {
+            // Labels differ in length across sections, so the padding has to
+            // be computed over the whole report rather than per section.
+            let mut report = Report::new();
+            let mut short = Section::new("short labels");
+            short.push(Row::new(Health::Good, "a", "detail-one"));
+            report.push(short);
+            let mut long = Section::new("long labels");
+            long.push(Row::new(
+                Health::Broken,
+                "a-much-longer-label",
+                "detail-two",
+            ));
+            report.push(long);
+
+            let text = report.render(false);
+            let offsets: Vec<usize> = ["detail-one", "detail-two"]
+                .iter()
+                .map(|detail| {
+                    let line = text
+                        .lines()
+                        .find(|line| line.contains(detail))
+                        .unwrap_or_else(|| panic!("no row for {detail} in:\n{text}"));
+                    line.find(detail).unwrap()
+                })
+                .collect();
+            assert_eq!(offsets[0], offsets[1], "misaligned:\n{text}");
+        }
+
+        #[test]
+        fn the_summary_names_the_worst_thing_found() {
+            assert_eq!(sample().worst(), Health::Broken);
+            assert!(
+                sample()
+                    .render(false)
+                    .contains("1 check degraded, 1 check broken")
+            );
+
+            let mut clean = Report::new();
+            let mut section = Section::new("storage");
+            section.push(Row::new(Health::Good, "state", "fine"));
+            clean.push(section);
+            assert_eq!(clean.worst(), Health::Good);
+            assert!(clean.render(false).contains("everything checked out"));
+        }
+
+        #[test]
+        fn an_empty_section_is_left_out_rather_than_printed_bare() {
+            let mut report = Report::new();
+            report.push(Section::new("nothing here"));
+            assert!(!report.render(false).contains("nothing here"));
+        }
+    }
 }
 
 /// This program's path, for an instruction the user can paste.
