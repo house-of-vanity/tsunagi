@@ -110,6 +110,16 @@ pub enum Error {
     #[error("agent is stopped")]
     Stopped,
 
+    /// Something that had to answer in bounded time did not.
+    ///
+    /// Reported instead of waited out: an agent that has wedged must not
+    /// leave a command hanging with nothing on screen and no way out.
+    #[error("{what} did not answer in time")]
+    Timeout {
+        /// What was asked, phrased so the message stands on its own.
+        what: String,
+    },
+
     /// Discovery backend failure. Never fatal for the agent.
     #[error("discovery error: {0}")]
     Discovery(String),

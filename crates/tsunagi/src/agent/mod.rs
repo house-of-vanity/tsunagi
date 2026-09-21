@@ -51,6 +51,7 @@ use crate::proto::message::ControlMessage;
 use crate::state::Ipv4Range;
 use crate::storage::{CacheOutcome, Storage};
 
+use crate::task::{TASK_GRACE, wind_down};
 use network::{InboundSession, NetCommand, NetworkHandle, RuntimeParams};
 use shutdown::Shutdown;
 
@@ -750,12 +751,22 @@ impl Agent {
             handle.stop().await;
         }
 
-        self.inner.adapter.close().await;
+        // iroh's own close waits for peers to acknowledge; a peer that has
+        // gone silent must not decide how long that takes.
+        if tokio::time::timeout(TASK_GRACE, self.inner.adapter.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("the endpoint did not close in time; abandoning it");
+        }
 
-        for handle in [&self.inner.accept_task, &self.inner.plugin_task] {
+        for (what, handle) in [
+            ("inbound connections", &self.inner.accept_task),
+            ("plugin requests", &self.inner.plugin_task),
+        ] {
             let task = handle.lock().ok().and_then(|mut guard| guard.take());
             if let Some(task) = task {
-                let _ = task.await;
+                wind_down(task, TASK_GRACE, what).await;
             }
         }
 

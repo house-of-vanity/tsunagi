@@ -10,6 +10,10 @@ repository.workspace = true
 [[bin]]
 name = "tsunagi"
 path = "src/main.rs"
+# The binary and the library share a name, which `cargo doc` cannot map to
+# two directories. The command line is documented by `--help`, not rustdoc,
+# so the library keeps the name and this opts out.
+doc = false
 
 [dependencies]
 tsunagi = { path = "../tsunagi", version = "0.1.0", features = ["tun-device", "dns-publish"] }

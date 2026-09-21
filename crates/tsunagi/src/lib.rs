@@ -48,6 +48,7 @@ pub mod overlay;
 pub mod proto;
 pub mod state;
 pub mod storage;
+pub mod task;
 #[cfg(feature = "testing")]
 pub mod testing;
 

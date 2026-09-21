@@ -16,9 +16,12 @@ rights and no changes to OS network settings: endpoints bind `127.0.0.1:0` and
 disabled, and net-report probing is reduced to its minimum.
 
 Synchronisation is always "wait for a specific event or condition under one
-overall deadline" (`wait_event`, `wait_until`, 30 s). `settle()` exists only
-for asserting that something did *not* happen. Ports are dynamic and
-directories are isolated, so tests run in parallel.
+overall deadline" (`wait_event`, `wait_until`, 30 s). The deadline covers the
+probe as well as the gaps between probes: a call into a wedged agent that
+never answers fails the test rather than hanging the process, which is the
+difference between a red run and a test binary still burning a core the next
+day. `settle()` exists only for asserting that something did *not* happen.
+Ports are dynamic and directories are isolated, so tests run in parallel.
 
 Several library instances in one process is exactly that. It is **not** a test
 of several system processes, and is not presented as one.

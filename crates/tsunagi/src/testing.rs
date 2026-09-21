@@ -155,14 +155,22 @@ where
 {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        if let Some(value) = probe().await {
-            return value;
-        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
         assert!(
-            Instant::now() < deadline,
+            !remaining.is_zero(),
             "timed out waiting for condition: {what}"
         );
-        tokio::time::sleep(POLL_INTERVAL).await;
+
+        // The probe is bounded too. A deadline checked only between probes is
+        // no deadline at all: one call into a wedged agent that never answers
+        // would hang the test process for ever instead of failing it.
+        match tokio::time::timeout(remaining, probe()).await {
+            Ok(Some(value)) => return value,
+            Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
+            Err(_) => panic!("timed out waiting for condition: {what}"),
+        }
     }
 }
 
@@ -189,4 +197,21 @@ pub async fn wait_for_peers(
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "timed out waiting for condition")]
+    async fn a_probe_that_never_answers_fails_the_deadline_instead_of_hanging() {
+        // Virtual time, so the deadline arrives at once rather than in thirty
+        // real seconds — and the deadline does arrive, which is the point: a
+        // probe that never returns used to hang the process instead.
+        wait_until::<(), _, _>("an answer that never comes", || async {
+            std::future::pending::<Option<()>>().await
+        })
+        .await;
+    }
 }

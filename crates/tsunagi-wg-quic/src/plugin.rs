@@ -45,6 +45,7 @@ use crate::device::{PeerSummary, WireguardDevice};
 use crate::keys::{WgPublicKey, WgSecretKey};
 use crate::store::WgKeyStore;
 use tsunagi::state::Ipv4Range;
+use tsunagi::task::{TASK_GRACE, wind_down};
 
 /// The protocol identifier this plugin announces.
 /// The protocol id of this plugin.
@@ -795,11 +796,14 @@ impl IpPlugin for WireguardPlugin {
         Box::pin(async move {
             let (reply_tx, reply_rx) = oneshot::channel();
             if self.commands.send(Command::Stop(reply_tx)).await.is_ok() {
-                let _ = reply_rx.await;
+                // Bounded here as well as by the agent's grace: that grace
+                // abandons this future, which would leave the runtime task
+                // running behind it.
+                let _ = tokio::time::timeout(TASK_GRACE, reply_rx).await;
             }
             let task = self.task.lock().ok().and_then(|mut guard| guard.take());
             if let Some(task) = task {
-                let _ = task.await;
+                wind_down(task, TASK_GRACE, "wg-quic runtime").await;
             }
         })
     }

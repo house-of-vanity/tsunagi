@@ -51,3 +51,25 @@ impl Shutdown {
         // The sender is gone, which for our purposes means "stop".
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn waiting_resolves_once_triggered_and_stays_resolved() {
+        let shutdown = Shutdown::new();
+        assert!(!shutdown.is_triggered());
+        let waiter = shutdown.clone();
+        let waiting = tokio::spawn(async move { waiter.wait().await });
+        shutdown.trigger();
+        waiting.await.unwrap();
+        assert!(shutdown.is_triggered());
+        // Triggering twice is not an error, and a token cloned afterwards
+        // sees the trigger that already happened.
+        shutdown.trigger();
+        shutdown.clone().wait().await;
+    }
+}

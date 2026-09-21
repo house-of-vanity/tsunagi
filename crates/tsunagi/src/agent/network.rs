@@ -105,7 +105,7 @@ impl NetworkHandle {
     /// Stops the runtime and waits for its task to finish.
     pub(crate) async fn stop(self) {
         self.shutdown.trigger();
-        let _ = self.task.await;
+        crate::task::wind_down(self.task, crate::task::TASK_GRACE, "network runtime").await;
     }
 }
 
