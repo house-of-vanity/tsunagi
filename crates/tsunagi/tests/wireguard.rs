@@ -474,10 +474,10 @@ async fn an_allocated_address_missing_from_the_host_is_reported() {
         reason.contains(&allocated.to_string()),
         "unexpected: {reason}"
     );
-    // The agent assigns the address itself, so the report says which
-    // interface should have had it rather than a command to run.
+    // The agent owns the interface, so it is the agent that notices and the
+    // report names the interface the address should have been on.
     assert!(
-        reason.contains(&a.plugin.overview(network_id).unwrap().interface),
+        reason.contains(&a.agent.overlay().unwrap().interface),
         "must name the interface: {reason}"
     );
 
@@ -815,7 +815,6 @@ async fn restarting_keeps_the_wireguard_identity_and_overlay_address() {
     })
     .await;
     assert_eq!(after.public_key, before.public_key);
-    assert_eq!(after.interface, before.interface);
 
     // The tunnel comes back on its own.
     wait_until("the tunnel is re-established", || async {

@@ -73,13 +73,13 @@ cargo build --release
 ./target/release/tsunagi id secret generate   # prints tsn1...; share it privately
 ./target/release/tsunagi status          # this device, the agent, and this host
 
-./target/release/tsunagi up --network lab --secret "$SECRET" --wireguard
+./target/release/tsunagi up --network lab --secret "$SECRET"
 ```
 
 It prints its endpoint id and then waits. On the second machine, pass that id:
 
 ```bash
-./target/release/tsunagi up --network lab --secret "$SECRET" --wireguard \
+./target/release/tsunagi up --network lab --secret "$SECRET" \
   --peer <endpoint-id-from-the-first-machine>
 ```
 
@@ -134,8 +134,8 @@ id and collides with essentially nothing.
 what they find, so `--ipv4-range` only matters for whoever starts the network:
 
 ```bash
-tsunagi up --network lab --secret "$SECRET" --wireguard --ipv4-range 10.44.0.0/16
-tsunagi up --network lab --secret "$SECRET" --wireguard --ipv4-range none   # IPv6 only
+tsunagi up --network lab --secret "$SECRET"  --ipv4-range 10.44.0.0/16
+tsunagi up --network lab --secret "$SECRET"  --ipv4-range none   # IPv6 only
 ```
 
 An address is claimed with a record signed by that member's persistent device
@@ -149,13 +149,48 @@ Because the address is allocated at run time rather than derived, it is not
 known until the agent has started and agreed with its peers. The agent then
 assigns it to the interface itself.
 
+## Levels
+
+The command line is split the way the design is. A bare `tsunagi up` needs
+only a network name and a secret; everything else sits under the level it
+belongs to, which `--help` shows as two sections:
+
+* **System** — what the agent itself does: how it reaches peers (`--reach`),
+  the one overlay interface it owns (`--interface`, `--mtu`, `--no-tun`), the
+  address range (`--ipv4-range`), and the local resolver (`--dns`).
+* **Transport** — which protocols carry packets (`--protocol`, a list) and
+  their own settings (`-o key=value`, or `-o protocol:key=value`).
+
+```bash
+tsunagi protocols          # what this build can carry packets with
+```
+
+```text
+wg-quic  (wire version 4)
+        what                  WireGuard's cryptography carried in iroh's QUIC datagrams
+        -o keepalive=SECONDS  keeps a tunnel and its link warm through a NAT
+        -o mtu=BYTES          largest packet a tunnel will carry, at least 576
+```
+
+Each protocol declares its own settings, so the agent can list them without
+knowing anything about the protocol, and a setting no selected protocol takes
+is refused rather than ignored. `--protocol none` runs the control plane by
+itself.
+
+A pair of peers uses a protocol they both have **at the same wire version**.
+That is not the software version: two peers on different builds carry traffic
+for each other for as long as the bytes between them have not changed. A peer
+with nothing in common keeps its control plane — messages and signed state
+still flow — and simply has no data plane, which `tsunagi status` shows as a
+session with no agreed protocol.
+
 ## Names
 
 `--dns` serves a local DNS zone for the network's members, so they can be
 reached by name instead of by address:
 
 ```bash
-tsunagi up --network lab --secret "$SECRET" --wireguard --dns
+tsunagi up --network lab --secret "$SECRET" --dns
 dig @10.13.37.69 -p 5354 music.lab
 ```
 
@@ -407,7 +442,7 @@ explicitly.
 Two different lookups are involved, and only one of them is this project's:
 
 **1. Resolving one endpoint's address — iroh's, and it works today.**
-With `--transport relay` or `--transport direct`, iroh publishes a signed
+With `--reach relay` or `--reach direct`, iroh publishes a signed
 record of this endpoint's addresses, keyed by its endpoint id, to the public
 service run by Number 0 — "n0", the company behind iroh — at `dns.iroh.link`,
 over pkarr and DNS, and resolves other endpoints the same way. That is why `--peer <endpoint-id>` works with no address attached:
@@ -426,7 +461,7 @@ What this means in practice:
 - With `relay` or `direct`, **your endpoint id and IP addresses are published
   to a public third-party service** (Number 0's, unless you change it). They are not secret, and the network secret is
   never published, but an observer of that service learns that your endpoint
-  exists and where it is. `--transport local` publishes nothing.
+  exists and where it is. `--reach local` publishes nothing.
 - A relay, when one is needed, sees the volume and timing of your traffic — not
   its contents. The default relays are Number 0's, in the US, EU and
   Asia-Pacific.

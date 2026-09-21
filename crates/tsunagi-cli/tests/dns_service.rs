@@ -92,7 +92,7 @@ fn start(zone: &str, port: u16) -> Running {
         .arg("--cache-dir")
         .arg(dir.path().join("cache"))
         // No real interface and no internet: this is about the wiring.
-        .args(["--transport", "local", "--no-tun", "--wireguard", "--dns"])
+        .args(["--reach", "local", "--no-tun", "--dns"])
         .args(["--dns-zone", zone])
         .args(["--dns-port", &port.to_string()])
         .args(["--log", "error", "--status-interval", "0"])

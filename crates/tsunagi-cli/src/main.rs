@@ -50,6 +50,8 @@ enum Command {
     Up(Box<UpArgs>),
     /// Reports this device, what the agent is doing, and what this host can do.
     Status(StatusArgs),
+    /// Shows the protocols this build can carry packets with.
+    Protocols,
 }
 
 #[derive(Debug, Args)]
@@ -160,7 +162,7 @@ impl PathArgs {
 /// behind iroh — at `dns.iroh.link`, and resolve peers through it. That is
 /// what makes `--peer <endpoint-id>` work without an address.
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum Transport {
+enum Reach {
     /// Loopback and the local network only. Publishes nothing.
     Local,
     /// Public address lookup, direct paths only, no relays.
@@ -170,12 +172,12 @@ enum Transport {
     Relay,
 }
 
-impl From<Transport> for TransportPolicy {
-    fn from(value: Transport) -> Self {
+impl From<Reach> for TransportPolicy {
+    fn from(value: Reach) -> Self {
         match value {
-            Transport::Local => TransportPolicy::LocalOnly,
-            Transport::Direct => TransportPolicy::DirectOnly,
-            Transport::Relay => TransportPolicy::N0Defaults,
+            Reach::Local => TransportPolicy::LocalOnly,
+            Reach::Direct => TransportPolicy::DirectOnly,
+            Reach::Relay => TransportPolicy::N0Defaults,
         }
     }
 }
@@ -203,44 +205,70 @@ struct UpArgs {
     secret_file: Option<PathBuf>,
 
     /// Hostname to announce. Defaults to the machine's.
-    #[arg(long)]
+    #[arg(long, help_heading = "System")]
     hostname: Option<String>,
 
-    /// How much external connectivity to use.
-    #[arg(long, value_enum, default_value_t = Transport::Relay)]
-    transport: Transport,
+    /// How much of iroh's reachability to use.
+    ///
+    /// About how the *control plane* finds peers, not about which protocol
+    /// carries packets — that is `--protocol`.
+    #[arg(long, value_enum, default_value_t = Reach::Relay, help_heading = "System")]
+    reach: Reach,
 
     /// A peer to contact, as `<endpoint-id>` or `<endpoint-id>@<ip:port>,...`.
     ///
     /// One agent needs to know another to begin with. Repeat for several.
-    #[arg(long = "peer", value_name = "PEER")]
+    #[arg(long = "peer", value_name = "PEER", help_heading = "System")]
     peers: Vec<String>,
 
     /// Local address to bind. Repeat for several; defaults to iroh's choice.
-    #[arg(long = "bind", value_name = "ADDR")]
+    #[arg(long = "bind", value_name = "ADDR", help_heading = "System")]
     binds: Vec<SocketAddr>,
 
-    /// Run the WireGuard data plane.
-    #[arg(long)]
-    wireguard: bool,
+    /// Name of the overlay interface. One agent has one, whatever carries it.
+    #[arg(
+        long,
+        default_value = "tsun0",
+        value_name = "NAME",
+        help_heading = "System"
+    )]
+    interface: String,
+
+    /// Largest packet the overlay carries, at least 576.
+    #[arg(long, value_name = "BYTES", help_heading = "System")]
+    mtu: Option<u32>,
 
     /// Do not create a real network interface.
     ///
-    /// The WireGuard tunnels still run and handshake, so the mesh can be
-    /// verified with no privileges; traffic just does not reach the
-    /// operating system.
-    #[arg(long)]
+    /// Tunnels still run and handshake, so a mesh can be verified with no
+    /// privileges; traffic just does not reach the operating system.
+    #[arg(long, help_heading = "System")]
     no_tun: bool,
 
-    /// Interface name prefix for the WireGuard data plane.
-    #[arg(long, default_value = "tsun")]
-    wg_prefix: String,
-
-    /// Interface MTU for the WireGuard data plane.
+    /// Protocols to carry packets with, best first.
     ///
-    /// Must be at least 1280, the minimum IPv6 requires.
-    #[arg(long)]
-    wg_mtu: Option<u32>,
+    /// A pair of peers uses one they both have at the same wire version. A
+    /// peer with none in common keeps its control plane and gets no data
+    /// plane. `none` runs the control plane alone.
+    #[arg(
+        long = "protocol",
+        value_name = "LIST",
+        value_delimiter = ',',
+        default_value = "wg-quic",
+        help_heading = "Transport"
+    )]
+    protocols: Vec<String>,
+
+    /// A protocol setting, as `key=value` or `protocol:key=value`.
+    ///
+    /// Repeat for several. `tsunagi protocols` lists what each one takes.
+    #[arg(
+        short = 'o',
+        long = "protocol-option",
+        value_name = "KEY=VALUE",
+        help_heading = "Transport"
+    )]
+    protocol_options: Vec<String>,
 
     /// IPv4 overlay range, as `address/prefix`, or `none` to disable IPv4.
     ///
@@ -249,22 +277,22 @@ struct UpArgs {
     /// agent adopts what it finds. Addresses are allocated from it and
     /// recorded in signed state, so each member keeps its own across
     /// restarts and long absences.
-    #[arg(long, value_name = "CIDR")]
+    #[arg(long, value_name = "CIDR", help_heading = "System")]
     ipv4_range: Option<String>,
 
     /// Serve a local DNS zone for this network's members.
     ///
     /// Members resolve as `<hostname>.<zone>`, from signed state, so a
     /// member that is switched off still resolves. IPv4 only.
-    #[arg(long)]
+    #[arg(long, help_heading = "System")]
     dns: bool,
 
     /// The zone to answer for. Defaults to the network name.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", help_heading = "System")]
     dns_zone: Option<String>,
 
     /// Port for the local DNS server.
-    #[arg(long, default_value_t = 5354)]
+    #[arg(long, default_value_t = 5354, help_heading = "System")]
     dns_port: u16,
 
     /// How often to print a status summary, in seconds. Zero disables it.
@@ -353,6 +381,7 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Id(args) => id(args).await,
         Command::Up(args) => up(*args).await,
         Command::Status(args) => status(args).await,
+        Command::Protocols => show_protocols(),
     }
 }
 
@@ -539,7 +568,6 @@ fn dns_publisher() -> Arc<dyn tsunagi::dns::DnsPublisher> {
 /// Starts the DNS service for one network and keeps it in step with state.
 fn spawn_dns(
     agent: Agent,
-    wireguard: Option<Arc<WireguardPlugin>>,
     network: NetworkId,
     zone: tsunagi::dns::ZoneName,
     port: u16,
@@ -599,10 +627,11 @@ fn spawn_dns(
                     .iter()
                     .find(|member| member.endpoint_id == own)
                     .and_then(|member| member.overlay_address_v4);
-                let interface = wireguard
-                    .as_ref()
-                    .and_then(|plugin| plugin.overview(network))
-                    .map(|view| view.interface)
+                // The interface belongs to the agent, so the resolver
+                // setting attaches to that one and not to a protocol's.
+                let interface = agent
+                    .overlay()
+                    .map(|overlay| overlay.interface)
                     .filter(|name| !name.is_empty());
                 let wanted = listen_addresses(overlay, port);
                 if attempted != wanted {
@@ -725,6 +754,110 @@ fn update(state: &Arc<std::sync::Mutex<DnsState>>, edit: impl FnOnce(&mut DnsSta
         Ok(mut guard) => edit(&mut guard),
         Err(poisoned) => edit(&mut poisoned.into_inner()),
     }
+}
+
+/// What a protocol is called, what it speaks, and what it takes.
+///
+/// A registry rather than a lookup on the plugins themselves, because
+/// `tsunagi protocols` has to answer before anything is constructed, and
+/// because this is the list `--protocol` resolves against.
+struct ProtocolSpec {
+    /// The name on the wire, which is what peers compare.
+    name: &'static str,
+    /// The wire version. Not the software version: two peers on different
+    /// builds carry traffic for each other as long as this matches.
+    version: u16,
+    /// One line about what it is.
+    summary: &'static str,
+    /// The settings it accepts.
+    options: &'static [tsunagi::dataplane::ProtocolOption],
+}
+
+/// Every protocol this build has.
+const PROTOCOLS: &[ProtocolSpec] = &[ProtocolSpec {
+    name: tsunagi::dataplane::wireguard::WIREGUARD_PROTOCOL,
+    version: tsunagi::dataplane::wireguard::ANNOUNCEMENT_VERSION,
+    summary: "WireGuard's cryptography carried in iroh's QUIC datagrams, so it \
+              crosses NAT and survives where plain WireGuard is blocked",
+    options: WireguardPlugin::OPTIONS,
+}];
+
+/// One `-o` setting, and the protocol it was aimed at.
+struct Setting {
+    /// `Some` when written as `protocol:key=value`.
+    protocol: Option<String>,
+    key: String,
+    value: String,
+}
+
+/// Parses `-o` settings, which are `key=value` or `protocol:key=value`.
+fn parse_settings(raw: &[String]) -> Result<Vec<Setting>, Box<dyn std::error::Error>> {
+    raw.iter()
+        .map(|entry| {
+            let (left, value) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("`{entry}` is not a setting; write it as key=value"))?;
+            let (protocol, key) = match left.split_once(':') {
+                Some((protocol, key)) => (Some(protocol.to_string()), key),
+                None => (None, left),
+            };
+            if key.is_empty() {
+                return Err(format!("`{entry}` has no key").into());
+            }
+            Ok(Setting {
+                protocol,
+                key: key.to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The settings meant for one protocol, refusing any that fit nowhere.
+fn settings_for(spec: &ProtocolSpec, settings: &[Setting]) -> Vec<(String, String)> {
+    let mut taken = Vec::new();
+    for setting in settings {
+        let aimed_here = match &setting.protocol {
+            Some(name) => name == spec.name,
+            // Unqualified settings go to whichever protocol declares the
+            // key. With one selected that is the obvious reading; with
+            // several, write `protocol:key=value`.
+            None => spec.options.iter().any(|option| option.key == setting.key),
+        };
+        if aimed_here {
+            taken.push((setting.key.clone(), setting.value.clone()));
+        }
+    }
+    taken
+}
+
+/// Shows the protocols this build has, and what each one takes.
+fn show_protocols() -> Result<(), Box<dyn std::error::Error>> {
+    use report::{Health, Report, Row, Section};
+
+    let mut out = Report::new();
+    for spec in PROTOCOLS {
+        let mut section = Section::new(format!("{}  (wire version {})", spec.name, spec.version));
+        section.push(Row::new(Health::Info, "what", spec.summary));
+        if spec.options.is_empty() {
+            section.push(Row::new(Health::Info, "settings", "none"));
+        }
+        for option in spec.options {
+            section.push(
+                Row::new(
+                    Health::Info,
+                    format!("-o {}={}", option.key, option.value),
+                    option.help,
+                )
+                .with_note(match option.default {
+                    Some(default) => format!("default {default}"),
+                    None => "no default".to_string(),
+                }),
+            );
+        }
+        out.push(section);
+    }
+    print_report("tsunagi protocols", &out)
 }
 
 /// Serves the local control socket from the running agent.
@@ -1872,7 +2005,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = AgentConfig::new(paths.clone())
         .with_overlay_ipv4_range(ipv4_range)
-        .with_transport(args.transport.into())
+        .with_transport(args.reach.into())
         .with_discovery(discovery)
         .with_discovery_interval(Duration::from_secs(5));
     if let Some(hostname) = &args.hostname {
@@ -1882,31 +2015,77 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         config = config.with_bind_addrs(args.binds.clone());
     }
 
-    // The data plane is optional and never required for the control plane.
-    let wireguard = if args.wireguard {
-        // The interface belongs to the agent, not to the protocol: one
-        // agent, one interface, and every protocol carries traffic for the
-        // same addresses on it.
+    // What the user asked for is checked first, before anything that could
+    // fail for a reason of its own: a misspelled protocol or setting is
+    // their mistake to see, not something to bury under a privilege error.
+    let wanted: Vec<&ProtocolSpec> = {
+        let mut wanted = Vec::new();
+        for name in args
+            .protocols
+            .iter()
+            .filter(|name| !name.eq_ignore_ascii_case("none"))
+        {
+            let Some(spec) = PROTOCOLS.iter().find(|spec| spec.name == name.as_str()) else {
+                let known: Vec<&str> = PROTOCOLS.iter().map(|spec| spec.name).collect();
+                return Err(format!(
+                    "this build has no protocol called `{name}`; it has {}. \
+                     Run `tsunagi protocols` to see what each one takes.",
+                    known.join(", ")
+                )
+                .into());
+            };
+            wanted.push(spec);
+        }
+        wanted
+    };
+
+    let settings = parse_settings(&args.protocol_options)?;
+    // A setting nobody takes is a mistake, not a preference: one that was
+    // silently dropped looks exactly like one that did not work.
+    for setting in &settings {
+        if !wanted
+            .iter()
+            .any(|spec| !settings_for(spec, std::slice::from_ref(setting)).is_empty())
+        {
+            return Err(format!(
+                "no selected protocol takes `{}`; run `tsunagi protocols` to see what they do",
+                setting.key
+            )
+            .into());
+        }
+    }
+
+    // The interface belongs to the agent, so it is configured once whatever
+    // was selected to carry traffic over it.
+    let mut wireguard = None;
+    if !wanted.is_empty() {
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
         } else {
             system_tun_factory()?
         };
         let mtu = args
-            .wg_mtu
+            .mtu
             .unwrap_or(tsunagi::dataplane::wireguard::DEFAULT_MTU);
-        config = config.with_interface(tun_factory, args.wg_prefix.clone(), mtu);
+        config = config.with_interface(tun_factory, args.interface.clone(), mtu);
+    }
 
-        let mut wg = WireguardConfig::new(paths.state_dir.join("wireguard"));
-        if let Some(mtu) = args.wg_mtu {
-            wg = wg.with_mtu(mtu);
+    for spec in &wanted {
+        let options = settings_for(spec, &settings);
+        match spec.name {
+            tsunagi::dataplane::wireguard::WIREGUARD_PROTOCOL => {
+                let mut wg = WireguardConfig::new(paths.state_dir.join("wg-quic"));
+                if let Some(mtu) = args.mtu {
+                    wg = wg.with_mtu(mtu);
+                }
+                let wg = WireguardPlugin::configure(wg, &options)?;
+                let plugin = WireguardPlugin::open(wg).await?;
+                config = config.with_plugin(plugin.clone() as Arc<dyn IpPlugin>);
+                wireguard = Some(plugin);
+            }
+            other => return Err(format!("`{other}` is listed but not built in").into()),
         }
-        let plugin = WireguardPlugin::open(wg).await?;
-        config = config.with_plugin(plugin.clone() as Arc<dyn IpPlugin>);
-        Some(plugin)
-    } else {
-        None
-    };
+    }
 
     let agent = Agent::spawn(config).await?;
     // From here on every exit goes through `agent.shutdown()`, so the endpoint
@@ -1943,13 +2122,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                     tracing::warn!("{warning}");
                 }
                 println!("  dns zone     {}", zone.as_str());
-                Some(spawn_dns(
-                    agent.clone(),
-                    wireguard.clone(),
-                    network,
-                    zone,
-                    args.dns_port,
-                ))
+                Some(spawn_dns(agent.clone(), network, zone, args.dns_port))
             }
             Err(err) => {
                 agent.shutdown().await;
@@ -2298,8 +2471,11 @@ async fn print_status(agent: &Agent, network: NetworkId, wireguard: Option<&Wire
         && let Some(view) = plugin.overview(network)
     {
         println!(
-            "wireguard: {} on {}/{} mtu {}, {}/{} tunnel(s) established",
-            view.interface,
+            "{}: {} on {}/{} mtu {}, {}/{} tunnel(s) established",
+            plugin.protocol_id(),
+            agent
+                .overlay()
+                .map_or_else(|| "no interface".to_string(), |overlay| overlay.interface),
             view.overlay_address_v4
                 .map_or_else(|| "no address yet".to_string(), |addr| addr.to_string()),
             view.ipv4_range.map_or(0, |range| range.prefix_len),

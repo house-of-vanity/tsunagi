@@ -25,7 +25,7 @@
 //! A failure here is reported and retried. It never stops the control plane.
 
 use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -44,11 +44,15 @@ use super::announcement::{ValidatedAnnouncement, WgAnnouncement};
 use super::device::{PeerSummary, WireguardDevice};
 use super::keys::{WgPublicKey, WgSecretKey};
 use super::store::WgKeyStore;
-use crate::overlay::config::{DEFAULT_INTERFACE_PREFIX, interface_name};
 use crate::state::Ipv4Range;
 
 /// The protocol identifier this plugin announces.
-pub const WIREGUARD_PROTOCOL: &str = "wireguard";
+/// The protocol id of this plugin.
+///
+/// `wg-quic`, because that is what it is: WireGuard's cryptography carried
+/// in QUIC datagrams. The name is on the wire, so it is a protocol name and
+/// not a description of the implementation.
+pub const WIREGUARD_PROTOCOL: &str = "wg-quic";
 
 /// Smallest interface MTU the overlay accepts.
 ///
@@ -77,14 +81,12 @@ pub const WIREGUARD_OVERHEAD: u32 = 32;
 pub struct WireguardConfig {
     /// Directory for the plugin's own key store. Separate from agent state.
     pub state_dir: PathBuf,
-    /// Prefix of the interface names this plugin creates.
-    ///
-    /// Two agents on one host in the same network need different prefixes,
-    /// because the rest of the name is derived from the network id.
-    pub interface_prefix: String,
     /// WireGuard keepalive, which keeps tunnels and their links warm.
     pub keepalive: Option<u16>,
-    /// Interface MTU. See [`DEFAULT_MTU`].
+    /// The largest packet a tunnel will carry.
+    ///
+    /// Not the interface MTU, which belongs to the agent: this is what this
+    /// protocol refuses to encrypt because it would not fit one datagram.
     pub mtu: u32,
     /// How long to coalesce changes before reconciling.
     pub reconcile_debounce: Duration,
@@ -98,18 +100,11 @@ impl WireguardConfig {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
             state_dir: state_dir.into(),
-            interface_prefix: DEFAULT_INTERFACE_PREFIX.to_string(),
             keepalive: Some(25),
             mtu: DEFAULT_MTU,
             reconcile_debounce: Duration::from_millis(200),
             reconcile_interval: Duration::from_secs(15),
         }
-    }
-
-    /// Sets the interface name prefix.
-    pub fn with_interface_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.interface_prefix = prefix.into();
-        self
     }
 
     /// Sets the interface MTU.
@@ -138,9 +133,7 @@ impl WireguardConfig {
 pub struct NetworkOverview {
     /// The network.
     pub network: NetworkId,
-    /// Packet interface this plugin created for it.
-    pub interface: String,
-    /// Interface MTU.
+    /// The largest packet a tunnel in this network will carry.
     pub mtu: u32,
     /// This agent's WireGuard public key in this network.
     pub public_key: WgPublicKey,
@@ -186,7 +179,6 @@ impl PeerOverview {
 #[derive(Debug)]
 struct NetworkState {
     key: WgSecretKey,
-    interface: String,
     device: Option<Arc<WireguardDevice>>,
     announcements: HashMap<EndpointId, ValidatedAnnouncement>,
     links: HashMap<EndpointId, SharedLink>,
@@ -194,8 +186,6 @@ struct NetworkState {
     allocations: HashMap<EndpointId, Ipv4Addr>,
     /// The range those allocations came from.
     ipv4_range: Option<Ipv4Range>,
-    /// The address last reported as missing, so it is said once, not forever.
-    reported_missing_v4: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Default)]
@@ -245,22 +235,60 @@ pub struct WireguardPlugin {
 
 impl WireguardPlugin {
     /// The settings this protocol accepts.
-    pub const OPTIONS: &'static [crate::dataplane::ProtocolOption] =
-        &[crate::dataplane::ProtocolOption {
+    pub const OPTIONS: &'static [crate::dataplane::ProtocolOption] = &[
+        crate::dataplane::ProtocolOption {
             key: "keepalive",
             value: "SECONDS",
-            help: "persistent keepalive interval; 0 turns it off",
+            help: "keeps a tunnel and its link warm through a NAT; 0 turns it off",
             default: Some("25"),
-        }];
+        },
+        crate::dataplane::ProtocolOption {
+            key: "mtu",
+            value: "BYTES",
+            help: "largest packet a tunnel will carry, at least 576",
+            default: Some("1280"),
+        },
+    ];
+
+    /// Applies `key=value` settings to a configuration.
+    ///
+    /// An unknown key is refused rather than ignored: a setting that was
+    /// silently dropped looks exactly like one that did not work.
+    pub fn configure(
+        mut config: WireguardConfig,
+        options: &[(String, String)],
+    ) -> Result<WireguardConfig, PluginError> {
+        for (key, value) in options {
+            match key.as_str() {
+                "keepalive" => {
+                    let seconds: u16 = value.parse().map_err(|_| {
+                        PluginError::Other(format!("keepalive={value} is not a number of seconds"))
+                    })?;
+                    config.keepalive = (seconds > 0).then_some(seconds);
+                }
+                "mtu" => {
+                    let mtu: u32 = value.parse().map_err(|_| {
+                        PluginError::Other(format!("mtu={value} is not a number of bytes"))
+                    })?;
+                    config = config.with_mtu(mtu);
+                }
+                other => {
+                    let known: Vec<&str> = Self::OPTIONS.iter().map(|spec| spec.key).collect();
+                    return Err(PluginError::Other(format!(
+                        "`{other}` is not a setting of {WIREGUARD_PROTOCOL}; it takes {}",
+                        known.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(config)
+    }
 
     /// Opens the plugin's key store and starts its reconciliation task.
     ///
     /// Must be called from inside a tokio runtime; the plugin starts no
     /// runtime of its own.
     pub async fn open(config: WireguardConfig) -> Result<Arc<Self>, PluginError> {
-        // Validate the prefix once, here, rather than failing per network.
-        interface_name(&config.interface_prefix, NetworkId::from_bytes([0u8; 32]))?;
-
         if config.mtu < MIN_MTU {
             return Err(PluginError::Other(format!(
                 "an MTU of {} is below the {MIN_MTU} bytes every IPv4 host must be able \
@@ -325,7 +353,6 @@ impl WireguardPlugin {
 
         Some(NetworkOverview {
             network,
-            interface: state.interface.clone(),
             mtu: self.worker.config.mtu,
             public_key: state.key.public(),
             overlay_address_v4: state.allocations.get(&self.worker.local_id()).copied(),
@@ -399,7 +426,6 @@ impl Worker {
             return Ok(false);
         }
 
-        let name = interface_name(&self.config.interface_prefix, network)?;
         let worker = Arc::clone(self);
         let key = tokio::task::spawn_blocking(move || worker.store.load_or_create(network))
             .await
@@ -409,13 +435,11 @@ impl Worker {
             let mut shared = self.lock_shared();
             shared.networks.entry(network).or_insert(NetworkState {
                 key,
-                interface: name,
                 device: None,
                 announcements: HashMap::new(),
                 links: HashMap::new(),
                 allocations: HashMap::new(),
                 ipv4_range: None,
-                reported_missing_v4: None,
             });
         }
 
@@ -471,10 +495,6 @@ impl Worker {
         };
 
         let allocations = state.allocations.clone();
-        let own_v4 = state.allocations.get(&self.local_id()).copied();
-        let interface = state.device.as_ref().map(|_| state.interface.clone());
-        let range = state.ipv4_range;
-        let state_reported = state.reported_missing_v4;
         let mut wanted: Vec<WgPublicKey> = Vec::new();
         let mut too_small: Vec<(usize, usize)> = Vec::new();
         for (endpoint_id, announcement) in &state.announcements {
@@ -515,53 +535,15 @@ impl Worker {
         }
         device.retain_peers(&wanted);
 
-        // The agent assigns this address itself, so finding it absent means
-        // the assignment did not take — something outside removed it, or the
-        // provisioner reported a success it did not achieve. Left unsaid it
-        // looks like a broken network: the kernel would send packets with the
-        // wrong source address and every peer would drop them. So it is
-        // checked rather than assumed, because the assumption is exactly the
-        // kind that has been wrong here before.
-        let missing_v4 = match (own_v4, interface.as_deref(), range) {
-            (Some(address), Some(interface), Some(range))
-                if !crate::overlay::tun::address_is_local(IpAddr::V4(address)) =>
-            {
-                let already = state_reported == Some(address);
-                if let Some(state) = shared.networks.get_mut(&network) {
-                    state.reported_missing_v4 = Some(address);
-                }
-                (!already).then_some((address, interface.to_string(), range))
-            }
-            _ => {
-                if let Some(state) = shared.networks.get_mut(&network) {
-                    state.reported_missing_v4 = None;
-                }
-                None
-            }
-        };
         drop(shared);
-
-        if let Some((address, interface, range)) = missing_v4 {
-            self.report(
-                network,
-                format!(
-                    "this agent was allocated {address}/{} but the address is not on any \
-                     interface, so IPv4 cannot work: packets would leave with the wrong \
-                     source and every peer would drop them. It should have been assigned \
-                     to `{interface}` automatically; check whether something else removed \
-                     it.",
-                    range.prefix_len
-                ),
-            );
-        }
 
         for (available, needed) in too_small {
             self.report(
                 network,
                 format!(
                     "this path carries only {available} byte datagrams but a {} byte MTU needs \
-                     {needed}; packets larger than {} bytes will be dropped. Lower the MTU only \
-                     if you can stay at or above {MIN_MTU}, which IPv6 requires.",
+                     {needed}; packets larger than {} bytes will be dropped. The floor is \
+                     {MIN_MTU} bytes, what every IPv4 host must be able to reassemble.",
                     self.config.mtu,
                     available.saturating_sub(WIREGUARD_OVERHEAD as usize)
                 ),

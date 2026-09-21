@@ -213,6 +213,9 @@ struct Runtime {
     /// Peers already told about a protocol version that cannot match, so it
     /// is said once rather than on every announcement.
     reported_mismatch: HashSet<(EndpointId, String)>,
+    /// The address last reported as absent from the interface, so it is said
+    /// once rather than for ever.
+    reported_missing: Option<std::net::Ipv4Addr>,
     /// Signed records, merged from every replica we have talked to.
     state: StateSet,
     /// Snapshots received while dispatching, handled on the next loop pass.
@@ -246,6 +249,7 @@ impl Runtime {
             link_results_tx,
             link_results_rx,
             reported_mismatch: HashSet::new(),
+            reported_missing: None,
             state: StateSet::new(),
             pending_state: Vec::new(),
             own_version: 0,
@@ -878,13 +882,49 @@ impl Runtime {
             });
             return;
         }
-        if let Some(interface) = &self.params.interface
-            && let Err(err) = interface.sync_addresses().await
-        {
+        let Some(interface) = self.params.interface.clone() else {
+            return;
+        };
+        if let Err(err) = interface.sync_addresses().await {
             self.emit(Event::PluginError {
                 network: self.network_id,
                 protocol: "overlay".into(),
                 reason: err.to_string(),
+            });
+            return;
+        }
+
+        // The agent assigns this address itself, so finding it absent means
+        // the assignment did not take — something outside removed it, or the
+        // provisioner reported a success it did not achieve. Left unsaid it
+        // looks like a broken network: packets would leave with the wrong
+        // source and every peer would drop them. Checked rather than
+        // assumed, because the assumption is exactly the kind that has been
+        // wrong here before. Said once per address, not every round.
+        let missing = match local {
+            Some(address) if !crate::overlay::address_is_local(std::net::IpAddr::V4(address)) => {
+                let already = self.reported_missing == Some(address);
+                self.reported_missing = Some(address);
+                (!already).then_some(address)
+            }
+            _ => {
+                self.reported_missing = None;
+                None
+            }
+        };
+        if let Some(address) = missing {
+            self.emit(Event::PluginError {
+                network: self.network_id,
+                protocol: "overlay".into(),
+                reason: format!(
+                    "this agent was allocated {address}/{} but the address is not on any \
+                     interface, so the overlay cannot work: packets would leave with the \
+                     wrong source and every peer would drop them. It should have been \
+                     assigned to `{}` automatically; check whether something else removed \
+                     it.",
+                    range.prefix_len,
+                    interface.name()
+                ),
             });
         }
     }
