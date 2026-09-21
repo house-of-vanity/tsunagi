@@ -267,6 +267,13 @@ pub struct NetworkReport {
     /// left to report is a dial-failure counter — which describes the symptom
     /// and not the cause.
     pub members: Vec<MemberReport>,
+    /// Unverified candidates this network currently knows of.
+    ///
+    /// Not peers: somewhere to try. Zero of them, with nobody connected,
+    /// is the difference between "nobody has joined yet" and "this agent
+    /// has no way to reach anybody" — which look identical in a report
+    /// that counts only members.
+    pub candidates: u32,
     /// Outbound dials that failed.
     pub dial_failures: u64,
     /// Handshakes rejected in either direction.

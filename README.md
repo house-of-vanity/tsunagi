@@ -95,6 +95,13 @@ and join the same network with the secret that was printed:
 ./target/release/tsunagi join --network lab --secret tsn1...
 ```
 
+**`--peer` is how the first meeting happens.** Two agents that have never
+met have nothing to go on: this project publishes nothing about who is in
+which network, by design. One of them has to be told the other's endpoint
+id — after that each remembers the other and finds it again by itself, so
+it is needed once. An agent with nobody to contact says so in `status`
+rather than sitting there looking patient.
+
 Within a few seconds both print something like:
 
 ```text

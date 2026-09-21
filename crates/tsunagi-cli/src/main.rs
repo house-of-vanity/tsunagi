@@ -2529,15 +2529,40 @@ fn network_section(
     let online = rows.iter().filter(|row| row.online()).count();
     if rows.is_empty() {
         // Why there is nobody, rather than just that there is nobody: the
-        // two reasons want different actions.
-        section.push(Row::new(
-            Health::Info,
-            "members",
-            match (&network.range, &network.range_conflict) {
-                (None, Some(_)) => "none: this network has no range to allocate from",
-                _ => "none known yet; nobody else has joined",
-            },
-        ));
+        // three reasons want different actions, and the third one used to
+        // read as the first.
+        match (&network.range, &network.range_conflict, network.candidates) {
+            (None, Some(_), _) => section.push(Row::new(
+                Health::Info,
+                "members",
+                "none: this network has no range to allocate from",
+            )),
+            // Nobody to contact and nowhere to look. An agent finds a peer
+            // by being told about one, or from what it remembers of an
+            // earlier session — with neither it waits for ever, and the
+            // report should say so rather than imply patience.
+            (_, _, 0) => section.push(
+                Row::new(
+                    Health::Degraded,
+                    "members",
+                    "none, and nobody to contact: no candidates in this network",
+                )
+                .with_note(format!(
+                    "somebody has to make the introduction. Start this agent with \
+                     `--peer <their-endpoint-id>`, or have them start theirs with \
+                     `--peer {}`. Once they have met, each remembers the other.",
+                    short(own_id, 12)
+                )),
+            ),
+            _ => section.push(Row::new(
+                Health::Info,
+                "members",
+                format!(
+                    "none yet  ·  {} candidate(s) being tried",
+                    network.candidates
+                ),
+            )),
+        }
     } else {
         section.push(Row::new(
             Health::Info,
@@ -3504,6 +3529,7 @@ async fn build_report(
                 name: network.name.to_string(),
                 network_id: network.network_id.to_string(),
                 active: matches!(network.state, tsunagi::agent::NetworkState::Active),
+                candidates: network.candidates.len() as u32,
                 peers: network
                     .peers
                     .iter()
@@ -3798,6 +3824,7 @@ mod status_tests {
             name: "LAB".into(),
             network_id: "xa7gyz".into(),
             active: true,
+            candidates: 1,
             peers: vec![PeerReport {
                 endpoint_id: ONLINE.into(),
                 hostname: Some("music".into()),
@@ -3845,6 +3872,43 @@ mod status_tests {
         );
         assert!(text.contains("also called `LAB`"), "{text}");
         assert!(text.contains("mistyped secret"), "{text}");
+    }
+
+    #[test]
+    fn an_agent_with_nobody_to_contact_says_so_instead_of_waiting_quietly() {
+        // The wiped-and-restarted case: both devices join the same network
+        // and sit there. An agent finds a peer by being told about one or
+        // by remembering an earlier session, and with neither it will wait
+        // for ever — which "nobody else has joined" reads as patience.
+        let mut network = network_after_a_peer_returned();
+        network.peers.clear();
+        network.members.clear();
+        network.overlay = None;
+        network.candidates = 0;
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert!(text.contains("nobody to contact"), "{text}");
+        assert!(text.contains("--peer"), "the fix is named: {text}");
+        assert!(text.contains(OWN), "with this device's own id: {text}");
+        assert_eq!(out.worst(), Health::Degraded, "{text}");
+    }
+
+    #[test]
+    fn candidates_with_nobody_connected_yet_is_patience_rather_than_a_fault() {
+        // Something to try is the ordinary state of a network coming up.
+        let mut network = network_after_a_peer_returned();
+        network.peers.clear();
+        network.members.clear();
+        network.overlay = None;
+        network.candidates = 2;
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert!(text.contains("2 candidate(s) being tried"), "{text}");
+        assert_ne!(out.worst(), Health::Degraded, "{text}");
     }
 
     #[test]
