@@ -18,13 +18,15 @@
 //! ourselves, and we do:
 //!
 //! * outbound, a packet is routed to the peer that **owns** its destination
-//!   address, where ownership is the derivation in [`super::overlay`];
+//!   address, where ownership is the signed claim the system level agreed;
 //! * inbound, a decrypted packet is dropped unless its **source** is exactly
-//!   the address derived for the peer whose tunnel decrypted it.
+//!   the address that peer holds.
 //!
 //! So a participant cannot receive traffic addressed to someone else, and
-//! cannot forge traffic that appears to come from someone else, no matter
-//! what it announced.
+//! cannot forge traffic that appears to come from someone else. Neither
+//! check consults anything the peer said here: an address is claimed at the
+//! system level and signed by its holder, and that is what is compared
+//! against.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};

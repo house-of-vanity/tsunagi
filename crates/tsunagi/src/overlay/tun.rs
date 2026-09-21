@@ -1,8 +1,8 @@
 //! The boundary to the operating system's packet interface.
 //!
-//! The WireGuard implementation in [`super::device`] is pure userspace and
-//! needs no kernel WireGuard module and no `wg` tool. It does still need a way
-//! to hand IP packets to the operating system, which is what this trait is.
+//! One agent has one of these, and it belongs to the agent rather than to
+//! any protocol: a packet arriving here is routed to whichever peer owns its
+//! destination, over whichever protocol has a link to that peer.
 //!
 //! Two implementations:
 //!
