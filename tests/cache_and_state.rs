@@ -177,6 +177,89 @@ async fn a_state_store_from_a_newer_build_is_refused() {
     );
 }
 
+/// A store written by the previous schema must come up, not break.
+///
+/// The record body gained a hostname, which changed the signing domain, so
+/// records written before it can never verify again. Leaving them in place
+/// would mean every read rejecting rows that look exactly like corruption.
+#[tokio::test]
+async fn a_state_store_from_the_previous_schema_is_migrated_and_stays_usable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let paths = StoragePaths::under(dir.path());
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+
+    // Build a schema-2 store by hand, with a record in it.
+    {
+        let conn = rusqlite::Connection::open(paths.state_db()).unwrap();
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE device_identity (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 secret_key BLOB NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE TABLE networks (
+                 network_id BLOB PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 secret BLOB NOT NULL,
+                 auto_start INTEGER NOT NULL DEFAULT 1,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE signed_records (
+                 network_id BLOB NOT NULL,
+                 author BLOB NOT NULL,
+                 version INTEGER NOT NULL,
+                 body BLOB NOT NULL,
+                 signature BLOB NOT NULL,
+                 PRIMARY KEY (network_id, author)
+             );
+             CREATE TABLE own_record_version (
+                 network_id BLOB PRIMARY KEY,
+                 version INTEGER NOT NULL
+             );
+             INSERT INTO signed_records VALUES (x'00', x'11', 7, x'2222', x'3333');
+             INSERT INTO own_record_version VALUES (x'00', 7);
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )
+        .unwrap();
+    }
+
+    // An agent comes up on it, which is the whole point.
+    let discovery = SharedMemoryDiscovery::new();
+    let agent = Agent::spawn(config_with(dir.path(), &discovery))
+        .await
+        .unwrap();
+    let (name, secret) = network("migrated");
+    let network_id = agent.join_network(&name, &secret).await.unwrap();
+    assert!(agent.network_status(network_id).await.is_ok());
+    agent.shutdown().await;
+
+    let conn = rusqlite::Connection::open(paths.state_db()).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, tsunagi::storage::SCHEMA_VERSION);
+
+    // The unverifiable record is gone rather than left to be rejected for
+    // ever, and the counter is keyed by author now.
+    let stale: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM signed_records WHERE author = x'11'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0, "records from the old signing domain are dropped");
+    conn.query_row(
+        "SELECT count(*) FROM own_record_version WHERE author IS NOT NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("the counter is keyed by author");
+}
+
 #[tokio::test]
 async fn secrets_never_appear_in_status_or_debug_output() {
     let discovery = SharedMemoryDiscovery::new();

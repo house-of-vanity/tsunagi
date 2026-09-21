@@ -18,10 +18,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
-use crate::state::SignedRecord;
+use crate::state::{RecordBody, SignedRecord};
 
 /// Schema version written by this build.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Key of the stored hostname setting.
 const SETTING_HOSTNAME: &str = "hostname";
@@ -57,6 +57,14 @@ impl StateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let existed = path.exists();
+        // The database file is created on demand, so the directory holding
+        // it has to be too — with the same restricted permissions the agent
+        // would have given it, never looser.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            super::create_dir(parent)?;
+        }
         let conn = Connection::open(&path).map_err(|err| Error::StateCorrupted {
             path: path.clone(),
             reason: format!("cannot open database: {err}"),
@@ -114,6 +122,29 @@ impl StateStore {
         }
         if found == SCHEMA_VERSION {
             return self.verify_shape();
+        }
+
+        // Migration 2 -> 3: the record body gained a hostname, which changed
+        // the signing domain, and the version counter gained an author.
+        //
+        // The stored records are discarded rather than carried over. They
+        // were signed under a domain that no longer verifies, so keeping them
+        // would mean holding rows that every read has to reject — and one of
+        // those rejections could be mistaken for corruption. Each member
+        // re-publishes its claim on the next run, which is the one thing here
+        // that repairs itself.
+        if (2..3).contains(&found) {
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+                     DROP TABLE IF EXISTS signed_records;
+                     DROP TABLE IF EXISTS own_record_version;
+                     COMMIT;",
+                )
+                .map_err(|err| self.corrupt(format!("cannot migrate schema to 3: {err}")))?;
+            self.conn
+                .execute_batch(SIGNED_RECORDS_SCHEMA)
+                .map_err(|err| self.corrupt(format!("cannot migrate schema to 3: {err}")))?;
         }
 
         // Migration 1 -> 2: signed records that outlive a session.
@@ -220,6 +251,110 @@ impl StateStore {
             )
             .map_err(|err| self.corrupt(format!("cannot store device identity: {err}")))?;
         Ok(identity)
+    }
+
+    /// Replaces the device identity, giving up what the outgoing key held.
+    ///
+    /// A device key is the author of every record this agent has signed, so
+    /// replacing it makes this a different member. The addresses and names
+    /// the old key claimed would otherwise stay reserved to a key nobody
+    /// holds, and nothing could ever free them — there is no way to sign on
+    /// another author's behalf, and by design there is no authority that
+    /// could overrule one.
+    ///
+    /// So the outgoing key signs a release for every network on its way out.
+    /// That is the revocation: a positive statement, merged like any other,
+    /// which frees the address and the name for whoever wants them next.
+    ///
+    /// All of it commits together. A crash part way through must not leave an
+    /// identity that has already been replaced beside releases that were
+    /// never written, because the old key would then be gone and unable to
+    /// sign them.
+    ///
+    /// Returns the new identity and the networks a release was signed for.
+    pub fn rotate_device_identity(&self) -> Result<(DeviceIdentity, Vec<NetworkId>)> {
+        let outgoing = self.device_identity()?;
+        let networks = self.list_networks()?;
+        let replacement = DeviceIdentity::generate();
+
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| Error::Storage(format!("cannot begin a transaction: {err}")))?;
+
+        let mut released = Vec::new();
+        if let Some(outgoing) = &outgoing {
+            let author = outgoing.endpoint_id();
+            let signing = outgoing.signing_key();
+            for network in &networks {
+                let previous: Option<i64> = transaction
+                    .query_row(
+                        "SELECT version FROM own_record_version
+                         WHERE network_id = ?1 AND author = ?2",
+                        params![
+                            network.network_id.as_bytes().as_slice(),
+                            author.as_bytes().as_slice()
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|err| Error::Storage(format!("cannot read our version: {err}")))?;
+                // A key that never published anything has nothing to give up.
+                let Some(previous) = previous else { continue };
+
+                let version = (previous.max(0) as u64).saturating_add(1);
+                let record =
+                    SignedRecord::sign(&signing, network.network_id, version, RecordBody::Release);
+                let body = postcard::to_stdvec(&record.body)
+                    .map_err(|err| Error::Storage(format!("cannot encode a record body: {err}")))?;
+                transaction
+                    .execute(
+                        "INSERT INTO signed_records (network_id, author, version, body, signature)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(network_id, author) DO UPDATE SET
+                             version = excluded.version,
+                             body = excluded.body,
+                             signature = excluded.signature",
+                        params![
+                            record.network.as_slice(),
+                            record.author.as_slice(),
+                            record.version as i64,
+                            body,
+                            record.signature
+                        ],
+                    )
+                    .map_err(|err| Error::Storage(format!("cannot store a release: {err}")))?;
+                transaction
+                    .execute(
+                        "INSERT INTO own_record_version (network_id, author, version)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(network_id, author) DO UPDATE SET
+                             version = max(version, excluded.version)",
+                        params![
+                            record.network.as_slice(),
+                            record.author.as_slice(),
+                            record.version as i64
+                        ],
+                    )
+                    .map_err(|err| Error::Storage(format!("cannot store our version: {err}")))?;
+                released.push(network.network_id);
+            }
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO device_identity (id, secret_key, created_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                     secret_key = excluded.secret_key,
+                     created_at = excluded.created_at",
+                params![replacement.secret_bytes().as_slice(), now_unix()],
+            )
+            .map_err(|err| Error::Storage(format!("cannot store the new identity: {err}")))?;
+
+        transaction
+            .commit()
+            .map_err(|err| Error::Storage(format!("cannot commit the new identity: {err}")))?;
+        Ok((replacement, released))
     }
 
     /// Inserts or updates a network configuration.
@@ -421,10 +556,15 @@ impl StateStore {
             .map_err(|err| Error::Storage(format!("cannot store our record: {err}")))?;
         transaction
             .execute(
-                "INSERT INTO own_record_version (network_id, version) VALUES (?1, ?2)
-                 ON CONFLICT(network_id) DO UPDATE SET
+                "INSERT INTO own_record_version (network_id, author, version)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(network_id, author) DO UPDATE SET
                      version = max(version, excluded.version)",
-                params![record.network.as_slice(), record.version as i64],
+                params![
+                    record.network.as_slice(),
+                    record.author.as_slice(),
+                    record.version as i64
+                ],
             )
             .map_err(|err| Error::Storage(format!("cannot store our version: {err}")))?;
 
@@ -433,16 +573,26 @@ impl StateStore {
             .map_err(|err| Error::Storage(format!("cannot commit our record: {err}")))
     }
 
-    /// The highest version we have ever published for a network.
+    /// The highest version an author has ever published for a network.
     ///
-    /// Monotonic even if our record is later replaced by a conflicting one,
-    /// so we never reuse a number.
-    pub fn own_record_version(&self, network_id: NetworkId) -> Result<u64> {
+    /// Monotonic even if the record is later replaced by a conflicting one,
+    /// so a number is never reused. Keyed by author as well: a replaced
+    /// device key is a different author and starts its own sequence, while
+    /// the outgoing one keeps its place so the release it signs on the way
+    /// out cannot collide with something it already published.
+    pub fn own_record_version(
+        &self,
+        network_id: NetworkId,
+        author: iroh::EndpointId,
+    ) -> Result<u64> {
         let version: Option<i64> = self
             .conn
             .query_row(
-                "SELECT version FROM own_record_version WHERE network_id = ?1",
-                params![network_id.as_bytes().as_slice()],
+                "SELECT version FROM own_record_version WHERE network_id = ?1 AND author = ?2",
+                params![
+                    network_id.as_bytes().as_slice(),
+                    author.as_bytes().as_slice()
+                ],
                 |row| row.get(0),
             )
             .optional()
@@ -487,6 +637,12 @@ impl StateStore {
 }
 
 /// Schema for the signed records described in [`crate::state`].
+///
+/// The version counter is keyed by author as well as network. A device key
+/// can be replaced, and the replacement is a different author: it must start
+/// its own sequence rather than inherit one, and the outgoing author's last
+/// version has to survive so its release record cannot collide with
+/// something it already published.
 const SIGNED_RECORDS_SCHEMA: &str = "BEGIN;
      CREATE TABLE IF NOT EXISTS signed_records (
          network_id BLOB NOT NULL,
@@ -497,10 +653,12 @@ const SIGNED_RECORDS_SCHEMA: &str = "BEGIN;
          PRIMARY KEY (network_id, author)
      );
      CREATE TABLE IF NOT EXISTS own_record_version (
-         network_id BLOB PRIMARY KEY,
-         version    INTEGER NOT NULL
+         network_id BLOB NOT NULL,
+         author     BLOB NOT NULL,
+         version    INTEGER NOT NULL,
+         PRIMARY KEY (network_id, author)
      );
-     PRAGMA user_version = 2;
+     PRAGMA user_version = 3;
      COMMIT;";
 
 /// Seconds since the Unix epoch, saturating at 0 before it.

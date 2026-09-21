@@ -56,7 +56,7 @@ async fn two_agents_authenticate_and_exchange_messages() {
     // Both sides announce a hostname over the authenticated session.
     let status = a.agent.network_status(network_id).await.unwrap();
     let peer = &status.peers[0];
-    assert_eq!(peer.hostname.as_deref(), Some(b.agent.hostname()));
+    assert_eq!(peer.hostname.as_deref(), Some(b.agent.hostname().as_str()));
     assert!(peer.transport != tsunagi::net::TransportKind::Unknown);
     assert!(peer.rtt.is_some(), "a verified path must report an RTT");
 

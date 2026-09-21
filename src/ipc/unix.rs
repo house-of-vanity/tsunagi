@@ -25,6 +25,18 @@ use super::{MAX_MESSAGE_LEN, Request, Response, StatusReport};
 pub trait ReportSource: Send + Sync + 'static {
     /// Produces a fresh report.
     fn report(&self) -> BoxFuture<'_, StatusReport>;
+
+    /// Changes the name the agent answers to, returning the accepted form.
+    ///
+    /// Defaulted to a refusal so that a source which only reports — the
+    /// closure impl below, and every test that uses it — stays valid and
+    /// says plainly that it cannot do this, rather than appearing to.
+    fn set_hostname(
+        &self,
+        _hostname: String,
+    ) -> BoxFuture<'_, std::result::Result<String, String>> {
+        Box::pin(async move { Err("this agent cannot change its hostname".to_string()) })
+    }
 }
 
 impl<F> ReportSource for F
@@ -137,6 +149,10 @@ async fn handle(mut stream: UnixStream, source: Arc<dyn ReportSource>) -> Result
     let request: Request = read_message(&mut stream).await?;
     let response = match request {
         Request::Status => Response::Status(Box::new(source.report().await)),
+        Request::SetHostname(hostname) => match source.set_hostname(hostname).await {
+            Ok(accepted) => Response::Hostname(accepted),
+            Err(reason) => Response::Error(reason),
+        },
     };
     write_message(&mut stream, &response).await
 }
@@ -154,6 +170,27 @@ pub async fn request_status(path: impl AsRef<Path>) -> Result<StatusReport> {
     match read_message::<Response>(&mut stream).await? {
         Response::Status(report) => Ok(*report),
         Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
+/// Asks a running agent to answer to a different name.
+///
+/// Returns the name it accepted, which is the canonical form of what was
+/// asked for and may differ from it.
+pub async fn set_hostname(path: impl AsRef<Path>, hostname: &str) -> Result<String> {
+    let path = path.as_ref();
+    let mut stream = UnixStream::connect(path)
+        .await
+        .map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    write_message(&mut stream, &Request::SetHostname(hostname.to_string())).await?;
+    match read_message::<Response>(&mut stream).await? {
+        Response::Hostname(accepted) => Ok(accepted),
+        Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
     }
 }
 
@@ -168,7 +205,7 @@ pub async fn request_status(path: impl AsRef<Path>) -> Result<StatusReport> {
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 2]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 3]);
 
 async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let encoded = postcard::to_stdvec(value)

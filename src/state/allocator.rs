@@ -196,7 +196,12 @@ mod tests {
     #[test]
     fn allocation_is_deterministic_and_spread_out() {
         let id = network("spread");
-        let authors: Vec<_> = (0..40).map(|_| SecretKey::generate().public()).collect();
+        // Fixed keys, not random ones. With 40 random authors in a /24 the
+        // birthday problem alone makes a handful of collisions likely, so a
+        // threshold on the count was a coin flip rather than a property.
+        let authors: Vec<_> = (0..40u8)
+            .map(|seed| SecretKey::from_bytes(&[seed; 32]).public())
+            .collect();
 
         let first: Vec<_> = authors
             .iter()

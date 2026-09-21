@@ -38,10 +38,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generates a fresh network secret and prints it.
-    Secret,
-    /// Shows this device's identity without joining anything.
-    Id(StatusArgs),
+    /// Shows this device's identity and secrets, and changes them.
+    ///
+    /// Every item follows the same shape: name it to see it, name it with a
+    /// value to change it.
+    Id(IdArgs),
     /// Joins a network and runs until interrupted.
     // Boxed: it is much larger than the other variants, and every command
     // but this one would otherwise pay for its size. A `//` comment, not a
@@ -49,6 +50,54 @@ enum Command {
     Up(Box<UpArgs>),
     /// Reports this device, what the agent is doing, and what this host can do.
     Status(StatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct IdArgs {
+    #[command(flatten)]
+    paths: PathArgs,
+
+    /// Control socket to talk to. Derived from the state directory by default.
+    #[arg(long, global = true)]
+    control_socket: Option<PathBuf>,
+
+    #[command(subcommand)]
+    action: Option<IdAction>,
+}
+
+#[derive(Debug, Subcommand)]
+enum IdAction {
+    /// Shows the name this device answers to, or changes it.
+    Hostname {
+        /// The new name. Omit it to see the current one.
+        name: Option<String>,
+    },
+    /// Shows the key this device signs with.
+    Key {
+        #[command(subcommand)]
+        action: Option<KeyAction>,
+    },
+    /// Shows the secret of every network this device has joined.
+    Secret {
+        #[command(subcommand)]
+        action: Option<SecretAction>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyAction {
+    /// Replaces the signing key with a fresh one.
+    ///
+    /// This device becomes a different member. The outgoing key gives up the
+    /// addresses and names it held on the way out, so they are freed rather
+    /// than reserved to a key nobody has. Requires the agent to be stopped.
+    Rotate,
+}
+
+#[derive(Debug, Subcommand)]
+enum SecretAction {
+    /// Prints a fresh random secret, for a network that does not exist yet.
+    Generate,
 }
 
 #[derive(Debug, Args)]
@@ -80,11 +129,14 @@ fn resolve_ipv4_range(
 
 #[derive(Debug, Args, Clone)]
 struct PathArgs {
+    // Global, so they may be written before or after a subcommand. A
+    // sub-subcommand that silently rejected the flag its parent accepts is
+    // the kind of inconsistency that makes a tool feel arbitrary.
     /// Directory for the mandatory state. Defaults to the platform location.
-    #[arg(long, env = "TSUNAGI_STATE_DIR")]
+    #[arg(long, env = "TSUNAGI_STATE_DIR", global = true)]
     state_dir: Option<PathBuf>,
     /// Directory for the disposable cache. Defaults to the platform location.
-    #[arg(long, env = "TSUNAGI_CACHE_DIR")]
+    #[arg(long, env = "TSUNAGI_CACHE_DIR", global = true)]
     cache_dir: Option<PathBuf>,
 }
 
@@ -283,16 +335,7 @@ fn main() -> std::process::ExitCode {
 
 async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Command::Secret => {
-            let secret = NetworkSecret::generate();
-            println!("{}", secret.encode().as_str());
-            eprintln!(
-                "\nShare this with every participant, over a channel you trust.\n\
-                 Anyone who has it can join the network."
-            );
-            Ok(())
-        }
-        Command::Id(args) => show_id(args).await,
+        Command::Id(args) => id(args).await,
         Command::Up(args) => up(*args).await,
         Command::Status(args) => status(args).await,
     }
@@ -320,7 +363,6 @@ enum Observed {
     Stored {
         endpoint_id: Option<String>,
         hostname: Option<String>,
-        networks: Vec<(String, String, bool)>,
         /// Why the agent could not be asked.
         why: String,
         /// Whether a socket was there at all.
@@ -345,34 +387,20 @@ async fn observe(paths: &StoragePaths, socket: &std::path::Path) -> Observed {
 
     // Read-only, and deliberately tolerant: a state directory that has never
     // been used is not an error, it just has nothing to report yet.
-    let (endpoint_id, hostname, networks) =
-        match tsunagi::storage::StateStore::open(paths.state_db()) {
-            Ok(store) => (
-                store
-                    .device_identity()
-                    .ok()
-                    .flatten()
-                    .map(|identity| identity.endpoint_id().to_string()),
-                store.hostname().ok().flatten(),
-                store
-                    .list_networks()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|network| {
-                        (
-                            network.name.to_string(),
-                            network.network_id.to_string(),
-                            network.auto_start,
-                        )
-                    })
-                    .collect(),
-            ),
-            Err(_) => (None, None, Vec::new()),
-        };
+    let (endpoint_id, hostname) = match tsunagi::storage::StateStore::open(paths.state_db()) {
+        Ok(store) => (
+            store
+                .device_identity()
+                .ok()
+                .flatten()
+                .map(|identity| identity.endpoint_id().to_string()),
+            store.hostname().ok().flatten(),
+        ),
+        Err(_) => (None, None),
+    };
     Observed::Stored {
         endpoint_id,
         hostname,
-        networks,
         why,
         socket_present,
     }
@@ -416,55 +444,243 @@ fn device_section(paths: &StoragePaths, observed: &Observed) -> report::Section 
     device
 }
 
-/// The `networks` section, as the state store knows them.
-fn stored_networks_section(networks: &[(String, String, bool)]) -> report::Section {
+/// The networks this device belongs to, named but not described.
+///
+/// No secrets: this is part of `status`, and a status report is somewhere a
+/// secret must never appear. `tsunagi id secret` is the place that shows one,
+/// because asking for it there is deliberate.
+fn configured_networks_section(paths: &StoragePaths) -> report::Section {
     use report::{Health, Row, Section};
 
     let mut section = Section::new("networks");
+    let networks = stored_networks(paths);
     if networks.is_empty() {
         section.push(Row::new(Health::Info, "none", "no network has been joined"));
     }
-    for (name, id, auto_start) in networks {
+    for network in &networks {
         section.push(Row::new(
             Health::Info,
-            name,
-            format!("{id}{}", if *auto_start { "  (auto-start)" } else { "" }),
+            network.name.as_str(),
+            format!(
+                "{}{}",
+                network.network_id,
+                if network.auto_start {
+                    "  (auto-start)"
+                } else {
+                    ""
+                }
+            ),
         ));
     }
     section
 }
 
-async fn show_id(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use report::{Health, Report, Row, Section};
+/// Serves the local control socket from the running agent.
+///
+/// A struct rather than a closure because this end both answers questions and
+/// accepts changes, and a change has to reach the agent itself: writing one
+/// into the store behind its back would be overwritten by the next thing it
+/// published.
+struct AgentControl {
+    agent: Agent,
+    plugin: Option<Arc<WireguardPlugin>>,
+}
 
+impl tsunagi::ipc::unix::ReportSource for AgentControl {
+    fn report(&self) -> tsunagi::BoxFuture<'_, tsunagi::ipc::StatusReport> {
+        Box::pin(async move { build_report(&self.agent, self.plugin.as_deref()).await })
+    }
+
+    fn set_hostname(&self, hostname: String) -> tsunagi::BoxFuture<'_, Result<String, String>> {
+        Box::pin(async move {
+            self.agent
+                .set_hostname(&hostname)
+                .await
+                .map_err(|err| err.to_string())
+        })
+    }
+}
+
+/// The networks this device has joined, read straight from the store.
+///
+/// Secrets live only in the mandatory state, never in a status report and
+/// never on the control socket, so they are read here rather than asked for.
+fn stored_networks(paths: &StoragePaths) -> Vec<tsunagi::storage::StoredNetwork> {
+    tsunagi::storage::StateStore::open(paths.state_db())
+        .and_then(|store| store.list_networks())
+        .unwrap_or_default()
+}
+
+/// `tsunagi id`: what this device is, and what changes it.
+async fn id(args: IdArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let socket = control_socket(&paths, args.control_socket.as_ref());
-    let observed = observe(&paths, &socket).await;
 
-    let mut out = Report::new();
-    out.push(device_section(&paths, &observed));
-    match &observed {
-        Observed::Agent(report) => {
-            let mut section = Section::new("networks");
-            if report.networks.is_empty() {
-                section.push(Row::new(Health::Info, "none", "no network has been joined"));
-            }
-            for network in &report.networks {
-                section.push(Row::new(
-                    Health::Info,
-                    &network.name,
-                    format!(
-                        "{}  ({})",
-                        network.network_id,
-                        if network.active { "active" } else { "inactive" }
-                    ),
-                ));
-            }
-            out.push(section);
+    match args.action {
+        None => show_identity(&paths, &socket).await,
+        Some(IdAction::Hostname { name: None }) => show_hostname(&paths, &socket).await,
+        Some(IdAction::Hostname { name: Some(name) }) => set_hostname(&paths, &socket, &name).await,
+        Some(IdAction::Key { action: None }) => show_key(&paths, &socket).await,
+        Some(IdAction::Key {
+            action: Some(KeyAction::Rotate),
+        }) => rotate_key(&paths, &socket).await,
+        Some(IdAction::Secret { action: None }) => show_secrets(&paths),
+        Some(IdAction::Secret {
+            action: Some(SecretAction::Generate),
+        }) => {
+            let secret = NetworkSecret::generate();
+            println!("{}", secret.encode().as_str());
+            eprintln!(
+                "\nShare this with every participant, over a channel you trust.\n\
+                 Anyone who has it can join the network."
+            );
+            Ok(())
         }
-        Observed::Stored { networks, .. } => out.push(stored_networks_section(networks)),
     }
+}
+
+/// Everything about this device in one view.
+async fn show_identity(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use report::{Health, Report, Row, Section};
+
+    let observed = observe(paths, socket).await;
+    let mut out = Report::new();
+
+    let mut device = device_section(paths, &observed);
+    device.push(Row::new(
+        Health::Info,
+        "signs with",
+        "the endpoint key above; there is no separate signing certificate",
+    ));
+    out.push(device);
+
+    let networks = stored_networks(paths);
+    let mut section = Section::new("networks");
+    if networks.is_empty() {
+        section.push(Row::new(Health::Info, "none", "no network has been joined"));
+    }
+    for network in &networks {
+        section.push(
+            Row::new(
+                Health::Info,
+                network.name.as_str(),
+                network.network_id.to_string(),
+            )
+            .with_note(format!("secret  {}", network.secret.encode().as_str())),
+        );
+    }
+    out.push(section);
+
     print_report("tsunagi id", &out)
+}
+
+/// The name this device answers to.
+async fn show_hostname(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match observe(paths, socket).await {
+        Observed::Agent(report) => println!("{}", report.hostname),
+        Observed::Stored { hostname, .. } => match hostname {
+            Some(hostname) => println!("{hostname}"),
+            None => println!(
+                "{}",
+                tsunagi::agent::system_hostname().unwrap_or_else(|| "unknown".into())
+            ),
+        },
+    }
+    Ok(())
+}
+
+/// Changes the name, through the agent when one is running.
+///
+/// Through it rather than behind its back: the agent republishes its signed
+/// claim, which is what gives up the previous name, and tells its peers. A
+/// write straight to the store while it ran would be overwritten by the next
+/// thing the agent published.
+async fn set_hostname(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if socket.exists() {
+        return match tsunagi::ipc::unix::set_hostname(socket, name).await {
+            Ok(accepted) => {
+                println!("{accepted}");
+                Ok(())
+            }
+            Err(err) => {
+                Err(format!("the agent is running but would not accept the change: {err}").into())
+            }
+        };
+    }
+
+    let accepted = tsunagi::state::sanitise_hostname(name);
+    if accepted.is_empty() {
+        return Err("a hostname must contain at least one letter, digit, `-`, `.` or `_`".into());
+    }
+    let store = tsunagi::storage::StateStore::open(paths.state_db())?;
+    store.set_hostname(&accepted)?;
+    println!("{accepted}");
+    Ok(())
+}
+
+/// The key this device signs with.
+async fn show_key(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match observe(paths, socket).await {
+        Observed::Agent(report) => println!("{}", report.endpoint_id),
+        Observed::Stored { endpoint_id, .. } => match endpoint_id {
+            Some(id) => println!("{id}"),
+            None => return Err("this device has no identity yet; start an agent once".into()),
+        },
+    }
+    Ok(())
+}
+
+/// Replaces the signing key.
+async fn rotate_key(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The rotation writes, so it needs the directory to itself. Refused up
+    // front rather than after the lock fails, because what a lock failure
+    // says does not tell the reader what to do about it.
+    if socket.exists() {
+        return Err(
+            "stop the agent first: replacing the signing key rewrites state it is using".into(),
+        );
+    }
+
+    let store = tsunagi::storage::StateStore::open(paths.state_db())?;
+    let (identity, released) = store.rotate_device_identity()?;
+    println!("{}", identity.endpoint_id());
+    if !released.is_empty() {
+        eprintln!(
+            "\nReleased what the previous key held in {} network(s). \
+             This device rejoins as a new member and is allocated a new address.",
+            released.len()
+        );
+    }
+    Ok(())
+}
+
+/// The secret of every network this device has joined.
+fn show_secrets(paths: &StoragePaths) -> Result<(), Box<dyn std::error::Error>> {
+    let networks = stored_networks(paths);
+    if networks.is_empty() {
+        eprintln!("no network has been joined");
+        return Ok(());
+    }
+    for network in networks {
+        println!("{}  {}", network.name, network.secret.encode().as_str());
+    }
+    Ok(())
 }
 
 /// Reports this device, what the agent is doing, and what this host can do.
@@ -530,10 +746,15 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     out.push(agent);
 
-    if let Observed::Agent(report) = &observed {
-        for network in &report.networks {
-            out.push(network_section(network, &report.endpoint_id));
+    match &observed {
+        Observed::Agent(report) => {
+            for network in &report.networks {
+                out.push(network_section(network, &report.endpoint_id));
+            }
         }
+        // Without an agent there is no live view, but the store still knows
+        // which networks this device belongs to, which is worth saying.
+        Observed::Stored { .. } => out.push(configured_networks_section(&paths)),
     }
 
     out.push(host_section());
@@ -1395,13 +1616,8 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let control = {
         let agent = agent.clone();
         let plugin = wireguard.clone();
-        let source: Arc<dyn tsunagi::ipc::unix::ReportSource> = Arc::new(
-            move || -> tsunagi::BoxFuture<'static, tsunagi::ipc::StatusReport> {
-                let agent = agent.clone();
-                let plugin = plugin.clone();
-                Box::pin(async move { build_report(&agent, plugin.as_deref()).await })
-            },
-        );
+        let source: Arc<dyn tsunagi::ipc::unix::ReportSource> =
+            Arc::new(AgentControl { agent, plugin });
         let path = control_socket(&paths, args.control_socket.as_ref());
         match tsunagi::ipc::unix::ControlSocket::bind(path, source).await {
             Ok(socket) => {

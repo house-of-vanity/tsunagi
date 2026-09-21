@@ -70,7 +70,7 @@ On the first machine:
 
 ```bash
 cargo build --release
-./target/release/tsunagi secret          # prints tsn1...; share it privately
+./target/release/tsunagi id secret generate   # prints tsn1...; share it privately
 ./target/release/tsunagi status          # this device, the agent, and this host
 
 ./target/release/tsunagi up --network lab --secret "$SECRET" --wireguard
@@ -183,6 +183,36 @@ sayable — it remembers who belongs while they are gone, so the report can say
 "offline, 10.13.37.99 still reserved for it" instead of leaving a
 dial-failure counter to imply it. Counters are history and are never graded:
 a peer that left and came back should not leave the report looking broken.
+
+`id` is the other half: it shows what this device is — its signing key, the
+name it answers to, and the secret of every network it has joined — and
+changes those. Every item takes the same shape, so there is nothing to
+remember: name it to see it, name it with a value to change it.
+
+```
+tsunagi id                      everything about this device
+tsunagi id hostname             the name it answers to
+tsunagi id hostname mango       change it
+tsunagi id key                  the key it signs with
+tsunagi id key rotate           replace that key
+tsunagi id secret               the secret of each joined network
+tsunagi id secret generate      a fresh secret for a network that does not exist yet
+```
+
+Secrets appear in `id`, which is where you go to ask for one, and never in
+`status`, in a log, in a `Debug` rendering or in anything sent to a peer.
+
+The name is part of the signed state, so changing it revokes the previous
+one: there is one record per author, a new version replaces the whole claim,
+and no replica can keep the old name standing. Changing it while the agent
+runs goes through the agent, which republishes and tells its peers straight
+away.
+
+Replacing the signing key makes this device a different member, and it loses
+the address and name the old key held — nothing can sign on a retired key's
+behalf, and by design there is no authority that could overrule an author. So
+the outgoing key signs a release for every network on its way out, which
+frees them for whoever wants them next, and the whole thing commits at once.
 
 `status` and `id` both prefer a running agent, which is live and
 authoritative, and fall back to reading the state store when there is none.

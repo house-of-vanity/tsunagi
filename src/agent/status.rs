@@ -43,15 +43,20 @@ pub struct CandidateStatus {
 /// "this peer is offline" rather than only "nobody is connected".
 ///
 /// It is not a complete membership list, and cannot be. A member is in signed
-/// state once it has claimed something — today that means an IPv4 overlay
-/// address. In an IPv6-only network nothing is claimed, so members are
-/// visible only while they are connected.
+/// state once it has claimed something — an address, a name, or both — so a
+/// member that has joined but never published is visible only while it is
+/// connected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberStatus {
     /// The member's device identity.
     pub endpoint_id: EndpointId,
     /// The IPv4 overlay address it claimed and signed for.
     pub overlay_address_v4: Option<std::net::Ipv4Addr>,
+    /// The name it claimed, when it holds that name uncontested.
+    ///
+    /// Signed, so it is still known while the member is away — which is what
+    /// lets an absent member be named rather than shown as a bare id.
+    pub hostname: Option<String>,
 }
 
 /// Status of one authenticated session.

@@ -49,6 +49,9 @@ thiserror = "2.0"
 tracing = "0.1"
 fs4 = { version = "1.1", features = ["sync"] }
 directories = "6.0"
+# The real system hostname, without a libc call of our own: this crate is
+# forbidden `unsafe` and will not make one.
+gethostname = "1.1"
 netwatch = "0.19.3"
 bytes = "1.12.1"
 boringtun = { version = "0.7.1", default-features = false }

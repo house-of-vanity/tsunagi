@@ -63,6 +63,8 @@ pub(crate) enum NetCommand {
     Recheck,
     /// Resend this agent's announcement to every peer of this network.
     Reannounce,
+    /// Answer to a different name from now on.
+    SetHostname(String),
     /// An IP plugin reported an error from one of its own tasks.
     PluginError {
         /// Plugin protocol id.
@@ -84,6 +86,7 @@ impl std::fmt::Debug for NetCommand {
             NetCommand::Status { .. } => f.write_str("Status"),
             NetCommand::Recheck => f.write_str("Recheck"),
             NetCommand::Reannounce => f.write_str("Reannounce"),
+            NetCommand::SetHostname(_) => f.write_str("SetHostname"),
             NetCommand::PluginError { protocol, .. } => write!(f, "PluginError({protocol})"),
         }
     }
@@ -339,6 +342,19 @@ impl Runtime {
             }
             NetCommand::Recheck => self.discovery_round().await,
             NetCommand::Reannounce => self.reannounce(),
+            NetCommand::SetHostname(hostname) => {
+                if self.params.hostname != hostname {
+                    self.params.hostname = hostname;
+                    // Publishing the claim is the revocation: one record per
+                    // author, so the new version replaces the old name
+                    // rather than sitting beside it.
+                    self.ensure_own_claim().await;
+                    self.broadcast_state();
+                }
+                // Told to peers regardless, so a session that missed the
+                // earlier announcement is not left with a stale name.
+                self.reannounce();
+            }
             NetCommand::PluginError { protocol, reason } => {
                 // Counted here so that the per-network metric and the event
                 // always agree, wherever the error came from.
@@ -594,7 +610,7 @@ impl Runtime {
         self.own_version = self
             .params
             .storage
-            .own_record_version(self.network_id)
+            .own_record_version(self.network_id, self.local_id)
             .await
             .unwrap_or(0);
 
@@ -616,52 +632,84 @@ impl Runtime {
     /// Called after anything that could change the picture: startup, and
     /// every time another replica's records arrive.
     async fn ensure_own_claim(&mut self) {
-        let Some(range) = self.effective_range() else {
-            return;
+        let wanted_hostname = {
+            let hostname = crate::state::sanitise_hostname(&self.params.hostname);
+            (!hostname.is_empty()).then_some(hostname)
         };
-        let holders = self.state.address_holders();
-        let mine = self.state.address_of(&self.local_id);
+        let range = self.effective_range();
 
-        // An address we still hold is kept; this is what makes a returning
-        // participant get its old address back.
-        if let Some(mine) = mine
-            && range.contains(mine)
+        let wanted_address = match range {
+            None => None,
+            Some(range) => {
+                let holders = self.state.address_holders();
+                // An address we still hold is kept; this is what makes a
+                // returning participant get its old address back.
+                match self.state.address_of(&self.local_id) {
+                    Some(mine) if range.contains(mine) => Some(mine),
+                    _ => {
+                        let taken: std::collections::HashSet<std::net::Ipv4Addr> = holders
+                            .iter()
+                            .filter(|(_, holder)| **holder != self.local_id)
+                            .map(|(address, _)| *address)
+                            .collect();
+                        match allocate(
+                            self.network_id,
+                            self.local_id,
+                            range,
+                            &taken,
+                            self.state
+                                .get(&self.local_id)
+                                .and_then(|record| record.body.claimed_address()),
+                        ) {
+                            Ok(address) => Some(address),
+                            Err(err) => {
+                                self.metrics.plugin_errors += 1;
+                                self.emit(Event::PluginError {
+                                    network: self.network_id,
+                                    protocol: "overlay".into(),
+                                    reason: err.to_string(),
+                                });
+                                None
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let body = RecordBody::Claim {
+            address: wanted_address,
+            // The range only travels with an address, so a member of an
+            // IPv6-only network does not assert one.
+            range: wanted_address.and(range),
+            hostname: wanted_hostname,
+        };
+
+        // Nothing to say is not the same as saying nothing changed: a member
+        // that claims neither an address nor a name has no reason to occupy a
+        // record at all.
+        if matches!(
+            &body,
+            RecordBody::Claim {
+                address: None,
+                hostname: None,
+                ..
+            }
+        ) {
+            return;
+        }
+
+        // Republishing an unchanged claim would bump the version for no
+        // reason and make every replica store it again.
+        if self
+            .state
+            .get(&self.local_id)
+            .is_some_and(|record| record.body == body)
         {
             return;
         }
 
-        let taken: std::collections::HashSet<std::net::Ipv4Addr> = holders
-            .iter()
-            .filter(|(_, holder)| **holder != self.local_id)
-            .map(|(address, _)| *address)
-            .collect();
-
-        let wanted = match allocate(
-            self.network_id,
-            self.local_id,
-            range,
-            &taken,
-            self.state
-                .get(&self.local_id)
-                .and_then(|record| record.body.claimed_address()),
-        ) {
-            Ok(address) => address,
-            Err(err) => {
-                self.metrics.plugin_errors += 1;
-                self.emit(Event::PluginError {
-                    network: self.network_id,
-                    protocol: "overlay".into(),
-                    reason: err.to_string(),
-                });
-                return;
-            }
-        };
-
-        self.publish_record(RecordBody::Ipv4Claim {
-            address: wanted,
-            range,
-        })
-        .await;
+        self.publish_record(body).await;
     }
 
     /// Signs, stores and announces one of this agent's own records.
@@ -1236,7 +1284,11 @@ impl Runtime {
                 let endpoint_id = record.author_id().ok()?;
                 Some(MemberStatus {
                     endpoint_id,
-                    overlay_address_v4: record.body.claimed_address(),
+                    // Only uncontested claims are reported as held: two
+                    // members may have claimed the same thing, and saying
+                    // both hold it would be untrue on one of them.
+                    overlay_address_v4: self.state.address_of(&endpoint_id),
+                    hostname: self.state.hostname_of(&endpoint_id).map(str::to_string),
                 })
             })
             .collect();

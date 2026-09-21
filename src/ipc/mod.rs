@@ -66,6 +66,12 @@ pub fn control_socket_path(state_dir: &Path) -> PathBuf {
 pub enum Request {
     /// Report what the agent is doing.
     Status,
+    /// Answer to a different name from now on.
+    ///
+    /// Applied by the running agent rather than written behind its back, so
+    /// the change takes effect and reaches peers immediately instead of
+    /// waiting for a restart.
+    SetHostname(String),
 }
 
 /// What the agent answers.
@@ -74,6 +80,8 @@ pub enum Request {
 pub enum Response {
     /// A status report.
     Status(Box<StatusReport>),
+    /// The name the agent now answers to, after reducing it to canonical form.
+    Hostname(String),
     /// The request could not be served.
     Error(String),
 }

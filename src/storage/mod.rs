@@ -302,8 +302,12 @@ impl Storage {
     }
 
     /// The highest version this agent has ever published for a network.
-    pub async fn own_record_version(&self, network_id: NetworkId) -> Result<u64> {
-        self.with_state(move |state| state.own_record_version(network_id))
+    pub async fn own_record_version(
+        &self,
+        network_id: NetworkId,
+        author: iroh::EndpointId,
+    ) -> Result<u64> {
+        self.with_state(move |state| state.own_record_version(network_id, author))
             .await
     }
 

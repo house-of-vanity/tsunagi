@@ -79,13 +79,32 @@ struct Inner {
     storage: Storage,
     identity: DeviceIdentity,
     adapter: EndpointAdapter,
-    hostname: String,
+    /// Behind a lock because it can be changed while the agent runs.
+    hostname: std::sync::RwLock<String>,
     events: broadcast::Sender<Event>,
     networks: RwLock<HashMap<NetworkId, NetworkHandle>>,
     shutdown: Shutdown,
     accept_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     plugin_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     transport: std::sync::OnceLock<Arc<dyn PacketTransport>>,
+}
+
+impl Inner {
+    /// The name this agent currently answers to.
+    fn read_hostname(&self) -> String {
+        match self.hostname.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Replaces it. Only [`Agent::set_hostname`] does this.
+    fn write_hostname(&self, hostname: String) {
+        match self.hostname.write() {
+            Ok(mut guard) => *guard = hostname,
+            Err(poisoned) => *poisoned.into_inner() = hostname,
+        }
+    }
 }
 
 /// Answers the data plane transport's questions about the agent.
@@ -142,6 +161,7 @@ impl Agent {
 
         let hostname = resolve_hostname(&config, &storage, identity.endpoint_id())?;
         storage.set_hostname(hostname.clone()).await?;
+        let hostname = std::sync::RwLock::new(hostname);
 
         let (events, _) = broadcast::channel(config.limits.event_buffer);
         let limits = Arc::new(config.limits.clone());
@@ -226,8 +246,45 @@ impl Agent {
     }
 
     /// The hostname announced to peers.
-    pub fn hostname(&self) -> &str {
-        &self.inner.hostname
+    pub fn hostname(&self) -> String {
+        self.inner.read_hostname()
+    }
+
+    /// Changes the name this agent answers to, and tells everyone.
+    ///
+    /// The name is reduced to a canonical form first, so what is stored is
+    /// what every peer will compare against; the accepted form is returned.
+    ///
+    /// Every running network publishes a fresh signed claim, which is what
+    /// gives up the previous name: there is one record per author, so a new
+    /// version replaces the whole claim and no replica can keep the old name
+    /// standing. A network that is not running picks it up when it starts.
+    pub async fn set_hostname(&self, hostname: &str) -> Result<String> {
+        let hostname = crate::state::sanitise_hostname(hostname);
+        if hostname.is_empty() {
+            return Err(Error::InvalidEncoding {
+                kind: "hostname",
+                reason: "must contain at least one letter, digit, `-`, `.` or `_`",
+            });
+        }
+
+        // Stored first: if the process dies here, the next start uses the new
+        // name rather than silently reverting to the old one.
+        self.inner.storage.set_hostname(hostname.clone()).await?;
+        self.inner.write_hostname(hostname.clone());
+
+        let senders: Vec<mpsc::Sender<NetCommand>> = self
+            .inner
+            .networks
+            .read()
+            .await
+            .values()
+            .map(|handle| handle.commands.clone())
+            .collect();
+        for sender in senders {
+            let _ = sender.send(NetCommand::SetHostname(hostname.clone())).await;
+        }
+        Ok(hostname)
     }
 
     /// The underlying iroh endpoint, for callers that need more detail.
@@ -310,7 +367,7 @@ impl Agent {
             discovery: self.inner.config.discovery.clone(),
             discovery_interval: self.inner.config.discovery_interval,
             plugins: self.inner.config.plugins.clone(),
-            hostname: self.inner.hostname.clone(),
+            hostname: self.inner.read_hostname(),
             transport: self.inner.transport.get().cloned(),
             device_secret: self.inner.identity.signing_key(),
             ipv4_range: self.inner.config.overlay_ipv4_range,
@@ -461,7 +518,7 @@ impl Agent {
 
         Ok(AgentStatus {
             endpoint_id: endpoint.endpoint_id,
-            hostname: self.inner.hostname.clone(),
+            hostname: self.inner.read_hostname(),
             bound_sockets: endpoint.bound_sockets,
             observed_addrs: endpoint.observed_addrs,
             endpoint_addr: self.inner.adapter.addr(),
@@ -803,29 +860,41 @@ async fn handle_inbound_data(inner: Arc<Inner>, conn: iroh::endpoint::Connection
 
 /// Picks the hostname to announce.
 ///
-/// Order: explicit configuration, then what the state store already holds, then
-/// a best-effort environment variable, then a stable fallback derived from the
-/// endpoint id. The library does not shell out to discover a hostname.
+/// Order: an explicit choice, then one the user set earlier and the store
+/// kept, then the machine's own name, then a fallback derived from the
+/// endpoint id for the rare host that has no usable name.
+///
+/// No shell is involved at any step: the system name comes from the platform
+/// call, not from running `hostname`.
 fn resolve_hostname(
     config: &AgentConfig,
     storage: &Storage,
     endpoint_id: EndpointId,
 ) -> Result<String> {
     if let Some(hostname) = &config.hostname {
-        return Ok(hostname.clone());
+        return Ok(crate::state::sanitise_hostname(hostname));
     }
     if let Some(stored) = storage.hostname_blocking()?
         && !stored.is_empty()
     {
-        return Ok(stored);
+        return Ok(crate::state::sanitise_hostname(&stored));
     }
-    for key in ["HOSTNAME", "COMPUTERNAME"] {
-        if let Ok(value) = std::env::var(key) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Ok(value.to_string());
-            }
-        }
+    if let Some(system) = system_hostname() {
+        return Ok(system);
     }
     Ok(format!("tsunagi-{}", endpoint_id.fmt_short()))
+}
+
+/// The machine's own name, if it has a usable one.
+///
+/// Some hosts answer with `localhost`, or with nothing at all. That is not a
+/// name that distinguishes this device from any other, so it is treated as
+/// absent and the caller falls back to something that does.
+pub fn system_hostname() -> Option<String> {
+    let raw = gethostname::gethostname();
+    let name = crate::state::sanitise_hostname(&raw.to_string_lossy());
+    if name.is_empty() || name.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    Some(name)
 }

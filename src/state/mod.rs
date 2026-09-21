@@ -121,7 +121,14 @@ pub const DEFAULT_IPV4_RANGE: Ipv4Range = Ipv4Range {
 };
 
 /// Frozen domain separator for the bytes a record signature covers.
-pub const RECORD_DOMAIN: &str = "tsunagi-signed-record-v1";
+pub const RECORD_DOMAIN: &str = "tsunagi-signed-record-v2";
+
+/// Longest hostname a record may carry.
+///
+/// One DNS label's worth. It bounds what arrives from the network before
+/// anything is allocated for it, and keeps a name short enough to print in a
+/// column.
+pub const MAX_HOSTNAME_LEN: usize = 63;
 
 /// Largest number of records accepted in one exchange.
 pub const MAX_RECORDS_PER_MESSAGE: usize = 256;
@@ -154,56 +161,129 @@ pub enum StateError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum RecordBody {
-    /// This author holds an IPv4 overlay address, in this range.
+    /// Everything this author currently asserts about itself.
     ///
-    /// The range travels with the claim so that a participant joining later
-    /// learns which range the network actually settled on, rather than having
-    /// to be told.
-    Ipv4Claim {
-        /// The address this author holds.
-        address: Ipv4Addr,
-        /// The overlay range it was allocated from.
-        range: Ipv4Range,
+    /// One record per author, so everything it claims travels together and a
+    /// later version supersedes the lot. That is what makes changing a claim
+    /// a revocation of the previous one rather than an addition beside it:
+    /// there is no way to leave the old value standing.
+    Claim {
+        /// The IPv4 overlay address this author holds, if it holds one.
+        address: Option<Ipv4Addr>,
+        /// The overlay range that address was allocated from.
+        ///
+        /// The range travels with the claim so that a participant joining
+        /// later learns which range the network actually settled on, rather
+        /// than having to be told.
+        range: Option<Ipv4Range>,
+        /// The name this author answers to.
+        hostname: Option<String>,
     },
-    /// This author gave its address up.
+    /// This author gives up everything it claimed.
     ///
     /// A tombstone, not an absence: it is a positive statement, so it
     /// survives merging and cannot be undone by a replica that simply has not
-    /// heard of it.
-    Ipv4Release,
+    /// heard of it. Published when a device key is replaced, so the address
+    /// and name it held are freed for somebody else rather than reserved
+    /// forever to a key nobody has.
+    Release,
 }
 
 impl RecordBody {
     /// The address this body claims, if any.
     pub fn claimed_address(&self) -> Option<Ipv4Addr> {
         match self {
-            RecordBody::Ipv4Claim { address, .. } => Some(*address),
-            RecordBody::Ipv4Release => None,
+            RecordBody::Claim { address, .. } => *address,
+            RecordBody::Release => None,
         }
     }
 
     /// The range this body names, if any.
     pub fn range(&self) -> Option<Ipv4Range> {
         match self {
-            RecordBody::Ipv4Claim { range, .. } => Some(*range),
-            RecordBody::Ipv4Release => None,
+            RecordBody::Claim { range, .. } => *range,
+            RecordBody::Release => None,
+        }
+    }
+
+    /// The hostname this body claims, if any.
+    pub fn hostname(&self) -> Option<&str> {
+        match self {
+            RecordBody::Claim { hostname, .. } => hostname.as_deref(),
+            RecordBody::Release => None,
         }
     }
 
     fn canonical(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(48);
+        let mut out = Vec::with_capacity(96);
         match self {
-            RecordBody::Ipv4Claim { address, range } => {
-                push_lp(&mut out, b"ipv4-claim");
-                push_lp(&mut out, &address.octets());
-                push_lp(&mut out, &range.base.octets());
-                push_lp(&mut out, &[range.prefix_len]);
+            RecordBody::Claim {
+                address,
+                range,
+                hostname,
+            } => {
+                push_lp(&mut out, b"claim");
+                push_opt(
+                    &mut out,
+                    address
+                        .map(|address| address.octets())
+                        .as_ref()
+                        .map(|o| &o[..]),
+                );
+                push_opt(
+                    &mut out,
+                    range
+                        .map(|range| {
+                            let mut bytes = range.base.octets().to_vec();
+                            bytes.push(range.prefix_len);
+                            bytes
+                        })
+                        .as_deref(),
+                );
+                push_opt(&mut out, hostname.as_deref().map(str::as_bytes));
             }
-            RecordBody::Ipv4Release => {
-                push_lp(&mut out, b"ipv4-release");
+            RecordBody::Release => {
+                push_lp(&mut out, b"release");
             }
         }
         out
+    }
+}
+
+/// Reduces a hostname to something safe to store, compare and print.
+///
+/// Three jobs at once. It bounds the length, so a record from the network
+/// cannot carry an unbounded string. It strips everything outside a
+/// conservative set, so a name can never be mistaken for a path, an option or
+/// a shell word by anything downstream — nothing here is ever executed, and
+/// this keeps it that way even if some later caller is careless. And it
+/// lower-cases, so that two members claiming the same name in different cases
+/// are recognised as claiming the same name rather than quietly both holding
+/// it.
+pub fn sanitise_hostname(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_HOSTNAME_LEN));
+    for ch in raw.chars() {
+        if out.len() >= MAX_HOSTNAME_LEN {
+            break;
+        }
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | '_') {
+            out.push(ch);
+        }
+    }
+    // A name that is only separators distinguishes nothing.
+    let trimmed = out.trim_matches(|ch| matches!(ch, '-' | '.' | '_'));
+    trimmed.to_string()
+}
+
+/// Writes an optional value unambiguously: a presence byte, then the value.
+fn push_opt(out: &mut Vec<u8>, value: Option<&[u8]>) {
+    match value {
+        Some(bytes) => {
+            out.push(1);
+            push_lp(out, bytes);
+        }
+        None => out.push(0),
     }
 }
 
@@ -278,14 +358,40 @@ impl SignedRecord {
         if self.network != *network.as_bytes() {
             return Err(StateError::WrongNetwork);
         }
-        if let RecordBody::Ipv4Claim { address, range } = &self.body {
-            if range.prefix_len > 30 {
-                return Err(StateError::Malformed("claimed range has no room for hosts"));
+        if let RecordBody::Claim {
+            address,
+            range,
+            hostname,
+        } = &self.body
+        {
+            // Bounds before anything is believed, because all of this came
+            // off the network.
+            if let Some(range) = range {
+                if range.prefix_len > 30 {
+                    return Err(StateError::Malformed("claimed range has no room for hosts"));
+                }
+                if let Some(address) = address
+                    && !range.contains(*address)
+                {
+                    return Err(StateError::Malformed(
+                        "claimed address is outside its range",
+                    ));
+                }
+            } else if address.is_some() {
+                return Err(StateError::Malformed("claimed an address with no range"));
             }
-            if !range.contains(*address) {
-                return Err(StateError::Malformed(
-                    "claimed address is outside its range",
-                ));
+            if let Some(hostname) = hostname {
+                // Rejected rather than sanitised: a name that does not
+                // survive sanitising unchanged would hash and compare
+                // differently from what the author signed, so accepting a
+                // repaired version would mean believing something nobody
+                // signed.
+                if hostname.len() > MAX_HOSTNAME_LEN {
+                    return Err(StateError::Malformed("claimed hostname is too long"));
+                }
+                if *hostname != sanitise_hostname(hostname) {
+                    return Err(StateError::Malformed("claimed hostname is not canonical"));
+                }
             }
         }
 
@@ -448,6 +554,35 @@ impl StateSet {
         holders
     }
 
+    /// Who currently holds each claimed hostname.
+    ///
+    /// The same rule as addresses, for the same reason: a name is owned, two
+    /// members may claim one, and every replica has to reach the same answer
+    /// about who has it without asking anybody.
+    pub fn hostname_holders(&self) -> HashMap<String, EndpointId> {
+        let mut holders: HashMap<String, EndpointId> = HashMap::new();
+        for (author, record) in &self.records {
+            let Some(hostname) = record.body.hostname() else {
+                continue;
+            };
+            holders
+                .entry(hostname.to_string())
+                .and_modify(|held| {
+                    if author.as_bytes() < held.as_bytes() {
+                        *held = *author;
+                    }
+                })
+                .or_insert(*author);
+        }
+        holders
+    }
+
+    /// The hostname an author holds, if it holds one uncontested.
+    pub fn hostname_of(&self, author: &EndpointId) -> Option<&str> {
+        let hostname = self.records.get(author)?.body.hostname()?;
+        (self.hostname_holders().get(hostname) == Some(author)).then_some(hostname)
+    }
+
     /// The address an author holds, if it holds one uncontested.
     pub fn address_of(&self, author: &EndpointId) -> Option<Ipv4Addr> {
         let address = self.records.get(author)?.body.claimed_address()?;
@@ -493,9 +628,10 @@ mod tests {
     }
 
     fn claim(address: &str) -> RecordBody {
-        RecordBody::Ipv4Claim {
-            address: address.parse().unwrap(),
-            range: range(),
+        RecordBody::Claim {
+            address: Some(address.parse().unwrap()),
+            range: Some(range()),
+            hostname: None,
         }
     }
 
@@ -551,9 +687,10 @@ mod tests {
             &secret,
             id,
             1,
-            RecordBody::Ipv4Claim {
-                address: "10.99.0.1".parse().unwrap(),
-                range: range(),
+            RecordBody::Claim {
+                address: Some("10.99.0.1".parse().unwrap()),
+                range: Some(range()),
+                hostname: None,
             },
         );
         assert!(matches!(outside.verify(id), Err(StateError::Malformed(_))));
@@ -562,15 +699,183 @@ mod tests {
             &secret,
             id,
             1,
-            RecordBody::Ipv4Claim {
-                address: "10.13.37.1".parse().unwrap(),
-                range: Ipv4Range {
+            RecordBody::Claim {
+                address: Some("10.13.37.1".parse().unwrap()),
+                range: Some(Ipv4Range {
                     base: "10.13.37.0".parse().unwrap(),
                     prefix_len: 31,
-                },
+                }),
+                hostname: None,
             },
         );
         assert!(matches!(no_hosts.verify(id), Err(StateError::Malformed(_))));
+    }
+
+    #[test]
+    fn a_hostname_is_reduced_to_something_safe_to_store_and_compare() {
+        // Lower-cased, so two members cannot both "own" the same name in
+        // different cases without noticing.
+        assert_eq!(sanitise_hostname("Music"), "music");
+        // Stripped, so nothing downstream can mistake a name for a path, an
+        // option or a shell word.
+        assert_eq!(sanitise_hostname("ab; rm -rf /"), "abrm-rf");
+        assert_eq!(sanitise_hostname("a/b\\c"), "abc");
+        assert_eq!(sanitise_hostname("host name"), "hostname");
+        // Bounded before anything is allocated for it.
+        assert_eq!(sanitise_hostname(&"x".repeat(200)).len(), MAX_HOSTNAME_LEN);
+        // A name of nothing but separators distinguishes nothing.
+        assert_eq!(sanitise_hostname("---"), "");
+        assert_eq!(sanitise_hostname(""), "");
+        // Already canonical names survive untouched, or the check in
+        // `verify` would reject what this produced.
+        for name in ["music", "ab-laptop", "host.example", "a_b.c-1"] {
+            assert_eq!(sanitise_hostname(name), name);
+        }
+    }
+
+    #[test]
+    fn a_hostname_that_is_not_canonical_is_rejected_rather_than_repaired() {
+        // Repairing it would mean storing something the author never signed.
+        let secret = SecretKey::generate();
+        let id = network("naming");
+        for bad in ["Music", "ab; rm", "x".repeat(MAX_HOSTNAME_LEN + 1).as_str()] {
+            let record = SignedRecord::sign(
+                &secret,
+                id,
+                1,
+                RecordBody::Claim {
+                    address: None,
+                    range: None,
+                    hostname: Some(bad.to_string()),
+                },
+            );
+            assert!(
+                matches!(record.verify(id), Err(StateError::Malformed(_))),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_without_a_range_is_rejected() {
+        let secret = SecretKey::generate();
+        let id = network("naming");
+        let record = SignedRecord::sign(
+            &secret,
+            id,
+            1,
+            RecordBody::Claim {
+                address: Some("10.13.37.5".parse().unwrap()),
+                range: None,
+                hostname: None,
+            },
+        );
+        assert!(matches!(record.verify(id), Err(StateError::Malformed(_))));
+    }
+
+    #[test]
+    fn two_members_claiming_one_name_resolve_it_the_same_way_everywhere() {
+        // The same rule as addresses: a name is owned, and every replica has
+        // to reach the same answer about who owns it with nobody to ask.
+        let a = SecretKey::generate();
+        let b = SecretKey::generate();
+        let id = network("naming");
+        let named = |secret: &SecretKey| {
+            SignedRecord::sign(
+                secret,
+                id,
+                1,
+                RecordBody::Claim {
+                    address: None,
+                    range: None,
+                    hostname: Some("music".into()),
+                },
+            )
+        };
+
+        let mut set = StateSet::new();
+        set.merge(id, named(&a)).unwrap();
+        set.merge(id, named(&b)).unwrap();
+
+        let (lower, higher) = if a.public().as_bytes() < b.public().as_bytes() {
+            (a.public(), b.public())
+        } else {
+            (b.public(), a.public())
+        };
+        assert_eq!(set.hostname_of(&lower), Some("music"));
+        assert_eq!(
+            set.hostname_of(&higher),
+            None,
+            "the loser does not hold the name it claimed"
+        );
+
+        // And the order the records arrived in cannot change the answer.
+        let mut reversed = StateSet::new();
+        reversed.merge(id, named(&b)).unwrap();
+        reversed.merge(id, named(&a)).unwrap();
+        assert_eq!(reversed.hostname_of(&lower), Some("music"));
+    }
+
+    #[test]
+    fn changing_a_name_revokes_the_old_one_everywhere() {
+        // There is one record per author, so a new version replaces the whole
+        // claim. The previous name cannot survive beside it.
+        let secret = SecretKey::generate();
+        let id = network("naming");
+        let claim = |version, name: &str| {
+            SignedRecord::sign(
+                &secret,
+                id,
+                version,
+                RecordBody::Claim {
+                    address: None,
+                    range: None,
+                    hostname: Some(name.to_string()),
+                },
+            )
+        };
+
+        let mut set = StateSet::new();
+        set.merge(id, claim(1, "old")).unwrap();
+        set.merge(id, claim(2, "new")).unwrap();
+
+        assert_eq!(set.hostname_of(&secret.public()), Some("new"));
+        assert!(
+            !set.hostname_holders().contains_key("old"),
+            "the old name is gone, not merely shadowed"
+        );
+
+        // A replica that has not heard of the change cannot bring it back.
+        set.merge(id, claim(1, "old")).unwrap();
+        assert_eq!(set.hostname_of(&secret.public()), Some("new"));
+    }
+
+    #[test]
+    fn a_release_gives_up_the_name_as_well_as_the_address() {
+        let secret = SecretKey::generate();
+        let id = network("naming");
+        let mut set = StateSet::new();
+        set.merge(
+            id,
+            SignedRecord::sign(
+                &secret,
+                id,
+                1,
+                RecordBody::Claim {
+                    address: Some("10.13.37.5".parse().unwrap()),
+                    range: Some(range()),
+                    hostname: Some("music".into()),
+                },
+            ),
+        )
+        .unwrap();
+        set.merge(id, SignedRecord::sign(&secret, id, 2, RecordBody::Release))
+            .unwrap();
+
+        assert_eq!(set.address_of(&secret.public()), None);
+        assert_eq!(set.hostname_of(&secret.public()), None);
+        assert!(set.address_holders().is_empty());
+        assert!(set.hostname_holders().is_empty());
     }
 
     #[test]
@@ -673,11 +978,8 @@ mod tests {
             .unwrap();
         assert!(set.address_of(&secret.public()).is_some());
 
-        set.merge(
-            id,
-            SignedRecord::sign(&secret, id, 2, RecordBody::Ipv4Release),
-        )
-        .unwrap();
+        set.merge(id, SignedRecord::sign(&secret, id, 2, RecordBody::Release))
+            .unwrap();
         assert_eq!(set.address_of(&secret.public()), None);
         assert!(set.address_holders().is_empty());
 
@@ -722,9 +1024,10 @@ mod tests {
                 &author,
                 id,
                 1,
-                RecordBody::Ipv4Claim {
-                    address: "10.99.0.7".parse().unwrap(),
-                    range: custom,
+                RecordBody::Claim {
+                    address: Some("10.99.0.7".parse().unwrap()),
+                    range: Some(custom),
+                    hostname: None,
                 },
             ),
         )
