@@ -174,8 +174,18 @@ sudo sysctl -qw net.ipv6.conf.tsunjwc6dcrtmo5.keep_addr_on_down=1
 sudo ip -6 address add fd80:1210:f724:f620:d1bb:f982:3b6e:19bd/64 dev tsunjwc6dcrtmo5 nodad
 ```
 
-If you asked for IPv4 with `--ipv4-range`, `tun-setup` adds an `ip address add`
-line for it too.
+With IPv4 enabled, `tun-setup` adds an `ip address add` line for the overlay
+IPv4 address too — but only once there is one to print. Unlike the IPv6
+address, the IPv4 address is not derived from the keys: it is allocated at run
+time and signed (see [docs/sync-model.md](docs/sync-model.md)), so it exists
+only after the agent has run once. `tun-setup` then reads it back out of
+`state.sqlite`, which does not disturb a running agent, and includes it from
+then on. Until then the first `tsunagi up` prints the exact command for the
+address it was given.
+
+That IPv4 line needs no `keep_addr_on_down` and no `nodad`: Linux keeps IPv4
+addresses on an interface that loses carrier, and IPv4 has no duplicate
+address detection to stall. Adding it once is enough.
 
 The MTU is 1280 because that is the minimum IPv6 requires (RFC 8200). Linux
 disables IPv6 entirely on an interface below it — the per-device

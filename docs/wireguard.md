@@ -271,7 +271,13 @@ async fn main() -> Result<()> {
   attached it has no carrier, and Linux then flushes its IPv6 addresses. The
   setup printed by `tsunagi tun-setup` sets it; the agent checks the address is
   present *and usable* — not tentative, not DAD-failed — before attaching, and
-  reports what it actually found.
+  reports what it actually found. This applies to IPv6 only: IPv4 addresses
+  survive carrier loss, so the overlay IPv4 address is added once and stays.
+* **The overlay IPv4 address is not derivable, so `tun-setup` cannot print it
+  on a fresh state directory.** It is allocated and signed at run time, so the
+  first `tsunagi up` is what names it; afterwards `tun-setup` reads it back
+  from `state.sqlite` — a read that takes no directory lock and so does not
+  disturb a running agent — and includes the `ip address add` line.
 * **The agent cannot assign the overlay address itself.** The `tun` crate sets
   addresses through an IPv4-only ioctl, so the IPv6 overlay address must come
   from `ip -6 address add` or an equivalent. The agent verifies the address is
