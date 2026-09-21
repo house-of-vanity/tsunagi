@@ -48,6 +48,7 @@ use crate::net::EndpointAdapter;
 use crate::overlay::PacketCarrier;
 use crate::proto::handshake;
 use crate::proto::message::ControlMessage;
+use crate::state::Ipv4Range;
 use crate::storage::{CacheOutcome, Storage};
 
 use network::{InboundSession, NetCommand, NetworkHandle, RuntimeParams};
@@ -353,18 +354,20 @@ impl Agent {
     /// waits to adopt whatever it settles on. One agent has one interface, so
     /// proposing a range it could not route would be worse than having none:
     /// the lowest author's range wins, and the collision would spread.
-    fn reserve_range(&self, network: NetworkId) -> Option<crate::state::Ipv4Range> {
-        let wanted = self.inner.config.overlay_ipv4_range?;
+    fn reserve_range(&self, network: NetworkId) -> (Option<Ipv4Range>, Option<Ipv4Range>) {
+        let Some(wanted) = self.inner.config.overlay_ipv4_range else {
+            return (None, None);
+        };
         let reservation = crate::overlay::NetworkRoutes {
             range: Some(wanted),
             local: None,
             peers: Vec::new(),
         };
         match self.inner.routes.set_network(network, reservation) {
-            Ok(()) => Some(wanted),
+            Ok(()) => (Some(wanted), None),
             Err(err) => {
                 tracing::info!(%err, "not proposing a range for this network");
-                None
+                (None, Some(wanted))
             }
         }
     }
@@ -456,6 +459,26 @@ impl Agent {
     ) -> Result<NetworkId> {
         let keys = NetworkKeys::derive(name, secret);
         let network_id = keys.network_id();
+
+        // A network's identity is its name *and* its secret, so the same
+        // name with a different secret is a different network — and one that
+        // looks identical in anything that shows a name. Almost always a
+        // mistyped secret, so it is said out loud rather than left to be
+        // discovered as an empty network sitting beside a working one.
+        if let Ok(configured) = self.inner.storage.list_networks().await {
+            for other in configured {
+                if other.name == *name && other.network_id != network_id {
+                    tracing::warn!(
+                        "`{name}` is already configured with a different secret, as {}. \
+                         Joining with this one adds a second network under the same name; \
+                         they share nothing. Check the secret, or use `tsunagi id secret` \
+                         to see which is which.",
+                        other.network_id
+                    );
+                }
+            }
+        }
+
         self.inner
             .storage
             .upsert_network(network_id, name.clone(), secret.clone(), true)
@@ -495,6 +518,7 @@ impl Agent {
             return Err(Error::NetworkAlreadyActive(network_id));
         }
 
+        let (reserved, conflict) = self.reserve_range(network_id);
         let handle = network::spawn(RuntimeParams {
             keys,
             adapter: self.inner.adapter.clone(),
@@ -510,7 +534,8 @@ impl Agent {
             hostname: self.inner.read_hostname(),
             transport: self.inner.transport.get().cloned(),
             device_secret: self.inner.identity.signing_key(),
-            ipv4_range: self.reserve_range(network_id),
+            ipv4_range: reserved,
+            range_conflict: conflict,
         });
         networks.insert(network_id, handle);
         drop(networks);
@@ -658,9 +683,11 @@ impl Agent {
                 state: NetworkState::Inactive,
                 peers: Vec::new(),
                 candidates: Vec::new(),
-                // An inactive network has no runtime to ask; the roster comes
-                // from one. Empty, not invented.
+                // An inactive network has no runtime to ask; the roster and
+                // the range come from one. Empty, not invented.
                 members: Vec::new(),
+                range: None,
+                range_conflict: None,
                 metrics: NetworkMetrics::default(),
             });
         }

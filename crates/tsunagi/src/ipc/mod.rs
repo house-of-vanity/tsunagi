@@ -149,7 +149,12 @@ pub struct NetworkReport {
     pub handshake_failures: u64,
     /// Control messages sent and received.
     pub control_messages: (u64, u64),
-    /// The overlay, when an IP plugin is running one.
+    /// The overlay range this network uses, once it has one.
+    pub range: Option<String>,
+    /// The range it could not have, because another network on this agent
+    /// already holds it.
+    pub range_conflict: Option<String>,
+    /// The overlay, when a protocol is running one.
     pub overlay: Option<OverlayReport>,
 }
 

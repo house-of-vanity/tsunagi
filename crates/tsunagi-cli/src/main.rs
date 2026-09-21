@@ -1140,7 +1140,15 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     match &observed {
         Observed::Agent(report) => {
             for network in &report.networks {
-                out.push(network_section(network, &report.endpoint_id));
+                // Whether another configured network answers to the same
+                // name, which is what makes two sections look like one.
+                let shared = report
+                    .networks
+                    .iter()
+                    .filter(|other| other.name == network.name)
+                    .count()
+                    > 1;
+                out.push(network_section(network, &report.endpoint_id, shared));
             }
         }
         // Without an agent there is no live view, but the store still knows
@@ -1306,23 +1314,56 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
 }
 
 /// One network: what it is, who is in it, and what has happened since start.
-fn network_section(network: &tsunagi::ipc::NetworkReport, own_id: &str) -> report::Section {
+fn network_section(
+    network: &tsunagi::ipc::NetworkReport,
+    own_id: &str,
+    name_shared: bool,
+) -> report::Section {
     use report::{Health, Row, Section};
 
-    let mut section = Section::new(format!("network {}", network.name));
+    // The id is in the heading, not only in a row: a name is a label a user
+    // chose and two networks may share one, so a heading without the id
+    // reads as one network that is somehow both working and empty.
+    let mut section = Section::new(format!(
+        "network {} ({})",
+        network.name,
+        short(&network.network_id, 10)
+    ));
     section.push(if network.active {
-        Row::new(
-            Health::Good,
-            "state",
-            format!("active  {}", network.network_id),
-        )
+        Row::new(Health::Good, "state", network.network_id.clone())
     } else {
-        Row::new(
-            Health::Degraded,
-            "state",
-            format!("inactive  {}", network.network_id),
-        )
+        Row::new(Health::Degraded, "state", "inactive")
     });
+    if name_shared {
+        section.push(
+            Row::new(
+                Health::Degraded,
+                "name",
+                format!(
+                    "another configured network is also called `{}`",
+                    network.name
+                ),
+            )
+            .with_note(
+                "a network is its name *and* its secret, so these two share nothing. \
+                 Usually a mistyped secret; `tsunagi id secret` shows which is which.",
+            ),
+        );
+    }
+    if let Some(conflict) = &network.range_conflict {
+        section.push(
+            Row::new(
+                Health::Degraded,
+                "range",
+                format!("cannot use {conflict}: another network here already does"),
+            )
+            .with_note(
+                "one agent has one interface, so an address belongs to one network. \
+                 This one waits to adopt whatever its members settle on; give it \
+                 `--ipv4-range` of its own to propose one.",
+            ),
+        );
+    }
 
     if let Some(overlay) = &network.overlay {
         section.push(Row::new(
@@ -1343,10 +1384,15 @@ fn network_section(network: &tsunagi::ipc::NetworkReport, own_id: &str) -> repor
     let rows = member_rows(network, own_id);
     let online = rows.iter().filter(|row| row.online()).count();
     if rows.is_empty() {
+        // Why there is nobody, rather than just that there is nobody: the
+        // two reasons want different actions.
         section.push(Row::new(
             Health::Info,
             "members",
-            "none known yet; nobody else has joined",
+            match (&network.range, &network.range_conflict) {
+                (None, Some(_)) => "none: this network has no range to allocate from",
+                _ => "none known yet; nobody else has joined",
+            },
         ));
     } else {
         section.push(Row::new(
@@ -2317,6 +2363,8 @@ async fn build_report(
                             .map_or(0, |candidate| candidate.consecutive_failures),
                     })
                     .collect(),
+                range: network.range.map(|range| range.to_string()),
+                range_conflict: network.range_conflict.map(|range| range.to_string()),
                 dial_failures: network.metrics.dial_failures,
                 handshake_failures: network.metrics.handshake_failures,
                 control_messages: (
@@ -2580,6 +2628,8 @@ mod status_tests {
                     failed_dials: 0,
                 },
             ],
+            range: Some("10.13.37.0/24".into()),
+            range_conflict: None,
             // Everything below happened while the peer was away.
             dial_failures: 9,
             handshake_failures: 0,
@@ -2593,6 +2643,42 @@ mod status_tests {
     }
 
     #[test]
+    fn two_networks_with_one_name_are_told_apart_and_flagged() {
+        // The confusing case: two sections headed identically, one working
+        // and one empty, read as a single network that is somehow both.
+        let network = network_after_a_peer_returned();
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, true));
+        let text = out.render(false);
+
+        assert!(
+            text.contains(&format!("network LAB ({})", short(&network.network_id, 10))),
+            "the heading must identify the network, not just name it:\n{text}"
+        );
+        assert!(text.contains("also called `LAB`"), "{text}");
+        assert!(text.contains("mistyped secret"), "{text}");
+    }
+
+    #[test]
+    fn a_network_with_no_range_says_that_is_why_it_is_empty() {
+        // Rather than "nobody else has joined", which points at the wrong
+        // thing entirely: nobody can join a network with no addresses.
+        let mut network = network_after_a_peer_returned();
+        network.peers.clear();
+        network.members.clear();
+        network.overlay = None;
+        network.range = None;
+        network.range_conflict = Some("10.13.37.0/24".into());
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert!(text.contains("no range to allocate from"), "{text}");
+        assert!(text.contains("another network here already does"), "{text}");
+        assert!(text.contains("--ipv4-range"), "the fix is named: {text}");
+    }
+
+    #[test]
     fn counters_from_the_past_do_not_grade_the_present() {
         // A peer that left and returned leaves dial failures and a packet
         // sent to an address nobody owned behind it. Once it is back, those
@@ -2600,7 +2686,7 @@ mod status_tests {
         // network look broken.
         let network = network_after_a_peer_returned();
         let mut out = report::Report::new();
-        out.push(network_section(&network, OWN));
+        out.push(network_section(&network, OWN, false));
 
         assert_eq!(out.worst(), Health::Good, "{}", out.render(false));
         let text = out.render(false);
@@ -2649,7 +2735,7 @@ mod status_tests {
         });
 
         let mut out = report::Report::new();
-        out.push(network_section(&network, OWN));
+        out.push(network_section(&network, OWN, false));
         let text = out.render(false);
 
         assert_eq!(out.worst(), Health::Good, "{text}");
@@ -2665,7 +2751,7 @@ mod status_tests {
         network.peers[0].transport = "relay".into();
 
         let mut out = report::Report::new();
-        out.push(network_section(&network, OWN));
+        out.push(network_section(&network, OWN, false));
         assert_eq!(out.worst(), Health::Degraded, "{}", out.render(false));
         assert!(out.render(false).contains("relay"));
     }
@@ -2676,7 +2762,7 @@ mod status_tests {
         network.overlay = Some(overlay(vec![tunnel(ONLINE, None)]));
 
         let mut out = report::Report::new();
-        out.push(network_section(&network, OWN));
+        out.push(network_section(&network, OWN, false));
         let text = out.render(false);
         assert_eq!(out.worst(), Health::Degraded, "{text}");
         assert!(text.contains("no WireGuard handshake yet"), "{text}");
@@ -2692,7 +2778,7 @@ mod status_tests {
         network.handshake_failures = 4;
 
         let mut out = report::Report::new();
-        out.push(network_section(&network, OWN));
+        out.push(network_section(&network, OWN, false));
         let text = out.render(false);
         assert_eq!(out.worst(), Health::Degraded, "{text}");
         assert!(text.contains("same secret"), "{text}");

@@ -159,6 +159,15 @@ pub struct NetworkStatus {
     pub candidates: Vec<CandidateStatus>,
     /// Members the signed state knows about, whether connected or not.
     pub members: Vec<MemberStatus>,
+    /// The overlay range this network uses, once it has one.
+    pub range: Option<crate::state::Ipv4Range>,
+    /// The range it could not have, because another network on this agent
+    /// already holds it.
+    ///
+    /// One agent has one interface, so an address belongs to one network.
+    /// This network waits to adopt whatever its members settle on instead of
+    /// proposing something it could not route.
+    pub range_conflict: Option<crate::state::Ipv4Range>,
     /// Per-network counters.
     pub metrics: NetworkMetrics,
 }

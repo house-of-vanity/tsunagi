@@ -130,6 +130,9 @@ pub(crate) struct RuntimeParams {
     /// The IPv4 overlay range this agent would use, if the network has not
     /// already settled on another one.
     pub(crate) ipv4_range: Option<Ipv4Range>,
+    /// The range it was configured with but cannot have, because another
+    /// network on this agent holds it.
+    pub(crate) range_conflict: Option<Ipv4Range>,
     /// How data plane links are opened. `None` disables the data plane.
     pub(crate) transport: Option<Arc<dyn PacketTransport>>,
 }
@@ -1439,6 +1442,8 @@ impl Runtime {
             peers,
             candidates,
             members,
+            range: self.effective_range(),
+            range_conflict: self.params.range_conflict,
             metrics: self.metrics.clone(),
         }
     }
