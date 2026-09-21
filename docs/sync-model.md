@@ -1,6 +1,6 @@
 # Planned state synchronisation
 
-**The first slice of this model is now implemented**, in `src/state/`, and is
+**The first slice of this model is now implemented**, in `crates/tsunagi/src/state/`, and is
 used for one thing: IPv4 overlay addresses. What follows describes the whole
 model; the section at the end says exactly which parts exist.
 
@@ -77,7 +77,7 @@ migrations for this.
 
 ## What exists today
 
-Implemented, in `src/state/`:
+Implemented, in `crates/tsunagi/src/state/`:
 
 * signed records, one per author per network, each holding that author's
   complete current statement rather than a delta;

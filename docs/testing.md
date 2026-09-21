@@ -50,7 +50,7 @@ keeping the WireGuard identity, shutdown removing every interface, a forged
 overlay claim being rejected, and the core carrying the payload without
 interpreting it.
 
-Unit tests in `src/state/` cover the signed record model directly: tampering
+Unit tests in `crates/tsunagi/src/state/` cover the signed record model directly: tampering
 with any field breaks verification, a newer version wins while an older one
 never rolls back, two authors claiming one address resolve the same way no
 matter the merge order, one key used in two places is reported rather than
@@ -68,11 +68,11 @@ staying short enough to bind.
 candidate is enough to join, several backends compose, entries are withdrawn
 when a network stops, and a forgotten network stays forgotten across a restart.
 
-Unit tests in `src/proto/handshake.rs` cover the transcript construction
+Unit tests in `crates/tsunagi/src/proto/handshake.rs` cover the transcript construction
 itself: role separation, channel binding, identity and network binding,
 unambiguous encoding, and rejection under the wrong key.
 
-Unit tests in `src/dataplane/wireguard/` cover key clamping against the RFC
+Unit tests in `crates/tsunagi/src/dataplane/wireguard/` cover key clamping against the RFC
 7748 vector, overlay derivation, announcement validation including the
 address-hijack attempt, interface naming, and IP header parsing against
 truncated and nonsense input.

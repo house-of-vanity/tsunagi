@@ -18,18 +18,18 @@ Design accordingly: a majority is not a root of trust.
 Keep these separate. Crossing them is the main thing to review for.
 
 - **Control plane vs data plane.** The separation is **logical, not physical**.
-  The control protocol in `src/proto/` knows nothing about packets, and
-  `src/dataplane/` knows nothing about the control protocol; either can be
+  The control protocol in `crates/tsunagi/src/proto/` knows nothing about packets, and
+  `crates/tsunagi/src/dataplane/` knows nothing about the control protocol; either can be
   replaced on its own. Both may ride on iroh — refusing to would throw away
   iroh's NAT traversal and force the data plane to reimplement it. They use
   different ALPNs and different connections, so a busy or broken data plane
   cannot disturb control traffic.
 - **Plugins never learn reachability.** An `IpPlugin` is handed a `PacketLink`
   per peer and moves datagrams over it. Addresses, hole punching and relays
-  belong to `src/dataplane/transport/`. A plugin announcement says *who*, never
+  belong to `crates/tsunagi/src/dataplane/transport/`. A plugin announcement says *who*, never
   *where*.
-- **The core never parses a plugin payload.** See `src/dataplane/mod.rs`. Only
-  `src/dataplane/wireguard/announcement.rs` interprets WireGuard payloads, and
+- **The core never parses a plugin payload.** See `crates/tsunagi/src/dataplane/mod.rs`. Only
+  `crates/tsunagi/src/dataplane/wireguard/announcement.rs` interprets WireGuard payloads, and
   only after bounding every field. A data plane failure must never stop the
   control plane.
 - **Derived, not claimed.** A peer's overlay address is derived from its public
@@ -37,7 +37,7 @@ Keep these separate. Crossing them is the main thing to review for.
   inbound packets are dropped unless their source is the address derived for
   the peer that sent them. Never trust an address a peer announces.
 - **Signed state is the only durable agreement.** A fact that must survive a
-  participant being away goes in `src/state/` as a record signed by its
+  participant being away goes in `crates/tsunagi/src/state/` as a record signed by its
   author, never in a session. Merging is deterministic, an older version never
   rolls back a newer one, and absence from a snapshot is not deletion. Never
   add a vote or a quorum: a majority is not a trust root here, and it would
@@ -65,7 +65,7 @@ Keep these separate. Crossing them is the main thing to review for.
    normal path *and* the important failures. See [docs/testing.md](docs/testing.md).
    Do not add tests for getters or to move a coverage number.
 2. **Never change `IDENTITY_SCHEME`, the derivation labels, or the transcript
-   encoding** in `src/identity/network.rs` and `src/proto/handshake.rs` without
+   encoding** in `crates/tsunagi/src/identity/network.rs` and `crates/tsunagi/src/proto/handshake.rs` without
    treating it as an incompatible protocol change. Bumping the crate version or
    the control protocol version must not change an existing `NetworkId`.
 3. **Secrets never leak.** Not into logs, not into `Debug`, not into status
@@ -76,7 +76,7 @@ Keep these separate. Crossing them is the main thing to review for.
    the library; tests opt out explicitly at the top of each file.
 5. **Bounds before allocation.** Frame lengths are checked against
    `Limits::max_frame_len` before a buffer is allocated. Every string, list and
-   queue has a limit in `src/config.rs`.
+   queue has a limit in `crates/tsunagi/src/config.rs`.
 6. **Failure is contained.** A bad signature, wrong secret, malformed packet or
    unknown version rejects one message or one session. It never stops another
    network and never stops the agent. There is no irreversible global error
@@ -99,19 +99,25 @@ Keep these separate. Crossing them is the main thing to review for.
 
 | path                | responsibility |
 |---------------------|----------------|
-| `src/identity/`     | device identity; deterministic network space identity and derived keys |
-| `src/storage/`      | `state.sqlite`, `cache.sqlite`, directory ownership lock |
-| `src/discovery.rs`  | candidate sources; test and static backends |
-| `src/proto/`        | framing, message formats, membership handshake |
-| `src/net.rs`        | iroh endpoint adapter and observability snapshots |
-| `src/agent/`        | agent lifecycle, per-network runtimes, sessions, events, status |
-| `src/state/`        | signed records that outlive a session, their merge rules and address allocation |
-| `src/dataplane/`    | the plugin contract, the packet transport, and the WireGuard plugin |
-| `src/bin/tsunagi.rs`| the command line agent; the only place that owns a runtime, a logger and signals |
+| `crates/tsunagi/src/identity/`     | device identity; deterministic network space identity and derived keys |
+| `crates/tsunagi/src/storage/`      | `state.sqlite`, `cache.sqlite`, directory ownership lock |
+| `crates/tsunagi/src/discovery.rs`  | candidate sources; test and static backends |
+| `crates/tsunagi/src/proto/`        | framing, message formats, membership handshake |
+| `crates/tsunagi/src/net.rs`        | iroh endpoint adapter and observability snapshots |
+| `crates/tsunagi/src/agent/`        | agent lifecycle, per-network runtimes, sessions, events, status |
+| `crates/tsunagi/src/state/`        | signed records that outlive a session, their merge rules and address allocation |
+| `crates/tsunagi/src/dataplane/`    | the plugin contract, the packet transport, and the WireGuard plugin |
+| `crates/tsunagi-cli/` | the command line agent; the only place that owns a runtime, a logger and signals |
 | `tests/`            | integration tests; `tests/common/` is the shared harness |
 
 Add abstractions only at real substitution or testing boundaries. Do not add a
-trait per struct. Prefer one crate with clear modules over many small crates.
+trait per struct.
+
+**The system level and its plugins are separate crates**, so that boundary is
+checked by the compiler and not by discipline: a plugin can reach only what
+`tsunagi` makes public, and carries its own version. Everything else stays
+one crate with clear modules — do not split further without a reason of that
+kind.
 
 ## Testing rules
 

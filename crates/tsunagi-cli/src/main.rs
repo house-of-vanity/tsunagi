@@ -526,11 +526,11 @@ impl DnsService {
 
 /// Picks the publisher for this platform.
 fn dns_publisher() -> Arc<dyn tsunagi::dns::DnsPublisher> {
-    #[cfg(all(feature = "dns-publish", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     {
         Arc::new(tsunagi::dns::publish::ResolvedPublisher::new())
     }
-    #[cfg(not(all(feature = "dns-publish", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         Arc::new(tsunagi::dns::publish::UnsupportedPublisher::new())
     }
@@ -1355,7 +1355,6 @@ fn host_section() -> report::Section {
         "implementation",
         "userspace WireGuard (boringtun); no kernel module needed",
     ));
-    #[cfg(feature = "tun-device")]
     {
         if cfg!(target_os = "linux") {
             let tun_path = std::path::Path::new("/dev/net/tun");
@@ -1420,15 +1419,6 @@ fn host_section() -> report::Section {
             }
         }
     }
-    #[cfg(not(feature = "tun-device"))]
-    host.push(
-        Row::new(
-            Health::Degraded,
-            "interface",
-            "not built in; the tunnels run but cannot reach the OS",
-        )
-        .with_note("rebuild with the `tun-device` feature, or run with `--no-tun`"),
-    );
     host
 }
 
@@ -2199,7 +2189,7 @@ async fn stop_signal() -> &'static str {
 /// also the one that cleans up after itself, because the interface is tied to
 /// an open file descriptor and goes away with the agent, however the agent
 /// goes away.
-#[cfg(all(feature = "tun-device", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     use tsunagi::dataplane::wireguard::{ManagedTunFactory, NetlinkProvisioner};
     let provisioner = NetlinkProvisioner::new()?;
@@ -2210,7 +2200,7 @@ fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error
 ///
 /// Refused here rather than at the first packet, and with the one thing that
 /// does work on every platform named.
-#[cfg(all(feature = "tun-device", not(target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     Err(format!(
         "managing the overlay interface is not implemented on {} yet. \
@@ -2218,11 +2208,6 @@ fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error
         std::env::consts::OS
     )
     .into())
-}
-
-#[cfg(not(feature = "tun-device"))]
-fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
-    Err("this build has no interface support; rebuild with the `tun-device` feature or pass --no-tun".into())
 }
 
 fn print_event(event: &Event) {

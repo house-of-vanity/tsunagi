@@ -1,0 +1,35 @@
+[package]
+name = "tsunagi-cli"
+version = "0.1.0"
+description = "The tsunagi command line agent."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tsunagi"
+path = "src/main.rs"
+
+[dependencies]
+tsunagi = { path = "../tsunagi", version = "0.1.0", features = ["tun-device", "dns-publish"] }
+iroh.workspace = true
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4.5", features = ["derive", "env"] }
+# Already in the tree through clap. `anstream` strips the escapes when stdout
+# is not a terminal and turns on virtual terminal processing on Windows, so
+# colour is never written where it would show up as rubbish.
+anstream = "1.0"
+anstyle = "1.0"
+# Local interface addresses, for the diagnostics in `status`.
+netwatch = "0.19.3"
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
+tempfile.workspace = true
+simple-dns = "0.12"
+
+[lints]
+workspace = true
