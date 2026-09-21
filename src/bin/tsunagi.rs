@@ -568,6 +568,12 @@ fn spawn_dns(
             // time for no reason.
             let mut attempted: Vec<SocketAddr> = Vec::new();
             let mut published: Option<tsunagi::dns::Published> = None;
+            // A condition that persists is worth saying once, not every
+            // pass; and a refusal will not lift without somebody acting, so
+            // hammering at it two seconds apart is pure noise.
+            let mut reported: Option<String> = None;
+            let mut retry_after: Option<tokio::time::Instant> = None;
+            let mut recipe_shown = false;
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
 
             loop {
@@ -654,7 +660,8 @@ fn spawn_dns(
                     server: address,
                     domains: vec![zone.as_str().to_string()],
                 };
-                if published.as_ref() != Some(&want_published) {
+                let due = retry_after.is_none_or(|at| tokio::time::Instant::now() >= at);
+                if published.as_ref() != Some(&want_published) && due {
                     match publisher.apply(&want_published).await {
                         Ok(()) => {
                             tracing::info!(
@@ -663,6 +670,8 @@ fn spawn_dns(
                                 "the system resolver was told where to ask"
                             );
                             published = Some(want_published);
+                            reported = None;
+                            retry_after = None;
                             update(&state, |state| {
                                 state.publish_error = None;
                                 state.publish_remedy = None;
@@ -671,10 +680,29 @@ fn spawn_dns(
                         Err(err) => {
                             // Not fatal, by design: the server keeps
                             // answering and the user is told what is missing.
-                            tracing::warn!(%err, "cannot configure the system resolver");
+                            let text = err.to_string();
+                            if reported.as_deref() != Some(text.as_str()) {
+                                tracing::warn!("cannot configure the system resolver: {text}");
+                                if err.needs_a_human() && !recipe_shown {
+                                    recipe_shown = true;
+                                    tracing::warn!(
+                                        "systemd-resolved asks polkit, and polkit decides by \
+                                         user rather than by capability, so this cannot be done \
+                                         from inside the agent. To grant it once:\n\n{}\n",
+                                        tsunagi::dns::publish::polkit_recipe(&current_user())
+                                    );
+                                }
+                                reported = Some(text.clone());
+                            }
+                            // Backed off, and further for something only a
+                            // person can change.
+                            let wait = if err.needs_a_human() { 300 } else { 15 };
+                            retry_after = Some(
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(wait),
+                            );
                             let remedy = err.remedy().map(str::to_string);
                             update(&state, |state| {
-                                state.publish_error = Some(err.to_string());
+                                state.publish_error = Some(text);
                                 state.publish_remedy = remedy;
                             });
                         }
@@ -1810,6 +1838,13 @@ mod report {
             assert!(!report.render(false).contains("nothing here"));
         }
     }
+}
+
+/// The user this process is running as, for an instruction it can paste.
+fn current_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "<your-user>".to_string())
 }
 
 /// This program's path, for an instruction the user can paste.

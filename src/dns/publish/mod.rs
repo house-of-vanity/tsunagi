@@ -62,18 +62,52 @@ pub enum PublishError {
 }
 
 impl PublishError {
-    /// What the user can do about it, when there is something.
+    /// Whether waiting will fix it.
+    ///
+    /// A refusal will not change on its own — somebody has to grant
+    /// permission — so retrying it at the pace of everything else is just
+    /// noise. Anything else might be a service still starting.
+    pub fn needs_a_human(&self) -> bool {
+        matches!(self, PublishError::Refused(_))
+    }
+
+    /// One line for a status table.
     pub fn remedy(&self) -> Option<&'static str> {
         match self {
             PublishError::Refused(_) => Some(
-                "systemd-resolved asks polkit before accepting this, and polkit \
-                 decides by user. Run the agent as a system service, or install a \
-                 polkit rule allowing this user the `org.freedesktop.resolve1.set-*` \
-                 actions.",
+                "grant this user the `org.freedesktop.resolve1.set-*` actions in \
+                 /etc/polkit-1/rules.d, or run the agent as a system service",
             ),
             _ => None,
         }
     }
+}
+
+/// The polkit rule that lets this user configure the resolver.
+///
+/// Printed in full rather than described, because the point of this feature
+/// is that the user has as little to do as possible, and "write a polkit
+/// rule" is a great deal more work than pasting one.
+///
+/// It grants exactly the four actions this agent calls and nothing else.
+/// polkit decides by user id — a capability does not help here — so there is
+/// no way to do this from inside the process.
+pub fn polkit_recipe(user: &str) -> String {
+    format!(
+        "sudo tee /etc/polkit-1/rules.d/50-tsunagi-resolved.rules > /dev/null <<'RULE'\n\
+         polkit.addRule(function(action, subject) {{\n\
+         \x20   var allowed = [\n\
+         \x20       \"org.freedesktop.resolve1.set-dns-servers\",\n\
+         \x20       \"org.freedesktop.resolve1.set-domains\",\n\
+         \x20       \"org.freedesktop.resolve1.set-default-route\",\n\
+         \x20       \"org.freedesktop.resolve1.revert\"\n\
+         \x20   ];\n\
+         \x20   if (allowed.indexOf(action.id) >= 0 && subject.user == \"{user}\") {{\n\
+         \x20       return polkit.Result.YES;\n\
+         \x20   }}\n\
+         }});\n\
+         RULE"
+    )
 }
 
 /// Arranges for the operating system to ask this server.
@@ -120,6 +154,36 @@ mod tests {
         assert!(PublishError::Refused("no".into()).remedy().is_some());
         assert!(PublishError::Unavailable("none".into()).remedy().is_none());
         assert!(PublishError::Failed("bang".into()).remedy().is_none());
+    }
+
+    #[test]
+    fn only_a_refusal_waits_for_a_person() {
+        // The rest may come right on their own, so they are worth retrying
+        // at the ordinary pace; a refusal is not.
+        assert!(PublishError::Refused("no".into()).needs_a_human());
+        assert!(!PublishError::Unavailable("none".into()).needs_a_human());
+        assert!(!PublishError::Failed("bang".into()).needs_a_human());
+    }
+
+    #[test]
+    fn the_polkit_recipe_grants_what_is_called_and_no_more() {
+        let recipe = polkit_recipe("ab");
+        for action in [
+            "set-dns-servers",
+            "set-domains",
+            "set-default-route",
+            "revert",
+        ] {
+            assert!(recipe.contains(action), "{action} missing from:\n{recipe}");
+        }
+        // Nothing beyond what the agent calls: a rule that granted the lot
+        // would be handing out more than this feature needs.
+        for other in ["set-dnssec", "set-mdns", "register-service", "set-llmnr"] {
+            assert!(!recipe.contains(other), "{other} should not be granted");
+        }
+        assert!(recipe.contains("subject.user == \"ab\""));
+        // ES5: the rules engine is duktape and has no `startsWith`.
+        assert!(!recipe.contains("startsWith"));
     }
 
     #[cfg(target_os = "linux")]

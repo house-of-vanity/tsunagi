@@ -178,11 +178,34 @@ so it never becomes the resolver for anything else. resolved drops the whole
 setting when the interface goes, and the interface goes with the agent.
 
 That last step needs permission that `CAP_NET_ADMIN` does not give:
-systemd-resolved asks polkit, and polkit decides by user. Running as a
-system service is enough; so is a polkit rule granting this user the
-`org.freedesktop.resolve1.set-*` actions. **Without it the server still
-runs** — `tsunagi status` prints where it is listening and the exact `dig`
-line — so the automatic part is missing, not the feature.
+systemd-resolved asks polkit, and polkit decides by **user**, not by
+capability, so there is no way for the agent to arrange it from inside. On
+a desktop the refusal reads `Interactive authentication required`.
+
+Running as a system service is enough. Otherwise the agent prints the rule
+that grants it — the four actions it calls and nothing else — ready to
+paste:
+
+```bash
+sudo tee /etc/polkit-1/rules.d/50-tsunagi-resolved.rules > /dev/null <<'RULE'
+polkit.addRule(function(action, subject) {
+    var allowed = [
+        "org.freedesktop.resolve1.set-dns-servers",
+        "org.freedesktop.resolve1.set-domains",
+        "org.freedesktop.resolve1.set-default-route",
+        "org.freedesktop.resolve1.revert"
+    ];
+    if (allowed.indexOf(action.id) >= 0 && subject.user == "YOUR-USER") {
+        return polkit.Result.YES;
+    }
+});
+RULE
+```
+
+**Without it the server still runs** — `tsunagi status` prints where it is
+listening and the exact `dig` line — so the automatic part is missing, not
+the feature. The refusal is said once rather than on every pass, and retried
+slowly, because nothing but a person will change it.
 
 The server is authoritative for its zone and nothing else. No recursion, no
 forwarding, no cache: pointing a resolver at it can never make it a route to
