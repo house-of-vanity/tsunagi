@@ -19,10 +19,14 @@
 //! A data plane failure never stops the daemon: errors returned here are
 //! recorded and surfaced, the control plane keeps running.
 
+pub mod wireguard;
+
 use std::sync::Arc;
 
 use iroh::EndpointId;
+use tokio::sync::mpsc;
 
+use crate::BoxFuture;
 use crate::identity::NetworkId;
 
 /// Maximum length of a plugin protocol identifier.
@@ -60,7 +64,92 @@ pub enum PluginError {
     Other(String),
 }
 
-/// The minimal contract a future IP plugin implements.
+/// A request a plugin makes of the agent that owns it.
+#[derive(Debug)]
+pub(crate) enum PluginRequest {
+    /// Re-send this agent's announcement to every peer of a network.
+    Reannounce(NetworkId),
+    /// Surface a plugin error on the agent's event stream.
+    Error {
+        /// Network the error is scoped to.
+        network: NetworkId,
+        /// Plugin protocol id.
+        protocol: String,
+        /// Human readable reason, free of secrets.
+        reason: String,
+    },
+}
+
+/// The agent-side handle a plugin is given when it is attached.
+///
+/// It is deliberately tiny: a plugin may ask for its announcement to be resent
+/// and may report an error. It cannot reach into agent state, cannot send
+/// arbitrary control messages and knows nothing about sessions.
+///
+/// All calls are non-blocking. If the agent is gone or its queue is full the
+/// request is dropped rather than stalling the plugin.
+#[derive(Clone)]
+pub struct PluginContext {
+    sender: Option<mpsc::Sender<PluginRequest>>,
+}
+
+impl PluginContext {
+    pub(crate) fn new(sender: mpsc::Sender<PluginRequest>) -> Self {
+        Self {
+            sender: Some(sender),
+        }
+    }
+
+    /// A context that discards everything, for plugins used outside an agent.
+    pub fn detached() -> Self {
+        Self { sender: None }
+    }
+
+    fn send(&self, request: PluginRequest) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        if let Err(err) = sender.try_send(request) {
+            tracing::debug!(%err, "dropping plugin request");
+        }
+    }
+
+    /// Asks the agent to resend this agent's announcement in `network`.
+    ///
+    /// A plugin calls this when its own capability changed — it finished
+    /// starting up, its keys or reachability changed — so that peers learn the
+    /// new value without waiting for a reconnect.
+    pub fn request_reannounce(&self, network: NetworkId) {
+        self.send(PluginRequest::Reannounce(network));
+    }
+
+    /// Reports a plugin error on the agent's event stream.
+    ///
+    /// Plugin work happens in the plugin's own tasks, so errors cannot always
+    /// be returned from a trait call. They are never fatal for the agent.
+    pub fn report_error(
+        &self,
+        network: NetworkId,
+        protocol: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        self.send(PluginRequest::Error {
+            network,
+            protocol: protocol.into(),
+            reason: reason.into(),
+        });
+    }
+}
+
+impl std::fmt::Debug for PluginContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginContext")
+            .field("attached", &self.sender.is_some())
+            .finish()
+    }
+}
+
+/// The contract an IP plugin implements.
 ///
 /// Implementations must be cheap and non-blocking: the agent calls them from
 /// its runtime tasks. Anything slow belongs in the plugin's own tasks.
@@ -70,6 +159,14 @@ pub trait IpPlugin: Send + Sync + std::fmt::Debug + 'static {
     /// Must be non-empty and at most [`MAX_PROTOCOL_ID_LEN`] bytes.
     fn protocol_id(&self) -> &str;
 
+    /// Called once, when the agent starts, before any network is activated.
+    ///
+    /// The plugin keeps the context to ask for re-announcements and to report
+    /// errors that happen in its own tasks.
+    fn attach(&self, context: PluginContext) {
+        let _ = context;
+    }
+
     /// Produces this agent's announcement for a given network.
     ///
     /// Returning `Ok(None)` means "nothing to announce right now", which is
@@ -78,6 +175,14 @@ pub trait IpPlugin: Send + Sync + std::fmt::Debug + 'static {
         &self,
         network: NetworkId,
     ) -> std::result::Result<Option<PluginCapability>, PluginError>;
+
+    /// Called when a network is activated locally, before any peer appears.
+    ///
+    /// A plugin uses it to get its per-network state ready, so that the first
+    /// announcement already carries its capability.
+    fn on_network_activated(&self, network: NetworkId) {
+        let _ = network;
+    }
 
     /// Called when a peer announces a capability for this plugin's protocol.
     ///
@@ -95,7 +200,16 @@ pub trait IpPlugin: Send + Sync + std::fmt::Debug + 'static {
     /// Called when a network is deactivated locally.
     ///
     /// This is a local deactivation, not a signed revocation of membership.
+    /// The plugin is expected to remove whatever it created for that network.
     fn on_network_deactivated(&self, network: NetworkId);
+
+    /// Called once when the agent shuts down.
+    ///
+    /// The plugin removes the system objects it created and stops its tasks.
+    /// It must be bounded: the agent awaits it during shutdown.
+    fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// A shared handle to a plugin.

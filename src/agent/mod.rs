@@ -37,6 +37,7 @@ use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::{AgentConfig, Limits};
+use crate::dataplane::{PluginContext, PluginRequest};
 use crate::error::{Error, Result};
 use crate::identity::{DeviceIdentity, NetworkId, NetworkKeys, NetworkName, NetworkSecret};
 use crate::net::EndpointAdapter;
@@ -80,6 +81,7 @@ struct Inner {
     networks: RwLock<HashMap<NetworkId, NetworkHandle>>,
     shutdown: Shutdown,
     accept_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    plugin_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for Inner {
@@ -87,10 +89,12 @@ impl Drop for Inner {
         // Nothing here awaits; this is only a safety net for a handle that was
         // dropped without an explicit shutdown.
         self.shutdown.trigger();
-        if let Ok(mut guard) = self.accept_task.lock()
-            && let Some(task) = guard.take()
-        {
-            task.abort();
+        for guard in [&self.accept_task, &self.plugin_task] {
+            if let Ok(mut guard) = guard.lock()
+                && let Some(task) = guard.take()
+            {
+                task.abort();
+            }
         }
     }
 }
@@ -122,6 +126,7 @@ impl Agent {
             networks: RwLock::new(HashMap::new()),
             shutdown: Shutdown::new(),
             accept_task: std::sync::Mutex::new(None),
+            plugin_task: std::sync::Mutex::new(None),
             config,
         });
 
@@ -132,6 +137,21 @@ impl Agent {
         let accept = tokio::spawn(accept_loop(Arc::downgrade(&inner)));
         if let Ok(mut guard) = inner.accept_task.lock() {
             *guard = Some(accept);
+        }
+
+        // Plugins get a handle to ask for re-announcements and report errors.
+        // A bounded queue keeps a noisy plugin from growing memory without
+        // bound; overflow drops the request rather than stalling the plugin.
+        if !inner.config.plugins.is_empty() {
+            let (plugin_tx, plugin_rx) = mpsc::channel(64);
+            let context = PluginContext::new(plugin_tx);
+            for plugin in &inner.config.plugins {
+                plugin.attach(context.clone());
+            }
+            let task = tokio::spawn(plugin_request_loop(Arc::downgrade(&inner), plugin_rx));
+            if let Ok(mut guard) = inner.plugin_task.lock() {
+                *guard = Some(task);
+            }
         }
 
         let agent = Self { inner };
@@ -240,6 +260,10 @@ impl Agent {
         });
         networks.insert(network_id, handle);
         drop(networks);
+
+        for plugin in &self.inner.config.plugins {
+            plugin.on_network_activated(network_id);
+        }
 
         let _ = self.inner.events.send(Event::NetworkActivated {
             network: network_id,
@@ -387,6 +411,15 @@ impl Agent {
         })
     }
 
+    /// Resends this agent's announcement to every peer of a network.
+    ///
+    /// Plugins normally trigger this themselves through
+    /// [`crate::dataplane::PluginContext::request_reannounce`] when their
+    /// capability changes.
+    pub async fn reannounce(&self, network_id: NetworkId) -> Result<()> {
+        self.command(network_id, NetCommand::Reannounce).await
+    }
+
     /// Asks one network to re-run discovery and re-evaluate dials right now.
     ///
     /// Call this when the host's network environment changed. Platform wake-up
@@ -426,14 +459,25 @@ impl Agent {
 
         self.inner.adapter.close().await;
 
-        let task = self
-            .inner
-            .accept_task
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
-        if let Some(task) = task {
-            let _ = task.await;
+        for handle in [&self.inner.accept_task, &self.inner.plugin_task] {
+            let task = handle.lock().ok().and_then(|mut guard| guard.take());
+            if let Some(task) = task {
+                let _ = task.await;
+            }
+        }
+
+        // Plugins remove whatever system objects they created. A plugin that
+        // misbehaves here must not hold up the agent, so this is bounded.
+        for plugin in &self.inner.config.plugins {
+            if tokio::time::timeout(PLUGIN_SHUTDOWN_GRACE, plugin.shutdown())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    protocol = plugin.protocol_id(),
+                    "plugin did not shut down in time"
+                );
+            }
         }
 
         // Release the directory so another instance can claim it right away.
@@ -449,6 +493,77 @@ impl Agent {
                 .ok_or(Error::NetworkNotActive(network_id))?
         };
         sender.send(command).await.map_err(|_| Error::Stopped)
+    }
+}
+
+/// How long each plugin gets to tear itself down during agent shutdown.
+const PLUGIN_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serves requests plugins make of the agent.
+///
+/// Holds only a weak reference, so it exits once the agent is dropped.
+async fn plugin_request_loop(weak: Weak<Inner>, mut requests: mpsc::Receiver<PluginRequest>) {
+    let Some(inner) = weak.upgrade() else {
+        return;
+    };
+    let shutdown = inner.shutdown.clone();
+    drop(inner);
+
+    loop {
+        let request = tokio::select! {
+            biased;
+            _ = shutdown.wait() => break,
+            request = requests.recv() => match request {
+                Some(request) => request,
+                None => break,
+            },
+        };
+
+        let Some(inner) = weak.upgrade() else {
+            break;
+        };
+
+        match request {
+            PluginRequest::Reannounce(network) => {
+                let sender = {
+                    let networks = inner.networks.read().await;
+                    networks.get(&network).map(|handle| handle.commands.clone())
+                };
+                // A plugin asking about a network that is no longer active is
+                // normal, not an error.
+                if let Some(sender) = sender {
+                    let _ = sender.send(NetCommand::Reannounce).await;
+                }
+            }
+            PluginRequest::Error {
+                network,
+                protocol,
+                reason,
+            } => {
+                let sender = {
+                    let networks = inner.networks.read().await;
+                    networks.get(&network).map(|handle| handle.commands.clone())
+                };
+                match sender {
+                    // The runtime owns this network's counters, so the error
+                    // is counted and published in one place.
+                    Some(sender) => {
+                        let _ = sender
+                            .send(NetCommand::PluginError { protocol, reason })
+                            .await;
+                    }
+                    // The network is gone; there is nothing to count it
+                    // against, but the report is still worth publishing.
+                    None => {
+                        let _ = inner.events.send(Event::PluginError {
+                            network,
+                            protocol,
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 

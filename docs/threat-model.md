@@ -19,6 +19,10 @@ Read this before relying on anything here. The protocol is in
   messages for network B, even over a shared physical connection.
 - **Confidentiality and integrity in transit.** Provided by QUIC/TLS. This
   crate adds no encryption of its own.
+- **Overlay address ownership.** A WireGuard peer's `AllowedIPs` are derived
+  from its public key, not taken from its announcement, so a member cannot
+  claim another member's overlay address and receive its traffic. See
+  [wireguard.md](wireguard.md#deterministic-overlay-addressing).
 - **Resource bounds.** Frame lengths are validated before allocation; strings,
   lists, queues, concurrent dials and in-flight handshakes are all bounded;
   handshakes, dials and writes have timeouts.
@@ -45,8 +49,20 @@ Read this before relying on anything here. The protocol is in
   permissions are owner-only where the platform supports it, and the state
   directory takes an ownership lock, but neither defends against a user who can
   read the file or against malware running as that user.
-- **User IP traffic.** Not carried here at all. Filtering it is the operating
-  system's and the user's job.
+- **User IP traffic.** Carried by the WireGuard plugin, not by iroh, and
+  encrypted by WireGuard itself. *Filtering* it is still the operating system's
+  and the user's job: the plugin creates connectivity between members and does
+  not police what flows over it.
+- **Overlay address squatting.** A member can mint many WireGuard keys and
+  therefore occupy many overlay addresses. It cannot pick which ones, but it
+  can consume them and appear as many participants.
+- **Plugin keys on disk.** The WireGuard private keys live in the plugin's own
+  `wireguard.sqlite`, owner-only where the platform supports it. Copying that
+  file copies this agent's overlay identity, exactly as copying `state.sqlite`
+  copies its control plane identity.
+- **What the data plane does not police.** The plugin sets `AllowedIPs` per
+  peer, which stops a member impersonating another member's overlay address.
+  It does not stop a member sending whatever it likes *from its own* address.
 - **Denial of service.** Bounds and timeouts stop trivial resource exhaustion
   from a single peer. They do not make the agent resistant to a determined
   attacker who knows the secret, and no rate limiting per identity exists yet.

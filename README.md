@@ -30,15 +30,20 @@ A working library with **real iroh connections** and integration tests:
 - automatic reconnect with bounded exponential backoff and jitter;
 - status snapshots, an event stream and honest diagnostics;
 - configuration restored after a restart;
-- correct behaviour when the disposable cache is missing or corrupt.
+- correct behaviour when the disposable cache is missing or corrupt;
+- a **WireGuard data plane plugin**: its own key per network, deterministic
+  IPv6 overlay addressing, a full-mesh configuration built locally, and
+  reconciliation that repairs drift.
 
 ### What it deliberately does **not** do
 
-Not implemented, and not pretended to be: WireGuard or any other IP plugin,
-Mainline DHT, DNS, routing through intermediate participants, a full CRDT,
-dynamically loaded plugins, a system service, a complete CLI, or a local
-control socket. Snapshot synchronisation and signed revocations are designed
-for but not implemented — see [docs/sync-model.md](docs/sync-model.md).
+Not implemented, and not pretended to be: Mainline DHT, DNS, routing through
+intermediate participants, a full CRDT, dynamically loaded plugins, a system
+service, a complete CLI, or a local control socket. Snapshot synchronisation
+and signed revocations are designed for but not implemented — see
+[docs/sync-model.md](docs/sync-model.md). The WireGuard plugin's own limits,
+including that its system backend is Linux-only, are in
+[docs/wireguard.md](docs/wireguard.md#limits-and-future-work).
 
 **Only control messages travel over iroh. User IP traffic is not tunnelled
 through it.** Filtering user traffic is the operating system's and the user's
@@ -61,11 +66,21 @@ cargo test --locked --workspace --all-targets
 The whole suite runs offline on loopback. Set `TSUNAGI_TEST_LOG=tsunagi=debug`
 to see agent logs while a test runs.
 
-There is also a runnable demo, which is a demo and not a substitute for the
+There are also two runnable demos, which are demos and not substitutes for the
 tests:
 
 ```bash
-cargo run --example two_agents
+cargo run --example two_agents       # control plane only
+cargo run --example wireguard_mesh   # two agents forming a WireGuard overlay
+```
+
+Both run with no privileges and change nothing on the host.
+
+The one part that does change the host's network — the real `wg`/`ip` backend —
+is behind `--ignored` and needs Linux, wireguard-tools and `CAP_NET_ADMIN`:
+
+```bash
+sudo -E cargo test --test wireguard_system -- --ignored --test-threads=1
 ```
 
 ## Usage
@@ -127,12 +142,18 @@ paths; tests always use temporary directories.
 | `state.sqlite` | device identity, network configuration, hostname | clear error, never reset |
 | `cache.sqlite` | address hints and other recoverable data          | discarded and recreated  |
 
+The WireGuard plugin keeps its own keys in its own `wireguard.sqlite`, wherever
+its configuration points, because plugin keys are neither the iroh identity nor
+the network secret.
+
 One state directory belongs to one live agent, enforced with a real OS file
 lock rather than an existence check.
 
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — module boundaries and runtime.
+- [docs/wireguard.md](docs/wireguard.md) — the WireGuard plugin: overlay
+  addressing, announcements, backends, reconciliation.
 - [docs/protocol.md](docs/protocol.md) — identity derivation, framing, handshake.
 - [docs/sync-model.md](docs/sync-model.md) — the planned signed-state model and
   what is deliberately not built yet.

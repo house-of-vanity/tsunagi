@@ -56,7 +56,7 @@ fn restrict_permissions(_file: &std::fs::File, _path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn restrict_path_permissions(path: &Path) -> Result<()> {
+pub(crate) fn restrict_path_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
         Error::Io {
@@ -67,12 +67,12 @@ fn restrict_path_permissions(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn restrict_path_permissions(_path: &Path) -> Result<()> {
+pub(crate) fn restrict_path_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn restrict_dir_permissions(path: &Path) -> Result<()> {
+pub(crate) fn restrict_dir_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
         Error::Io {
@@ -83,11 +83,11 @@ fn restrict_dir_permissions(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn restrict_dir_permissions(_path: &Path) -> Result<()> {
+pub(crate) fn restrict_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_dir(path: &Path) -> Result<()> {
+pub(crate) fn create_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,

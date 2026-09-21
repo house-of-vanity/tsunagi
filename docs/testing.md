@@ -38,6 +38,19 @@ of several system processes, and is not presented as one.
 | 9 | wrong version, a message before authentication, a proof replayed on another connection, an oversized frame and a `Hello` for an inactive network are all rejected without taking the agent down | `tests/authentication.rs` |
 | 10 | a second agent on the same state directory gets a clear error; after a clean stop the directory reopens; shutdown ends background tasks and refuses further work; independent agents coexist in one process | `tests/resilience.rs` |
 
+`tests/wireguard.rs` drives the WireGuard plugin over real iroh connections
+with the in-memory backend: a pair and a three-agent mesh converge to `N - 1`
+peers with locally derived `AllowedIPs`, a departing peer is removed, two
+networks get separate interfaces, keys and overlays, reconciliation repairs a
+configuration edited by hand, a backend failure leaves the control plane
+untouched, a restart keeps the WireGuard identity, shutdown removes every
+interface, a member claiming another member's overlay address is rejected, and
+the core carries the payload without interpreting it.
+
+`tests/wireguard_system.rs` exercises the real `wg`/`ip` backend. It is
+**ignored by default** because it changes the host's network and needs Linux,
+wireguard-tools and `CAP_NET_ADMIN`.
+
 `tests/discovery.rs` covers the discovery contract itself: a static bootstrap
 candidate is enough to join, several backends compose, entries are withdrawn
 when a network stops, and a forgotten network stays forgotten across a restart.
@@ -45,6 +58,12 @@ when a network stops, and a forgotten network stays forgotten across a restart.
 Unit tests in `src/proto/handshake.rs` cover the transcript construction
 itself: role separation, channel binding, identity and network binding,
 unambiguous encoding, and rejection under the wrong key.
+
+Unit tests in `src/dataplane/wireguard/` cover the parts that would otherwise
+need root: key clamping against the RFC 7748 vector, overlay derivation,
+announcement validation including the address-hijack attempt, configuration
+building and rendering, the exact command plan the real backend would run, and
+parsing `wg showconf` and `ip address show` output.
 
 `tests/end_to_end.rs` is the vertical slice: persistent identity → network
 space → discovery → iroh → authentication → message exchange.

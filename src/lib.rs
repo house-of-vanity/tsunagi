@@ -27,6 +27,9 @@
 
 #![deny(rustdoc::broken_intra_doc_links)]
 
+/// A boxed future, used where a trait must stay object safe.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
 pub mod agent;
 pub mod config;
 pub mod dataplane;

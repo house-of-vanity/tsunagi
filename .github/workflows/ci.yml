@@ -38,8 +38,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace --all-targets
-      - name: run the example
-        run: cargo run --locked --example two_agents
+      - name: run the examples
+        run: |
+          cargo run --locked --example two_agents
+          cargo run --locked --example wireguard_mesh
+
+  # The real wg/ip backend changes the host's network and needs
+  # CAP_NET_ADMIN, so it is never part of the default job above. It is run on
+  # demand only.
+  wireguard-system:
+    name: wireguard system backend (opt-in)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y wireguard-tools
+      - run: sudo -E $(which cargo) test --locked --test wireguard_system -- --ignored --test-threads=1
 
   docs:
     name: rustdoc

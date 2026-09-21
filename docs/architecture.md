@@ -12,12 +12,16 @@ authentication, participant announcements, capability exchange and — later —
 state synchronisation and delivery of IP-plugin data.
 
 **Data plane.** Separate plugins create IP connectivity. WireGuard is the first
-planned one; none exists yet. Plugin keys, configuration and lifecycle are
-separate from iroh identity and from the network secret. The core moves an
-opaque, bounded payload and never parses it.
+one and is implemented — see [wireguard.md](wireguard.md). Plugin keys,
+configuration and lifecycle are separate from iroh identity and from the
+network secret. The core moves an opaque, bounded payload and never parses it.
 
 Only control messages travel over iroh. User IP traffic is not tunnelled
-through it.
+through it; WireGuard packets travel over WireGuard's own UDP sockets.
+
+A plugin talks to the core through three narrow hooks — `on_network_activated`,
+a `PluginContext` for re-announcements and error reports, and a bounded
+`shutdown` — so the core never learns anything protocol-specific.
 
 A data plane failure never stops the daemon: the control plane keeps running
 and the agent stays manageable.
@@ -32,11 +36,12 @@ and the agent stays manageable.
 | `proto` | message format, handshake, membership proof, protocol limits |
 | `agent` | agent and per-network lifecycle, reconnect, in-process message routing |
 | `storage` | mandatory state and the separately recoverable cache |
-| `dataplane` | the minimal contract future IP plugins implement |
+| `dataplane` | the contract IP plugins implement, plus the WireGuard plugin |
 
 Abstractions exist only where something is really substituted or really needs
-isolating for tests: `NetworkDiscovery` and `IpPlugin`. Everything else is a
-concrete type.
+isolating for tests: `NetworkDiscovery`, `IpPlugin`, and `WireguardBackend`
+(which is what lets the plugin be tested in full without root). Everything else
+is a concrete type.
 
 ## Runtime shape
 

@@ -54,6 +54,15 @@ pub(crate) enum NetCommand {
         reply: oneshot::Sender<Box<NetworkStatus>>,
     },
     Recheck,
+    /// Resend this agent's announcement to every peer of this network.
+    Reannounce,
+    /// An IP plugin reported an error from one of its own tasks.
+    PluginError {
+        /// Plugin protocol id.
+        protocol: String,
+        /// Human readable reason, free of secrets.
+        reason: String,
+    },
 }
 
 impl std::fmt::Debug for NetCommand {
@@ -66,6 +75,8 @@ impl std::fmt::Debug for NetCommand {
             NetCommand::Broadcast { message, .. } => write!(f, "Broadcast({})", kind(message)),
             NetCommand::Status { .. } => f.write_str("Status"),
             NetCommand::Recheck => f.write_str("Recheck"),
+            NetCommand::Reannounce => f.write_str("Reannounce"),
+            NetCommand::PluginError { protocol, .. } => write!(f, "PluginError({protocol})"),
         }
     }
 }
@@ -270,6 +281,31 @@ impl Runtime {
                 let _ = reply.send(Box::new(self.status()));
             }
             NetCommand::Recheck => self.discovery_round().await,
+            NetCommand::Reannounce => self.reannounce(),
+            NetCommand::PluginError { protocol, reason } => {
+                // Counted here so that the per-network metric and the event
+                // always agree, wherever the error came from.
+                self.metrics.plugin_errors += 1;
+                self.emit(Event::PluginError {
+                    network: self.network_id,
+                    protocol,
+                    reason,
+                });
+            }
+        }
+    }
+
+    /// Rebuilds this agent's announcement and pushes it to every session.
+    ///
+    /// Used when a plugin's capability changed, so peers do not have to wait
+    /// for a reconnect to learn about it.
+    fn reannounce(&mut self) {
+        let announcement = ControlMessage::Announce(self.local_announcement());
+        let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
+        for peer in peers {
+            if let Err(err) = self.send_to(peer, announcement.clone()) {
+                tracing::debug!(%err, "could not queue re-announcement");
+            }
         }
     }
 

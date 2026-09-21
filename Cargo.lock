@@ -3182,6 +3182,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "iroh",
+ "netwatch",
  "postcard",
  "rand",
  "rusqlite",
@@ -3193,6 +3194,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -3757,6 +3759,17 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "x25519-dalek"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core",
+ "zeroize",
 ]
 
 [[package]]

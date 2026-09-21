@@ -23,8 +23,6 @@
 //! Mainline DHT discovery is future work and is not implemented here.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use iroh::{EndpointAddr, EndpointId};
@@ -32,8 +30,7 @@ use iroh::{EndpointAddr, EndpointId};
 use crate::error::Result;
 use crate::identity::DiscoveryKey;
 
-/// A boxed future, so that [`NetworkDiscovery`] stays object safe.
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub use crate::BoxFuture;
 
 /// Where a candidate came from. Purely informational.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
