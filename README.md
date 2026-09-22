@@ -563,26 +563,31 @@ explicitly.
 
 ### Through somebody in the middle
 
-Everybody tries everybody first: the mesh is pairwise, and a relay is only
-for the pair that cannot manage it. Two members can both reach a third and
-not each other: a blocked path, a
-relay that is unavailable, a network only reachable from inside somebody
-else's building. When that happens the pair is routed through a member that
-has both.
+Tsunagi routes the overlay in userspace. A direct data link always wins;
+otherwise the shortest available path can pass through several members.
+Each authenticated member advertises only its own live, protocol-specific
+transport links. The control plane collects these into a graph and replaces
+the routing table when connectivity changes; announcements expire after
+90 seconds without refresh.
 
-Nothing is agreed and nothing is elected. Each member says only which peers
-*it* has a live link with, first-hand, over the control plane and one hop
-only; everyone picks their own way through from that, deterministically, and
-drops it the moment a direct link exists. There is no routing protocol, no
-second-hand claim to weigh, and a relayed datagram is never relayed again —
-so a loop cannot form.
+Transit goes transport → router → transport, without entering WireGuard or
+the intermediate host's TUN. The payload stays encrypted between the original
+endpoints. TUN connects only the local OS to Tsunagi; the kernel needs only
+the overlay route through that interface, with no IP forwarding configuration.
 
-The one in the middle carries **bytes it cannot read**: the tunnel stays end
-to end between the two ends, and a relayed datagram never touches the middle
-host's interface, so no forwarding, routing or firewall setting of that host
-is involved. `status` says `via <peer>` on a path that goes through
-somebody, and counts what this device has carried for others — it is their
-traffic on your uplink, and that should not be invisible.
+A 16-hop limit bounds loops while topology updates converge. Equal shortest
+paths use a stable flow hash derived before encryption, so packets of a TCP
+or UDP flow keep their path while topology is unchanged. Physical link changes
+do not replace end-to-end WireGuard tunnels or change the 1280-byte default MTU.
+`status` reports the hop count and first next hop for relayed paths.
+
+The hot path reads an immutable routing snapshot and sends directly to a cached
+transport handle. It takes no routing mutex, walks no graph and does not parse
+the encrypted payload. See [routing.md](docs/routing.md) for the architecture,
+limits and reproducible forwarding microbenchmark.
+
+This wire format requires all members to upgrade together (control ALPN 2,
+data ALPN 4); saved identities, network names, secrets and addresses survive.
 
 ## How peers find each other
 

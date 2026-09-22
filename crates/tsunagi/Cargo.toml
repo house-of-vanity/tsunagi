@@ -33,6 +33,7 @@ dns-publish = ["dep:zbus"]
 testing = ["dep:tempfile", "dep:tracing-subscriber"]
 
 [dependencies]
+arc-swap = "1.9"
 iroh.workspace = true
 # `net` for the local control interface: a Unix socket on Unix, a named pipe
 # on Windows. Both live behind the same `net` feature.

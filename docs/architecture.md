@@ -35,6 +35,16 @@ a `PluginContext` for re-announcements and error reports, and a bounded
 A data plane failure never stops the daemon: the control plane keeps running
 and the agent stays manageable.
 
+## Userspace routing
+
+The routing engine builds shortest paths over opaque peer identifiers, with no
+WireGuard or iroh dependency. The relay adapter binds those next hops to
+`PacketLink` handles and publishes an immutable table per network and protocol.
+One reader per raw transport forwards transit without entering the plugin or
+TUN. End-to-end plugin links survive physical link changes. The existing
+authenticated control mesh supplies first-hand topology; the data router does
+not tunnel control sessions. See [routing.md](routing.md).
+
 ## Module responsibilities
 
 | component | responsibility |
@@ -47,7 +57,9 @@ and the agent stays manageable.
 | `storage` | mandatory state and the separately recoverable cache |
 | `state` | signed records that outlive a session, merged between replicas |
 | `dataplane::transport` | authenticated datagram links to peers; where reachability lives |
-| `dataplane` | the contract a protocol implements, and nothing else |
+| `dataplane::routing` | transport-independent graph, shortest paths and opaque flow identifiers |
+| `dataplane::relay` | immutable forwarding snapshots and transport-to-transport transit |
+| `dataplane` | the contract an IP protocol implements |
 | `overlay` | the one interface an agent owns: provisioning, the TUN, whose packet is whose |
 | `dns` | the DNS view of a network, and telling the system resolver about it |
 

@@ -28,7 +28,7 @@
 //! system level and signed by its holder, and that is what is compared
 //! against.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -39,6 +39,7 @@ use bytes::Bytes;
 use iroh::EndpointId;
 use tokio::task::JoinHandle;
 
+use tsunagi::dataplane::routing::{FlowId, flow::ip_flow};
 use tsunagi::dataplane::transport::{SharedLink, TransportError};
 use tsunagi::dataplane::{PacketSink, PluginError};
 use tsunagi::identity::NetworkId;
@@ -53,6 +54,66 @@ const TIMER_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Scratch space for one encapsulate or decapsulate call.
 const SCRATCH: usize = 4096;
+
+/// Mirrors boringtun 0.7's bounded pending-packet FIFO with opaque flow tags.
+/// All three operations share the same mutex as the cryptographic state.
+struct FlowTunnel {
+    tunn: Tunn,
+    queued: VecDeque<FlowId>,
+}
+
+fn is_data(result: &TunnResult<'_>) -> bool {
+    matches!(result, TunnResult::WriteToNetwork(bytes) if bytes.starts_with(&[4, 0, 0, 0]))
+}
+
+impl FlowTunnel {
+    fn encapsulate<'a>(
+        &mut self,
+        packet: &[u8],
+        scratch: &'a mut [u8],
+        flow: FlowId,
+    ) -> (TunnResult<'a>, FlowId) {
+        let result = self.tunn.encapsulate(packet, scratch);
+        if is_data(&result) {
+            return (result, flow);
+        }
+        // MAX_QUEUE_DEPTH in boringtun 0.7: the newest packet is dropped at 256.
+        if self.queued.len() < 256 {
+            self.queued.push_back(flow);
+        }
+        (result, 0)
+    }
+
+    fn decapsulate<'a>(
+        &mut self,
+        packet: &[u8],
+        scratch: &'a mut [u8],
+    ) -> (TunnResult<'a>, FlowId) {
+        let result = self.tunn.decapsulate(None, packet, scratch);
+        let mut flow = 0;
+        if packet.is_empty() {
+            if is_data(&result) {
+                flow = self.queued.pop_front().unwrap_or(0);
+            } else if let Some(pending) = self.queued.pop_front() {
+                // Without a session, draining pops the oldest IP packet and
+                // encapsulate queues it again at the back.
+                self.queued.push_back(pending);
+            }
+        }
+        (result, flow)
+    }
+
+    fn update_timers<'a>(&mut self, scratch: &'a mut [u8]) -> TunnResult<'a> {
+        let result = self.tunn.update_timers(scratch);
+        if matches!(
+            result,
+            TunnResult::Err(boringtun::noise::errors::WireGuardError::ConnectionExpired)
+        ) {
+            self.queued.clear();
+        }
+        result
+    }
+}
 
 /// Counters for one peer's tunnel.
 #[derive(Debug, Default)]
@@ -120,7 +181,7 @@ struct Peer {
     /// allocates it, the peer signs the claim, and every protocol carries
     /// traffic for the same address.
     overlay_v4: Mutex<Option<Ipv4Addr>>,
-    tunn: Mutex<Tunn>,
+    tunn: Mutex<FlowTunnel>,
     link: SharedLink,
     counters: Arc<PeerCounters>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -165,7 +226,7 @@ impl Peer {
             Err(poisoned) => poisoned.into_inner(),
         };
         PeerHealth {
-            since_handshake: guard.time_since_last_handshake(),
+            since_handshake: guard.tunn.time_since_last_handshake(),
         }
     }
 }
@@ -254,32 +315,34 @@ impl WireguardDevice {
             return false;
         };
 
-        let mut scratch = vec![0u8; SCRATCH];
+        let mut scratch = [0u8; SCRATCH];
+        let flow = ip_flow(packet);
         // The encryption is the whole of what this protocol contributes, so
         // it happens here rather than anywhere the packet passes through.
         // The lock is released before the send: a slow link must not hold up
         // the tunnel's timers.
-        let len = {
+        let result = {
             let mut tunn = match peer.tunn.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            match tunn.encapsulate(packet, &mut scratch) {
-                TunnResult::WriteToNetwork(out) => Some(out.len()),
+            let (result, selected_flow) = tunn.encapsulate(packet, &mut scratch, flow);
+            match result {
+                TunnResult::WriteToNetwork(out) => Some((out.len(), selected_flow)),
                 // No session yet, so nothing to send. Counted as dropped
                 // rather than reported: the handshake is in flight and the
                 // next packet will go.
                 _ => None,
             }
         };
-        let Some(len) = len else {
+        let Some((len, selected_flow)) = result else {
             peer.counters
                 .dropped_no_session
                 .fetch_add(1, Ordering::Relaxed);
             return false;
         };
 
-        send_to_peer(&peer, &scratch[..len]);
+        send_to_peer_flow(&peer, &scratch[..len], selected_flow);
         peer.counters.tx_packets.fetch_add(1, Ordering::Relaxed);
         peer.counters
             .tx_bytes
@@ -320,7 +383,10 @@ impl WireguardDevice {
             endpoint_id,
             public_key,
             overlay_v4: Mutex::new(overlay_v4),
-            tunn: Mutex::new(tunn),
+            tunn: Mutex::new(FlowTunnel {
+                tunn,
+                queued: VecDeque::new(),
+            }),
             link,
             counters: Arc::new(PeerCounters::default()),
             task: Mutex::new(None),
@@ -412,9 +478,7 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 
 /// Asks boringtun for a handshake initiation and sends it.
 ///
-/// Encapsulating an empty packet is how the protocol state machine is told
-/// "there is something to say"; with no session yet it answers with the
-/// handshake initiation.
+/// This does not enqueue an empty IP packet in boringtun's pending queue.
 fn kick_handshake(peer: &Peer) {
     let mut scratch = vec![0u8; SCRATCH];
     let len = {
@@ -422,7 +486,7 @@ fn kick_handshake(peer: &Peer) {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match tunn.encapsulate(&[], &mut scratch) {
+        match tunn.tunn.format_handshake_initiation(&mut scratch, false) {
             TunnResult::WriteToNetwork(out) => Some(out.len()),
             _ => None,
         }
@@ -434,7 +498,11 @@ fn kick_handshake(peer: &Peer) {
 
 /// Sends whatever boringtun produced, without holding the tunnel lock.
 fn send_to_peer(peer: &Peer, payload: &[u8]) {
-    match peer.link.send(Bytes::copy_from_slice(payload)) {
+    send_to_peer_flow(peer, payload, 0);
+}
+
+fn send_to_peer_flow(peer: &Peer, payload: &[u8], flow: FlowId) {
+    match peer.link.send_flow(Bytes::copy_from_slice(payload), flow) {
         Ok(()) => {}
         Err(TransportError::TooLarge { .. }) => {
             peer.counters
@@ -449,12 +517,12 @@ fn send_to_peer(peer: &Peer, payload: &[u8]) {
 }
 
 async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
+    let mut scratch = vec![0u8; SCRATCH];
     loop {
         let Some(datagram) = peer.link.recv().await else {
             return;
         };
 
-        let mut scratch = vec![0u8; SCRATCH];
         // boringtun may need several passes: a handshake reply first, then
         // any packets that were queued while the session was coming up.
         let mut input: Option<&[u8]> = Some(&datagram);
@@ -464,8 +532,9 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                match tunn.decapsulate(None, input.unwrap_or(&[]), &mut scratch) {
-                    TunnResult::WriteToNetwork(out) => Outcome::ToNetwork(out.len()),
+                let (result, flow) = tunn.decapsulate(input.unwrap_or(&[]), &mut scratch);
+                match result {
+                    TunnResult::WriteToNetwork(out) => Outcome::ToNetwork(out.len(), flow),
                     // The source boringtun reports is not consulted here:
                     // whether the peer may use it is checked where the
                     // claims live.
@@ -480,8 +549,8 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
             };
 
             match outcome {
-                Outcome::ToNetwork(len) => {
-                    send_to_peer(&peer, &scratch[..len]);
+                Outcome::ToNetwork(len, flow) => {
+                    send_to_peer_flow(&peer, &scratch[..len], flow);
                     // Keep draining with an empty datagram, as boringtun asks.
                     input = None;
                     continue;
@@ -515,7 +584,7 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
 }
 
 enum Outcome {
-    ToNetwork(usize),
+    ToNetwork(usize, FlowId),
     ToTunnel(usize),
     Done,
     Failed,
@@ -548,5 +617,75 @@ async fn drive_timers(inner: Arc<Inner>) {
                 send_to_peer(&peer, &scratch[..len]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    fn tunnel(ours: &WgSecretKey, theirs: &WgSecretKey) -> FlowTunnel {
+        FlowTunnel {
+            tunn: Tunn::new(
+                ours.to_static_secret(),
+                theirs.public().into_x25519(),
+                None,
+                None,
+                1,
+                None,
+            ),
+            queued: VecDeque::new(),
+        }
+    }
+    fn wire(result: TunnResult<'_>) -> Vec<u8> {
+        match result {
+            TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
+            _ => panic!("expected WireGuard frame"),
+        }
+    }
+
+    #[test]
+    fn flow_tags_survive_pending_queue_overflow_handshake_and_encryption() {
+        let ak = WgSecretKey::from_bytes(&[1; 32]);
+        let bk = WgSecretKey::from_bytes(&[2; 32]);
+        let mut a = tunnel(&ak, &bk);
+        let mut b = tunnel(&bk, &ak);
+        let mut scratch = [0u8; SCRATCH];
+        let mut packet = [0u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+        packet[9] = 6;
+        packet[12..20].copy_from_slice(&[10, 0, 0, 1, 10, 0, 0, 2]);
+        let (result, flow) = a.encapsulate(&packet, &mut scratch, 100);
+        assert_eq!(
+            flow, 0,
+            "handshake does not masquerade as application traffic"
+        );
+        let hello = wire(result);
+        for flow in 101..400 {
+            let _ = a.encapsulate(&packet, &mut scratch, flow);
+        }
+        assert_eq!(a.queued.len(), 256);
+        let response = wire(b.decapsulate(&hello, &mut scratch).0);
+        let keepalive = wire(a.decapsulate(&response, &mut scratch).0);
+        let _ = b.decapsulate(&keepalive, &mut scratch);
+        for expected in 100..356 {
+            let (result, flow) = a.decapsulate(&[], &mut scratch);
+            assert_eq!(flow, expected);
+            let ciphertext = wire(result);
+            match b.decapsulate(&ciphertext, &mut scratch).0 {
+                TunnResult::WriteToTunnelV4(bytes, _) => assert_eq!(bytes, packet),
+                _ => panic!("queued IP packet must decrypt"),
+            }
+        }
+        assert!(a.queued.is_empty());
+        assert!(matches!(
+            a.decapsulate(&[], &mut scratch).0,
+            TunnResult::Done
+        ));
+        let (result, flow) = a.encapsulate(&packet, &mut scratch, 12345);
+        assert!(is_data(&result));
+        assert_eq!(flow, 12345);
     }
 }

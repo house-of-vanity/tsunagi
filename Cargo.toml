@@ -4,6 +4,12 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["vendor/mainline"]
+
+# Mainline 8.0.0 treats Windows UDP read timeouts as socket failures.
+# Keep the small receive-loop correction reproducible until an upstream fix.
+[patch.crates-io]
+mainline = { path = "vendor/mainline" }
 
 [workspace.package]
 edition = "2024"

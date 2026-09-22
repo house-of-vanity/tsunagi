@@ -264,10 +264,16 @@ struct Runtime {
     /// else, so there is no hearsay to weigh and nothing to poison. Soft
     /// state — an entry that stops being refreshed expires, which is how a
     /// relay that has gone stops being chosen without anybody revoking it.
-    reachable: HashMap<EndpointId, (HashSet<EndpointId>, std::time::Instant)>,
+    reachable: HashMap<
+        EndpointId,
+        (
+            HashSet<crate::proto::message::ReachableLink>,
+            std::time::Instant,
+        ),
+    >,
     /// What this agent last told its peers it could reach, so it is only
     /// said again when it changed.
-    announced_reach: HashSet<EndpointId>,
+    announced_reach: HashSet<crate::proto::message::ReachableLink>,
     /// Links currently being opened, so we do not start two.
     opening: HashSet<(EndpointId, String)>,
     link_results_tx: mpsc::Sender<LinkOutcome>,
@@ -328,7 +334,7 @@ impl Runtime {
             dial_results_tx,
             dial_results_rx,
             links: HashMap::new(),
-            hub: crate::dataplane::relay::RelayHub::new(network_id),
+            hub: crate::dataplane::relay::RelayHub::new(network_id, local_id),
             reachable: HashMap::new(),
             announced_reach: HashSet::new(),
             opening: HashSet::new(),
@@ -360,6 +366,11 @@ impl Runtime {
             tokio::select! {
                 biased;
                 _ = self.shutdown.wait() => break,
+                _ = self.hub.changed() => {
+                    self.ensure_links();
+                    self.update_paths();
+                    self.announce_reach(false);
+                }
                 command = commands.recv() => match command {
                     Some(command) => self.handle_command(command).await,
                     None => break,
@@ -387,6 +398,8 @@ impl Runtime {
                 _ = ticker.tick() => {
                     self.discovery_round().await;
                     self.ensure_links();
+                    self.update_paths();
+                    self.announce_reach(false);
                 }
             }
         }
@@ -401,6 +414,7 @@ impl Runtime {
         // Stop accepting session events first: nothing is going to act on them
         // any more, and a sender blocked on a full queue would stall shutdown.
         self.session_events_rx.close();
+        self.hub.close();
         self.links.clear();
         let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
         for peer in peers {
@@ -1122,7 +1136,7 @@ impl Runtime {
 
         let mut dead: Vec<(EndpointId, String)> = Vec::new();
         for (key, link) in &self.links {
-            if link.is_closed() {
+            if link.is_closed() || self.no_direct_data(key.0) {
                 dead.push(key.clone());
             }
         }
@@ -1307,28 +1321,28 @@ impl Runtime {
         }
     }
 
-    /// Tells peers which peers this agent has a live link with, when that
-    /// has changed.
-    ///
-    /// Only what it can see for itself, and only to the peers it is
-    /// talking to: one hop, no flooding, nothing second-hand. A peer that
-    /// hears this is the only one that can use it, because it is also the
-    /// only one that could route through this agent.
+    /// Publishes only locally observed, protocol-specific transport edges.
     fn announce_reach(&mut self, force: bool) {
-        let live: HashSet<EndpointId> = self
+        let live: HashSet<_> = self
             .links
             .iter()
             .filter(|(_, link)| !link.is_closed())
-            .map(|((peer, _), _)| *peer)
+            .map(
+                |((peer, protocol), _)| crate::proto::message::ReachableLink {
+                    peer: *peer.as_bytes(),
+                    protocol: protocol.clone(),
+                },
+            )
             .collect();
         if !force && live == self.announced_reach {
             return;
         }
         self.announced_reach = live.clone();
-        let message = ControlMessage::Reachable {
-            peers: live.iter().map(|peer| *peer.as_bytes()).collect(),
-        };
-        let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
+        let mut links: Vec<_> = live.into_iter().collect();
+        links.sort_by(|a, b| (&a.protocol, a.peer).cmp(&(&b.protocol, b.peer)));
+        links.truncate(self.params.limits.max_state_records);
+        let message = ControlMessage::Reachable { links };
+        let peers: Vec<_> = self.sessions.keys().copied().collect();
         for peer in peers {
             if let Err(err) = self.send_to(peer, message.clone()) {
                 tracing::debug!(%err, "could not queue a reachability announcement");
@@ -1336,99 +1350,72 @@ impl Runtime {
         }
     }
 
-    /// Chooses, for every peer with no direct link, somebody to go through.
-    ///
-    /// Local and deterministic: the lowest endpoint id among the peers
-    /// that both this agent has a link with and that say they have a link
-    /// with the destination. Nothing is agreed with anybody — two agents
-    /// may well pick differently, and traffic each way finds its own path.
+    /// Builds the graph off the packet path. Every remote row comes from that
+    /// member's authenticated control session; stale or incompatible rows never
+    /// enter the graph. The hub replaces an immutable table only on changes.
     fn update_paths(&mut self) {
-        self.reachable
-            .retain(|_, (_, heard)| heard.elapsed() < REACH_EXPIRY);
-
-        let served = self.served_protocols();
-        let live: HashSet<EndpointId> = self
-            .links
-            .iter()
-            .filter(|(_, link)| !link.is_closed())
-            .map(|((peer, _), _)| *peer)
-            .collect();
-
-        // Every peer this agent would carry traffic with: a session says
-        // who it is and what it speaks, which is also what a protocol
-        // needs before it can have a link at all.
-        let wanted: Vec<(EndpointId, String)> = self
-            .sessions
-            .values()
-            .flat_map(|session| {
-                let peer = session.peer;
-                session
-                    .capabilities
-                    .iter()
-                    .filter(|capability| capability.enabled)
-                    .map(move |capability| (peer, capability.protocol.clone(), capability.version))
-            })
-            .filter(|(_, protocol, version)| {
-                served
-                    .iter()
-                    .any(|(name, ours)| name == protocol && ours == version)
-            })
-            .map(|(peer, protocol, _)| (peer, protocol))
-            .collect();
-
-        for (peer, protocol) in wanted {
-            if live.contains(&peer) {
-                // There is a direct link; a hop is only for when there is
-                // not, and holding a stale one would keep a peer that has
-                // gone looking reachable.
-                if self.hub.has_link(peer, &protocol) {
-                    self.hub.set_hop(peer, &protocol, None);
-                }
-                continue;
-            }
-            let hop = self
+        self.reachable.retain(|peer, (_, heard)| {
+            heard.elapsed() < REACH_EXPIRY && self.sessions.contains_key(peer)
+        });
+        for (protocol, version) in self.served_protocols() {
+            let peers: Vec<_> = self
+                .sessions
+                .values()
+                .filter(|session| {
+                    session.capabilities.iter().any(|capability| {
+                        capability.enabled
+                            && capability.protocol == protocol
+                            && capability.version == version
+                    })
+                })
+                .map(|session| session.peer)
+                .collect();
+            let mut members: HashSet<_> = peers.iter().map(|peer| *peer.as_bytes()).collect();
+            members.insert(*self.local_id.as_bytes());
+            let graph = self
                 .reachable
                 .iter()
-                .filter(|(middle, (reaches, _))| {
-                    live.contains(*middle) && reaches.contains(&peer) && **middle != peer
+                .filter(|(peer, _)| members.contains(peer.as_bytes()))
+                .map(|(peer, (links, _))| {
+                    let mut neighbors: Vec<_> = links
+                        .iter()
+                        .filter(|link| {
+                            link.protocol == protocol
+                                && members.contains(&link.peer)
+                                && link.peer != *peer.as_bytes()
+                        })
+                        .map(|link| link.peer)
+                        .collect();
+                    neighbors.sort_unstable();
+                    (*peer.as_bytes(), neighbors)
                 })
-                .map(|(middle, _)| *middle)
-                .min_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-
-            let known = self.hub.has_link(peer, &protocol);
-            if !known && hop.is_none() {
-                // Nothing to reach it with and nothing to offer a
-                // protocol; inventing a link object here would only look
-                // like connectivity.
-                continue;
+                .collect();
+            self.hub.set_topology(&protocol, graph, members);
+            for peer in peers {
+                if self.hub.has_link(peer, &protocol) || !self.hub.reachable(peer, &protocol) {
+                    continue;
+                }
+                let Some(plugin) = self
+                    .params
+                    .plugins
+                    .iter()
+                    .find(|plugin| plugin.protocol_id() == protocol)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let link = self.hub.link(peer, &protocol);
+                let path = link.path_description();
+                let max_datagram = link.max_datagram_size();
+                plugin.on_peer_link(self.network_id, peer, link);
+                self.emit(Event::DataLinkUp {
+                    network: self.network_id,
+                    peer,
+                    protocol: protocol.clone(),
+                    path,
+                    max_datagram,
+                });
             }
-            self.hub.set_hop(peer, &protocol, hop);
-            if known {
-                continue;
-            }
-            // A peer reachable only through somebody still gets a link, so
-            // its tunnel can be built: the protocol is not told how its
-            // datagrams travel, only that this is the way to that peer.
-            let Some(plugin) = self
-                .params
-                .plugins
-                .iter()
-                .find(|plugin| plugin.protocol_id() == protocol)
-                .cloned()
-            else {
-                continue;
-            };
-            let link = self.hub.link(peer, &protocol);
-            let path = link.path_description();
-            let max_datagram = link.max_datagram_size();
-            plugin.on_peer_link(self.network_id, peer, link);
-            self.emit(Event::DataLinkUp {
-                network: self.network_id,
-                peer,
-                protocol,
-                path,
-                max_datagram,
-            });
         }
     }
 
@@ -1718,6 +1705,8 @@ impl Runtime {
                 }
                 self.metrics.disconnects += 1;
                 self.drop_links_for(peer);
+                self.update_paths();
+                self.announce_reach(false);
                 for plugin in &self.params.plugins {
                     plugin.on_peer_gone(self.network_id, peer);
                 }
@@ -1748,6 +1737,7 @@ impl Runtime {
                 }
                 self.dispatch_capabilities(peer, &capabilities);
                 self.ensure_links();
+                self.update_paths();
             }
             ControlMessage::Ping { seq, payload } => {
                 let pong = ControlMessage::Pong {
@@ -1772,11 +1762,8 @@ impl Runtime {
             }
             // What that peer can reach, from that peer. Kept with the time
             // it was heard, so it can go stale on its own.
-            ControlMessage::Reachable { peers } => {
-                let heard: HashSet<EndpointId> = peers
-                    .iter()
-                    .filter_map(|raw| EndpointId::from_bytes(raw).ok())
-                    .collect();
+            ControlMessage::Reachable { links } => {
+                let heard = links.iter().cloned().collect();
                 self.reachable
                     .insert(peer, (heard, std::time::Instant::now()));
                 self.update_paths();

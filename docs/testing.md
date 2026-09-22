@@ -63,15 +63,22 @@ intermediate peer. Fragment tests cover reordering, duplicates, loss, changing
 fragment sizes, malformed input, timeout and memory bounds. These are packet
 transport checks, not a claim to have run an SSH server or a host TCP stack.
 
-`crates/tsunagi/src/dataplane/relay.rs` has its own tests for the way
-through a peer in the middle: the wrapping and what a malformed one does, a
-direct path being preferred over a hop, the middle passing a datagram on
-without being handed it, what arrives through somebody reaching the peer it
-came from rather than the one that carried it, a link outliving the paths
-under it, and the datagram size not changing when the path does.
-`tests/wireguard.rs` proves it end to end — two agents that can each reach a
-third and not each other, with a real WireGuard packet crossing through the
-middle.
+Routing tests cover shortest paths, direct preference, deterministic per-flow
+ECMP, link loss, protocol isolation, malformed/unknown frames, bounded local
+queues, zero-copy transit of an owned buffer, and deliberately inconsistent
+tables whose loop terminates at the hop limit. A transit reader is exercised
+without any plugin reader, so forwarding cannot accidentally depend on one.
+WireGuard tests also cover flow tags queued before a handshake, queue overflow,
+and their preservation through encryption.
+
+`tests/wireguard.rs` includes a four-agent chain A—B—C—D with only adjacent data
+links. Real encrypted 1280-byte TCP packets travel in both directions while the
+middle TUNs remain empty. A direct A—D link is enabled, then removed; the route
+switches back to the chain without replacing end-to-end tunnels.
+
+The ignored `forwarding_benchmark` measures the synchronous transit routine in
+release mode, excluding crypto and socket I/O. Run it explicitly as described
+in [routing.md](routing.md); it has no timing threshold in the default suite.
 
 Unit tests in `crates/tsunagi/src/state/` cover the signed record model directly: tampering
 with any field breaks verification, a newer version wins while an older one
@@ -123,6 +130,10 @@ What the default suite does **not** cover is the real TUN interface, because
 that needs `CAP_NET_ADMIN`. Everything above it does run.
 
 Mainline discovery tests use an isolated loopback `mainline::Testnet`.
+`tests/mainline_socket.rs` checks that idle UDP receive timeouts do not emit
+warnings (including Windows error 10060) and that the same node still answers
+a real KRPC ping afterwards. The local dependency correction is documented in
+[`vendor/mainline/PATCHES.md`](../vendor/mainline/PATCHES.md).
 `tests/mainline.rs` restores two agents after their DHT and disposable cache
 have disappeared. `tests/discovery_lifecycle.rs` checks that publication
 continues while connected, lookup resumes after isolation, and a hung backend

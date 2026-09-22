@@ -45,9 +45,11 @@ Keep these separate. Crossing them is the main thing to review for.
   is why the authenticated transport does too.
 - **A relay carries bytes, never packets.** A datagram passed on for two
   other peers goes link in, link out: it is never written to the middle's
-  interface, never decrypted there, and never relayed twice. Reachability
-  that decides a route is first-hand and volatile — a live announcement
-  over the control plane, never a signed record and never second-hand.
+  interface or decrypted there. Multihop routing has a bounded hop limit;
+  equal-cost next hops are chosen per flow. Reachability is first-hand and
+  volatile: each authenticated member advertises its own protocol-specific
+  links. Build routing tables on topology changes, never per packet. Transit
+  must not acquire a routing mutex or wait for a protocol/TUN reader.
 - **Plugins never learn reachability.** An `IpPlugin` is handed a `PacketLink`
   per peer and moves datagrams over it. Addresses, hole punching and relays
   belong to `crates/tsunagi/src/dataplane/transport/`. A plugin announcement says *who*, never

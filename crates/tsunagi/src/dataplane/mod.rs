@@ -20,6 +20,7 @@
 //! recorded and surfaced, the control plane keeps running.
 
 pub mod relay;
+pub mod routing;
 pub mod transport;
 
 use std::sync::Arc;

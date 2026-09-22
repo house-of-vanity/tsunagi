@@ -1510,3 +1510,120 @@ async fn a_peer_with_no_direct_path_is_reached_through_one_that_has_both() {
     b.shutdown().await;
     middle.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_chain_routes_through_two_transit_peers_without_touching_their_tuns() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-multihop");
+    let mut agents = Vec::new();
+    let mut blocked = Vec::new();
+    for index in 0..4 {
+        let cuts = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        agents.push(WgAgent::spawn_cut_off(&discovery, &format!("mh{index}"), cuts.clone()).await);
+        blocked.push(cuts);
+    }
+    // The authenticated control plane stays connected. The only available
+    // data links are A--B--C--D; A and D need two transit routers.
+    for (i, cuts) in blocked.iter().enumerate() {
+        for (j, agent) in agents.iter().enumerate() {
+            if i.abs_diff(j) > 1 {
+                cuts.lock().unwrap().insert(agent.endpoint_id());
+            }
+        }
+    }
+    let mut id = None;
+    for agent in &agents {
+        id = Some(agent.agent.join_network(&name, &secret).await.unwrap());
+    }
+    let id = id.unwrap();
+    for agent in &agents {
+        wait_for_peers(&agent.agent, id, 3).await;
+        agent.wait_for_tunnels(id, 3).await;
+    }
+    let a = &agents[0];
+    let d = &agents[3];
+    let a_addr = a.overlay(id).await;
+    let d_addr = d.overlay(id).await;
+    let a_tun = a.tun(id).await;
+    let d_tun = d.tun(id).await;
+    for (from, to, source, destination) in [
+        (&a_tun, &d_tun, a_addr, d_addr),
+        (&d_tun, &a_tun, d_addr, a_addr),
+    ] {
+        let packet = tcp_packet(source, destination, 1280);
+        from.push_from_os(packet.clone());
+        let received = tokio::time::timeout(tsunagi::testing::DEADLINE, to.pop_to_os())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, packet);
+    }
+    for middle in &agents[1..3] {
+        assert!(
+            middle
+                .agent
+                .network_status(id)
+                .await
+                .unwrap()
+                .relay
+                .forwarded
+                > 0
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), middle.tun(id).await.pop_to_os())
+                .await
+                .is_err(),
+            "transit ciphertext must never enter the intermediate host's TUN"
+        );
+    }
+    // A direct shortcut wins immediately; losing it restores the chain using
+    // the same end-to-end tunnels and overlay addresses.
+    for allow_direct in [true, false] {
+        for (from, to) in [(0, 3), (3, 0)] {
+            if allow_direct {
+                blocked[from]
+                    .lock()
+                    .unwrap()
+                    .remove(&agents[to].endpoint_id());
+            } else {
+                blocked[from]
+                    .lock()
+                    .unwrap()
+                    .insert(agents[to].endpoint_id());
+            }
+            agents[from].agent.recheck_network(id).await.unwrap();
+        }
+        for (from, to) in [(a, d), (d, a)] {
+            wait_until("route follows the changed topology", || async {
+                let view = from.plugin.overview(id)?;
+                let tunnel = view
+                    .peers
+                    .iter()
+                    .find(|peer| peer.endpoint_id == to.endpoint_id())?
+                    .tunnel
+                    .as_ref()?;
+                let relayed = tunnel.path.contains("relay 3 hops");
+                (tunnel.health.is_up()
+                    && if allow_direct {
+                        !tunnel.path.contains("relay") && !tunnel.path.contains("unreachable")
+                    } else {
+                        relayed
+                    })
+                .then_some(())
+            })
+            .await;
+        }
+        let packet = tcp_packet(a_addr, d_addr, 1280);
+        a_tun.push_from_os(packet.clone());
+        assert_eq!(
+            tokio::time::timeout(tsunagi::testing::DEADLINE, d_tun.pop_to_os())
+                .await
+                .unwrap()
+                .unwrap(),
+            packet
+        );
+    }
+    for agent in agents {
+        agent.shutdown().await;
+    }
+}

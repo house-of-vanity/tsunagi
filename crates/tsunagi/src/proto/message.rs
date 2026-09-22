@@ -20,7 +20,7 @@ use crate::error::ProtocolError;
 /// The version in the ALPN is the wire-compatibility version of the control
 /// protocol. It is independent of the network identity scheme version, so
 /// bumping it must not change any existing [`crate::NetworkId`].
-pub const ALPN: &[u8] = b"tsunagi/ctrl/1";
+pub const ALPN: &[u8] = b"tsunagi/ctrl/2";
 
 /// ALPN of the tsunagi data plane.
 ///
@@ -29,11 +29,10 @@ pub const ALPN: &[u8] = b"tsunagi/ctrl/1";
 /// saturated or broken data plane cannot disturb control traffic, and the
 /// transport underneath can be replaced without touching the control protocol.
 ///
-/// Version 3 fragments logical datagrams below the peer-relay envelope, so
-/// the overlay's MTU is independent of the current QUIC path MTU. Older data
-/// versions cannot form a data link; control and persistent identities remain
-/// compatible. Both ends, including any intermediate peer, must be upgraded.
-pub const DATA_ALPN: &[u8] = b"tsunagi/data/3";
+/// Version 4 adds source, destination, hop limit and stable flow id above
+/// transport fragmentation. All members must upgrade together. Persistent
+/// identities and network configuration do not change.
+pub const DATA_ALPN: &[u8] = b"tsunagi/data/4";
 
 /// Largest plugin protocol identifier accepted when opening a data channel.
 pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
@@ -42,7 +41,7 @@ pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
 pub const MAX_SIGNATURE_LEN: usize = 64;
 
 /// Control protocol version carried inside the handshake.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// First message of the handshake, sent by the initiator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,8 +153,8 @@ pub enum ControlMessage {
     /// and repairs itself; and volatile, so it lives here and not in
     /// signed state, which is for what has to survive a member being away.
     Reachable {
-        /// The peers, as raw endpoint keys.
-        peers: Vec<[u8; 32]>,
+        /// Direct links, scoped to the plugin protocol they actually carry.
+        links: Vec<ReachableLink>,
     },
     /// Graceful goodbye.
     ///
@@ -181,6 +180,15 @@ pub struct PeerHint {
     /// worth sending: an id alone is enough for a receiver whose endpoint
     /// can resolve it.
     pub addrs: Vec<String>,
+}
+
+/// One directly observed edge, advertised only by its authenticated source.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReachableLink {
+    /// The other end of this transport link.
+    pub peer: [u8; 32],
+    /// Protocol carried by the link.
+    pub protocol: String,
 }
 
 /// Longest address text accepted in a hint.
@@ -256,10 +264,18 @@ pub fn validate(message: &ControlMessage, limits: &Limits) -> Result<(), Protoco
                 }
             }
         }
-        ControlMessage::Reachable { peers } => {
-            // One entry per member at most; a sender claiming more than a
-            // network can hold is not describing this network.
-            check_len("reachable.peers", peers.len(), limits.max_state_records)?;
+        ControlMessage::Reachable { links } => {
+            check_len("reachable.links", links.len(), limits.max_state_records)?;
+            for link in links {
+                if link.protocol.is_empty() {
+                    return Err(ProtocolError::Malformed("empty routing protocol"));
+                }
+                check_len(
+                    "reachable.protocol",
+                    link.protocol.len(),
+                    MAX_PROTOCOL_ID_LEN,
+                )?;
+            }
         }
         ControlMessage::Announce(announcement) => {
             check_len(

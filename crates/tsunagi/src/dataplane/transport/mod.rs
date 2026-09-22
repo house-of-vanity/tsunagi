@@ -88,6 +88,16 @@ pub trait PacketLink: Send + Sync + std::fmt::Debug + 'static {
     /// handed to the transport, nothing more.
     fn send(&self, payload: Bytes) -> Result<(), TransportError>;
 
+    /// Sends a datagram with an opaque stable flow identifier. Plugins derive
+    /// this before encryption; transports that do not route can ignore it.
+    fn send_flow(
+        &self,
+        payload: Bytes,
+        _flow: super::routing::FlowId,
+    ) -> Result<(), TransportError> {
+        self.send(payload)
+    }
+
     /// Receives the next datagram, or `None` once the link is finished.
     fn recv(&self) -> BoxFuture<'_, Option<Bytes>>;
 

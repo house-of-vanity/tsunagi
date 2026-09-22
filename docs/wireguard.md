@@ -184,7 +184,7 @@ QUIC DATAGRAM frames themselves cannot fragment.
 Reassembly is bounded and expires incomplete packets; one lost fragment loses
 one packet, without blocking unrelated traffic. The logical data payload limit
 is 64 KiB, with the relay envelope subtracted before it reaches the plugin.
-The new framing uses data ALPN `tsunagi/data/3`; both ends and intermediate
+The new framing uses data ALPN `tsunagi/data/4`; both ends and intermediate
 peers need the updated binary. Network identities and saved state do not change.
 See [protocol.md](protocol.md#the-data-plane-protocol) for the wire format.
 

@@ -480,3 +480,5 @@ impl std::fmt::Debug for AgentConfig {
             .finish()
     }
 }
+/// Maximum number of transport links a routed datagram may traverse.
+pub const ROUTING_HOP_LIMIT: u8 = 16;
