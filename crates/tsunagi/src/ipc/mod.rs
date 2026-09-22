@@ -584,6 +584,8 @@ async fn exchange(path: &Path, request: &Request, within: Duration) -> Result<Re
 ///
 /// Used to tell a running agent from a leftover: on Unix a socket file with
 /// nothing behind it, on Windows nothing at all.
+/// A Windows pipe that denies access still counts as present; the subsequent
+/// request reports the permission error instead of attempting an offline edit.
 pub async fn is_serving(path: impl AsRef<Path>) -> bool {
     transport::probe(path.as_ref()).await
 }

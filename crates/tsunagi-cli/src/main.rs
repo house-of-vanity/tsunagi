@@ -2256,14 +2256,8 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
             // Nothing running is an ordinary answer to "what is running", not
             // a fault; a socket that will not answer is a fault.
             agent.push(if *socket_present {
-                // The version check in the framing names a mismatch only for
-                // whichever side is newer. An older agent reading a newer
-                // request just drops the connection, so the hint has to be
-                // offered rather than asserted.
-                Row::new(Health::Degraded, "running", "not answering").with_note(format!(
-                    "{why}  ·  it may be an older build: restart it with this binary. \
-                         The rest was read from the store"
-                ))
+                Row::new(Health::Degraded, "running", "not answering")
+                    .with_note(format!("{why}  ·  the rest was read from the store"))
             } else {
                 Row::new(Health::Info, "running", "no")
                     .with_note(format!("{why}  ·  the rest was read from the store"))

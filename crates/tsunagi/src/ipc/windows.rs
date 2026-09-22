@@ -25,6 +25,8 @@
 //! other unprivileged users, the default is the practical equivalent of the
 //! owner-only Unix socket. There is no leftover to clean up: a pipe exists only
 //! while its server does.
+//! Commands must run as the same Windows user with the same elevation as the
+//! agent. A permission denial is reported as such, never as an absent agent.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,8 +43,8 @@ pub use super::{
     request_status, set_active, set_dns, set_hostname,
 };
 
-/// `ERROR_ACCESS_DENIED`: what creating the first pipe instance returns when
-/// one already exists, so another agent already owns the name.
+/// `ERROR_ACCESS_DENIED`: creating a first instance finds an existing pipe,
+/// or a client cannot access an existing pipe with its current privileges.
 const ERROR_ACCESS_DENIED: i32 = 5;
 /// `ERROR_PIPE_BUSY`: every instance is serving a client right now. A server
 /// is there; the client only has to wait for a free instance.
@@ -177,6 +179,20 @@ pub(crate) async fn connect(path: &Path) -> Result<NamedPipeClient> {
             Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(Error::Io {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "the agent's control pipe exists, but Windows denied access. \
+                             Run this command as the same Windows user and with the same \
+                             elevation as `tsunagi up` (use an administrator terminal if \
+                             the agent is elevated). Windows error: {err}"
+                        ),
+                    ),
+                });
+            }
             Err(source) => {
                 return Err(Error::Io {
                     path: path.to_path_buf(),
@@ -189,13 +205,17 @@ pub(crate) async fn connect(path: &Path) -> Result<NamedPipeClient> {
 
 /// Whether an agent is serving the pipe for `path`.
 ///
-/// A busy pipe still means a server is there; only a name nothing has created
-/// counts as not serving.
+/// A busy or inaccessible pipe still means a server is there. In particular,
+/// access denied must not send a mutating command down the offline path,
+/// where it would only produce a misleading state-directory lock error.
 pub(crate) async fn probe(path: &Path) -> bool {
     let name = pipe_name(path);
     match ClientOptions::new().open(&name) {
         Ok(_) => true,
-        Err(err) => err.raw_os_error() == Some(ERROR_PIPE_BUSY),
+        Err(err) => {
+            err.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                || err.kind() == std::io::ErrorKind::PermissionDenied
+        }
     }
 }
 
@@ -246,6 +266,39 @@ mod tests {
         assert!(matches!(answer, Response::Status(_)));
 
         control.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_inaccessible_agent_is_not_mistaken_for_an_absent_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        // An outbound-only pipe denies the client's duplex open even when
+        // both processes have the same privileges. This exercises the same
+        // Windows error as a client unable to access an elevated agent,
+        // without requiring elevation or changing any ACLs.
+        let _server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .access_inbound(false)
+            .create(pipe_name(&path))
+            .unwrap();
+
+        assert!(is_serving(&path).await, "access denied is not absence");
+        for error in [
+            request_status(&path).await.unwrap_err(),
+            join_network(&path, "test", "local-ipc-test-secret")
+                .await
+                .unwrap_err(),
+            set_dns(&path, false, None).await.unwrap_err(),
+        ] {
+            let Error::Io { source, .. } = error else {
+                panic!("expected an access error, got {error}");
+            };
+            assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            let message = source.to_string();
+            assert!(message.contains("same Windows user"), "{message}");
+            assert!(message.contains("administrator"), "{message}");
+            assert!(!message.contains("local-ipc-test-secret"), "{message}");
+        }
     }
 
     #[tokio::test]

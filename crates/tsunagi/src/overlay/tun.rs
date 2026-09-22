@@ -401,13 +401,7 @@ mod system {
         // applies those to the interface separately, the same way on every
         // platform, so the plan stays the single source of what it carries.
 
-        let device = tun::create_as_async(&config).map_err(|err| {
-            OverlayError::Unavailable(format!(
-                "cannot create the TUN interface `{}`: {err}. {}",
-                request.name,
-                open_hint()
-            ))
-        })?;
+        let device = tun::create_as_async(&config).map_err(|err| open_error(&request.name, err))?;
 
         let (reader, writer) = tokio::io::split(device);
         Ok(Arc::new(SystemTun {
@@ -416,6 +410,44 @@ mod system {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
         }) as Arc<dyn TunDevice>)
+    }
+
+    fn open_error(name: &str, error: tun::Error) -> OverlayError {
+        // Wintun preserves the Windows code in its I/O variant. Normalize it
+        // before testing permissions; matching localized error text would
+        // miss the same failure on another Windows language.
+        #[cfg(target_os = "windows")]
+        let error = match error {
+            tun::Error::WintunError(error) => tun::Error::Io(error.into()),
+            error => error,
+        };
+        let denied = match &error {
+            tun::Error::Io(error) => {
+                error.kind() == std::io::ErrorKind::PermissionDenied
+                    || (cfg!(target_os = "windows")
+                        && matches!(error.raw_os_error(), Some(5 | 740 | 1314)))
+            }
+            _ => false,
+        };
+        if denied {
+            let hint = if cfg!(target_os = "windows") {
+                "Open PowerShell or Command Prompt with 'Run as administrator' and \
+                 start `tsunagi up` there."
+            } else if cfg!(target_os = "linux") {
+                "Start `tsunagi up` as root or grant CAP_NET_ADMIN with \
+                 `sudo setcap cap_net_admin+p /path/to/tsunagi`."
+            } else {
+                "Start `tsunagi up` with the privileges required to create a TUN interface."
+            };
+            return OverlayError::Unavailable(format!(
+                "permission denied while creating the TUN interface `{name}`. \
+                 {hint} OS error: {error}"
+            ));
+        }
+        OverlayError::Unavailable(format!(
+            "cannot create the TUN interface `{name}`: {error}. {}",
+            open_hint()
+        ))
     }
 
     /// The platform-appropriate tail of a "cannot create the interface" error:
@@ -435,6 +467,44 @@ mod system {
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             "Run with `--no-tun` to keep the tunnels off the operating system."
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_tun_permission_error_explains_how_to_start_the_agent() {
+            let error = tun::Error::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            let message = open_error("tsun0", error).to_string();
+            assert!(message.contains("permission denied"), "{message}");
+            assert!(message.contains("tsun0"), "{message}");
+            assert!(message.contains("tsunagi up"), "{message}");
+            #[cfg(target_os = "windows")]
+            assert!(message.contains("Run as administrator"), "{message}");
+            #[cfg(target_os = "linux")]
+            assert!(message.contains("CAP_NET_ADMIN"), "{message}");
+        }
+
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn wintun_access_and_elevation_errors_get_the_permission_hint() {
+            for code in [5, 740, 1314] {
+                let error = tun::Error::WintunError(std::io::Error::from_raw_os_error(code).into());
+                let message = open_error("tsun0", error).to_string();
+                assert!(message.contains("permission denied"), "{message}");
+                assert!(message.contains("Run as administrator"), "{message}");
+                assert!(message.contains(&format!("os error {code}")), "{message}");
+                assert!(!message.contains("wintun.dll"), "{message}");
+            }
+        }
+
+        #[test]
+        fn other_tun_errors_keep_their_cause_without_claiming_access_was_denied() {
+            let message = open_error("tsun0", tun::Error::InvalidName).to_string();
+            assert!(message.contains("invalid device tun name"), "{message}");
+            assert!(!message.contains("permission denied"), "{message}");
         }
     }
 }

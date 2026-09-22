@@ -480,12 +480,18 @@ The original IP packet, including its DF bit, is preserved. See
 | `sudo tsunagi up` | root | everything works, nothing is isolated |
 | `--no-tun` | ordinary user, no capabilities | tunnels run and handshake, traffic never reaches the OS |
 
-**Not implemented yet.** macOS and Windows have no provisioner: both need
-real platform work — `utun` and `SystemConfiguration` on one, the IP Helper
-API and a Wintun adapter on the other. There the agent says so and `--no-tun`
-is the way to run it; the control plane and the tunnels are unaffected. The
-decision logic that says *what* to change is shared and tested on every
-platform, so only the execution is left to write.
+On Windows, put `wintun.dll` beside the executable and start `tsunagi up`
+from PowerShell or Command Prompt opened with **Run as administrator**.
+Run commands controlling that agent (`join`, `status`, `dns`, `network`)
+as the same Windows user with the same elevation. If Windows denies access
+to the agent's control pipe, the command reports a permission error instead
+of claiming the agent is absent or trying to edit its locked state.
+Creating a TUN without sufficient privileges also explains how to restart
+the agent with the required permissions.
+
+**Not implemented yet.** macOS has no provisioner; `--no-tun` is the way to
+run it. The control plane and tunnels are unaffected. The decision logic
+that says *what* to change is shared and tested on every platform.
 
 ## Checks
 
