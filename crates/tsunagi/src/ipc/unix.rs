@@ -1,98 +1,30 @@
 //! A Unix socket adapter for the local control interface.
 //!
-//! One of possibly several adapters; see [`super`]. It serves exactly the
-//! requests in [`Request`] and nothing else, and it is reachable only by a
-//! process that can open a file inside the agent's owner-only state
-//! directory.
+//! One of the per-platform adapters; see [`super`]. It provides only what is
+//! particular to a Unix socket — binding a listener, connecting a client, and
+//! the owner-only permissions — and hands every accepted connection to the
+//! shared [`serve_connection`](super::serve_connection). The request framing,
+//! the dispatch and the client wrappers are the same on every platform and
+//! live in [`super`], re-exported here so `ipc::unix::request_status` and its
+//! siblings keep resolving.
+//!
+//! It is reachable only by a process that can open a file inside the agent's
+//! owner-only state directory, and the socket itself is created mode `0600`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinHandle;
 
-use crate::BoxFuture;
 use crate::error::{Error, Result};
 
-use super::{
-    ActiveReport, DnsReport, JoinedReport, LeftReport, MAX_MESSAGE_LEN, Request, Response,
-    StatusReport,
+// The transport-agnostic surface, re-exported so this module is a complete
+// view of the local control interface on its own.
+pub use super::{
+    CONTROL_PROTOCOL, EXCHANGE_TIMEOUT, ReportSource, is_serving, join_network, leave_network,
+    request_status, set_active, set_dns, set_hostname,
 };
-
-/// Builds the report that answers a status request.
-///
-/// Supplied by the caller, because only the caller knows which plugins are
-/// running and what they can report. That is what keeps this module free of
-/// any knowledge of them.
-pub trait ReportSource: Send + Sync + 'static {
-    /// Produces a fresh report.
-    fn report(&self) -> BoxFuture<'_, StatusReport>;
-
-    /// Changes the name the agent answers to, returning the accepted form.
-    ///
-    /// Defaulted to a refusal so that a source which only reports — the
-    /// closure impl below, and every test that uses it — stays valid and
-    /// says plainly that it cannot do this, rather than appearing to.
-    fn set_hostname(
-        &self,
-        _hostname: String,
-    ) -> BoxFuture<'_, std::result::Result<String, String>> {
-        Box::pin(async move { Err("this agent cannot change its hostname".to_string()) })
-    }
-
-    /// Leaves a network, publishing a release first.
-    ///
-    /// Defaulted to a refusal for the same reason as the above: a source
-    /// that only reports says so plainly rather than appearing to do it.
-    fn leave(&self, _network_id: String) -> BoxFuture<'_, std::result::Result<LeftReport, String>> {
-        Box::pin(async move { Err("this agent cannot leave a network".to_string()) })
-    }
-
-    /// Joins a network, or starts one that is configured and not running.
-    ///
-    /// Defaulted to a refusal, like the others: a source that only reports
-    /// says so rather than appearing to have done it.
-    fn join(
-        &self,
-        _name: String,
-        _secret: String,
-    ) -> BoxFuture<'_, std::result::Result<JoinedReport, String>> {
-        Box::pin(async move { Err("this agent cannot join a network".to_string()) })
-    }
-
-    /// Stops serving a network, or starts serving it again.
-    ///
-    /// Defaulted to a refusal, like the others.
-    fn set_active(
-        &self,
-        _network_id: String,
-        _active: bool,
-    ) -> BoxFuture<'_, std::result::Result<ActiveReport, String>> {
-        Box::pin(async move { Err("this agent cannot stop or start a network".to_string()) })
-    }
-
-    /// Turns the local resolver on or off while the agent runs.
-    ///
-    /// Defaulted to a refusal, like the others.
-    fn set_dns(
-        &self,
-        _enable: bool,
-        _port: Option<u16>,
-    ) -> BoxFuture<'_, std::result::Result<Option<DnsReport>, String>> {
-        Box::pin(async move { Err("this agent cannot serve DNS".to_string()) })
-    }
-}
-
-impl<F> ReportSource for F
-where
-    F: Fn() -> BoxFuture<'static, StatusReport> + Send + Sync + 'static,
-{
-    fn report(&self) -> BoxFuture<'_, StatusReport> {
-        (self)()
-    }
-}
 
 /// Serves the local control interface on a Unix socket.
 #[derive(Debug)]
@@ -115,18 +47,14 @@ impl ControlSocket {
         }
 
         if path.exists() {
-            match UnixStream::connect(&path).await {
-                Ok(_) => {
-                    return Err(Error::StateLocked { path: path.clone() });
-                }
-                // Nothing is listening, so the file is a leftover.
-                Err(_) => {
-                    std::fs::remove_file(&path).map_err(|source| Error::Io {
-                        path: path.clone(),
-                        source,
-                    })?;
-                }
+            if is_serving(&path).await {
+                return Err(Error::StateLocked { path: path.clone() });
             }
+            // Nothing is listening, so the file is a leftover.
+            std::fs::remove_file(&path).map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
         }
 
         let listener = UnixListener::bind(&path).map_err(|source| Error::Io {
@@ -166,7 +94,6 @@ impl Drop for ControlSocket {
     }
 }
 
-#[cfg(unix)]
 fn restrict(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
@@ -184,248 +111,35 @@ async fn serve(listener: UnixListener, source: Arc<dyn ReportSource>) {
         };
         let source = Arc::clone(&source);
         tokio::spawn(async move {
-            if let Err(err) = handle(stream, source).await {
+            if let Err(err) = super::serve_connection(stream, source).await {
                 tracing::debug!(%err, "local control request failed");
             }
         });
     }
 }
 
-async fn handle(mut stream: UnixStream, source: Arc<dyn ReportSource>) -> Result<()> {
-    // Bounded, so a connection that sends nothing cannot hold a task open.
-    // Only the wait for the request: building the report afterwards takes as
-    // long as it takes, and cutting it off would answer a live client with a
-    // closed socket.
-    let request: Request =
-        match tokio::time::timeout(EXCHANGE_TIMEOUT, read_message(&mut stream)).await {
-            Ok(request) => request?,
-            Err(_) => {
-                return Err(Error::Timeout {
-                    what: "a local control connection".to_string(),
-                });
-            }
-        };
-    let response = match request {
-        Request::Status => Response::Status(Box::new(source.report().await)),
-        Request::SetHostname(hostname) => match source.set_hostname(hostname).await {
-            Ok(accepted) => Response::Hostname(accepted),
-            Err(reason) => Response::Error(reason),
-        },
-        Request::Leave(network_id) => match source.leave(network_id).await {
-            Ok(report) => Response::Left(report),
-            Err(reason) => Response::Error(reason),
-        },
-        Request::Join { name, secret } => match source.join(name, secret).await {
-            Ok(report) => Response::Joined(report),
-            Err(reason) => Response::Error(reason),
-        },
-        Request::SetActive { network_id, active } => {
-            match source.set_active(network_id, active).await {
-                Ok(report) => Response::Active(report),
-                Err(reason) => Response::Error(reason),
-            }
-        }
-        Request::Dns { enable, port } => match source.set_dns(enable, port).await {
-            Ok(report) => Response::Dns(report),
-            Err(reason) => Response::Error(reason),
-        },
-    };
-    write_message(&mut stream, &response).await
-}
-
-/// How long either end waits for the other.
-///
-/// A local answer comes from memory, so anything this slow means the agent is
-/// wedged rather than busy. Saying so beats waiting: unbounded, one wedged
-/// runtime leaves `tsunagi status` hanging with nothing on screen and no way
-/// out but Ctrl-C.
-const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Asks a running agent for its status.
-pub async fn request_status(path: impl AsRef<Path>) -> Result<StatusReport> {
-    let path = path.as_ref();
-    match exchange(path, &Request::Status, EXCHANGE_TIMEOUT).await? {
-        Response::Status(report) => Ok(*report),
-        Response::Error(reason) => Err(Error::Storage(reason)),
-        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
-    }
-}
-
-/// Asks a running agent to answer to a different name.
-///
-/// Returns the name it accepted, which is the canonical form of what was
-/// asked for and may differ from it.
-pub async fn set_hostname(path: impl AsRef<Path>, hostname: &str) -> Result<String> {
-    let path = path.as_ref();
-    let request = Request::SetHostname(hostname.to_string());
-    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
-        Response::Hostname(accepted) => Ok(accepted),
-        Response::Error(reason) => Err(Error::Storage(reason)),
-        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
-    }
-}
-
-/// Connects, sends one request and reads the answer, all within `within`.
-///
-/// The bound covers the whole exchange rather than each read: an agent that
-/// answers the header and then stops is as stuck as one that never answers.
-async fn exchange(path: &Path, request: &Request, within: Duration) -> Result<Response> {
-    let attempt = async {
-        let mut stream = UnixStream::connect(path)
-            .await
-            .map_err(|source| Error::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        write_message(&mut stream, request).await?;
-        read_message::<Response>(&mut stream).await
-    };
-
-    match tokio::time::timeout(within, attempt).await {
-        Ok(result) => result,
-        Err(_) => Err(Error::Timeout {
-            what: format!("the agent at {}", path.display()),
-        }),
-    }
-}
-
-/// Asks a running agent to leave a network.
-///
-/// The agent publishes the release and removes the network; this only
-/// carries the request and the outcome.
-pub async fn leave_network(path: impl AsRef<Path>, network_id: &str) -> Result<LeftReport> {
-    let path = path.as_ref();
-    let request = Request::Leave(network_id.to_string());
-    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
-        Response::Left(report) => Ok(report),
-        Response::Error(reason) => Err(Error::Storage(reason)),
-        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
-    }
-}
-
-/// Asks a running agent to join a network.
-///
-/// The one way to add a network to an agent that is already up: the state
-/// directory belongs to one live agent, so a second `up` cannot.
-pub async fn join_network(
-    path: impl AsRef<Path>,
-    name: &str,
-    secret: &str,
-) -> Result<JoinedReport> {
-    let path = path.as_ref();
-    let request = Request::Join {
-        name: name.to_string(),
-        secret: secret.to_string(),
-    };
-    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
-        Response::Joined(report) => Ok(report),
-        Response::Error(reason) => Err(Error::Storage(reason)),
-        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
-    }
-}
-
-/// Asks a running agent to stop serving a network, or to serve it again.
-pub async fn set_active(
-    path: impl AsRef<Path>,
-    network_id: &str,
-    active: bool,
-) -> Result<ActiveReport> {
-    let path = path.as_ref();
-    let request = Request::SetActive {
-        network_id: network_id.to_string(),
-        active,
-    };
-    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
-        Response::Active(report) => Ok(report),
-        Response::Error(reason) => Err(Error::Storage(reason)),
-        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
-    }
-}
-
-/// Turns the running agent's local resolver on or off.
-pub async fn set_dns(
-    path: impl AsRef<Path>,
-    enable: bool,
-    port: Option<u16>,
-) -> Result<Option<DnsReport>> {
-    let path = path.as_ref();
-    match exchange(path, &Request::Dns { enable, port }, EXCHANGE_TIMEOUT).await? {
-        Response::Dns(report) => Ok(report),
-        Response::Error(reason) => Err(Error::Storage(reason)),
-        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
-    }
-}
-
-/// Marks the wire format of the local control socket.
-///
-/// `b"TSN"` followed by the version, so a mismatch is recognised as one
-/// instead of being read as a length. The encoding is postcard, which is not
-/// self-describing: adding a field to a report changes how the bytes parse,
-/// and without this a client one build ahead of its agent reports something
-/// like "Found an Option discriminant that wasn't 0 or 1" — which says
-/// nothing about the actual problem, that the two are different builds.
-///
-/// Bump it whenever [`Request`], [`Response`] or anything they contain
-/// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 13]);
-
-async fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
-    let encoded = postcard::to_stdvec(value)
-        .map_err(|err| Error::Storage(format!("cannot encode a control message: {err}")))?;
-    if encoded.len() > MAX_MESSAGE_LEN {
-        return Err(Error::Storage("control message is too large".into()));
-    }
-    let len = encoded.len() as u32;
-    stream
-        .write_all(&CONTROL_PROTOCOL.to_be_bytes())
-        .await
-        .map_err(io_error)?;
-    stream
-        .write_all(&len.to_be_bytes())
-        .await
-        .map_err(io_error)?;
-    stream.write_all(&encoded).await.map_err(io_error)?;
-    stream.flush().await.map_err(io_error)
-}
-
-async fn read_message<T: for<'de> serde::Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header).await.map_err(io_error)?;
-    let version = u32::from_be_bytes(header);
-    if version != CONTROL_PROTOCOL {
-        return Err(Error::Storage(format!(
-            "the other end speaks control protocol {version:#010x} and this build speaks \
-             {CONTROL_PROTOCOL:#010x}; they are different builds of tsunagi, so restart the \
-             agent with the binary you are running now"
-        )));
-    }
-
-    stream.read_exact(&mut header).await.map_err(io_error)?;
-    let len = u32::from_be_bytes(header) as usize;
-    // Checked before allocating, exactly as on the network.
-    if len > MAX_MESSAGE_LEN {
-        return Err(Error::Storage(format!(
-            "control message of {len} bytes exceeds the {MAX_MESSAGE_LEN} byte limit"
-        )));
-    }
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await.map_err(io_error)?;
-    postcard::from_bytes(&payload)
-        .map_err(|err| Error::Storage(format!("cannot decode a control message: {err}")))
-}
-
-fn io_error(source: std::io::Error) -> Error {
-    Error::Io {
-        path: PathBuf::from("<local control socket>"),
+/// Connects a client to the socket at `path`.
+pub(crate) async fn connect(path: &Path) -> Result<UnixStream> {
+    UnixStream::connect(path).await.map_err(|source| Error::Io {
+        path: path.to_path_buf(),
         source,
-    }
+    })
+}
+
+/// Whether an agent is listening on the socket at `path`.
+pub(crate) async fn probe(path: &Path) -> bool {
+    UnixStream::connect(path).await.is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    use std::time::Duration;
+
+    use super::super::{Request, Response, StatusReport, exchange};
     use super::*;
+    use crate::BoxFuture;
 
     #[tokio::test]
     async fn a_silent_agent_is_reported_rather_than_waited_out() {

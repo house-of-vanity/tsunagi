@@ -712,14 +712,14 @@ enum Observed {
 
 /// Asks the agent, and falls back to the state store.
 async fn observe(paths: &StoragePaths, socket: &std::path::Path) -> Observed {
-    let socket_present = socket.exists();
+    let socket_present = tsunagi::ipc::is_serving(socket).await;
     let why = if socket_present {
-        match tsunagi::ipc::unix::request_status(socket).await {
+        match tsunagi::ipc::request_status(socket).await {
             Ok(report) => return Observed::Agent(Box::new(report)),
             Err(err) => format!("{err}"),
         }
     } else {
-        "no control socket for this state directory".to_string()
+        "no agent is serving this state directory".to_string()
     };
 
     // Read-only, and deliberately tolerant: a state directory that has never
@@ -876,7 +876,11 @@ fn dns_publisher() -> Arc<dyn tsunagi::dns::DnsPublisher> {
     {
         Arc::new(tsunagi::dns::publish::ResolvedPublisher::new())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        Arc::new(tsunagi::dns::publish::NrptPublisher::new())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         Arc::new(tsunagi::dns::publish::UnsupportedPublisher::new())
     }
@@ -1212,7 +1216,7 @@ struct AgentControl {
     paths: StoragePaths,
 }
 
-impl tsunagi::ipc::unix::ReportSource for AgentControl {
+impl tsunagi::ipc::ReportSource for AgentControl {
     fn report(&self) -> tsunagi::BoxFuture<'_, tsunagi::ipc::StatusReport> {
         Box::pin(async move {
             let dns = self.dns_state().await;
@@ -1531,9 +1535,9 @@ async fn join_network(
     // The running agent, because a second `up` cannot have the directory
     // and because this way the network starts at once instead of at the
     // next restart.
-    if socket.exists() {
+    if tsunagi::ipc::is_serving(socket).await {
         let report =
-            tsunagi::ipc::unix::join_network(socket, name.as_str(), secret.encode().as_str())
+            tsunagi::ipc::join_network(socket, name.as_str(), secret.encode().as_str())
                 .await?;
         // The id in full either way: it is what every other command takes,
         // and the shortened form in a report is for reading, not copying.
@@ -1618,7 +1622,7 @@ async fn join_network(
 /// comes from the running agent, because without a peer to contact the
 /// other side has nothing to go on.
 async fn invite(socket: &std::path::Path, name: &NetworkName, secret: &NetworkSecret) {
-    let endpoint = tsunagi::ipc::unix::request_status(socket)
+    let endpoint = tsunagi::ipc::request_status(socket)
         .await
         .ok()
         .map(|report| report.endpoint_id)
@@ -1726,8 +1730,8 @@ async fn set_active(
     let id = network.network_id.to_string();
     let name = network.name.clone();
 
-    if socket.exists() {
-        let report = tsunagi::ipc::unix::set_active(socket, &id, active).await?;
+    if tsunagi::ipc::is_serving(socket).await {
+        let report = tsunagi::ipc::set_active(socket, &id, active).await?;
         match (report.active, report.changed) {
             (false, true) => println!(
                 "stopped `{}` ({}); everything it has is kept",
@@ -1777,8 +1781,8 @@ async fn leave_network(
 
     // The running agent does it, because only it can publish the release
     // while its sessions are still up.
-    if socket.exists() {
-        let report = tsunagi::ipc::unix::leave_network(socket, &id).await?;
+    if tsunagi::ipc::is_serving(socket).await {
+        let report = tsunagi::ipc::leave_network(socket, &id).await?;
         println!("left `{}` ({})", report.name, short(&id, 10));
         match (report.announced, report.peers_told) {
             (true, 0) => eprintln!(
@@ -1846,7 +1850,7 @@ fn forget_protocol_state(paths: &StoragePaths, network: tsunagi::NetworkId) {
 async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let socket = control_socket(&paths, args.control_socket.as_ref());
-    if socket.exists() {
+    if tsunagi::ipc::is_serving(&socket).await {
         return Err(
             "stop the agent first: a wipe removes the state it is using, and leaving a \
              network properly needs it running anyway"
@@ -1883,8 +1887,9 @@ async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let removed = tsunagi::storage::wipe(&paths)?;
-    // A socket file with nothing behind it is a leftover of the same kind.
-    if tokio::net::UnixStream::connect(&socket).await.is_err() {
+    // A socket file with nothing behind it is a leftover of the same kind. On
+    // Windows there is no socket file, so this only ever tidies a Unix one.
+    if !tsunagi::ipc::is_serving(&socket).await {
         let _ = std::fs::remove_file(&socket);
     }
     println!("removed {} item(s):", removed.entries().count());
@@ -1918,8 +1923,8 @@ async fn dns_command(args: DnsArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // The running agent, so it takes effect now; it stores the setting too,
     // so the two can never say different things.
-    if socket.exists() {
-        let report = tsunagi::ipc::unix::set_dns(&socket, enable, port).await?;
+    if tsunagi::ipc::is_serving(&socket).await {
+        let report = tsunagi::ipc::set_dns(&socket, enable, port).await?;
         match report {
             Some(report) => {
                 println!(
@@ -2083,8 +2088,8 @@ async fn set_hostname(
     socket: &std::path::Path,
     name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if socket.exists() {
-        return match tsunagi::ipc::unix::set_hostname(socket, name).await {
+    if tsunagi::ipc::is_serving(socket).await {
+        return match tsunagi::ipc::set_hostname(socket, name).await {
             Ok(accepted) => {
                 println!("{accepted}");
                 Ok(())
@@ -2128,7 +2133,7 @@ async fn rotate_key(
     // The rotation writes, so it needs the directory to itself. Refused up
     // front rather than after the lock fails, because what a lock failure
     // says does not tell the reader what to do about it.
-    if socket.exists() {
+    if tsunagi::ipc::is_serving(socket).await {
         return Err(
             "stop the agent first: replacing the signing key rewrites state it is using".into(),
         );
@@ -2741,7 +2746,12 @@ fn host_section() -> report::Section {
         use tsunagi::overlay::{Privilege, probe_net_admin};
         match probe_net_admin() {
             Privilege::Available => {
-                host.push(Row::new(Health::Good, "privileges", "CAP_NET_ADMIN held"));
+                let held = if cfg!(target_os = "windows") {
+                    "assumes an elevated process; creation reports if not"
+                } else {
+                    "CAP_NET_ADMIN held"
+                };
+                host.push(Row::new(Health::Good, "privileges", held));
                 host.push(Row::new(
                     Health::Good,
                     "interface",
@@ -3339,7 +3349,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         // answer to a question nobody asked.
         Err(tsunagi::Error::StateLocked { path }) => {
             let socket = control_socket(&paths, args.control_socket.as_ref());
-            if socket.exists() {
+            if tsunagi::ipc::is_serving(&socket).await {
                 return Err(format!(
                     "an agent is already running for {}, and one state directory is one \
                      agent — it is the device, not a network.\n\n\
@@ -3394,14 +3404,14 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         let agent = agent.clone();
         let plugin = wireguard.clone();
         let dns = Arc::clone(&dns);
-        let source: Arc<dyn tsunagi::ipc::unix::ReportSource> = Arc::new(AgentControl {
+        let source: Arc<dyn tsunagi::ipc::ReportSource> = Arc::new(AgentControl {
             agent,
             plugin,
             dns,
             paths: paths.clone(),
         });
         let path = control_socket(&paths, args.control_socket.as_ref());
-        match tsunagi::ipc::unix::ControlSocket::bind(path, source).await {
+        match tsunagi::ipc::ControlSocket::bind(path, source).await {
             Ok(socket) => {
                 println!("  control      {}", socket.path().display());
                 Some(socket)
@@ -3643,11 +3653,20 @@ fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error
     Ok(Arc::new(ManagedTunFactory::new(Arc::new(provisioner))))
 }
 
+/// The Wintun adapter, created and configured by the agent and removed when it
+/// exits, the same as the Linux one.
+#[cfg(target_os = "windows")]
+fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+    use tsunagi::overlay::{ManagedTunFactory, WintunProvisioner};
+    let provisioner = WintunProvisioner::new()?;
+    Ok(Arc::new(ManagedTunFactory::new(Arc::new(provisioner))))
+}
+
 /// There is no provisioner for this platform yet.
 ///
 /// Refused here rather than at the first packet, and with the one thing that
 /// does work on every platform named.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     Err(format!(
         "managing the overlay interface is not implemented on {} yet. \

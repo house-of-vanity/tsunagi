@@ -3832,6 +3832,7 @@ dependencies = [
  "hkdf",
  "hmac 0.13.0",
  "iroh",
+ "netdev 0.45.1",
  "netwatch",
  "postcard",
  "rand 0.10.3",

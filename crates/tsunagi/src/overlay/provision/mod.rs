@@ -20,9 +20,11 @@
 //! pure and tested on every platform, and only the execution is behind
 //! [`InterfaceProvisioner`].
 //!
-//! Three implementations:
+//! Four implementations:
 //!
 //! * `NetlinkProvisioner` on Linux, which needs `CAP_NET_ADMIN`.
+//! * `WintunProvisioner` on Windows, a Wintun adapter configured with `netsh`,
+//!   which needs an elevated process.
 //! * [`MockProvisioner`], an in-memory host used by the tests.
 //! * [`UnsupportedProvisioner`] elsewhere, which fails with an explanation
 //!   and a pointer at the manual route rather than pretending to work.
@@ -50,6 +52,11 @@ pub use mock::{MockHost, MockProvisioner};
 mod linux;
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 pub use linux::NetlinkProvisioner;
+
+#[cfg(all(feature = "tun-device", target_os = "windows"))]
+mod windows;
+#[cfg(all(feature = "tun-device", target_os = "windows"))]
+pub use windows::WintunProvisioner;
 
 mod privilege;
 pub use privilege::{Privilege, probe_net_admin};

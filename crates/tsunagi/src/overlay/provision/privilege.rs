@@ -60,16 +60,44 @@ impl Privilege {
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 pub use linux_impl::{NetAdmin, probe_net_admin};
 
-#[cfg(not(all(feature = "tun-device", target_os = "linux")))]
+#[cfg(all(feature = "tun-device", target_os = "windows"))]
+pub use windows_impl::probe_net_admin;
+
+#[cfg(not(any(
+    all(feature = "tun-device", target_os = "linux"),
+    all(feature = "tun-device", target_os = "windows")
+)))]
 pub use other_impl::probe_net_admin;
 
-#[cfg(not(all(feature = "tun-device", target_os = "linux")))]
+#[cfg(not(any(
+    all(feature = "tun-device", target_os = "linux"),
+    all(feature = "tun-device", target_os = "windows")
+)))]
 mod other_impl {
     use super::Privilege;
 
     /// Whether this process can configure interfaces.
     pub fn probe_net_admin() -> Privilege {
         Privilege::Unsupported
+    }
+}
+
+#[cfg(all(feature = "tun-device", target_os = "windows"))]
+mod windows_impl {
+    use super::Privilege;
+
+    /// Whether this process can configure interfaces.
+    ///
+    /// Windows has no capability to hold and lower the way Linux does:
+    /// creating an adapter simply needs the process to be elevated. Reading
+    /// whether it *is* elevated means inspecting the process token through a
+    /// raw call this crate forbids, so the probe is deliberately optimistic —
+    /// it reports that the platform can manage interfaces — and the real
+    /// check is left to Wintun's adapter creation, which fails with a precise
+    /// message when the process is not elevated. This matches how the Linux
+    /// path treats the open itself as the honest answer.
+    pub fn probe_net_admin() -> Privilege {
+        Privilege::Available
     }
 }
 

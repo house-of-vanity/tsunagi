@@ -12,11 +12,21 @@ repository.workspace = true
 
 [features]
 default = []
-# A real TUN device, so a plugin can carry actual IP traffic. Needs
-# CAP_NET_ADMIN at run time; without it the in-memory device serves tests.
-tun-device = ["dep:tun", "dep:rtnetlink", "dep:caps", "dep:futures-util"]
-# Telling the operating system where to send its DNS questions. Linux only
-# for now; the zone and the server work without it.
+# A real TUN device, so a plugin can carry actual IP traffic. On Linux it
+# needs CAP_NET_ADMIN; on Windows the process must run elevated and
+# `wintun.dll` must be reachable. Without either the in-memory device serves
+# tests. The platform-specific dependencies are declared per target, so
+# enabling this only pulls what the target it is built for actually uses.
+tun-device = [
+    "dep:tun",
+    "dep:rtnetlink",
+    "dep:caps",
+    "dep:futures-util",
+    "dep:netdev",
+]
+# Telling the operating system where to send its DNS questions. systemd-resolved
+# on Linux, the Name Resolution Policy Table on Windows; the zone and the
+# server work without it either way.
 dns-publish = ["dep:zbus"]
 # The test harness in `testing`, for this crate's own tests and for a
 # protocol crate's. Not on by default: it is only of use to a test.
@@ -24,7 +34,9 @@ testing = ["dep:tempfile", "dep:tracing-subscriber"]
 
 [dependencies]
 iroh.workspace = true
-tokio.workspace = true
+# `net` for the local control interface: a Unix socket on Unix, a named pipe
+# on Windows. Both live behind the same `net` feature.
+tokio = { workspace = true, features = ["net"] }
 serde.workspace = true
 postcard.workspace = true
 bytes.workspace = true
@@ -68,6 +80,16 @@ rtnetlink = { version = "0.23", optional = true }
 zbus = { version = "5.19", default-features = false, features = ["tokio"], optional = true }
 caps = { version = "0.5", optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }
+
+# Windows-only interface provisioning. The Wintun adapter itself is created
+# and driven through the `tun` dependency, whose safe wrapper is the only way
+# in — loading `wintun.dll` is an `unsafe` call this crate forbids. `netdev`
+# (already in the tree through `netwatch`) reads the interface table through a
+# safe wrapper, which is how the provisioner observes an adapter by name
+# before deciding what to change. Creating an adapter needs the process to be
+# elevated and `wintun.dll` to be reachable at run time.
+[target.'cfg(target_os = "windows")'.dependencies]
+netdev = { version = "0.45", optional = true }
 
 [dev-dependencies]
 # Its own tests use the harness it publishes.

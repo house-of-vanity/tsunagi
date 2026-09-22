@@ -312,13 +312,17 @@ mod system {
 
     /// A real TUN interface.
     ///
-    /// Created by opening `/dev/net/tun`, which needs `CAP_NET_ADMIN` and is
-    /// why [`open_tun`] is only ever called from
-    /// [`provision`](super::super::provision), where that capability is
-    /// raised for the length of the call and no longer.
+    /// On Linux it is created by opening `/dev/net/tun`, which needs
+    /// `CAP_NET_ADMIN`; on Windows it is a Wintun adapter, which needs the
+    /// process to be elevated and `wintun.dll` to be reachable. Either way
+    /// [`open_tun`] is only ever called from
+    /// [`provision`](super::super::provision), which holds whatever privilege
+    /// the platform requires for the length of the call and no longer.
     ///
-    /// It is deliberately **not** made persistent, so the kernel removes the
-    /// interface when this value is dropped — however the process ends.
+    /// It is deliberately **not** made persistent, so the operating system
+    /// removes the interface when this value is dropped — however the process
+    /// ends. (A Wintun adapter created this way is likewise torn down when the
+    /// last handle to it closes, which the reader and writer below hold.)
     pub struct SystemTun {
         name: String,
         mtu: u32,
@@ -383,6 +387,7 @@ mod system {
     pub(crate) fn open_tun(request: &TunRequest) -> Result<Arc<dyn TunDevice>, OverlayError> {
         let mut config = tun::Configuration::default();
         config.tun_name(&request.name);
+        #[cfg(target_os = "linux")]
         config.platform_config(|platform| {
             // The crate's own root check is not the check we want: this holds
             // CAP_NET_ADMIN without being root. Whether the open succeeds is
@@ -391,14 +396,16 @@ mod system {
         });
         // Packet information stays off, so reads and writes are raw IP
         // packets. `ip tuntap add ... mode tun` also defaults to no packet
-        // information, so the flags match when attaching to one.
+        // information, so the flags match when attaching to one. The address
+        // and MTU are left off the configuration on purpose: the provisioner
+        // applies those to the interface separately, the same way on every
+        // platform, so the plan stays the single source of what it carries.
 
         let device = tun::create_as_async(&config).map_err(|err| {
             OverlayError::Unavailable(format!(
-                "cannot create the TUN interface `{}`: {err}. Creating one needs \
-                 CAP_NET_ADMIN; grant it with `setcap cap_net_admin+p`, or run with \
-                 `--no-tun` to keep the tunnels off the operating system.",
-                request.name
+                "cannot create the TUN interface `{}`: {err}. {}",
+                request.name,
+                open_hint()
             ))
         })?;
 
@@ -409,5 +416,25 @@ mod system {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
         }) as Arc<dyn TunDevice>)
+    }
+
+    /// The platform-appropriate tail of a "cannot create the interface" error:
+    /// what privilege it needs and the fallback that always works.
+    fn open_hint() -> &'static str {
+        #[cfg(target_os = "linux")]
+        {
+            "Creating one needs CAP_NET_ADMIN; grant it with `setcap cap_net_admin+p`, \
+             or run with `--no-tun` to keep the tunnels off the operating system."
+        }
+        #[cfg(target_os = "windows")]
+        {
+            "Creating one needs an elevated process and `wintun.dll` on the search path; \
+             run as Administrator with the DLL beside the executable, or run with `--no-tun` \
+             to keep the tunnels off the operating system."
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            "Run with `--no-tun` to keep the tunnels off the operating system."
+        }
     }
 }

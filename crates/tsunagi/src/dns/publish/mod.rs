@@ -23,6 +23,11 @@ mod resolved;
 #[cfg(all(feature = "dns-publish", target_os = "linux"))]
 pub use resolved::ResolvedPublisher;
 
+#[cfg(all(feature = "dns-publish", target_os = "windows"))]
+mod windows;
+#[cfg(all(feature = "dns-publish", target_os = "windows"))]
+pub use windows::NrptPublisher;
+
 mod unsupported;
 pub use unsupported::UnsupportedPublisher;
 
@@ -143,6 +148,10 @@ pub fn interface_index(name: &str) -> Option<u32> {
         .ok()
 }
 
+/// The kernel's index for an interface.
+///
+/// Only the systemd-resolved publisher needs one, so off Linux there is
+/// nothing to look up and this is always `None`.
 #[cfg(not(target_os = "linux"))]
 pub fn interface_index(_name: &str) -> Option<u32> {
     None

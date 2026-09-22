@@ -12,7 +12,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tsunagi::dataplane::IpPlugin;
 use tsunagi::discovery::SharedMemoryDiscovery;
-use tsunagi::ipc::unix::{ControlSocket, request_status};
+use tsunagi::ipc::{ControlSocket, request_status};
 use tsunagi::ipc::{StatusReport, control_socket_path};
 use tsunagi::overlay::MemoryTunFactory;
 use tsunagi::testing::{config_with, network, wait_for_peers, wait_until};
@@ -20,7 +20,7 @@ use tsunagi::{Agent, BoxFuture};
 use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 
 /// Builds the report the way the binary does, from the agent plus the plugin.
-fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::unix::ReportSource> {
+fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::ReportSource> {
     Arc::new(move || -> BoxFuture<'static, StatusReport> {
         let agent = agent.clone();
         let plugin = Arc::clone(&plugin);
@@ -186,7 +186,7 @@ async fn a_leftover_socket_file_is_replaced_but_a_live_one_is_not() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("agent.sock");
 
-    let empty: Arc<dyn tsunagi::ipc::unix::ReportSource> =
+    let empty: Arc<dyn tsunagi::ipc::ReportSource> =
         Arc::new(|| -> BoxFuture<'static, StatusReport> {
             Box::pin(async { StatusReport::default() })
         });
@@ -238,7 +238,7 @@ fn the_socket_path_is_derived_and_short_enough() {
 #[derive(Debug)]
 struct Control(Agent);
 
-impl tsunagi::ipc::unix::ReportSource for Control {
+impl tsunagi::ipc::ReportSource for Control {
     fn report(&self) -> BoxFuture<'_, StatusReport> {
         Box::pin(async move { StatusReport::default() })
     }
@@ -324,7 +324,7 @@ async fn a_client_can_leave_a_network_through_the_running_agent() {
         .await
         .unwrap();
 
-    let report = tsunagi::ipc::unix::leave_network(&socket_path, &network_id.to_string())
+    let report = tsunagi::ipc::leave_network(&socket_path, &network_id.to_string())
         .await
         .unwrap();
     assert_eq!(report.name, name.as_str());
@@ -333,7 +333,7 @@ async fn a_client_can_leave_a_network_through_the_running_agent() {
     assert!(agent.list_networks().await.unwrap().is_empty());
 
     // Asking again names the state it is in rather than failing obscurely.
-    let err = tsunagi::ipc::unix::leave_network(&socket_path, &network_id.to_string())
+    let err = tsunagi::ipc::leave_network(&socket_path, &network_id.to_string())
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not a network"), "{err}");
@@ -364,7 +364,7 @@ async fn a_client_can_add_a_network_to_a_running_agent() {
         .await
         .unwrap();
 
-    let report = tsunagi::ipc::unix::join_network(
+    let report = tsunagi::ipc::join_network(
         &socket_path,
         second.as_str(),
         second_secret.encode().as_str(),
@@ -382,7 +382,7 @@ async fn a_client_can_add_a_network_to_a_running_agent() {
     assert!(agent.network_status(joined).await.is_ok());
 
     // Joining the same one again is not an error, and says which it was.
-    let again = tsunagi::ipc::unix::join_network(
+    let again = tsunagi::ipc::join_network(
         &socket_path,
         second.as_str(),
         second_secret.encode().as_str(),
@@ -393,7 +393,7 @@ async fn a_client_can_add_a_network_to_a_running_agent() {
     assert_eq!(again.network_id, report.network_id);
 
     // A secret that is not one is refused rather than stored.
-    let err = tsunagi::ipc::unix::join_network(&socket_path, "rubbish", "not-a-secret")
+    let err = tsunagi::ipc::join_network(&socket_path, "rubbish", "not-a-secret")
         .await
         .unwrap_err();
     assert!(!err.to_string().is_empty());
