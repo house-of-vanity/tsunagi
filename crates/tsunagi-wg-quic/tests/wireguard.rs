@@ -23,11 +23,25 @@ use tsunagi::overlay::{
     MemoryTun, MemoryTunFactory, OverlayError, TunDevice, TunFactory, TunRequest,
 };
 use tsunagi::state::Ipv4Range;
-use tsunagi::testing::{config_with, network, settle, wait_event, wait_for_peers, wait_until};
+use tsunagi::testing::{network, settle, wait_event, wait_for_peers, wait_until};
 use tsunagi::{Agent, NetworkStatus};
 use tsunagi_wg_quic::{
     WIREGUARD_PROTOCOL, WgAnnouncement, WgSecretKey, WireguardConfig, WireguardPlugin,
 };
+
+/// Real QUIC at its minimum path MTU: loopback PMTU discovery must not hide
+/// failures that occur on ordinary Internet paths. The TUN MTU stays at 1280.
+fn config_with(root: &std::path::Path, discovery: &SharedMemoryDiscovery) -> tsunagi::AgentConfig {
+    let mut config = tsunagi::testing::config_with(root, discovery);
+    config.test_quic_transport = Some(
+        iroh::endpoint::QuicTransportConfig::builder()
+            .initial_mtu(1200)
+            .min_mtu(1200)
+            .mtu_discovery_config(None)
+            .build(),
+    );
+    config
+}
 
 /// A factory that claims the host and puts nothing on it.
 ///
@@ -288,6 +302,84 @@ fn ipv4_packet(source: Ipv4Addr, destination: Ipv4Addr, payload: &[u8]) -> Bytes
     packet.extend_from_slice(&source.octets());
     packet.extend_from_slice(&destination.octets());
     packet.extend_from_slice(payload);
+    Bytes::from(packet)
+}
+
+#[tokio::test]
+async fn full_size_tcp_packets_cross_the_default_overlay() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-default-mtu");
+    let a = WgAgent::spawn(&discovery, "tmtua").await;
+    let b = WgAgent::spawn(&discovery, "tmtub").await;
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(id, 1).await;
+    b.wait_for_tunnels(id, 1).await;
+    let addr_a = a.overlay(id).await;
+    let addr_b = b.overlay(id).await;
+    let tun_a = a.tun(id).await;
+    let tun_b = b.tun(id).await;
+    assert_eq!(tun_a.mtu(), tsunagi_wg_quic::DEFAULT_MTU);
+    for size in [1280, 1279, 1098, 1097, 64] {
+        for (source, dest, from, to) in [
+            (addr_a, addr_b, &tun_a, &tun_b),
+            (addr_b, addr_a, &tun_b, &tun_a),
+        ] {
+            let packet = tcp_packet(source, dest, size);
+            from.push_from_os(packet.clone());
+            let received = tokio::time::timeout(Duration::from_secs(5), to.pop_to_os())
+                .await
+                .expect("a full-size TCP packet must arrive at the default MTU")
+                .unwrap();
+            assert_eq!(received, packet, "including DF, TCP flags and checksums");
+        }
+    }
+    for peer in [&a, &b] {
+        let view = peer.plugin.overview(id).unwrap();
+        assert_eq!(
+            view.peers[0]
+                .tunnel
+                .as_ref()
+                .unwrap()
+                .stats
+                .dropped_oversize,
+            0
+        );
+    }
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// A checksummed IPv4/TCP segment with DF set, as a host's TCP stack sends it.
+fn tcp_packet(source: Ipv4Addr, destination: Ipv4Addr, size: usize) -> Bytes {
+    fn checksum(bytes: &[u8]) -> u16 {
+        let mut sum: u32 = bytes
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32)
+            .sum();
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+    assert!(size >= 40);
+    let mut packet = ipv4_packet(source, destination, &vec![0x5a; size - 20]).to_vec();
+    packet[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // don't fragment
+    packet[9] = 6; // TCP
+    packet[20..40].fill(0);
+    packet[20..22].copy_from_slice(&40000u16.to_be_bytes());
+    packet[22..24].copy_from_slice(&22u16.to_be_bytes());
+    packet[24..28].copy_from_slice(&1u32.to_be_bytes());
+    packet[32] = 5 << 4;
+    packet[33] = 0x18; // PSH, ACK
+    packet[34..36].copy_from_slice(&65535u16.to_be_bytes());
+    let mut pseudo = Vec::from(&packet[12..20]);
+    pseudo.extend_from_slice(&[0, 6]);
+    pseudo.extend_from_slice(&((size - 20) as u16).to_be_bytes());
+    pseudo.extend_from_slice(&packet[20..]);
+    packet[36..38].copy_from_slice(&checksum(&pseudo).to_be_bytes());
+    let ip_checksum = checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
     Bytes::from(packet)
 }
 
@@ -1404,7 +1496,7 @@ async fn a_peer_with_no_direct_path_is_reached_through_one_that_has_both() {
     // And a real packet crosses: A's interface to B's interface, through C.
     a.tun(network_id)
         .await
-        .push_from_os(ipv4_packet(a_addr, b_addr, b"through the middle"));
+        .push_from_os(tcp_packet(a_addr, b_addr, 1280));
     let seen = tokio::time::timeout(
         tsunagi::testing::DEADLINE,
         b.tun(network_id).await.pop_to_os(),
@@ -1412,7 +1504,7 @@ async fn a_peer_with_no_direct_path_is_reached_through_one_that_has_both() {
     .await
     .expect("the packet should arrive")
     .unwrap();
-    assert_eq!(&seen[20..], b"through the middle");
+    assert_eq!(seen, tcp_packet(a_addr, b_addr, 1280));
 
     a.shutdown().await;
     b.shutdown().await;

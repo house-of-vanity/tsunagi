@@ -14,9 +14,10 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::config::{Limits, ReconnectPolicy};
+use crate::config::{DiscoveryPolicy, Limits, ReconnectPolicy};
 use crate::dataplane::transport::{InboundLink, PacketLink, PacketTransport, SharedLink};
 use crate::dataplane::{PluginCapability, SharedPlugin};
+use crate::discovery::worker::DiscoveryWorker;
 use crate::discovery::{Candidate, CandidateSource, NetworkDiscovery};
 use crate::error::{Error, Result};
 use crate::identity::{NetworkId, NetworkKeys};
@@ -129,6 +130,7 @@ pub(crate) struct RuntimeParams {
     pub(crate) reconnect: ReconnectPolicy,
     pub(crate) discovery: Option<Arc<dyn NetworkDiscovery>>,
     pub(crate) discovery_interval: Duration,
+    pub(crate) discovery_policy: DiscoveryPolicy,
     pub(crate) plugins: Vec<SharedPlugin>,
     /// Who holds which overlay address, shared with every other network.
     pub(crate) routes: Arc<crate::overlay::RoutingTable>,
@@ -232,6 +234,8 @@ const REACH_EXPIRY: Duration = Duration::from_secs(90);
 const RANGE_PROPOSAL_GRACE: Duration = Duration::from_secs(3);
 
 struct Runtime {
+    discovery_worker: Option<DiscoveryWorker>,
+    discovery_candidates: mpsc::Receiver<Candidate>,
     params: RuntimeParams,
     /// When this runtime started, for the fallback range's grace period.
     activated: std::time::Instant,
@@ -295,7 +299,21 @@ impl Runtime {
         let (session_events_tx, session_events_rx) = mpsc::channel(256);
         let (dial_results_tx, dial_results_rx) = mpsc::channel(64);
         let (link_results_tx, link_results_rx) = mpsc::channel(64);
+        let (candidate_tx, discovery_candidates) =
+            mpsc::channel(params.limits.max_discovery_candidates.max(1));
+        let discovery_worker = params.discovery.as_ref().map(|backend| {
+            DiscoveryWorker::spawn(
+                backend.clone(),
+                params.keys.discovery_key(),
+                params.adapter.clone(),
+                params.discovery_policy.clone(),
+                params.discovery_interval,
+                candidate_tx,
+            )
+        });
         Self {
+            discovery_worker,
+            discovery_candidates,
             params,
             activated: std::time::Instant::now(),
             network_id,
@@ -362,6 +380,10 @@ impl Runtime {
                         self.handle_link_result(result);
                     }
                 }
+                Some(candidate) = self.discovery_candidates.recv() => {
+                    self.add_candidate(candidate);
+                    self.start_dials();
+                }
                 _ = ticker.tick() => {
                     self.discovery_round().await;
                     self.ensure_links();
@@ -373,14 +395,12 @@ impl Runtime {
     }
 
     async fn teardown(&mut self) {
+        if let Some(worker) = self.discovery_worker.take() {
+            worker.stop().await;
+        }
         // Stop accepting session events first: nothing is going to act on them
         // any more, and a sender blocked on a full queue would stall shutdown.
         self.session_events_rx.close();
-        if let Some(discovery) = &self.params.discovery {
-            let _ = discovery
-                .unpublish(self.params.keys.discovery_key(), self.local_id)
-                .await;
-        }
         self.links.clear();
         let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
         for peer in peers {
@@ -528,25 +548,6 @@ impl Runtime {
 
         let mut candidates: Vec<Candidate> = Vec::new();
 
-        if let Some(discovery) = self.params.discovery.clone() {
-            let key = self.params.keys.discovery_key();
-            // Publishing every round keeps a restarted agent reachable at its
-            // new local port without any special case.
-            if let Err(err) = discovery.publish(key, self.params.adapter.addr()).await {
-                tracing::debug!(%err, "discovery publish failed");
-            }
-            if let Err(err) = discovery
-                .publish(key, self.params.adapter.loopback_addr())
-                .await
-            {
-                tracing::debug!(%err, "discovery publish of bound sockets failed");
-            }
-            match discovery.resolve(key).await {
-                Ok(found) => candidates.extend(found),
-                Err(err) => tracing::debug!(%err, "discovery resolve failed"),
-            }
-        }
-
         // Everybody the signed state says belongs here. Their records
         // reached us through somebody, so we know they exist and who they
         // are, even having never spoken to them; an id with no address is
@@ -577,22 +578,56 @@ impl Runtime {
         }
 
         for candidate in candidates {
-            let peer = candidate.endpoint_id();
-            if peer == self.local_id {
-                continue;
-            }
-            self.candidate_addrs
-                .entry(peer)
-                .and_modify(|existing| merge_addr(existing, &candidate.addr))
-                .or_insert_with(|| candidate.addr.clone());
-            self.dial_states
-                .entry(peer)
-                .or_insert_with(|| DialState::new(candidate.source));
+            self.add_candidate(candidate);
         }
 
         self.start_dials();
         // Last, so it carries what this round learned.
         self.introduce_peers();
+    }
+
+    fn add_candidate(&mut self, candidate: Candidate) {
+        let peer = candidate.endpoint_id();
+        if peer == self.local_id {
+            return;
+        }
+        if candidate.source == CandidateSource::Discovery && !self.dial_states.contains_key(&peer) {
+            let count = self
+                .dial_states
+                .values()
+                .filter(|s| s.source == CandidateSource::Discovery)
+                .count();
+            if count >= self.params.limits.max_discovery_candidates {
+                let replace = self
+                    .dial_states
+                    .iter()
+                    .filter(|(id, s)| {
+                        s.source == CandidateSource::Discovery
+                            && !s.in_flight
+                            && !self.sessions.contains_key(*id)
+                    })
+                    .max_by_key(|(_, s)| s.consecutive_failures)
+                    .map(|(id, _)| *id);
+                let Some(replace) = replace else {
+                    return;
+                };
+                self.dial_states.remove(&replace);
+                self.candidate_addrs.remove(&replace);
+            }
+        }
+        self.candidate_addrs
+            .entry(peer)
+            .and_modify(|existing| {
+                if candidate.source == CandidateSource::Discovery {
+                    *existing = candidate.addr.clone();
+                } else {
+                    merge_addr(existing, &candidate.addr);
+                }
+            })
+            .or_insert_with(|| candidate.addr.clone());
+        self.dial_states
+            .entry(peer)
+            .or_insert_with(|| DialState::new(candidate.source));
     }
 
     fn start_dials(&mut self) {
@@ -1563,6 +1598,9 @@ impl Runtime {
 
         let snapshot = snapshot_connection(&conn);
         self.sessions.insert(peer, session);
+        if let Some(worker) = &self.discovery_worker {
+            worker.set_connected(true);
+        }
         self.metrics.sessions_established += 1;
 
         // Announce ourselves straight away so the peer learns our hostname and
@@ -1674,6 +1712,9 @@ impl Runtime {
                 if let Some(session) = self.sessions.remove(&peer) {
                     session.abort();
                     session.conn.close(0u32.into(), b"session ended");
+                }
+                if let Some(worker) = &self.discovery_worker {
+                    worker.set_connected(!self.sessions.is_empty());
                 }
                 self.metrics.disconnects += 1;
                 self.drop_links_for(peer);

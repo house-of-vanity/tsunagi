@@ -552,6 +552,21 @@ impl Agent {
         }
 
         let range = self.reserve_range(network_id);
+        let mut backends = Vec::new();
+        if let Some(discovery) = &self.inner.config.discovery {
+            backends.push(discovery.clone());
+        }
+        if let Some(dht) = &self.inner.config.dht {
+            backends.push(dht.for_network(&keys));
+        }
+        let discovery = if backends.is_empty() {
+            None
+        } else {
+            Some(
+                Arc::new(crate::discovery::CompositeDiscovery::new(backends))
+                    as Arc<dyn crate::discovery::NetworkDiscovery>,
+            )
+        };
         let handle = network::spawn(RuntimeParams {
             keys,
             adapter: self.inner.adapter.clone(),
@@ -559,8 +574,9 @@ impl Agent {
             events: self.inner.events.clone(),
             limits: Arc::clone(&self.inner.limits),
             reconnect: self.inner.config.reconnect.clone(),
-            discovery: self.inner.config.discovery.clone(),
+            discovery,
             discovery_interval: self.inner.config.discovery_interval,
+            discovery_policy: self.inner.config.discovery_policy.clone(),
             plugins: self.inner.config.plugins.clone(),
             routes: Arc::clone(&self.inner.routes),
             interface: self.inner.interface.get().cloned(),
@@ -798,7 +814,8 @@ impl Agent {
         self.command(network_id, NetCommand::Reannounce).await
     }
 
-    /// Asks one network to re-run discovery and re-evaluate dials right now.
+    /// Asks one network to re-evaluate known peers and dials right now.
+    /// External lookup still follows its connected/isolation policy.
     ///
     /// Call this when the host's network environment changed. Platform wake-up
     /// notifications can be wired to it later.
@@ -806,7 +823,7 @@ impl Agent {
         self.command(network_id, NetCommand::Recheck).await
     }
 
-    /// Asks every running network to re-run discovery right now.
+    /// Asks every running network to re-evaluate known peers right now.
     pub async fn recheck(&self) {
         let senders: Vec<mpsc::Sender<NetCommand>> = self
             .inner
@@ -833,6 +850,10 @@ impl Agent {
         };
         for handle in handles {
             handle.stop().await;
+        }
+
+        if let Some(dht) = &self.inner.config.dht {
+            dht.shutdown().await;
         }
 
         // iroh's own close waits for peers to acknowledge; a peer that has

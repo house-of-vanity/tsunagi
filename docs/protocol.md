@@ -135,13 +135,13 @@ event does not report a network id.
 ## The data plane protocol
 
 IP plugin packets never travel on a control connection. They use their own
-ALPN, `tsunagi/data/1`, on their own iroh connection:
+ALPN, `tsunagi/data/3`, on their own iroh connection:
 
 ```text
 initiator -> responder : (the same membership handshake as above)
-initiator -> responder : DataOpen    { protocol }
+initiator -> responder : DataOpen    { protocol, max_datagram }
 initiator <- responder : DataOpenAck { accepted, max_datagram }
-thereafter             : QUIC datagrams carrying that plugin's packets
+thereafter             : QUIC datagrams carrying fragments of opaque payloads
 ```
 
 The membership handshake is identical and bound to the same network, so a data
@@ -154,7 +154,27 @@ never open two channels for the same thing.
 
 Packets ride as QUIC **datagrams**: unreliable and unordered, which is what a
 tunnelled protocol wants, and free of the head-of-line blocking a stream would
-add. The datagram limit is what caps a plugin's MTU.
+add. `max_datagram` negotiates the reassembled payload limit (at most 65536
+bytes), independently of the current QUIC path MTU. The transport reads QUIC's
+current datagram capacity for every fragment, including after migration.
+
+Every datagram starts with a 16-byte header: packet ID (`u64`), total payload
+length (`u32`), and byte offset (`u32`), all big endian. The payload is the
+complete peer-relay envelope containing opaque plugin bytes. Relays reassemble
+before forwarding and fragment again for their outgoing path; they never
+decrypt the plugin's payload. Small packets use the same framing in one part.
+
+Reassembly tolerates reordering and exact duplicates. Conflicting lengths,
+overlapping data and excessive fragment counts discard that packet. Each link
+allows at most 64 incomplete packets, 256 KiB of their payload buffers, and 128
+fragments per packet. Incomplete packets expire after five seconds, without
+holding up subsequent packets. Packet IDs are scoped to a QUIC connection;
+reassembly is created only after the membership handshake. All limits live in
+`config.rs`. There is no transport-layer retransmission added by this framing.
+
+Version 3 is incompatible with previous data ALPNs. Upgrade both endpoints
+and intermediate peers together. The control protocol, network secret,
+device identity and stored network configuration are unchanged.
 
 Separate connections mean separate congestion control, so a saturated data
 plane cannot delay control messages, and a data plane failure cannot take the

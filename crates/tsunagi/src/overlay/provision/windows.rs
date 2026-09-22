@@ -415,7 +415,9 @@ async fn netsh(args: Vec<String>) -> Result<(), OverlayError> {
             text
         }
     };
-    Err(OverlayError::Unavailable(format!("{display} failed: {message}")))
+    Err(OverlayError::Unavailable(format!(
+        "{display} failed: {message}"
+    )))
 }
 
 /// The absolute path to a program in `System32`.
@@ -436,7 +438,11 @@ mod tests {
     }
 
     fn v6(last: u16) -> Cidr {
-        Cidr::new(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, last)), 64).unwrap()
+        Cidr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, last)),
+            64,
+        )
+        .unwrap()
     }
 
     #[test]

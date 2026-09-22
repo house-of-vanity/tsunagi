@@ -340,6 +340,8 @@ pub struct NetworkKeys {
     network_id: NetworkId,
     discovery_key: DiscoveryKey,
     auth_key: Zeroizing<[u8; 32]>,
+    // Separate from the semi-public DiscoveryKey. Existing derivations stay frozen.
+    dht_write_key: Zeroizing<[u8; 32]>,
     name: NetworkName,
 }
 
@@ -373,6 +375,7 @@ impl NetworkKeys {
             network_id: NetworkId(expand("network-id")),
             discovery_key: DiscoveryKey(expand("discovery-key")),
             auth_key: Zeroizing::new(expand("handshake-auth")),
+            dht_write_key: Zeroizing::new(expand("mainline-rendezvous-write-v1")),
             name: name.clone(),
         }
     }
@@ -404,6 +407,11 @@ impl NetworkKeys {
     /// The handshake authentication key. Crate-internal on purpose.
     pub(crate) fn auth_key(&self) -> &[u8; 32] {
         &self.auth_key
+    }
+
+    /// Secret signing material for network rendezvous; never exported or logged.
+    pub(crate) fn dht_write_key(&self) -> &[u8; 32] {
+        &self.dht_write_key
     }
 }
 

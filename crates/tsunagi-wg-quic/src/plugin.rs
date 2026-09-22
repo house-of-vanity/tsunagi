@@ -58,23 +58,22 @@ pub const WIREGUARD_PROTOCOL: &str = "wg-quic";
 /// Smallest interface MTU the overlay accepts.
 ///
 /// 576 bytes is what IPv4 guarantees every host can reassemble (RFC 1122),
-/// so nothing below it is worth offering. The floor used to be 1280 because
-/// Linux tears IPv6 down on an interface below that; the overlay is IPv4
-/// now, so that constraint is gone and a path with small datagrams — a
-/// relay, typically — can be matched instead of warned about.
+/// so nothing below it is worth offering. The current overlay is IPv4.
+/// Lowering this is not needed to accommodate a narrow QUIC path: the default
+/// transport fragments opaque payloads below the plugin.
 pub const MIN_MTU: u32 = 576;
 
 /// Default interface MTU.
 ///
-/// Comfortably under what a direct path carries, and the same number the
-/// overlay used before, so an existing network does not have to change.
+/// Kept stable across path changes. The default transport splits encrypted
+/// packets when the current QUIC path cannot carry them in one datagram.
 pub const DEFAULT_MTU: u32 = 1280;
 
 /// Bytes WireGuard adds to a packet: type and reserved, receiver index,
 /// counter and the Poly1305 tag.
 ///
-/// A link therefore has to carry `mtu + WIREGUARD_OVERHEAD` bytes in one
-/// datagram for a full-size packet to get through.
+/// A link must carry `mtu + WIREGUARD_OVERHEAD` logical payload bytes.
+/// Transport fragmentation is independent of WireGuard and the inner IP flags.
 pub const WIREGUARD_OVERHEAD: u32 = 32;
 
 /// Configuration of the WireGuard plugin.
@@ -87,7 +86,8 @@ pub struct WireguardConfig {
     /// The largest packet a tunnel will carry.
     ///
     /// Not the interface MTU, which belongs to the agent: this is what this
-    /// protocol refuses to encrypt because it would not fit one datagram.
+    /// protocol is configured to carry. The transport may split ciphertext
+    /// into smaller datagrams without changing the original IP packet.
     pub mtu: u32,
     /// How long to coalesce changes before reconciling.
     pub reconcile_debounce: Duration,

@@ -29,11 +29,11 @@ pub const ALPN: &[u8] = b"tsunagi/ctrl/1";
 /// saturated or broken data plane cannot disturb control traffic, and the
 /// transport underneath can be replaced without touching the control protocol.
 ///
-/// Version 2 puts a tag on every datagram, so one can say "this is for
-/// somebody else" and be passed on by the peer in the middle. An agent
-/// speaking version 1 simply does not form a data link with one speaking
-/// version 2, which is what the version in an ALPN is for.
-pub const DATA_ALPN: &[u8] = b"tsunagi/data/2";
+/// Version 3 fragments logical datagrams below the peer-relay envelope, so
+/// the overlay's MTU is independent of the current QUIC path MTU. Older data
+/// versions cannot form a data link; control and persistent identities remain
+/// compatible. Both ends, including any intermediate peer, must be upgraded.
+pub const DATA_ALPN: &[u8] = b"tsunagi/data/3";
 
 /// Largest plugin protocol identifier accepted when opening a data channel.
 pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
@@ -86,6 +86,8 @@ pub struct Announcement {
 pub struct DataOpen {
     /// Which IP plugin's packets this channel will carry.
     pub protocol: String,
+    /// Maximum reassembled payload the initiator is willing to receive.
+    pub max_datagram: u32,
 }
 
 /// The responder's answer to [`DataOpen`].

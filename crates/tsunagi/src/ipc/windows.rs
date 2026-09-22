@@ -112,7 +112,11 @@ impl Drop for ControlSocket {
 /// A named pipe server instance serves a single client, so a new instance is
 /// created as soon as one is taken — otherwise a second `tsunagi status` while
 /// the first is mid-flight would find nothing listening.
-async fn serve(name: String, first: tokio::net::windows::named_pipe::NamedPipeServer, source: Arc<dyn ReportSource>) {
+async fn serve(
+    name: String,
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+    source: Arc<dyn ReportSource>,
+) {
     let mut server = first;
     loop {
         if server.connect().await.is_err() {
@@ -149,7 +153,10 @@ async fn serve(name: String, first: tokio::net::windows::named_pipe::NamedPipeSe
 /// Creates the next pipe instance, or `None` if the name can no longer be
 /// served.
 fn next_instance(name: &str) -> Option<tokio::net::windows::named_pipe::NamedPipeServer> {
-    match ServerOptions::new().reject_remote_clients(true).create(name) {
+    match ServerOptions::new()
+        .reject_remote_clients(true)
+        .create(name)
+    {
         Ok(server) => Some(server),
         Err(err) => {
             tracing::debug!(%err, "cannot create the next control pipe instance");
@@ -272,7 +279,9 @@ mod tests {
             Box::pin(async { StatusReport::default() })
         });
 
-        let first = ControlSocket::bind(&path, Arc::clone(&source)).await.unwrap();
+        let first = ControlSocket::bind(&path, Arc::clone(&source))
+            .await
+            .unwrap();
         let second = ControlSocket::bind(&path, source).await;
         assert!(
             matches!(second, Err(Error::StateLocked { .. })),

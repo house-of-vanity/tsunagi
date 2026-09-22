@@ -29,6 +29,7 @@
 //! encrypted by the transport, and scoped to exactly one network, one peer and
 //! one plugin protocol.
 
+mod fragments;
 pub mod iroh_link;
 
 use bytes::Bytes;
@@ -77,8 +78,8 @@ pub trait PacketLink: Send + Sync + std::fmt::Debug + 'static {
 
     /// The largest datagram this link can carry, in bytes.
     ///
-    /// A plugin must size its own packets to fit, because there is no
-    /// fragmentation here.
+    /// This is the logical payload limit. A transport can fragment underneath
+    /// it so path MTU changes do not force a plugin to resize the host interface.
     fn max_datagram_size(&self) -> usize;
 
     /// Sends one datagram.

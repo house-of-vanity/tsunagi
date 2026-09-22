@@ -12,8 +12,7 @@
 //!
 //! * *Finding members of a network* — [`NetworkDiscovery::resolve`], keyed by
 //!   the secret-derived [`DiscoveryKey`]. That is what lives here, and today
-//!   it is [`StaticBootstrap`] plus a test backend; a DHT backend is future
-//!   work.
+//!   it includes [`StaticBootstrap`], [`MainlineDiscovery`] and a test backend.
 //! * *Resolving the address of one iroh endpoint* — **iroh's job, not ours**.
 //!   With [`crate::config::TransportPolicy::N0Defaults`] or `DirectOnly`, iroh
 //!   publishes and resolves endpoint addresses through Number 0's public
@@ -23,14 +22,18 @@
 //! No empty result ever proves a network is empty. It only means "nobody found
 //! yet".
 //!
-//! Mainline DHT discovery is future work and is not implemented here.
+//! Mainline rendezvous is opt-in for library callers; the command line enables it.
+
+mod mainline;
+pub(crate) mod worker;
+pub use mainline::MainlineDiscovery;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use iroh::{EndpointAddr, EndpointId};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::identity::DiscoveryKey;
 
 pub use crate::BoxFuture;
@@ -103,6 +106,23 @@ pub trait NetworkDiscovery: Send + Sync + std::fmt::Debug + 'static {
 
     /// Returns the candidates currently known for `key`.
     fn resolve<'a>(&'a self, key: DiscoveryKey) -> BoxFuture<'a, Result<Vec<Candidate>>>;
+
+    /// Delivers candidates as they arrive. The default adapts a batch backend;
+    /// remote backends can override this so the first dial need not wait for all lookups.
+    fn resolve_into<'a>(
+        &'a self,
+        key: DiscoveryKey,
+        candidates: tokio::sync::mpsc::Sender<Candidate>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            for candidate in self.resolve(key).await? {
+                if candidates.send(candidate).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 /// A statically configured list of bootstrap candidates.
@@ -273,13 +293,25 @@ impl NetworkDiscovery for CompositeDiscovery {
 
     fn publish<'a>(&'a self, key: DiscoveryKey, addr: EndpointAddr) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let mut tasks = tokio::task::JoinSet::new();
             for backend in &self.backends {
-                // One failing backend must not stop the others.
-                if let Err(err) = backend.publish(key, addr.clone()).await {
-                    tracing::debug!(backend = backend.name(), %err, "publish failed");
+                let backend = backend.clone();
+                let addr = addr.clone();
+                tasks.spawn(async move { backend.publish(key, addr).await });
+            }
+            let mut failed = false;
+            while let Some(result) = tasks.join_next().await {
+                if !matches!(result, Ok(Ok(()))) {
+                    failed = true;
                 }
             }
-            Ok(())
+            if failed {
+                Err(Error::Discovery(
+                    "a discovery publication failed; will retry".into(),
+                ))
+            } else {
+                Ok(())
+            }
         })
     }
 
@@ -289,11 +321,12 @@ impl NetworkDiscovery for CompositeDiscovery {
         endpoint: EndpointId,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            let mut tasks = tokio::task::JoinSet::new();
             for backend in &self.backends {
-                if let Err(err) = backend.unpublish(key, endpoint).await {
-                    tracing::debug!(backend = backend.name(), %err, "unpublish failed");
-                }
+                let backend = backend.clone();
+                tasks.spawn(async move { backend.unpublish(key, endpoint).await });
             }
+            while tasks.join_next().await.is_some() {}
             Ok(())
         })
     }
@@ -310,6 +343,27 @@ impl NetworkDiscovery for CompositeDiscovery {
                 }
             }
             Ok(out)
+        })
+    }
+
+    fn resolve_into<'a>(
+        &'a self,
+        key: DiscoveryKey,
+        candidates: tokio::sync::mpsc::Sender<Candidate>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for backend in &self.backends {
+                let backend = backend.clone();
+                let candidates = candidates.clone();
+                tasks.spawn(async move {
+                    if let Err(err) = backend.resolve_into(key, candidates).await {
+                        tracing::debug!(backend = backend.name(), %err, "resolve failed");
+                    }
+                });
+            }
+            while tasks.join_next().await.is_some() {}
+            Ok(())
         })
     }
 }

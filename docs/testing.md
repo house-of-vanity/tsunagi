@@ -10,7 +10,7 @@ per-test temporary directories, and independent agent instances. Discovery is
 substitutable; **iroh, authentication, message passing and persistent storage
 are not**.
 
-The suite runs with no internet, no DHT, no public relay, no administrator
+The suite runs with no internet, no public DHT, no public relay, no administrator
 rights and no changes to OS network settings: endpoints bind `127.0.0.1:0` and
 `[::1]:0`, relays are disabled, address lookup is cleared, port mapping is
 disabled, and net-report probing is reduced to its minimum.
@@ -54,6 +54,14 @@ losing its tunnel, two networks keeping separate interfaces and keys, restart
 keeping the WireGuard identity, shutdown removing every interface, a forged
 overlay claim being rejected, and the core carrying the payload without
 interpreting it.
+
+The WireGuard traffic tests constrain real QUIC to a 1200-byte path MTU with
+PMTU discovery disabled, so large loopback MTUs cannot hide Internet failures.
+Checksummed IPv4/TCP packets up to the default 1280-byte interface MTU cross in
+both directions without changing DF or packet contents, including through an
+intermediate peer. Fragment tests cover reordering, duplicates, loss, changing
+fragment sizes, malformed input, timeout and memory bounds. These are packet
+transport checks, not a claim to have run an SSH server or a host TCP stack.
 
 `crates/tsunagi/src/dataplane/relay.rs` has its own tests for the way
 through a peer in the middle: the wrapping and what a malformed one does, a
@@ -113,6 +121,14 @@ space → discovery → iroh → authentication → message exchange.
 
 What the default suite does **not** cover is the real TUN interface, because
 that needs `CAP_NET_ADMIN`. Everything above it does run.
+
+Mainline discovery tests use an isolated loopback `mainline::Testnet`.
+`tests/mainline.rs` restores two agents after their DHT and disposable cache
+have disappeared. `tests/discovery_lifecycle.rs` checks that publication
+continues while connected, lookup resumes after isolation, and a hung backend
+does not block the network actor. Unit tests cover record bounds, timestamps,
+colliding publications, wrong secrets and the full recovery delay with a
+paused clock. The public Mainline/relay smoke test is ignored by default.
 
 ## Not covered, and not claimed to be
 

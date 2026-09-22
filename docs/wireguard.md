@@ -167,24 +167,26 @@ than silent non-connectivity.
 
 ## MTU
 
-Two constraints pull against each other.
+The default interface MTU is 1280. The IPv4 overlay permits explicit values
+down to 576, but a small physical path does not require lowering the interface
+MTU. WireGuard adds 32 bytes; peer relaying also has an envelope. Previously,
+a path advertising only 1129 bytes dropped large packets despite the tunnel
+being established: ping worked while TCP connections stalled.
 
-**IPv6 sets a floor of 1280 bytes** (RFC 8200), and Linux enforces it
-brutally: an interface whose MTU drops below 1280 loses IPv6 entirely — its
-`/proc/sys/net/ipv6/conf/<dev>` directory disappears and `ip -6 address add`
-answers `Invalid argument`. So the overlay MTU cannot go below 1280, and the
-plugin refuses a smaller one at startup instead of letting it fail obscurely.
+The iroh transport now fragments the opaque, encrypted payload according to
+the current QUIC datagram limit. It reassembles before handing the ciphertext
+to WireGuard or forwarding it through an intermediate peer. This happens below
+IP: the inner TCP segment, checksums and DF flag are unchanged. No MSS rewriting
+or special SSH settings are needed. This follows the application responsibility
+described in [RFC 9221 section 5](https://www.rfc-editor.org/rfc/rfc9221.html#section-5):
+QUIC DATAGRAM frames themselves cannot fragment.
 
-**The transport sets a ceiling.** Every packet rides in one datagram and
-WireGuard adds 32 bytes, so a link must carry `mtu + 32` = 1312 bytes. A direct
-QUIC path typically offers around 1380, which fits. A relayed path can offer
-less, and then full-size packets do not fit: they are dropped and counted as
-`dropped_oversize`, never truncated, and the plugin reports the exact numbers
-when the tunnel is set up.
-
-There is no room left to trade, so the default MTU is exactly 1280.
-Fragmenting a packet across several datagrams would lift the ceiling and is
-not implemented.
+Reassembly is bounded and expires incomplete packets; one lost fragment loses
+one packet, without blocking unrelated traffic. The logical data payload limit
+is 64 KiB, with the relay envelope subtracted before it reaches the plugin.
+The new framing uses data ALPN `tsunagi/data/3`; both ends and intermediate
+peers need the updated binary. Network identities and saved state do not change.
+See [protocol.md](protocol.md#the-data-plane-protocol) for the wire format.
 
 ## Lifecycle
 

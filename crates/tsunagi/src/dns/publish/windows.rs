@@ -201,8 +201,7 @@ impl DnsPublisher for NrptPublisher {
                 )));
             }
 
-            let namespaces: Vec<String> =
-                published.domains.iter().map(|d| namespace(d)).collect();
+            let namespaces: Vec<String> = published.domains.iter().map(|d| namespace(d)).collect();
             let servers: Vec<String> = servers.iter().map(|ip| ip.to_string()).collect();
 
             powershell(apply_script(&namespaces, &servers)).await?;
@@ -257,7 +256,10 @@ mod tests {
         let script = apply_script(&[".lab".into()], &["10.13.37.69".into()]);
         let remove = script.find("Remove-DnsClientNrptRule").unwrap();
         let add = script.find("Add-DnsClientNrptRule").unwrap();
-        assert!(remove < add, "a stale rule must go before the new one:\n{script}");
+        assert!(
+            remove < add,
+            "a stale rule must go before the new one:\n{script}"
+        );
         assert!(script.contains("@('.lab')"));
         assert!(script.contains("@('10.13.37.69')"));
     }
@@ -272,7 +274,10 @@ mod tests {
             classify("The term 'Add-DnsClientNrptRule' is not recognized"),
             PublishError::Unavailable(_)
         ));
-        assert!(matches!(classify("something else"), PublishError::Failed(_)));
+        assert!(matches!(
+            classify("something else"),
+            PublishError::Failed(_)
+        ));
     }
 
     #[tokio::test]

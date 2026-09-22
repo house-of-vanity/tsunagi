@@ -20,13 +20,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 
 use crate::BoxFuture;
-use crate::config::Limits;
+use crate::config::{DATA_REASSEMBLY_TTL, Limits, MAX_DATA_DATAGRAM, MAX_DATA_FRAGMENTS};
 use crate::error::ProtocolError;
 use crate::identity::{NetworkId, NetworkKeys};
 use crate::net::EndpointAdapter;
@@ -36,6 +37,7 @@ use crate::proto::message::{
 };
 use crate::proto::{read_frame, write_frame};
 
+use super::fragments::{self, Reassembler};
 use super::{InboundLink, PacketLink, PacketTransport, SharedLink, TransportError};
 
 /// What the iroh transport needs from the agent.
@@ -61,6 +63,8 @@ pub struct IrohLink {
     peer: EndpointId,
     conn: Connection,
     max_datagram: usize,
+    next_packet: AtomicU64,
+    reassembly: tokio::sync::Mutex<Reassembler>,
     // Kept alive so the peer sees the channel as open; the connection closes
     // when the link is dropped.
     _send: tokio::sync::Mutex<SendStream>,
@@ -76,14 +80,16 @@ impl IrohLink {
         send: SendStream,
         recv: RecvStream,
     ) -> Self {
-        let local_limit = conn.max_datagram_size().unwrap_or(0);
-        // Both ends must agree, so the smaller limit wins.
-        let max_datagram = local_limit.min(peer_limit);
+        // The negotiated limit is for reassembled payloads, never a snapshot
+        // of the initial path (which may still be a relay or another VPN).
+        let max_datagram = MAX_DATA_DATAGRAM.min(peer_limit);
         Self {
             network,
             peer,
             conn,
             max_datagram,
+            next_packet: AtomicU64::new(0),
+            reassembly: tokio::sync::Mutex::new(Reassembler::default()),
             _send: tokio::sync::Mutex::new(send),
             _recv: tokio::sync::Mutex::new(recv),
         }
@@ -110,17 +116,65 @@ impl PacketLink for IrohLink {
                 limit: self.max_datagram,
             });
         }
-        self.conn.send_datagram(payload).map_err(|err| {
-            use iroh::endpoint::SendDatagramError;
-            match err {
-                SendDatagramError::ConnectionLost(_) => TransportError::Closed,
-                other => TransportError::Other(other.to_string()),
+        let id = self.next_packet.fetch_add(1, Ordering::Relaxed);
+        let mut offset: usize = 0;
+        let mut attempts = 0;
+        // Re-read the current path's capacity for every fragment. A migration
+        // can shrink it even between two send_datagram calls.
+        for _ in 0..MAX_DATA_FRAGMENTS {
+            loop {
+                let capacity = self
+                    .conn
+                    .max_datagram_size()
+                    .unwrap_or(0)
+                    .checked_sub(fragments::HEADER)
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        TransportError::Other("QUIC path cannot carry data fragments".into())
+                    })?;
+                let end = offset.saturating_add(capacity).min(payload.len());
+                let frame = fragments::encode(id, payload.len(), offset, &payload[offset..end]);
+                match self.conn.send_datagram(frame) {
+                    Ok(()) => {
+                        offset = end;
+                        break;
+                    }
+                    Err(iroh::endpoint::SendDatagramError::TooLarge) if attempts < 3 => {
+                        attempts += 1;
+                    }
+                    Err(iroh::endpoint::SendDatagramError::ConnectionLost(_)) => {
+                        return Err(TransportError::Closed);
+                    }
+                    Err(err) => return Err(TransportError::Other(err.to_string())),
+                }
             }
-        })
+            if offset == payload.len() {
+                return Ok(());
+            }
+        }
+        Err(TransportError::Other(
+            "QUIC path needs too many fragments".into(),
+        ))
     }
 
     fn recv(&self) -> BoxFuture<'_, Option<Bytes>> {
-        Box::pin(async move { self.conn.read_datagram().await.ok() })
+        Box::pin(async move {
+            let mut reassembly = self.reassembly.lock().await;
+            loop {
+                match tokio::time::timeout(DATA_REASSEMBLY_TTL, self.conn.read_datagram()).await {
+                    Ok(Ok(frame)) => {
+                        if let Some(packet) = reassembly.push(frame, tokio::time::Instant::now()) {
+                            return Some(packet);
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        *reassembly = Reassembler::default();
+                        return None;
+                    }
+                    Err(_) => reassembly.expire(tokio::time::Instant::now()),
+                }
+            }
+        })
     }
 
     fn closed(&self) -> BoxFuture<'_, ()> {
@@ -208,10 +262,14 @@ impl IrohTransport {
         }
 
         let serves = self.lookup.serves(outcome.network_id, &open.protocol).await;
-        let max_datagram = conn.max_datagram_size().unwrap_or(0);
+        if open.max_datagram == 0 || conn.max_datagram_size().is_none() {
+            return Err(TransportError::Other(
+                "data channel has no datagram support".into(),
+            ));
+        }
         let ack = DataOpenAck {
             accepted: serves,
-            max_datagram: max_datagram as u32,
+            max_datagram: MAX_DATA_DATAGRAM as u32,
         };
         write_frame(
             &mut send,
@@ -226,7 +284,14 @@ impl IrohTransport {
             return Err(TransportError::Declined(open.protocol));
         }
 
-        let link = IrohLink::new(outcome.network_id, peer, conn, usize::MAX, send, recv);
+        let link = IrohLink::new(
+            outcome.network_id,
+            peer,
+            conn,
+            open.max_datagram as usize,
+            send,
+            recv,
+        );
         Ok(InboundLink {
             network: outcome.network_id,
             peer,
@@ -289,6 +354,7 @@ impl PacketTransport for IrohTransport {
 
             let open = DataOpen {
                 protocol: protocol.to_string(),
+                max_datagram: MAX_DATA_DATAGRAM as u32,
             };
             write_frame(
                 &mut send,
@@ -308,6 +374,12 @@ impl PacketTransport for IrohTransport {
             if !ack.accepted {
                 conn.close(4u32.into(), b"declined");
                 return Err(TransportError::Declined(protocol.to_string()));
+            }
+
+            if ack.max_datagram == 0 || conn.max_datagram_size().is_none() {
+                return Err(TransportError::Other(
+                    "data channel has no datagram support".into(),
+                ));
             }
 
             let link = IrohLink::new(network, peer, conn, ack.max_datagram as usize, send, recv);

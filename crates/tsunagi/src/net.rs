@@ -240,6 +240,11 @@ impl EndpointAdapter {
             TransportPolicy::N0Defaults => builder.preset(presets::N0),
         };
 
+        #[cfg(feature = "testing")]
+        if let Some(transport) = &config.test_quic_transport {
+            builder = builder.transport_config(transport.clone());
+        }
+
         if !config.bind_addrs.is_empty() {
             builder = builder.clear_ip_transports();
             for addr in &config.bind_addrs {

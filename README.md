@@ -24,6 +24,7 @@ A working library with **real iroh connections** and integration tests:
 - several independent networks at once in one agent;
 - deterministic network identity derived from name + secret;
 - candidates supplied by a replaceable discovery component;
+- automatic first contact through the public Mainline DHT (BEP44);
 - real iroh connections plus an explicit mutual proof of network membership;
 - a small versioned control protocol: handshake, hostname/capability
   announcement, ping/pong;
@@ -39,7 +40,7 @@ A working library with **real iroh connections** and integration tests:
 
 ### What it deliberately does **not** do
 
-Not implemented, and not pretended to be: Mainline DHT, DNS, routing through
+Not implemented, and not pretended to be: DNS, routing through
 intermediate participants, a full CRDT, dynamically loaded plugins, a system
 service, a complete CLI, or a local control socket. Snapshot synchronisation
 and signed revocations are designed for but not implemented — see
@@ -58,7 +59,7 @@ system's and the user's responsibility, not this library's.
 
 - Rust 1.91 or newer (iroh 1.2 requires it), edition 2024. Pinned dependencies
   in `Cargo.lock`.
-- No internet, no DHT, no public relay, no administrator rights and no changes
+- No internet, no public DHT, no public relay, no administrator rights and no changes
   to OS network settings are needed to build or test.
 - WireGuard runs in userspace (boringtun): **no kernel module and no `wg`
   tool**. Only creating a real network interface needs `CAP_NET_ADMIN`, and
@@ -87,20 +88,26 @@ what it belongs to, at any time, while it runs.
 ./target/release/tsunagi join --network lab
 ```
 
-On the second machine, start its agent with the first machine's endpoint id
-and join the same network with the secret that was printed:
+On the second machine, start its agent and join the same network with the
+secret that was printed:
 
 ```bash
-./target/release/tsunagi up --peer <endpoint-id-from-the-first-machine>
+./target/release/tsunagi up
 ./target/release/tsunagi join --network lab --secret tsn1...
 ```
 
-**`--peer` is how the first meeting happens, and only the first.** Two
-agents that have never met have nothing to go on: this project publishes
-nothing about who is in which network, by design. One of them has to be
-told the other's endpoint id — after that each remembers the other and
-finds it again by itself. Give several for redundancy; any one of them
-getting through is enough.
+**Name and secret are enough for the first meeting.** Mainline DHT discovery
+is enabled by default. Each active network publishes this device's endpoint
+and searches until the first authenticated connection. While connected it
+only republishes; after 60 seconds without any authenticated connection it
+searches again. Publication is approximately every five minutes, and records
+older than 15 minutes are ignored. DHT storage nodes may retain them longer.
+
+Use `--no-dht` to disable DHT, or `--peer <endpoint-id>` for optional manual
+bootstrap. `--reach local` disables public DHT regardless of the DHT flag.
+Endpoint records are public, signed, and contain no network secret. Discovery
+is not authentication: every connection must still prove network membership.
+Details and failure behavior are in [docs/mainline-dht.md](docs/mainline-dht.md).
 
 **One introduction is enough for the whole network.** Members tell each
 other about the members they know, and every author of a signed record is
@@ -458,13 +465,12 @@ its whole life has carrier for its whole life.
 
 ### The MTU is 1280
 
-That is the minimum IPv6 requires (RFC 8200), and Linux enforces it by
-disabling IPv6 outright on an interface below it — the per-device
-`/proc/sys/net/ipv6` entries vanish and adding an address fails with
-`Invalid argument`. A smaller MTU cannot work at all, so the agent refuses one
-rather than letting it fail later. See
-[docs/wireguard.md](docs/wireguard.md#mtu) for the ceiling that pushes back
-from the other side.
+The default interface MTU stays at 1280 on direct paths, relays and paths
+inside another VPN. Large encrypted packets are split into smaller QUIC
+datagrams and reassembled before reaching WireGuard. SSH and full-size TCP
+segments therefore do not require a manual MTU override or MSS adjustment.
+The original IP packet, including its DF bit, is preserved. See
+[docs/wireguard.md](docs/wireguard.md#mtu) for limits and compatibility.
 
 ### Summary
 
@@ -584,13 +590,14 @@ service run by Number 0 — "n0", the company behind iroh — at `dns.iroh.link`
 over pkarr and DNS, and resolves other endpoints the same way. That is why `--peer <endpoint-id>` works with no address attached:
 iroh looks it up. None of that code is ours.
 
-**2. Finding who is in a network — ours, and it is still manual.**
-`NetworkDiscovery` maps a secret-derived `DiscoveryKey` to a set of *candidate*
-members. Two backends exist: `StaticBootstrap` (what `--peer` feeds) and an
-in-memory one for tests. The planned Mainline DHT backend, which would let
-members find each other from the network secret alone, is **not implemented**.
-So today you bootstrap by passing one peer's id; after that the mesh is
-whatever those agents reach.
+**2. Finding who is in a network — Mainline DHT by default.**
+`NetworkDiscovery` supplies unverified candidates. The Mainline backend uses
+a signing key derived from the network name and secret to publish signed
+BEP44 records containing each writer's endpoint ID and addresses. Its 16
+slots provide starting candidates, not a complete membership list or a limit
+on network size. After the first authenticated connection, introductions and
+signed state reveal the other members. `StaticBootstrap` (`--peer`) remains
+available, and tests use either a local Mainline Testnet or in-memory discovery.
 
 What this means in practice:
 
@@ -598,6 +605,8 @@ What this means in practice:
   to a public third-party service** (Number 0's, unless you change it). They are not secret, and the network secret is
   never published, but an observer of that service learns that your endpoint
   exists and where it is. `--reach local` publishes nothing.
+- With DHT enabled, endpoint records are also published to the public Mainline
+  DHT. They are signed, not encrypted; membership still requires the secret.
 - A relay, when one is needed, sees the volume and timing of your traffic — not
   its contents. The default relays are Number 0's, in the US, EU and
   Asia-Pacific.

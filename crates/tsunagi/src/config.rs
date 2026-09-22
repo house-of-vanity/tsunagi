@@ -11,11 +11,37 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dataplane::SharedPlugin;
-use crate::discovery::NetworkDiscovery;
+use crate::discovery::{MainlineDiscovery, NetworkDiscovery};
 use crate::error::{Error, Result};
 
 /// Qualifier/organisation/application triple used for platform directories.
 const APP_NAME: &str = "tsunagi";
+
+/// Rendezvous slots per network; this bounds a discovery sample, not membership.
+pub const DHT_SLOTS: u8 = 16;
+/// BEP44 permits 1000 bencoded bytes; a 996-byte string has a four-byte prefix.
+pub const DHT_MAX_VALUE: usize = 996;
+/// Maximum direct addresses in one rendezvous record.
+pub const DHT_MAX_ADDRS: usize = 8;
+/// Maximum relay URL bytes in a rendezvous record.
+pub const DHT_MAX_RELAY_LEN: usize = 512;
+/// Application freshness, independent of storage nodes' own expiration.
+pub const DHT_RECORD_TTL: Duration = Duration::from_secs(900);
+/// Clock skew tolerated when reading a recently published record.
+pub const DHT_CLOCK_SKEW: Duration = Duration::from_secs(120);
+
+/// Maximum reassembled data-transport payload, independent of the path MTU.
+pub const MAX_DATA_DATAGRAM: usize = 64 * 1024;
+/// Maximum incomplete datagrams held by one authenticated data link.
+pub const MAX_DATA_ASSEMBLIES: usize = 64;
+/// Maximum allocated payload bytes for incomplete datagrams on one data link.
+pub const MAX_DATA_REASSEMBLY_BYTES: usize = 256 * 1024;
+/// Maximum fragments of one logical datagram, including after a path MTU change.
+pub const MAX_DATA_FRAGMENTS: usize = 128;
+/// Time allowed to assemble a datagram; loss never stalls later datagrams.
+pub const DATA_REASSEMBLY_TTL: Duration = Duration::from_secs(5);
+/// Completed or discarded packet IDs retained to ignore late duplicate fragments.
+pub const DATA_RECENT_IDS: usize = 128;
 
 /// Where the two stores live.
 ///
@@ -137,6 +163,8 @@ pub struct Limits {
     pub write_timeout: Duration,
     /// Maximum simultaneous outbound dials per network.
     pub max_concurrent_dials: usize,
+    /// Maximum unverified discovery candidates retained per network.
+    pub max_discovery_candidates: usize,
     /// Maximum simultaneous authenticated sessions per network.
     pub max_sessions_per_network: usize,
     /// Maximum simultaneous inbound connections being handshaken.
@@ -163,6 +191,7 @@ impl Default for Limits {
             dial_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(30),
             max_concurrent_dials: 8,
+            max_discovery_candidates: 16,
             max_sessions_per_network: 64,
             max_inbound_handshakes: 32,
             session_send_queue: 64,
@@ -212,6 +241,33 @@ impl ReconnectPolicy {
     }
 }
 
+/// Scheduling of candidate lookup and independent self-publication.
+#[derive(Debug, Clone)]
+pub struct DiscoveryPolicy {
+    /// Mean interval between successful self-publications (20% jitter).
+    pub publish_interval: Duration,
+    /// Initial delay between unsuccessful bootstrap lookups.
+    pub lookup_interval: Duration,
+    /// Maximum delay between bootstrap lookups.
+    pub max_lookup_interval: Duration,
+    /// Continuous isolation before a previously connected network searches again.
+    pub reconnect_delay: Duration,
+    /// Deadline for one backend operation.
+    pub request_timeout: Duration,
+}
+
+impl Default for DiscoveryPolicy {
+    fn default() -> Self {
+        Self {
+            publish_interval: Duration::from_secs(300),
+            lookup_interval: Duration::from_secs(5),
+            max_lookup_interval: Duration::from_secs(30),
+            reconnect_delay: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
 /// Everything needed to start an [`crate::Agent`].
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -223,6 +279,9 @@ pub struct AgentConfig {
     pub bind_addrs: Vec<SocketAddr>,
     /// How much external connectivity machinery the endpoint may use.
     pub transport: TransportPolicy,
+    /// Real QUIC transport settings for constrained-path integration tests.
+    #[cfg(feature = "testing")]
+    pub test_quic_transport: Option<iroh::endpoint::QuicTransportConfig>,
     /// Peers with no direct data path, for tests. See
     /// [`AgentConfig::with_unreachable_data_peers`].
     #[cfg(feature = "testing")]
@@ -230,10 +289,14 @@ pub struct AgentConfig {
     /// Hostname announced to peers. `None` keeps whatever the state store holds,
     /// falling back to the OS hostname and finally to a short endpoint id.
     pub hostname: Option<String>,
-    /// Discovery backend. `None` disables discovery-driven dialling; static
-    /// bootstrap candidates still work.
+    /// Additional discovery backend, composed with Mainline when it is enabled.
     pub discovery: Option<Arc<dyn NetworkDiscovery>>,
-    /// How often each active network re-runs discovery and re-evaluates dials.
+    /// Optional Mainline client, shared by this agent's networks. The CLI enables
+    /// it by default except in local-only mode; library callers opt in explicitly.
+    pub dht: Option<MainlineDiscovery>,
+    /// Lookup, publication and recovery scheduling.
+    pub discovery_policy: DiscoveryPolicy,
+    /// How often each active network maintains known peers and observes address changes.
     pub discovery_interval: Duration,
     /// Bounds applied to network input.
     pub limits: Limits,
@@ -269,11 +332,15 @@ impl AgentConfig {
             bind_addrs: Vec::new(),
             transport: TransportPolicy::default(),
             #[cfg(feature = "testing")]
+            test_quic_transport: None,
+            #[cfg(feature = "testing")]
             unreachable_data_peers: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
             hostname: None,
             discovery: None,
+            dht: None,
+            discovery_policy: DiscoveryPolicy::default(),
             discovery_interval: Duration::from_secs(5),
             limits: Limits::default(),
             reconnect: ReconnectPolicy::default(),
@@ -327,7 +394,19 @@ impl AgentConfig {
         self
     }
 
-    /// Sets how often discovery runs.
+    /// Adds Mainline discovery alongside the configured candidate backend.
+    pub fn with_dht(mut self, dht: MainlineDiscovery) -> Self {
+        self.dht = Some(dht);
+        self
+    }
+
+    /// Sets lookup, publication and isolation recovery timing.
+    pub fn with_discovery_policy(mut self, policy: DiscoveryPolicy) -> Self {
+        self.discovery_policy = policy;
+        self
+    }
+
+    /// Sets the known-peer maintenance and endpoint-address observation interval.
     pub fn with_discovery_interval(mut self, interval: Duration) -> Self {
         self.discovery_interval = interval;
         self
@@ -385,6 +464,8 @@ impl std::fmt::Debug for AgentConfig {
             .field("transport", &self.transport)
             .field("hostname", &self.hostname)
             .field("discovery", &self.discovery.as_ref().map(|d| d.name()))
+            .field("dht", &self.dht.is_some())
+            .field("discovery_policy", &self.discovery_policy)
             .field("discovery_interval", &self.discovery_interval)
             .field("limits", &self.limits)
             .field("reconnect", &self.reconnect)

@@ -65,6 +65,8 @@ directories = "6.0"
 # forbidden `unsafe` and will not make one.
 gethostname = "1.1"
 netwatch = "0.19.3"
+mainline = "8.0"
+futures-lite = "2.6"
 tun = { version = "0.8", features = ["async"], optional = true }
 # Only for the `testing` harness, which a protocol crate's tests use too.
 tempfile = { version = "3.24", optional = true }
@@ -94,7 +96,7 @@ netdev = { version = "0.45", optional = true }
 [dev-dependencies]
 # Its own tests use the harness it publishes.
 tsunagi = { path = ".", features = ["testing"] }
-tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process", "test-util"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 

@@ -15,7 +15,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tsunagi::agent::Event;
 use tsunagi::config::{AgentConfig, StoragePaths, TransportPolicy};
 use tsunagi::dataplane::IpPlugin;
-use tsunagi::discovery::{CompositeDiscovery, NetworkDiscovery, StaticBootstrap};
+use tsunagi::discovery::{
+    CompositeDiscovery, MainlineDiscovery, NetworkDiscovery, StaticBootstrap,
+};
 use tsunagi::identity::{NetworkName, NetworkSecret};
 use tsunagi::iroh_types::EndpointAddr;
 use tsunagi::overlay::{MemoryTunFactory, TunFactory};
@@ -347,9 +349,17 @@ struct UpArgs {
     #[arg(long, value_enum, default_value_t = Reach::Relay, help_heading = "System")]
     reach: Reach,
 
+    /// Enable Mainline DHT rendezvous (already enabled by default).
+    #[arg(long, conflicts_with = "no_dht", help_heading = "System")]
+    dht: bool,
+
+    /// Disable Mainline DHT lookup and publication. --reach local also disables it.
+    #[arg(long, conflicts_with = "dht", help_heading = "System")]
+    no_dht: bool,
+
     /// A peer to contact, as `<endpoint-id>` or `<endpoint-id>@<ip:port>,...`.
     ///
-    /// One agent needs to know another to begin with. Repeat for several.
+    /// Optional alongside DHT discovery. Repeat for several.
     #[arg(long = "peer", value_name = "PEER", help_heading = "System")]
     peers: Vec<String>,
 
@@ -470,7 +480,11 @@ fn load_secret(
 /// the tests, can each take a port of their own); this only decides what a
 /// plain `--dns` picks. Elsewhere the default is a high port that needs no
 /// privilege, since systemd-resolved can be pointed at any port.
-const DEFAULT_DNS_PORT: u16 = if cfg!(target_os = "windows") { 53 } else { 5354 };
+const DEFAULT_DNS_PORT: u16 = if cfg!(target_os = "windows") {
+    53
+} else {
+    5354
+};
 
 /// Settings key: whether the local resolver is wanted.
 const DNS_ENABLED: &str = "dns.enabled";
@@ -1546,8 +1560,7 @@ async fn join_network(
     // next restart.
     if tsunagi::ipc::is_serving(socket).await {
         let report =
-            tsunagi::ipc::join_network(socket, name.as_str(), secret.encode().as_str())
-                .await?;
+            tsunagi::ipc::join_network(socket, name.as_str(), secret.encode().as_str()).await?;
         // The id in full either way: it is what every other command takes,
         // and the shortened form in a report is for reading, not copying.
         match standing {
@@ -1644,8 +1657,8 @@ async fn invite(socket: &std::path::Path, name: &NetworkName, secret: &NetworkSe
     );
     match endpoint {
         Some(endpoint) => println!(
-            "\nIts agent has to be running. If it is not:\n\n  \
-             tsunagi up --peer {endpoint}"
+            "\nStart its agent with `tsunagi up`; DHT discovery is enabled by default.\n\n  \
+             Optional manual bootstrap: tsunagi up --peer {endpoint}"
         ),
         None => println!("\nIts agent has to be running: `tsunagi up`."),
     }
@@ -2566,10 +2579,8 @@ fn network_section(
                 "members",
                 "none: this network has no range to allocate from",
             )),
-            // Nobody to contact and nowhere to look. An agent finds a peer
-            // by being told about one, or from what it remembers of an
-            // earlier session — with neither it waits for ever, and the
-            // report should say so rather than imply patience.
+            // No candidates yet. DHT may still be bootstrapping; manual
+            // bootstrap remains useful when public UDP is unavailable.
             (_, _, 0) => section.push(
                 Row::new(
                     Health::Degraded,
@@ -2577,9 +2588,9 @@ fn network_section(
                     "none, and nobody to contact: no candidates in this network",
                 )
                 .with_note(format!(
-                    "somebody has to make the introduction. Start this agent with \
-                     `--peer <their-endpoint-id>`, or have them start theirs with \
-                     `--peer {}`. Once they have met, each remembers the other.",
+                    "DHT lookup retries automatically when enabled. For manual \
+                     bootstrap, start with `--peer <their-endpoint-id>`, or have \
+                     the other device start with `--peer {}`.",
                     short(own_id, 12)
                 )),
             ),
@@ -3233,6 +3244,10 @@ async fn netwatch_addresses() -> Vec<std::net::IpAddr> {
     addresses
 }
 
+fn dht_enabled(args: &UpArgs) -> bool {
+    !matches!(args.reach, Reach::Local) && (args.dht || !args.no_dht)
+}
+
 async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
 
@@ -3273,6 +3288,9 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         .with_transport(args.reach.into())
         .with_discovery(discovery)
         .with_discovery_interval(Duration::from_secs(5));
+    if dht_enabled(&args) {
+        config = config.with_dht(MainlineDiscovery::default());
+    }
     if let Some(hostname) = &args.hostname {
         config = config.with_hostname(hostname.clone());
     }
@@ -4157,6 +4175,26 @@ mod status_tests {
 #[cfg(test)]
 mod network_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #[test]
+    fn dht_defaults_and_local_mode_do_not_require_manual_peers() {
+        use clap::Parser;
+        for (flags, expected) in [
+            (vec![], true),
+            (vec!["--dht"], true),
+            (vec!["--no-dht"], false),
+            (vec!["--reach", "local"], false),
+            (vec!["--reach", "local", "--dht"], false),
+            (vec!["--reach", "direct"], true),
+        ] {
+            let cli =
+                super::Cli::try_parse_from(["tsunagi", "up"].into_iter().chain(flags)).unwrap();
+            let super::Command::Up(args) = cli.command else {
+                panic!("expected up");
+            };
+            assert_eq!(super::dht_enabled(&args), expected);
+        }
+        assert!(super::Cli::try_parse_from(["tsunagi", "up", "--dht", "--no-dht"]).is_err());
+    }
 
     use super::*;
     use tsunagi::identity::{NetworkKeys, NetworkName, NetworkSecret};
