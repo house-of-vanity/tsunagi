@@ -362,11 +362,11 @@ tsunagi id key rotate           replace that key
 tsunagi network                 the networks this device belongs to
 tsunagi network join -n lab -s tsn1…   join one; adds it to a running agent
 tsunagi network join -n lab     resume one this device has, or make it on the spot
-tsunagi network stop <id>       stop serving it, keeping everything
-tsunagi network start <id>      serve it again, from where it left off
-tsunagi network leave <id>      give up the address and name, then forget it
+tsunagi network stop lab        stop serving it, keeping everything
+tsunagi network start lab       serve it again, from where it left off
+tsunagi network leave lab       give up the address and name, then forget it
 tsunagi network secret          the secret of each joined network
-tsunagi network secret <id>     just that one, for copying
+tsunagi network secret lab      just that one, for copying
 tsunagi network secret generate a fresh secret for a network that does not exist yet
 
 tsunagi dns                     whether the local resolver is serving, and what
@@ -599,8 +599,8 @@ received broadcasts never trigger another fanout.
 ```sh
 tsunagi join -n games --no-broadcast
 tsunagi join -n games --broadcast
-tsunagi network broadcast <network-id-or-prefix> off
-tsunagi network broadcast <network-id-or-prefix> on
+tsunagi network broadcast games off
+tsunagi network broadcast games on
 ```
 
 The choice persists across restarts and a plain `join`. It can be changed while
@@ -674,7 +674,7 @@ Membership outlives a session, so it also has to be possible to end it.
 
 ```bash
 tsunagi network                     # what this device belongs to
-tsunagi network leave <network-id>  # give up the address and the name, then forget it
+tsunagi network leave lab           # give up the address and the name, then forget it
 tsunagi wipe --yes                  # remove everything and be a stranger again
 ```
 
@@ -703,9 +703,12 @@ nothing can sign or send it: the command says so and refuses, and `--offline`
 drops the network locally while leaving the others holding the old claim. The
 protocol key for that network goes too — rejoining is joining, not resuming.
 
-A network is named by its id, never by its name: two networks can share a
-name, and choosing between them for the user is how the wrong one gets left. A
-unique prefix is enough.
+`leave`, `stop`, `start`, `secret` and `broadcast` accept an exact stored network
+name, its full id, or a unique id prefix (including a copied report ellipsis).
+Names are case-sensitive. If several networks share a name, or a name matches
+another network's id prefix, the command lists matching names and full ids and
+changes nothing. Use a full id to choose explicitly; a full id always takes
+precedence over a name. No secret is needed to select a configured network.
 
 `wipe` removes both directories' contents: the device identity, every network,
 every signed record and everything a protocol kept beside them. It refuses

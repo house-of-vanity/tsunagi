@@ -147,7 +147,7 @@ struct JoinArgs {
 enum NetworkAction {
     /// Shows or changes this network's local LAN broadcast participation.
     Broadcast {
-        /// Network id or unique id prefix.
+        /// Exact network name, full id or unique id prefix.
         network: String,
         /// New choice; omit to show the stored choice.
         #[arg(value_enum)]
@@ -168,12 +168,12 @@ enum NetworkAction {
     /// simply away, as if it had been switched off. It stays stopped
     /// across restarts until `tsunagi network start`.
     Stop {
-        /// Which network, by id. A unique prefix is enough.
+        /// Exact network name, full id or unique id prefix.
         network: String,
     },
     /// Serves a stopped network again, from where it left off.
     Start {
-        /// Which network, by id. A unique prefix is enough.
+        /// Exact network name, full id or unique id prefix.
         network: String,
     },
     /// Gives up this device's address and name in a network, and forgets it.
@@ -186,8 +186,8 @@ enum NetworkAction {
     /// network's signed records, its cached hints and the protocol key it
     /// used. `stop` is the one that keeps them.
     Leave {
-        /// Which network, by id. A unique prefix is enough; the name is not,
-        /// because two networks may share one.
+        /// Exact network name, full id or unique id prefix.
+        /// If the name is shared, use the id to select one network.
         network: String,
 
         /// Remove it without telling anybody.
@@ -202,8 +202,7 @@ enum NetworkAction {
     /// Printed only when asked for, never as part of an overview: these
     /// reports get pasted into chats and issue trackers.
     Secret {
-        /// Which network, by id; a unique prefix is enough. All of them if
-        /// omitted.
+        /// Exact network name, full id or unique id prefix. All of them if omitted.
         network: Option<String>,
 
         #[command(subcommand)]
@@ -1498,44 +1497,51 @@ fn stored_networks(paths: &StoragePaths) -> Vec<tsunagi::storage::StoredNetwork>
         .unwrap_or_default()
 }
 
-/// Finds the one configured network whose id starts with `wanted`.
+/// Resolves a stored network by exact name, full id or unique id prefix.
 ///
-/// A prefix, because the ids are 52 characters and `status` prints them
-/// shortened; the name is deliberately not accepted, since two networks can
-/// share one and choosing for the user is how the wrong network gets left.
+/// Full ids are definitive. Otherwise name and prefix matches must identify
+/// exactly one network: a shared name or a name colliding with another id's
+/// prefix must never select an arbitrary network for a destructive command.
 fn resolve_network<'a>(
     networks: &'a [tsunagi::storage::StoredNetwork],
     wanted: &str,
 ) -> Result<&'a tsunagi::storage::StoredNetwork, String> {
-    let wanted = wanted.trim().trim_end_matches('…');
+    let wanted = wanted.trim_matches(|c: char| c.is_ascii_whitespace());
     if wanted.is_empty() {
-        return Err("name a network by its id; `tsunagi network` lists them".to_string());
+        return Err("select a network by name or id; `tsunagi network` lists them".to_string());
     }
+    if let Some(network) = networks
+        .iter()
+        .find(|network| network.network_id.to_string() == wanted)
+    {
+        return Ok(network);
+    }
+    // Only id prefixes lose a copied report ellipsis; names are used verbatim.
+    let prefix = wanted.trim_end_matches('…');
     let matched: Vec<&tsunagi::storage::StoredNetwork> = networks
         .iter()
-        .filter(|network| network.network_id.to_string().starts_with(wanted))
+        .filter(|network| {
+            network.name.as_str() == wanted
+                || (!prefix.is_empty() && network.network_id.to_string().starts_with(prefix))
+        })
         .collect();
     match matched.as_slice() {
         [one] => Ok(one),
-        [] => {
-            if networks
+        [] => Err(format!(
+            "no configured network matches name or id `{wanted}`; \
+             `tsunagi network` lists them"
+        )),
+        several => {
+            let candidates = several
                 .iter()
-                .any(|network| network.name.as_str() == wanted)
-            {
-                return Err(format!(
-                    "`{wanted}` is a network name, not an id. Two networks can share a name, \
-                     so this takes the id; `tsunagi network` lists them."
-                ));
-            }
+                .map(|network| format!("  `{}`  {}", network.name, network.network_id))
+                .collect::<Vec<_>>()
+                .join("\n");
             Err(format!(
-                "no configured network has an id starting `{wanted}`; \
-                 `tsunagi network` lists them"
+                "`{wanted}` matches {} networks; use the full id or a unique id prefix:\n{candidates}",
+                several.len()
             ))
         }
-        several => Err(format!(
-            "`{wanted}` matches {} networks; use more of the id",
-            several.len()
-        )),
     }
 }
 
@@ -4320,21 +4326,68 @@ mod network_tests {
         assert_eq!(picked.network_id, networks[0].network_id);
 
         let err = resolve_network(&networks, "").unwrap_err();
-        assert!(err.contains("by its id"), "{err}");
+        assert!(err.contains("by name or id"), "{err}");
     }
 
     #[test]
-    fn a_name_is_refused_because_two_networks_can_share_one() {
+    fn a_unique_exact_name_selects_the_stored_network_without_normalizing_it() {
+        let networks = vec![
+            configured("lab", "one"),
+            configured("Lab", "two"),
+            configured("Игры дома…", "three"),
+        ];
+        for network in &networks {
+            assert_eq!(
+                resolve_network(&networks, network.name.as_str())
+                    .unwrap()
+                    .network_id,
+                network.network_id
+            );
+        }
+        assert!(resolve_network(&networks, "LAB").is_err());
+        assert!(resolve_network(&networks, "Игры дома").is_err());
+        assert!(resolve_network(&networks, "Игры").is_err());
+        assert!(resolve_network(&networks, "…").is_err());
+    }
+
+    #[test]
+    fn a_shared_name_lists_the_ids_without_choosing_or_disclosing_secrets() {
         // Exactly the situation this command exists for: two networks called
         // `lab`, one of them joined with a mistyped secret. Choosing for the
         // user here is how the wrong one gets left.
         let networks = vec![configured("lab", "one"), configured("lab", "two")];
         let err = resolve_network(&networks, "lab").unwrap_err();
-        assert!(err.contains("not an id"), "{err}");
-        assert!(
-            err.contains("tsunagi network"),
-            "it says where to look: {err}"
+        assert!(err.contains("matches 2 networks"), "{err}");
+        for network in &networks {
+            assert!(err.contains(&network.network_id.to_string()), "{err}");
+            assert!(!err.contains(network.secret.encode().as_str()), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_name_colliding_with_an_id_prefix_requires_a_full_id() {
+        let first = configured("lab", "one");
+        let id = first.network_id.to_string();
+        let networks = vec![
+            first,
+            configured(&id[..10], "two"),
+            configured(&id, "three"),
+        ];
+        let err = resolve_network(&networks, &id[..10]).unwrap_err();
+        assert!(err.contains("matches 2 networks"), "{err}");
+        // An explicit full id remains definitive, even if another name is an id.
+        assert_eq!(
+            resolve_network(&networks, &id).unwrap().network_id,
+            networks[0].network_id
         );
+        for network in &networks[1..] {
+            assert_eq!(
+                resolve_network(&networks, &network.network_id.to_string())
+                    .unwrap()
+                    .network_id,
+                network.network_id
+            );
+        }
     }
 
     #[test]
@@ -4346,21 +4399,26 @@ mod network_tests {
 
     #[test]
     fn a_prefix_shared_by_two_networks_is_refused_rather_than_guessed() {
-        let networks = vec![configured("lab", "one"), configured("other", "two")];
-        let shared = &networks[0].network_id.to_string()[..1];
-        let both = networks
+        // 33 distinct ids must share at least one initial base32 character.
+        let networks: Vec<_> = (0..33)
+            .map(|i| configured(&format!("network-{i}"), "secret"))
+            .collect();
+        let shared = networks
             .iter()
-            .filter(|network| network.network_id.to_string().starts_with(shared))
-            .count();
-        if both < 2 {
-            // The two derived ids happen not to share a first character;
-            // the empty prefix is the same question with a certain answer.
-            let err = resolve_network(&networks, "").unwrap_err();
-            assert!(err.contains("by its id"), "{err}");
-            return;
-        }
-        let err = resolve_network(&networks, shared).unwrap_err();
-        assert!(err.contains("use more of the id"), "{err}");
+            .map(|network| network.network_id.to_string()[..1].to_string())
+            .find(|prefix| {
+                networks
+                    .iter()
+                    .filter(|network| network.network_id.to_string().starts_with(prefix))
+                    .count()
+                    > 1
+            })
+            .unwrap();
+        let err = resolve_network(&networks, &shared).unwrap_err();
+        assert!(
+            err.contains("use the full id or a unique id prefix"),
+            "{err}"
+        );
     }
 }
 

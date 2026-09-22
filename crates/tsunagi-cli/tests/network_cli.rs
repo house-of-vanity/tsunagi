@@ -25,15 +25,26 @@ impl Drop for Running {
 
 impl Running {
     fn run(&self, args: &[&str]) -> std::process::Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
-            .args(args)
-            .arg("--state-dir")
-            .arg(self.dir.path().join("state"))
-            .arg("--cache-dir")
-            .arg(self.dir.path().join("cache"))
-            .output()
-            .expect("the agent binary runs")
+        run_in(&self.dir, args)
     }
+}
+
+fn run_in(dir: &TempDir, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+        .args(args)
+        .arg("--state-dir")
+        .arg(dir.path().join("state"))
+        .arg("--cache-dir")
+        .arg(dir.path().join("cache"))
+        .output()
+        .expect("the agent binary runs")
+}
+
+fn read_networks(dir: &TempDir) -> Vec<tsunagi::storage::StoredNetwork> {
+    tsunagi::storage::StateStore::open(dir.path().join("state/state.sqlite"))
+        .unwrap()
+        .list_networks()
+        .unwrap()
 }
 
 /// An agent with no network at all, the way a daemon is started before
@@ -155,7 +166,7 @@ fn a_network_can_be_stopped_and_resumed_without_losing_anything() {
         .to_string();
     assert!(secret_before.starts_with("tsn1"));
 
-    let stopped = agent.run(&["network", "stop", &id[..10]]);
+    let stopped = agent.run(&["network", "stop", "resident"]);
     assert!(
         stopped.status.success(),
         "{}",
@@ -181,7 +192,7 @@ fn a_network_can_be_stopped_and_resumed_without_losing_anything() {
         String::from_utf8_lossy(&again.stdout)
     );
 
-    let started = agent.run(&["network", "start", &id[..10]]);
+    let started = agent.run(&["network", "start", "resident"]);
     assert!(started.status.success());
     assert!(
         String::from_utf8_lossy(&started.stdout).contains("started `resident`"),
@@ -192,7 +203,7 @@ fn a_network_can_be_stopped_and_resumed_without_losing_anything() {
     assert!(listed.contains("running"), "{listed}");
 
     // And nothing was given up on the way: the same network, same secret.
-    let secret_after = agent.run(&["network", "secret", &id[..10]]);
+    let secret_after = agent.run(&["network", "secret", "resident"]);
     assert_eq!(
         String::from_utf8_lossy(&secret_after.stdout).trim(),
         secret_before,
@@ -290,7 +301,7 @@ fn broadcast_choice_is_per_network_live_persistent_and_preserved_by_rejoin() {
             .broadcast
     );
     let id = disabled.network_id.to_string();
-    let change = agent.run(&["network", "broadcast", &id, "on"]);
+    let change = agent.run(&["network", "broadcast", "broadcast-off", "on"]);
     assert!(
         change.status.success(),
         "{}",
@@ -311,4 +322,99 @@ fn broadcast_choice_is_per_network_live_persistent_and_preserved_by_rejoin() {
             .status
             .success()
     );
+}
+
+#[test]
+fn leaving_by_name_removes_only_that_network_from_a_running_agent() {
+    let agent = start("resident", 0);
+    assert!(agent.run(&["join", "-n", "games"]).status.success());
+    let resident = read_networks(&agent.dir)
+        .into_iter()
+        .find(|network| network.name.as_str() == "resident")
+        .unwrap();
+
+    let left = agent.run(&["network", "leave", "games"]);
+    assert!(
+        left.status.success(),
+        "{}",
+        String::from_utf8_lossy(&left.stderr)
+    );
+    assert!(String::from_utf8_lossy(&left.stdout).contains("left `games`"));
+    let remaining = read_networks(&agent.dir);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].network_id, resident.network_id);
+    assert_eq!(
+        remaining[0].secret.encode().as_str(),
+        resident.secret.encode().as_str()
+    );
+    let status = agent.run(&["network"]);
+    assert!(status.status.success());
+    let out = String::from_utf8_lossy(&status.stdout);
+    assert!(out.contains("resident") && out.contains("running"), "{out}");
+    assert!(!out.contains("games"), "{out}");
+}
+
+#[test]
+fn leaving_by_name_offline_keeps_the_explicit_offline_requirement() {
+    let dir = TempDir::new().unwrap();
+    for name in ["resident", "games"] {
+        assert!(run_in(&dir, &["join", "-n", name]).status.success());
+    }
+    let refused = run_in(&dir, &["network", "leave", "games"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--offline"));
+    assert_eq!(read_networks(&dir).len(), 2);
+
+    let left = run_in(&dir, &["network", "leave", "games", "--offline"]);
+    assert!(
+        left.status.success(),
+        "{}",
+        String::from_utf8_lossy(&left.stderr)
+    );
+    let remaining = read_networks(&dir);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].name.as_str(), "resident");
+}
+
+#[test]
+fn ambiguous_and_unknown_names_leave_every_network_untouched() {
+    let agent = start_bare(0);
+    for secret in [
+        "first-secret-for-the-cli-test",
+        "second-secret-for-the-cli-test",
+    ] {
+        assert!(
+            agent
+                .run(&["join", "-n", "games", "-s", secret])
+                .status
+                .success()
+        );
+    }
+    let before = read_networks(&agent.dir);
+    assert_eq!(before.len(), 2);
+    for name in ["games", "missing-network"] {
+        let result = agent.run(&["network", "leave", name]);
+        assert!(!result.status.success());
+        let err = String::from_utf8_lossy(&result.stderr);
+        if name == "games" {
+            assert!(err.contains("matches 2 networks"), "{err}");
+            for network in &before {
+                assert!(err.contains(&network.network_id.to_string()), "{err}");
+                assert!(!err.contains(network.secret.encode().as_str()), "{err}");
+            }
+        } else {
+            assert!(err.contains("no configured network"), "{err}");
+        }
+        assert_eq!(read_networks(&agent.dir).len(), 2);
+    }
+    // The suggested full id still selects exactly one of the same-name networks.
+    let left = agent.run(&["network", "leave", &before[0].network_id.to_string()]);
+    assert!(
+        left.status.success(),
+        "{}",
+        String::from_utf8_lossy(&left.stderr)
+    );
+    let remaining = read_networks(&agent.dir);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].network_id, before[1].network_id);
 }

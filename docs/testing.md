@@ -108,6 +108,11 @@ with no secret invents one, prints it in full and prints a line the other
 side can paste unchanged; a bare name this device already knows resumes
 that network instead of inventing another of the same name; and a network
 can be stopped and started again with its secret and its place intact.
+Network selection accepts exact names consistently across commands. Leave-by-name
+is tested with a live agent and with offline state, preserving other networks;
+duplicate and unknown names change nothing and full ids resolve ambiguity.
+Selector unit tests cover case-sensitive names, Unicode/ellipsis names, copied
+id prefixes and collisions between names and ids without revealing secrets.
 
 `crates/tsunagi-cli/tests/dns_service.rs` runs the real binary: the resolver
 comes up with no interface to attach it to, the listener is not rebuilt on

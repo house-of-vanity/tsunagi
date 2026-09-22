@@ -8,14 +8,16 @@ control session. It is not a network-wide vote or signed shared configuration.
 ```sh
 tsunagi join -n games --no-broadcast
 tsunagi join -n games --broadcast
-tsunagi network broadcast <network-id-or-prefix> off
-tsunagi network broadcast <network-id-or-prefix> on
-tsunagi network broadcast <network-id-or-prefix>
+tsunagi network broadcast games off
+tsunagi network broadcast games on
+tsunagi network broadcast games
 ```
 
 Joining without either flag preserves the saved choice. The `network broadcast`
 command can change a running network immediately or configure it while the
-agent is stopped. `status` reports the local setting. There is no global `up`
+agent is stopped. It accepts the exact network name, full id or a unique id
+prefix; ambiguous selectors list candidates without changing anything.
+`status` reports the local setting. There is no global `up`
 override: starting the agent preserves every network's independent policy.
 
 ## Delivery

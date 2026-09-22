@@ -13,6 +13,18 @@ messages. Scope and non-scope are in [README.md](README.md).
 There is no central server, no owner, no registration and no majority vote.
 Design accordingly: a majority is not a root of trust.
 
+## User experience
+
+User convenience is a core requirement. The CLI should feel logical and
+predictable to an experienced administrator: use consistent selectors and
+flags, sensible defaults, and actionable errors. Let users refer to configured
+networks by their exact name as well as by id or a unique id prefix; do not
+make them copy an opaque identifier when the stored name identifies one network.
+When a selector is ambiguous, list the matching names and ids and change
+nothing. Never guess which resource a destructive command should affect.
+Keep help text and examples in sync with behavior, and preserve existing
+scripts when improving the interactive workflow.
+
 ## Architectural boundaries
 
 Keep these separate. Crossing them is the main thing to review for.
