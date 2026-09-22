@@ -43,6 +43,11 @@ Keep these separate. Crossing them is the main thing to review for.
 - **A protocol never sees the network secret.** It proves who is at the other
   end of a tunnel; proving membership of a network stays in the core, which
   is why the authenticated transport does too.
+- **A relay carries bytes, never packets.** A datagram passed on for two
+  other peers goes link in, link out: it is never written to the middle's
+  interface, never decrypted there, and never relayed twice. Reachability
+  that decides a route is first-hand and volatile — a live announcement
+  over the control plane, never a signed record and never second-hand.
 - **Plugins never learn reachability.** An `IpPlugin` is handed a `PacketLink`
   per peer and moves datagrams over it. Addresses, hole punching and relays
   belong to `crates/tsunagi/src/dataplane/transport/`. A plugin announcement says *who*, never

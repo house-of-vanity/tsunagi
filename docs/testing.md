@@ -55,6 +55,16 @@ keeping the WireGuard identity, shutdown removing every interface, a forged
 overlay claim being rejected, and the core carrying the payload without
 interpreting it.
 
+`crates/tsunagi/src/dataplane/relay.rs` has its own tests for the way
+through a peer in the middle: the wrapping and what a malformed one does, a
+direct path being preferred over a hop, the middle passing a datagram on
+without being handed it, what arrives through somebody reaching the peer it
+came from rather than the one that carried it, a link outliving the paths
+under it, and the datagram size not changing when the path does.
+`tests/wireguard.rs` proves it end to end — two agents that can each reach a
+third and not each other, with a real WireGuard packet crossing through the
+middle.
+
 Unit tests in `crates/tsunagi/src/state/` cover the signed record model directly: tampering
 with any field breaks verification, a newer version wins while an older one
 never rolls back, two authors claiming one address resolve the same way no

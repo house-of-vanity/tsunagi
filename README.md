@@ -536,6 +536,27 @@ async fn main() -> Result<()> {
 reaches the internet by accident. Opt into `DirectOnly` or `N0Defaults`
 explicitly.
 
+### Through somebody in the middle
+
+Two members can both reach a third and not each other: a blocked path, a
+relay that is unavailable, a network only reachable from inside somebody
+else's building. When that happens the pair is routed through a member that
+has both.
+
+Nothing is agreed and nothing is elected. Each member says only which peers
+*it* has a live link with, first-hand, over the control plane and one hop
+only; everyone picks their own way through from that, deterministically, and
+drops it the moment a direct link exists. There is no routing protocol, no
+second-hand claim to weigh, and a relayed datagram is never relayed again —
+so a loop cannot form.
+
+The one in the middle carries **bytes it cannot read**: the tunnel stays end
+to end between the two ends, and a relayed datagram never touches the middle
+host's interface, so no forwarding, routing or firewall setting of that host
+is involved. `status` says `via <peer>` on a path that goes through
+somebody, and counts what this device has carried for others — it is their
+traffic on your uplink, and that should not be invisible.
+
 ## How peers find each other
 
 Two different lookups are involved, and only one of them is this project's:

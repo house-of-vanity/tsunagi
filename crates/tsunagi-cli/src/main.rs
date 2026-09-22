@@ -2525,6 +2525,21 @@ fn network_section(
         ));
     }
 
+    // Only when something has: a relay that has carried nothing is not
+    // worth a line, and one that has is worth knowing about — it is
+    // somebody else's traffic on this device's uplink.
+    let relayed = network.relay_forwarded + network.relay_sent_via + network.relay_received_via;
+    if relayed > 0 {
+        section.push(Row::new(
+            Health::Info,
+            "relay",
+            format!(
+                "{} carried for others  ·  {} sent through a peer, {} arrived through one",
+                network.relay_forwarded, network.relay_sent_via, network.relay_received_via
+            ),
+        ));
+    }
+
     let rows = member_rows(network, own_id);
     let online = rows.iter().filter(|row| row.online()).count();
     if rows.is_empty() {
@@ -3530,6 +3545,9 @@ async fn build_report(
                 network_id: network.network_id.to_string(),
                 active: matches!(network.state, tsunagi::agent::NetworkState::Active),
                 candidates: network.candidates.len() as u32,
+                relay_forwarded: network.relay.forwarded,
+                relay_sent_via: network.relay.sent_via,
+                relay_received_via: network.relay.received_via,
                 peers: network
                     .peers
                     .iter()
@@ -3825,6 +3843,9 @@ mod status_tests {
             network_id: "xa7gyz".into(),
             active: true,
             candidates: 1,
+            relay_forwarded: 0,
+            relay_sent_via: 0,
+            relay_received_via: 0,
             peers: vec![PeerReport {
                 endpoint_id: ONLINE.into(),
                 hostname: Some("music".into()),

@@ -162,6 +162,43 @@ impl WgAgent {
         (agent, plugin, tuns)
     }
 
+    /// An agent that refuses a direct data path to some peers.
+    ///
+    /// The one arrangement a single host cannot produce by itself: two
+    /// agents that both reach a third and not each other. The control
+    /// plane is untouched — they are members and they talk — only the
+    /// direct data link is refused, which is the real-world case of a
+    /// blocked or unreachable data path.
+    async fn spawn_cut_off(
+        discovery: &SharedMemoryDiscovery,
+        tag: &str,
+        blocked: Arc<std::sync::Mutex<std::collections::HashSet<EndpointId>>>,
+    ) -> Self {
+        let dir = TempDir::new().unwrap();
+        let tuns = MemoryTunFactory::new();
+        let plugin = WireguardPlugin::open(
+            WireguardConfig::new(dir.path().join("wireguard"))
+                .with_reconcile(Duration::from_millis(20), Duration::from_millis(250)),
+        )
+        .await
+        .unwrap();
+        let agent = Agent::spawn(
+            config_with(dir.path(), discovery)
+                .with_overlay_ipv4_range(Some(tsunagi::state::DEFAULT_IPV4_RANGE))
+                .with_interface(Arc::new(tuns.clone()), tag, 1280)
+                .with_unreachable_data_peers(blocked)
+                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+        )
+        .await
+        .unwrap();
+        Self {
+            dir,
+            agent,
+            plugin,
+            tuns,
+        }
+    }
+
     /// An agent whose interface claims to be on the host but is not.
     ///
     /// Used only by the missing-address test: everywhere else the in-memory
@@ -1305,4 +1342,79 @@ async fn an_mtu_below_what_ipv4_guarantees_is_refused() {
             .await
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn a_peer_with_no_direct_path_is_reached_through_one_that_has_both() {
+    // A and B can each reach C and not each other. Without a way through
+    // the middle they are lost to one another while sitting in the same
+    // mesh; with one, C carries their datagrams without being able to read
+    // a byte of them — the WireGuard tunnel is still end to end.
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-relay");
+
+    let a_blocks = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let b_blocks = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let a = WgAgent::spawn_cut_off(&discovery, "tra", Arc::clone(&a_blocks)).await;
+    let b = WgAgent::spawn_cut_off(&discovery, "trb", Arc::clone(&b_blocks)).await;
+    let middle = WgAgent::spawn(&discovery, "trc").await;
+    a_blocks.lock().unwrap().insert(b.endpoint_id());
+    b_blocks.lock().unwrap().insert(a.endpoint_id());
+
+    let network_id = middle.agent.join_network(&name, &secret).await.unwrap();
+    a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+
+    // All three are members and all three talk: only the data path
+    // between A and B is missing.
+    wait_for_peers(&a.agent, network_id, 2).await;
+    wait_for_peers(&b.agent, network_id, 2).await;
+    middle.wait_for_tunnels(network_id, 2).await;
+
+    let a_addr = a.overlay(network_id).await;
+    let b_addr = b.overlay(network_id).await;
+    assert_ne!(a_addr, b_addr);
+
+    // A's tunnel to B comes up through C.
+    wait_until("a's tunnel to b is established", || async {
+        let view = a.plugin.overview(network_id)?;
+        view.peers
+            .iter()
+            .find(|peer| peer.endpoint_id == b.endpoint_id())?
+            .tunnel
+            .as_ref()
+            .map(|tunnel| tunnel.health.since_handshake)?
+            .map(|_| ())
+    })
+    .await;
+    let path = a
+        .plugin
+        .overview(network_id)
+        .unwrap()
+        .peers
+        .iter()
+        .find(|peer| peer.endpoint_id == b.endpoint_id())
+        .and_then(|peer| peer.tunnel.as_ref().map(|tunnel| tunnel.path.clone()))
+        .unwrap_or_default();
+    assert!(
+        path.contains("via"),
+        "the path should say it goes through somebody: {path}"
+    );
+
+    // And a real packet crosses: A's interface to B's interface, through C.
+    a.tun(network_id)
+        .await
+        .push_from_os(ipv4_packet(a_addr, b_addr, b"through the middle"));
+    let seen = tokio::time::timeout(
+        tsunagi::testing::DEADLINE,
+        b.tun(network_id).await.pop_to_os(),
+    )
+    .await
+    .expect("the packet should arrive")
+    .unwrap();
+    assert_eq!(&seen[20..], b"through the middle");
+
+    a.shutdown().await;
+    b.shutdown().await;
+    middle.shutdown().await;
 }

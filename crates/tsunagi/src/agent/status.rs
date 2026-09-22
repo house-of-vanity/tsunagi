@@ -176,6 +176,8 @@ pub struct NetworkStatus {
     pub range_conflict: Option<crate::state::Ipv4Range>,
     /// Per-network counters.
     pub metrics: NetworkMetrics,
+    /// What has gone through a peer in the middle, in both directions.
+    pub relay: crate::dataplane::relay::RelayCounters,
 }
 
 impl NetworkStatus {

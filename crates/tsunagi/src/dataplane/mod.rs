@@ -19,6 +19,7 @@
 //! A data plane failure never stops the daemon: errors returned here are
 //! recorded and surfaced, the control plane keeps running.
 
+pub mod relay;
 pub mod transport;
 
 use std::sync::Arc;

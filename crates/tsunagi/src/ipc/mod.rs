@@ -274,6 +274,12 @@ pub struct NetworkReport {
     /// has no way to reach anybody" — which look identical in a report
     /// that counts only members.
     pub candidates: u32,
+    /// Datagrams this agent passed on between two other peers.
+    pub relay_forwarded: u64,
+    /// Datagrams this agent sent to a peer through somebody else.
+    pub relay_sent_via: u64,
+    /// Datagrams that reached this agent through somebody else.
+    pub relay_received_via: u64,
     /// Outbound dials that failed.
     pub dial_failures: u64,
     /// Handshakes rejected in either direction.

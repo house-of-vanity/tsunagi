@@ -28,7 +28,12 @@ pub const ALPN: &[u8] = b"tsunagi/ctrl/1";
 /// They carry one IP plugin's packets for one network and nothing else, so a
 /// saturated or broken data plane cannot disturb control traffic, and the
 /// transport underneath can be replaced without touching the control protocol.
-pub const DATA_ALPN: &[u8] = b"tsunagi/data/1";
+///
+/// Version 2 puts a tag on every datagram, so one can say "this is for
+/// somebody else" and be passed on by the peer in the middle. An agent
+/// speaking version 1 simply does not form a data link with one speaking
+/// version 2, which is what the version in an ALPN is for.
+pub const DATA_ALPN: &[u8] = b"tsunagi/data/2";
 
 /// Largest plugin protocol identifier accepted when opening a data channel.
 pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
@@ -124,6 +129,20 @@ pub enum ControlMessage {
         /// The records. Bounded by [`crate::config::Limits::max_state_records`].
         records: Vec<crate::state::SignedRecord>,
     },
+    /// Which peers this sender has a live data link with, right now.
+    ///
+    /// First-hand and nothing else: a sender speaks only for itself, never
+    /// about what somebody else can reach. That is what makes it usable
+    /// without weighing hearsay — the claim is proved or disproved by
+    /// sending through it.
+    ///
+    /// A snapshot rather than a change, because a snapshot is idempotent
+    /// and repairs itself; and volatile, so it lives here and not in
+    /// signed state, which is for what has to survive a member being away.
+    Reachable {
+        /// The peers, as raw endpoint keys.
+        peers: Vec<[u8; 32]>,
+    },
     /// Graceful goodbye.
     ///
     /// A peer going away is not a revocation of anything.
@@ -191,6 +210,11 @@ pub fn validate_capability(
 /// network, the other networks or the agent.
 pub fn validate(message: &ControlMessage, limits: &Limits) -> Result<(), ProtocolError> {
     match message {
+        ControlMessage::Reachable { peers } => {
+            // One entry per member at most; a sender claiming more than a
+            // network can hold is not describing this network.
+            check_len("reachable.peers", peers.len(), limits.max_state_records)?;
+        }
         ControlMessage::Announce(announcement) => {
             check_len(
                 "announce.hostname",
@@ -229,6 +253,7 @@ pub fn kind(message: &ControlMessage) -> &'static str {
         ControlMessage::Ping { .. } => "ping",
         ControlMessage::Pong { .. } => "pong",
         ControlMessage::State { .. } => "state",
+        ControlMessage::Reachable { .. } => "reachable",
         ControlMessage::Bye { .. } => "bye",
     }
 }

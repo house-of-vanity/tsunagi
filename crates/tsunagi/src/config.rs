@@ -223,6 +223,10 @@ pub struct AgentConfig {
     pub bind_addrs: Vec<SocketAddr>,
     /// How much external connectivity machinery the endpoint may use.
     pub transport: TransportPolicy,
+    /// Peers with no direct data path, for tests. See
+    /// [`AgentConfig::with_unreachable_data_peers`].
+    #[cfg(feature = "testing")]
+    pub unreachable_data_peers: Arc<std::sync::Mutex<std::collections::HashSet<iroh::EndpointId>>>,
     /// Hostname announced to peers. `None` keeps whatever the state store holds,
     /// falling back to the OS hostname and finally to a short endpoint id.
     pub hostname: Option<String>,
@@ -264,6 +268,10 @@ impl AgentConfig {
             paths,
             bind_addrs: Vec::new(),
             transport: TransportPolicy::default(),
+            #[cfg(feature = "testing")]
+            unreachable_data_peers: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             hostname: None,
             discovery: None,
             discovery_interval: Duration::from_secs(5),
@@ -289,6 +297,21 @@ impl AgentConfig {
     /// Sets an explicit list of bind addresses.
     pub fn with_bind_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
         self.bind_addrs = addrs.into_iter().collect();
+        self
+    }
+
+    /// Peers this agent will not open or accept a **direct** data link with.
+    ///
+    /// Test-only, and behind the `testing` feature so a release build has
+    /// no such switch. The one arrangement that cannot be made on a single
+    /// host is two agents that both reach a third and not each other,
+    /// which is exactly the case a relay exists for.
+    #[cfg(feature = "testing")]
+    pub fn with_unreachable_data_peers(
+        mut self,
+        peers: Arc<std::sync::Mutex<std::collections::HashSet<iroh::EndpointId>>>,
+    ) -> Self {
+        self.unreachable_data_peers = peers;
         self
     }
 

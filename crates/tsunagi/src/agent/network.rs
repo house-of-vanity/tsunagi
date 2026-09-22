@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::{Limits, ReconnectPolicy};
-use crate::dataplane::transport::{InboundLink, PacketTransport, SharedLink};
+use crate::dataplane::transport::{InboundLink, PacketLink, PacketTransport, SharedLink};
 use crate::dataplane::{PluginCapability, SharedPlugin};
 use crate::discovery::{Candidate, CandidateSource, NetworkDiscovery};
 use crate::error::{Error, Result};
@@ -137,6 +137,9 @@ pub(crate) struct RuntimeParams {
     pub(crate) hostname: String,
     /// Signing key for this agent's own records.
     pub(crate) device_secret: iroh::SecretKey,
+    /// Peers with no direct data path, for tests only.
+    #[cfg(feature = "testing")]
+    pub(crate) unreachable_data_peers: Arc<std::sync::Mutex<std::collections::HashSet<EndpointId>>>,
     /// The IPv4 overlay range this agent would use, if the network has not
     /// already settled on another one.
     pub(crate) ipv4_range: Option<Ipv4Range>,
@@ -212,6 +215,14 @@ pub(crate) fn spawn(params: RuntimeParams) -> NetworkHandle {
     }
 }
 
+/// How long a peer's account of what it can reach is believed.
+///
+/// Soft state: it is repeated while it holds, and simply stops being
+/// repeated when the peer goes. Nothing is revoked, so nothing can be
+/// revoked wrongly — a relay that disappears stops being chosen by
+/// itself, a few announcements later.
+const REACH_EXPIRY: Duration = Duration::from_secs(90);
+
 /// How long a network waits to be told its range before proposing the one
 /// derived from its id.
 ///
@@ -236,7 +247,23 @@ struct Runtime {
     dial_results_tx: mpsc::Sender<DialOutcome>,
     dial_results_rx: mpsc::Receiver<DialOutcome>,
     /// Live data plane links, keyed by peer and plugin protocol.
+    ///
+    /// The direct ones. What a protocol holds is the hub's link for that
+    /// peer, which outlives any particular path.
     links: HashMap<(EndpointId, String), SharedLink>,
+    /// Every data link of this network, and what is reached through what.
+    hub: Arc<crate::dataplane::relay::RelayHub>,
+    /// Which peers each peer says it has a live link with, and when it
+    /// last said so.
+    ///
+    /// First-hand only: a peer speaks for itself and never for anybody
+    /// else, so there is no hearsay to weigh and nothing to poison. Soft
+    /// state — an entry that stops being refreshed expires, which is how a
+    /// relay that has gone stops being chosen without anybody revoking it.
+    reachable: HashMap<EndpointId, (HashSet<EndpointId>, std::time::Instant)>,
+    /// What this agent last told its peers it could reach, so it is only
+    /// said again when it changed.
+    announced_reach: HashSet<EndpointId>,
     /// Links currently being opened, so we do not start two.
     opening: HashSet<(EndpointId, String)>,
     link_results_tx: mpsc::Sender<LinkOutcome>,
@@ -283,6 +310,9 @@ impl Runtime {
             dial_results_tx,
             dial_results_rx,
             links: HashMap::new(),
+            hub: crate::dataplane::relay::RelayHub::new(network_id),
+            reachable: HashMap::new(),
+            announced_reach: HashSet::new(),
             opening: HashSet::new(),
             link_results_tx,
             link_results_rx,
@@ -491,6 +521,10 @@ impl Runtime {
         // alone, so something has to look again; this runs on a timer and
         // the check is a comparison when nothing has changed.
         self.ensure_own_claim().await;
+        // The same timer repairs the relay picture: reachability is soft
+        // state, repeated while it holds and forgotten when it stops.
+        self.update_paths();
+        self.announce_reach(true);
 
         let mut candidates: Vec<Candidate> = Vec::new();
 
@@ -1040,6 +1074,10 @@ impl Runtime {
         }
         for (peer, protocol) in dead {
             self.links.remove(&(peer, protocol.clone()));
+            // Only the direct path is gone. Whether the peer is still
+            // reachable through somebody is decided below; the protocol's
+            // link stays either way.
+            self.hub.clear_direct(peer, &protocol);
             self.emit(Event::DataLinkDown {
                 network: self.network_id,
                 peer,
@@ -1076,6 +1114,9 @@ impl Runtime {
             if self.links.contains_key(&key) || self.opening.contains(&key) {
                 continue;
             }
+            if self.no_direct_data(peer) {
+                continue;
+            }
             // The smaller endpoint id dials; the other side accepts. Both
             // compute this identically, so exactly one link is created.
             if self.local_id.as_bytes() >= peer.as_bytes() {
@@ -1106,11 +1147,142 @@ impl Runtime {
         }
     }
 
+    /// Tells peers which peers this agent has a live link with, when that
+    /// has changed.
+    ///
+    /// Only what it can see for itself, and only to the peers it is
+    /// talking to: one hop, no flooding, nothing second-hand. A peer that
+    /// hears this is the only one that can use it, because it is also the
+    /// only one that could route through this agent.
+    fn announce_reach(&mut self, force: bool) {
+        let live: HashSet<EndpointId> = self
+            .links
+            .iter()
+            .filter(|(_, link)| !link.is_closed())
+            .map(|((peer, _), _)| *peer)
+            .collect();
+        if !force && live == self.announced_reach {
+            return;
+        }
+        self.announced_reach = live.clone();
+        let message = ControlMessage::Reachable {
+            peers: live.iter().map(|peer| *peer.as_bytes()).collect(),
+        };
+        let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
+        for peer in peers {
+            if let Err(err) = self.send_to(peer, message.clone()) {
+                tracing::debug!(%err, "could not queue a reachability announcement");
+            }
+        }
+    }
+
+    /// Chooses, for every peer with no direct link, somebody to go through.
+    ///
+    /// Local and deterministic: the lowest endpoint id among the peers
+    /// that both this agent has a link with and that say they have a link
+    /// with the destination. Nothing is agreed with anybody — two agents
+    /// may well pick differently, and traffic each way finds its own path.
+    fn update_paths(&mut self) {
+        self.reachable
+            .retain(|_, (_, heard)| heard.elapsed() < REACH_EXPIRY);
+
+        let served = self.served_protocols();
+        let live: HashSet<EndpointId> = self
+            .links
+            .iter()
+            .filter(|(_, link)| !link.is_closed())
+            .map(|((peer, _), _)| *peer)
+            .collect();
+
+        // Every peer this agent would carry traffic with: a session says
+        // who it is and what it speaks, which is also what a protocol
+        // needs before it can have a link at all.
+        let wanted: Vec<(EndpointId, String)> = self
+            .sessions
+            .values()
+            .flat_map(|session| {
+                let peer = session.peer;
+                session
+                    .capabilities
+                    .iter()
+                    .filter(|capability| capability.enabled)
+                    .map(move |capability| (peer, capability.protocol.clone(), capability.version))
+            })
+            .filter(|(_, protocol, version)| {
+                served
+                    .iter()
+                    .any(|(name, ours)| name == protocol && ours == version)
+            })
+            .map(|(peer, protocol, _)| (peer, protocol))
+            .collect();
+
+        for (peer, protocol) in wanted {
+            if live.contains(&peer) {
+                // There is a direct link; a hop is only for when there is
+                // not, and holding a stale one would keep a peer that has
+                // gone looking reachable.
+                if self.hub.has_link(peer, &protocol) {
+                    self.hub.set_hop(peer, &protocol, None);
+                }
+                continue;
+            }
+            let hop = self
+                .reachable
+                .iter()
+                .filter(|(middle, (reaches, _))| {
+                    live.contains(*middle) && reaches.contains(&peer) && **middle != peer
+                })
+                .map(|(middle, _)| *middle)
+                .min_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+            let known = self.hub.has_link(peer, &protocol);
+            if !known && hop.is_none() {
+                // Nothing to reach it with and nothing to offer a
+                // protocol; inventing a link object here would only look
+                // like connectivity.
+                continue;
+            }
+            self.hub.set_hop(peer, &protocol, hop);
+            if known {
+                continue;
+            }
+            // A peer reachable only through somebody still gets a link, so
+            // its tunnel can be built: the protocol is not told how its
+            // datagrams travel, only that this is the way to that peer.
+            let Some(plugin) = self
+                .params
+                .plugins
+                .iter()
+                .find(|plugin| plugin.protocol_id() == protocol)
+                .cloned()
+            else {
+                continue;
+            };
+            let link = self.hub.link(peer, &protocol);
+            let path = link.path_description();
+            let max_datagram = link.max_datagram_size();
+            plugin.on_peer_link(self.network_id, peer, link);
+            self.emit(Event::DataLinkUp {
+                network: self.network_id,
+                peer,
+                protocol,
+                path,
+                max_datagram,
+            });
+        }
+    }
+
     fn handle_link_result(&mut self, outcome: LinkOutcome) {
         let key = (outcome.peer, outcome.protocol.clone());
         self.opening.remove(&key);
         match outcome.result {
-            Ok(link) => self.adopt_link(outcome.peer, outcome.protocol, link),
+            Ok(link) => {
+                self.adopt_link(outcome.peer, outcome.protocol, link);
+                // A new link is both a path for us and one we can offer
+                // others, so it changes what we route and what we say.
+                self.update_paths();
+                self.announce_reach(false);
+            }
             Err(reason) => {
                 // A data plane that cannot be set up is reported, never fatal.
                 self.metrics.data_link_failures += 1;
@@ -1124,8 +1296,32 @@ impl Runtime {
         }
     }
 
+    /// Whether this agent refuses a direct data path to a peer.
+    ///
+    /// Always false outside a test build: see
+    /// [`crate::config::AgentConfig::with_unreachable_data_peers`].
+    fn no_direct_data(&self, peer: EndpointId) -> bool {
+        #[cfg(feature = "testing")]
+        {
+            match self.params.unreachable_data_peers.lock() {
+                Ok(guard) => guard.contains(&peer),
+                Err(poisoned) => poisoned.into_inner().contains(&peer),
+            }
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            let _ = peer;
+            false
+        }
+    }
+
     fn install_link(&mut self, inbound: InboundLink) {
+        if self.no_direct_data(inbound.peer) {
+            return;
+        }
         self.adopt_link(inbound.peer, inbound.protocol, inbound.link);
+        self.update_paths();
+        self.announce_reach(false);
     }
 
     /// Hands a link to the plugin that owns its protocol.
@@ -1141,10 +1337,19 @@ impl Runtime {
         };
 
         let path = link.path_description();
-        let max_datagram = link.max_datagram_size();
         self.links
             .insert((peer, protocol.clone()), Arc::clone(&link));
-        plugin.on_peer_link(self.network_id, peer, link);
+        // The protocol is handed the hub's link, not this one: the same
+        // object for as long as the peer is a peer, whatever happens to
+        // the path under it. A tunnel is not torn down because a direct
+        // link came or went.
+        let first_time = !self.hub.has_link(peer, &protocol);
+        self.hub.set_direct(peer, &protocol, link);
+        let shared = self.hub.link(peer, &protocol);
+        let max_datagram = shared.max_datagram_size();
+        if first_time {
+            plugin.on_peer_link(self.network_id, peer, shared);
+        }
         self.metrics.data_links_established += 1;
         self.emit(Event::DataLinkUp {
             network: self.network_id,
@@ -1157,6 +1362,10 @@ impl Runtime {
 
     /// Drops every link to a peer.
     fn drop_links_for(&mut self, peer: EndpointId) {
+        // The peer itself is going, not just a path to it, so the
+        // protocol's link goes with it.
+        self.hub.remove_peer(peer);
+        self.reachable.remove(&peer);
         let keys: Vec<(EndpointId, String)> = self
             .links
             .keys()
@@ -1386,6 +1595,17 @@ impl Runtime {
             ControlMessage::State { records } => {
                 self.pending_state.push((peer, records.clone()));
             }
+            // What that peer can reach, from that peer. Kept with the time
+            // it was heard, so it can go stale on its own.
+            ControlMessage::Reachable { peers } => {
+                let heard: HashSet<EndpointId> = peers
+                    .iter()
+                    .filter_map(|raw| EndpointId::from_bytes(raw).ok())
+                    .collect();
+                self.reachable
+                    .insert(peer, (heard, std::time::Instant::now()));
+                self.update_paths();
+            }
             ControlMessage::Pong { .. } | ControlMessage::Bye { .. } => {}
         }
 
@@ -1532,6 +1752,7 @@ impl Runtime {
                 .range_conflict
                 .filter(|_| self.effective_range().is_none()),
             metrics: self.metrics.clone(),
+            relay: self.hub.counters(),
         }
     }
 }

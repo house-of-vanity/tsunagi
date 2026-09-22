@@ -567,6 +567,8 @@ impl Agent {
             hostname: self.inner.read_hostname(),
             transport: self.inner.transport.get().cloned(),
             device_secret: self.inner.identity.signing_key(),
+            #[cfg(feature = "testing")]
+            unreachable_data_peers: Arc::clone(&self.inner.config.unreachable_data_peers),
             ipv4_range: range.propose,
             ipv4_fallback: range.fallback,
             range_conflict: range.conflict,
@@ -771,6 +773,7 @@ impl Agent {
                 range: None,
                 range_conflict: None,
                 metrics: NetworkMetrics::default(),
+                relay: Default::default(),
             });
         }
 
