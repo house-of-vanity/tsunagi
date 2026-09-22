@@ -36,6 +36,7 @@ pub enum OverlayError {
     Other(String),
 }
 
+pub mod broadcast;
 pub mod config;
 pub mod interface;
 pub mod packet;

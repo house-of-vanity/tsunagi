@@ -586,8 +586,27 @@ transport handle. It takes no routing mutex, walks no graph and does not parse
 the encrypted payload. See [routing.md](docs/routing.md) for the architecture,
 limits and reproducible forwarding microbenchmark.
 
-This wire format requires all members to upgrade together (control ALPN 2,
+This wire format requires all members to upgrade together (control ALPN 3,
 data ALPN 4); saved identities, network names, secrets and addresses survive.
+
+### LAN game discovery
+
+IPv4 UDP broadcast relay is enabled by default for each network. The IP router
+sends one encrypted copy to each participating peer, including through multihop
+paths. It supports `255.255.255.255` and the overlay subnet's broadcast address;
+received broadcasts never trigger another fanout.
+
+```sh
+tsunagi join -n games --no-broadcast
+tsunagi join -n games --broadcast
+tsunagi network broadcast <network-id-or-prefix> off
+tsunagi network broadcast <network-id-or-prefix> on
+```
+
+The choice persists across restarts and a plain `join`. It can be changed while
+the agent runs; `status` shows it for each network. The game must send through
+the Tsunagi interface. Physical LAN capture/subnet sharing is not implemented.
+See [broadcast.md](docs/broadcast.md) for domain isolation and future LAN gateways.
 
 ## How peers find each other
 

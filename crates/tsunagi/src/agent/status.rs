@@ -81,6 +81,8 @@ pub struct MemberStatus {
 /// Status of one authenticated session.
 #[derive(Debug, Clone)]
 pub struct PeerStatus {
+    /// This authenticated peer accepts network broadcasts.
+    pub broadcast: bool,
     /// Authenticated endpoint id.
     pub endpoint_id: EndpointId,
     /// Which side this agent played in the handshake.
@@ -151,6 +153,8 @@ pub struct NetworkMetrics {
 /// Status of one network.
 #[derive(Debug, Clone)]
 pub struct NetworkStatus {
+    /// Local broadcast participation in this network.
+    pub broadcast: bool,
     /// Immutable deterministic description of the network space.
     pub descriptor: NetworkDescriptor,
     /// Network name, for convenience.

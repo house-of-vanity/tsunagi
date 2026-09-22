@@ -116,6 +116,13 @@ struct NetworkArgs {
 /// so it can be passed on.
 #[derive(Debug, Args)]
 struct JoinArgs {
+    /// Enable LAN UDP broadcast relay for this network (default for new networks).
+    #[arg(long, conflicts_with = "no_broadcast")]
+    broadcast: bool,
+    /// Disable LAN UDP broadcast relay for this network, including after restart.
+    #[arg(long, conflicts_with = "broadcast")]
+    no_broadcast: bool,
+
     #[command(flatten)]
     paths: PathArgs,
 
@@ -138,6 +145,14 @@ struct JoinArgs {
 
 #[derive(Debug, Subcommand)]
 enum NetworkAction {
+    /// Shows or changes this network's local LAN broadcast participation.
+    Broadcast {
+        /// Network id or unique id prefix.
+        network: String,
+        /// New choice; omit to show the stored choice.
+        #[arg(value_enum)]
+        choice: Option<BroadcastChoice>,
+    },
     /// Makes a network, or joins one, in the agent that is already running.
     ///
     /// The state directory belongs to one live agent, so this is how a
@@ -194,6 +209,12 @@ enum NetworkAction {
         #[command(subcommand)]
         action: Option<SecretAction>,
     },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum BroadcastChoice {
+    On,
+    Off,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1326,6 +1347,7 @@ impl tsunagi::ipc::ReportSource for AgentControl {
         &self,
         name: String,
         secret: String,
+        broadcast: Option<bool>,
     ) -> tsunagi::BoxFuture<'_, Result<tsunagi::ipc::JoinedReport, String>> {
         Box::pin(async move {
             let name = NetworkName::new(&name).map_err(|err| err.to_string())?;
@@ -1349,7 +1371,7 @@ impl tsunagi::ipc::ReportSource for AgentControl {
 
             let network_id = self
                 .agent
-                .join_network(&name, &secret)
+                .join_network_with_broadcast(&name, &secret, broadcast)
                 .await
                 .map_err(|err| err.to_string())?;
             Ok(tsunagi::ipc::JoinedReport {
@@ -1358,6 +1380,23 @@ impl tsunagi::ipc::ReportSource for AgentControl {
                 already_configured: already,
                 name_shared_with: shared,
             })
+        })
+    }
+
+    fn set_broadcast(
+        &self,
+        network_id: String,
+        enabled: bool,
+    ) -> tsunagi::BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async move {
+            let id = network_id
+                .parse()
+                .map_err(|err| format!("invalid network id: {err}"))?;
+            self.agent
+                .set_broadcast(id, enabled)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(enabled)
         })
     }
 
@@ -1506,6 +1545,9 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
     let socket = control_socket(&paths, args.control_socket.as_ref());
     match args.action {
         None => show_networks(&paths, &socket).await,
+        Some(NetworkAction::Broadcast { network, choice }) => {
+            broadcast_command(&paths, &socket, &network, choice).await
+        }
         Some(NetworkAction::Join(args)) => join_command(args).await,
         Some(NetworkAction::Stop { network }) => set_active(&paths, &socket, &network, false).await,
         Some(NetworkAction::Start { network }) => set_active(&paths, &socket, &network, true).await,
@@ -1549,7 +1591,14 @@ async fn join_command(args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> 
     // configured and the difference is what the user needs to see.
     let network_id = tsunagi::identity::NetworkKeys::derive(&name, &secret).network_id();
     let (standing, _) = network_context(&stored_networks(&paths), &name, network_id);
-    join_network(&paths, &socket, &name, secret, origin, standing).await
+    let broadcast = if args.no_broadcast {
+        Some(false)
+    } else if args.broadcast {
+        Some(true)
+    } else {
+        None
+    };
+    join_network(&paths, &socket, &name, secret, origin, standing, broadcast).await
 }
 
 /// Joins a network: into the running agent if there is one.
@@ -1560,13 +1609,19 @@ async fn join_network(
     secret: NetworkSecret,
     origin: SecretOrigin,
     standing: NetworkStanding,
+    broadcast: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The running agent, because a second `up` cannot have the directory
     // and because this way the network starts at once instead of at the
     // next restart.
     if tsunagi::ipc::is_serving(socket).await {
-        let report =
-            tsunagi::ipc::join_network(socket, name.as_str(), secret.encode().as_str()).await?;
+        let report = tsunagi::ipc::join_network_with_broadcast(
+            socket,
+            name.as_str(),
+            secret.encode().as_str(),
+            broadcast,
+        )
+        .await?;
         // The id in full either way: it is what every other command takes,
         // and the shortened form in a report is for reading, not copying.
         match standing {
@@ -1614,6 +1669,9 @@ async fn join_network(
     storage
         .upsert_network(keys.network_id(), name.clone(), secret.clone(), true)
         .await?;
+    if let Some(enabled) = broadcast {
+        storage.set_broadcast(keys.network_id(), enabled).await?;
+    }
     storage.release_ownership_lock();
 
     match standing {
@@ -1747,6 +1805,33 @@ async fn show_networks(
 /// Deliberately not a signed anything: stopping is this device being away,
 /// which is an ordinary condition the others already handle, and the whole
 /// point is that everything is still here when it comes back.
+async fn broadcast_command(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+    wanted: &str,
+    choice: Option<BroadcastChoice>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let configured = stored_networks(paths);
+    let network = resolve_network(&configured, wanted)?;
+    let mut enabled = network.broadcast;
+    if let Some(choice) = choice {
+        enabled = matches!(choice, BroadcastChoice::On);
+        if tsunagi::ipc::is_serving(socket).await {
+            tsunagi::ipc::set_broadcast(socket, &network.network_id.to_string(), enabled).await?;
+        } else {
+            let storage = tsunagi::storage::Storage::open(paths)?;
+            storage.set_broadcast(network.network_id, enabled).await?;
+        }
+    }
+    println!(
+        "broadcast {} for `{}` ({})",
+        if enabled { "on" } else { "off" },
+        network.name,
+        network.network_id
+    );
+    Ok(())
+}
+
 async fn set_active(
     paths: &StoragePaths,
     socket: &std::path::Path,
@@ -2555,6 +2640,11 @@ fn network_section(
     // Only when something has: a relay that has carried nothing is not
     // worth a line, and one that has is worth knowing about — it is
     // somebody else's traffic on this device's uplink.
+    section.push(Row::new(
+        Health::Info,
+        "broadcast",
+        if network.broadcast { "on" } else { "off" },
+    ));
     let relayed = network.relay_forwarded + network.relay_sent_via + network.relay_received_via;
     if relayed > 0 {
         section.push(Row::new(
@@ -3577,6 +3667,7 @@ async fn build_report(
                 });
 
             NetworkReport {
+                broadcast: network.broadcast,
                 name: network.name.to_string(),
                 network_id: network.network_id.to_string(),
                 active: matches!(network.state, tsunagi::agent::NetworkState::Active),
@@ -3884,6 +3975,7 @@ mod status_tests {
     /// The situation that prompted this: one peer left and came back.
     fn network_after_a_peer_returned() -> NetworkReport {
         NetworkReport {
+            broadcast: true,
             name: "LAB".into(),
             network_id: "xa7gyz".into(),
             active: true,
@@ -4205,6 +4297,7 @@ mod network_tests {
             NetworkSecret::from_bytes(&[secret.as_bytes(), &[0u8; 32]].concat()[..32]).unwrap();
         let keys = NetworkKeys::derive(&name, &secret);
         StoredNetwork {
+            broadcast: true,
             network_id: keys.network_id(),
             name,
             secret,
@@ -4373,6 +4466,7 @@ mod network_context_tests {
         let secret = NetworkSecret::from_bytes([seed; 32]).unwrap();
         let keys = NetworkKeys::derive(&name, &secret);
         StoredNetwork {
+            broadcast: true,
             network_id: keys.network_id(),
             name,
             secret,

@@ -248,6 +248,12 @@ impl Storage {
             .await
     }
 
+    /// Persists local broadcast participation for one configured network.
+    pub async fn set_broadcast(&self, network_id: NetworkId, enabled: bool) -> Result<()> {
+        self.with_state(move |state| state.set_broadcast(network_id, enabled))
+            .await
+    }
+
     /// Updates the auto-start flag of a network.
     pub async fn set_auto_start(&self, network_id: NetworkId, auto_start: bool) -> Result<()> {
         self.with_state(move |state| state.set_auto_start(network_id, auto_start))

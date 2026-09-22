@@ -60,6 +60,7 @@ not tunnel control sessions. See [routing.md](routing.md).
 | `dataplane::routing` | transport-independent graph, shortest paths and opaque flow identifiers |
 | `dataplane::relay` | immutable forwarding snapshots and transport-to-transport transit |
 | `dataplane` | the contract an IP protocol implements |
+| `overlay::broadcast` | domain-scoped IPv4 UDP discovery fanout and receive admission |
 | `overlay` | the one interface an agent owns: provisioning, the TUN, whose packet is whose |
 | `dns` | the DNS view of a network, and telling the system resolver about it |
 

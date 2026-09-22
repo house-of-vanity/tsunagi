@@ -20,7 +20,7 @@ use crate::error::ProtocolError;
 /// The version in the ALPN is the wire-compatibility version of the control
 /// protocol. It is independent of the network identity scheme version, so
 /// bumping it must not change any existing [`crate::NetworkId`].
-pub const ALPN: &[u8] = b"tsunagi/ctrl/2";
+pub const ALPN: &[u8] = b"tsunagi/ctrl/3";
 
 /// ALPN of the tsunagi data plane.
 ///
@@ -41,7 +41,7 @@ pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
 pub const MAX_SIGNATURE_LEN: usize = 64;
 
 /// Control protocol version carried inside the handshake.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// First message of the handshake, sent by the initiator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +73,8 @@ pub struct AuthProof {
 /// What this agent tells a peer about itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Announcement {
+    /// Local opt-in to receive LAN broadcasts in this network.
+    pub broadcast: bool,
     /// Human-readable hostname. A mutable binding, not an identity.
     pub hostname: String,
     /// Announced IP plugin capabilities. Opaque to the core.

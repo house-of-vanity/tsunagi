@@ -58,6 +58,8 @@ use shutdown::Shutdown;
 /// Summary of a configured network, whether or not it is running.
 #[derive(Debug, Clone)]
 pub struct ConfiguredNetwork {
+    /// Saved local broadcast participation.
+    pub broadcast: bool,
     /// Public network identifier.
     pub network_id: NetworkId,
     /// Network name.
@@ -361,6 +363,7 @@ impl Agent {
         };
         let reserve = |wanted: Ipv4Range| {
             let reservation = crate::overlay::NetworkRoutes {
+                broadcast: Default::default(),
                 range: Some(wanted),
                 local: None,
                 peers: Vec::new(),
@@ -489,6 +492,16 @@ impl Agent {
         name: &NetworkName,
         secret: &NetworkSecret,
     ) -> Result<NetworkId> {
+        self.join_network_with_broadcast(name, secret, None).await
+    }
+
+    /// Joins with an explicit broadcast choice; absent preserves saved policy.
+    pub async fn join_network_with_broadcast(
+        &self,
+        name: &NetworkName,
+        secret: &NetworkSecret,
+        broadcast: Option<bool>,
+    ) -> Result<NetworkId> {
         let keys = NetworkKeys::derive(name, secret);
         let network_id = keys.network_id();
 
@@ -516,11 +529,29 @@ impl Agent {
             .storage
             .upsert_network(network_id, name.clone(), secret.clone(), true)
             .await?;
+        if let Some(enabled) = broadcast {
+            self.set_broadcast(network_id, enabled).await?;
+        }
         match self.activate_with_keys(keys).await {
             // Already a member of exactly this network space: nothing to do.
             Ok(()) | Err(Error::NetworkAlreadyActive(_)) => Ok(network_id),
             Err(err) => Err(err),
         }
+    }
+
+    /// Changes a network's local broadcast policy now and after restart.
+    pub async fn set_broadcast(&self, network_id: NetworkId, enabled: bool) -> Result<()> {
+        self.inner
+            .storage
+            .set_broadcast(network_id, enabled)
+            .await?;
+        if self.is_active(network_id).await {
+            let (reply, receive) = oneshot::channel();
+            self.command(network_id, NetCommand::SetBroadcast { enabled, reply })
+                .await?;
+            receive.await.map_err(|_| Error::Stopped)?;
+        }
+        Ok(())
     }
 
     /// Activates a configured network that is currently inactive.
@@ -567,7 +598,16 @@ impl Agent {
                     as Arc<dyn crate::discovery::NetworkDiscovery>,
             )
         };
+        let broadcast = self
+            .inner
+            .storage
+            .list_networks()
+            .await?
+            .into_iter()
+            .find(|stored| stored.network_id == network_id)
+            .is_none_or(|stored| stored.broadcast);
         let handle = network::spawn(RuntimeParams {
+            broadcast,
             keys,
             adapter: self.inner.adapter.clone(),
             storage: self.inner.storage.clone(),
@@ -703,6 +743,7 @@ impl Agent {
             .await?
             .into_iter()
             .map(|stored| ConfiguredNetwork {
+                broadcast: stored.broadcast,
                 network_id: stored.network_id,
                 name: stored.name,
                 auto_start: stored.auto_start,
@@ -777,6 +818,7 @@ impl Agent {
             }
             let keys = NetworkKeys::derive(&stored.name, &stored.secret);
             networks.push(NetworkStatus {
+                broadcast: stored.broadcast,
                 descriptor: keys.descriptor(),
                 name: stored.name,
                 network_id: stored.network_id,

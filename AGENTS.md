@@ -50,6 +50,12 @@ Keep these separate. Crossing them is the main thing to review for.
   volatile: each authenticated member advertises its own protocol-specific
   links. Build routing tables on topology changes, never per packet. Transit
   must not acquire a routing mutex or wait for a protocol/TUN reader.
+- **Broadcast fanout belongs at local IP ingress.** Participation is local to
+  each network, enabled by default, persisted and advertised to authenticated
+  peers. Resolve one source domain and target only its willing members. Remote
+  delivery never triggers another fanout. Physical LAN exports must extend
+  explicit ingress and source/destination admission policies; never bypass
+  ownership checks or add broadcast flooding to encrypted transit.
 - **Plugins never learn reachability.** An `IpPlugin` is handed a `PacketLink`
   per peer and moves datagrams over it. Addresses, hole punching and relays
   belong to `crates/tsunagi/src/dataplane/transport/`. A plugin announcement says *who*, never
@@ -168,7 +174,26 @@ kind.
 - Running several library instances in one process is not a test of several
   system processes; do not describe it as one.
 
-## Before you open a change
+## Commit every completed change
+
+Agents must create a Git commit before finishing any task that changes this
+repository. Do not leave the user to make the commit. Inspect recent commit
+messages and follow their style: a short English subject stating the change,
+then a useful body explaining the problem, final behavior, architectural
+decisions, compatibility/migration effects, and checks actually performed.
+Write enough context for a future maintainer or LLM to understand why the code
+exists. Record failed or skipped checks honestly; never claim unrun tests.
+
+Before committing, inspect the diff and stage only this task's changes. Preserve
+unrelated user changes and never commit secrets or generated build artifacts.
+If Git has no effective author name or email, set only the missing repository-
+local values to `AB` and `ab@hexor.cy`. Do not override an existing identity or
+change global Git configuration. Report the resulting commit hash.
+
+Version bumps, release tags, and pushing commits/tags belong to the user unless
+they explicitly ask the agent to do them. Read-only tasks need no empty commit.
+
+## Required validation
 
 ```bash
 cargo fmt --all -- --check

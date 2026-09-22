@@ -53,6 +53,10 @@ pub enum Rejected {
     WrongFamily,
     /// The sending peer does not hold the source address it used.
     WrongSource,
+    /// Broadcast disabled, outside this domain, or malformed/non-UDP.
+    BroadcastDenied,
+    /// The packet terminates outside this host's network address/domain.
+    WrongDestination,
 }
 
 /// Counters for one interface.
@@ -60,6 +64,12 @@ pub enum Rejected {
 pub struct Counters {
     /// Packets handed to a protocol.
     pub sent: u64,
+    /// Broadcast copies handed to recipient tunnels.
+    pub broadcast_sent: u64,
+    /// Broadcast packets admitted to this host.
+    pub broadcast_received: u64,
+    /// Broadcasts refused by domain policy or packet validation.
+    pub broadcast_dropped: u64,
     /// Packets written to the operating system.
     pub received: u64,
     /// Packets for an address nobody in any network holds.
@@ -68,10 +78,12 @@ pub struct Counters {
     pub unroutable_sample: Option<IpAddr>,
     /// Packets nothing could carry, though their destination was known.
     pub undeliverable: u64,
-    /// Multicast and broadcast packets, which the overlay does not carry.
+    /// Unsupported multicast or unspecified-destination packets.
     pub multicast: u64,
     /// Packets from a peer that does not hold the source address used.
     pub wrong_source: u64,
+    /// Decrypted packets addressed outside the receiving network's local host.
+    pub wrong_destination: u64,
     /// Packets that could not be read at all.
     pub malformed: u64,
 }
@@ -79,11 +91,15 @@ pub struct Counters {
 #[derive(Debug, Default)]
 struct Tally {
     sent: AtomicU64,
+    broadcast_sent: AtomicU64,
+    broadcast_received: AtomicU64,
+    broadcast_dropped: AtomicU64,
     received: AtomicU64,
     unroutable: AtomicU64,
     undeliverable: AtomicU64,
     multicast: AtomicU64,
     wrong_source: AtomicU64,
+    wrong_destination: AtomicU64,
     malformed: AtomicU64,
     sample: std::sync::Mutex<Option<IpAddr>>,
 }
@@ -92,6 +108,9 @@ impl Tally {
     fn snapshot(&self) -> Counters {
         Counters {
             sent: self.sent.load(Ordering::Relaxed),
+            broadcast_sent: self.broadcast_sent.load(Ordering::Relaxed),
+            broadcast_received: self.broadcast_received.load(Ordering::Relaxed),
+            broadcast_dropped: self.broadcast_dropped.load(Ordering::Relaxed),
             received: self.received.load(Ordering::Relaxed),
             unroutable: self.unroutable.load(Ordering::Relaxed),
             unroutable_sample: match self.sample.lock() {
@@ -101,6 +120,7 @@ impl Tally {
             undeliverable: self.undeliverable.load(Ordering::Relaxed),
             multicast: self.multicast.load(Ordering::Relaxed),
             wrong_source: self.wrong_source.load(Ordering::Relaxed),
+            wrong_destination: self.wrong_destination.load(Ordering::Relaxed),
             malformed: self.malformed.load(Ordering::Relaxed),
         }
     }
@@ -158,6 +178,27 @@ impl Interface {
                         continue;
                     };
                     let destination = header.destination();
+                    if let (IpAddr::V4(source), IpAddr::V4(destination)) =
+                        (header.source(), destination)
+                        && routes.is_broadcast(destination)
+                    {
+                        let recipients = super::broadcast::valid_udp(&packet)
+                            .then(|| routes.broadcast_recipients(source, destination))
+                            .flatten();
+                        if let Some(recipients) = recipients {
+                            for &route in recipients.iter() {
+                                if carrier.carry(route, packet.clone()) {
+                                    tally.sent.fetch_add(1, Ordering::Relaxed);
+                                    tally.broadcast_sent.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    tally.undeliverable.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        } else {
+                            tally.broadcast_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
                     if is_multicast_or_broadcast(destination) {
                         // The operating system emits these on any interface.
                         // The overlay is a set of point-to-point tunnels and
@@ -286,7 +327,31 @@ impl Interface {
             self.tally.wrong_source.fetch_add(1, Ordering::Relaxed);
             return Err(Rejected::WrongSource);
         }
+        let broadcast = match header.destination() {
+            IpAddr::V4(destination) if self.routes.is_broadcast(destination) => {
+                if !super::broadcast::valid_udp(&packet)
+                    || !self.routes.accepts_broadcast(network, peer, destination)
+                {
+                    self.tally.broadcast_dropped.fetch_add(1, Ordering::Relaxed);
+                    return Err(Rejected::BroadcastDenied);
+                }
+                true
+            }
+            IpAddr::V4(destination) if self.routes.is_local_destination(network, destination) => {
+                false
+            }
+            _ => {
+                self.tally.wrong_destination.fetch_add(1, Ordering::Relaxed);
+                return Err(Rejected::WrongDestination);
+            }
+        };
+        // Remote broadcasts terminate here. Only local TUN ingress can fan out.
         if self.device.send(packet).await.is_ok() {
+            if broadcast {
+                self.tally
+                    .broadcast_received
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.tally.received.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -393,6 +458,73 @@ mod tests {
         Bytes::from(packet)
     }
 
+    #[tokio::test]
+    async fn broadcast_ingress_is_validated_and_remote_delivery_never_refloods() {
+        use super::super::broadcast::BroadcastPolicy;
+        use std::collections::HashSet;
+        let (interface, device, routes, carrier, id) = interface(false).await;
+        let enabled = BroadcastPolicy {
+            enabled: true,
+            peers: HashSet::from([peer(2)]),
+        };
+        routes.set_broadcast(id, enabled.clone());
+        let packet = ipv4(addr(2), Ipv4Addr::BROADCAST, &[0, 1, 0, 2, 0, 8, 0, 0]);
+        interface
+            .deliver(id, peer(2), packet.clone())
+            .await
+            .unwrap();
+        assert_eq!(device.pop_to_os().await.unwrap(), packet);
+        assert!(
+            carrier.carried().is_empty(),
+            "remote ingress never originates a fanout"
+        );
+        assert_eq!(
+            interface.deliver(id, peer(3), packet.clone()).await,
+            Err(Rejected::WrongSource)
+        );
+        assert_eq!(
+            interface
+                .deliver(id, peer(2), ipv4(addr(2), Ipv4Addr::BROADCAST, b"bad"))
+                .await,
+            Err(Rejected::BroadcastDenied)
+        );
+        routes.set_broadcast(
+            id,
+            BroadcastPolicy {
+                enabled: false,
+                ..enabled
+            },
+        );
+        assert_eq!(
+            interface.deliver(id, peer(2), packet).await,
+            Err(Rejected::BroadcastDenied)
+        );
+        // An authenticated sender cannot use TUN as a gateway to a physical LAN.
+        assert_eq!(
+            interface
+                .deliver(
+                    id,
+                    peer(2),
+                    ipv4(
+                        addr(2),
+                        "192.168.1.255".parse().unwrap(),
+                        &[0, 1, 0, 2, 0, 8, 0, 0]
+                    )
+                )
+                .await,
+            Err(Rejected::WrongDestination)
+        );
+        device.push_from_os(ipv4(
+            addr(1),
+            Ipv4Addr::BROADCAST,
+            &[0, 1, 0, 2, 0, 8, 0, 0],
+        ));
+        wait_for(&interface, |c| c.broadcast_dropped.saturating_sub(2)).await;
+        assert!(carrier.carried().is_empty());
+        assert_eq!(interface.counters().received, 1);
+        interface.remove().await;
+    }
+
     /// Records what it was asked to carry, and can refuse.
     #[derive(Debug, Default)]
     struct Recorder {
@@ -437,6 +569,7 @@ mod tests {
             .set_network(
                 id,
                 NetworkRoutes {
+                    broadcast: Default::default(),
                     range: Some("10.13.37.0/24".parse().unwrap()),
                     local: Some(addr(1)),
                     peers: vec![(addr(2), peer(2)), (addr(3), peer(3))],
@@ -602,6 +735,7 @@ mod tests {
             .set_network(
                 id,
                 NetworkRoutes {
+                    broadcast: Default::default(),
                     range: Some("10.13.37.0/24".parse().unwrap()),
                     local: Some(addr(9)),
                     peers: vec![(addr(2), peer(2))],

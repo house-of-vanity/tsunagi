@@ -21,7 +21,7 @@ use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
 use crate::state::{RecordBody, SignedRecord};
 
 /// Schema version written by this build.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Key of the stored hostname setting.
 const SETTING_HOSTNAME: &str = "hostname";
@@ -40,6 +40,8 @@ pub struct StoredNetwork {
     pub secret: NetworkSecret,
     /// Whether the network is activated automatically at agent startup.
     pub auto_start: bool,
+    /// Local broadcast participation, enabled unless explicitly disabled.
+    pub broadcast: bool,
 }
 
 /// The mandatory state store.
@@ -182,6 +184,12 @@ impl StateStore {
             self.conn
                 .execute_batch(SIGNED_RECORDS_SCHEMA)
                 .map_err(|err| self.corrupt(format!("cannot create schema: {err}")))?;
+        }
+        if found < 4 {
+            self.conn.execute_batch("BEGIN;
+                ALTER TABLE networks ADD COLUMN broadcast INTEGER NOT NULL DEFAULT 1 CHECK (broadcast IN (0,1));
+                PRAGMA user_version = 4;
+                COMMIT;").map_err(|err| self.corrupt(format!("cannot migrate schema to 4: {err}")))?;
         }
         Ok(())
     }
@@ -396,6 +404,21 @@ impl StateStore {
         Ok(())
     }
 
+    /// Saves local participation without changing identity, membership or auto-start.
+    pub fn set_broadcast(&self, network_id: NetworkId, enabled: bool) -> Result<()> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE networks SET broadcast = ?2 WHERE network_id = ?1",
+                params![network_id.as_bytes().as_slice(), enabled as i64],
+            )
+            .map_err(|err| Error::Storage(format!("cannot update broadcast policy: {err}")))?;
+        if changed == 0 {
+            return Err(Error::NetworkUnknown(network_id));
+        }
+        Ok(())
+    }
+
     /// Removes a network configuration entirely.
     pub fn remove_network(&self, network_id: NetworkId) -> Result<()> {
         self.conn
@@ -411,7 +434,7 @@ impl StateStore {
     pub fn list_networks(&self) -> Result<Vec<StoredNetwork>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT network_id, name, secret, auto_start FROM networks ORDER BY name")
+            .prepare("SELECT network_id, name, secret, auto_start, broadcast FROM networks ORDER BY name")
             .map_err(|err| Error::Storage(format!("cannot list networks: {err}")))?;
         let rows = stmt
             .query_map([], |row| {
@@ -419,13 +442,13 @@ impl StateStore {
                 let name: String = row.get(1)?;
                 let secret: Vec<u8> = row.get(2)?;
                 let auto_start: i64 = row.get(3)?;
-                Ok((id, name, secret, auto_start != 0))
+                Ok((id, name, secret, auto_start != 0, row.get::<_, bool>(4)?))
             })
             .map_err(|err| Error::Storage(format!("cannot list networks: {err}")))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id, name, secret, auto_start) =
+            let (id, name, secret, auto_start, broadcast) =
                 row.map_err(|err| Error::Storage(format!("cannot read network row: {err}")))?;
             let id: [u8; 32] = id
                 .as_slice()
@@ -436,6 +459,7 @@ impl StateStore {
                 name: NetworkName::new(name)?,
                 secret: NetworkSecret::from_bytes(secret)?,
                 auto_start,
+                broadcast,
             });
         }
         Ok(out)
@@ -667,4 +691,59 @@ pub(crate) fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+#[cfg(test)]
+mod broadcast_storage_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use crate::identity::NetworkKeys;
+
+    #[test]
+    fn v3_migration_preserves_identity_and_networks_and_defaults_broadcast_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let name = NetworkName::new("migration-broadcast").unwrap();
+        let secret = NetworkSecret::from_bytes([7; 32]).unwrap();
+        let id = NetworkKeys::derive(&name, &secret).network_id();
+        let store = StateStore::open(&path).unwrap();
+        let identity = store
+            .load_or_create_device_identity()
+            .unwrap()
+            .endpoint_id();
+        store.upsert_network(id, &name, &secret, false).unwrap();
+        store.set_hostname("old-host").unwrap();
+        store
+            .conn
+            .execute_batch("ALTER TABLE networks DROP COLUMN broadcast; PRAGMA user_version=3;")
+            .unwrap();
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        let networks = store.list_networks().unwrap();
+        assert_eq!(networks.len(), 1);
+        assert_eq!(networks[0].network_id, id);
+        assert!(!networks[0].auto_start);
+        assert!(networks[0].broadcast);
+        assert_eq!(store.hostname().unwrap().as_deref(), Some("old-host"));
+        assert_eq!(
+            store
+                .load_or_create_device_identity()
+                .unwrap()
+                .endpoint_id(),
+            identity
+        );
+        store.set_broadcast(id, false).unwrap();
+        store.upsert_network(id, &name, &secret, true).unwrap();
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        assert!(
+            !store.list_networks().unwrap()[0].broadcast,
+            "rejoin and restart preserve opt-out"
+        );
+        store.remove_network(id).unwrap();
+        store.upsert_network(id, &name, &secret, true).unwrap();
+        assert!(
+            store.list_networks().unwrap()[0].broadcast,
+            "forgotten network gets defaults"
+        );
+    }
 }

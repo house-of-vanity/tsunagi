@@ -92,6 +92,13 @@ pub fn control_socket_path(state_dir: &Path) -> PathBuf {
 pub enum Request {
     /// Report what the agent is doing.
     Status,
+    /// Set local broadcast participation in one configured network.
+    SetBroadcast {
+        /// Public network identifier.
+        network_id: String,
+        /// Whether to originate and accept broadcasts.
+        enabled: bool,
+    },
     /// Answer to a different name from now on.
     ///
     /// Applied by the running agent rather than written behind its back, so
@@ -135,6 +142,9 @@ pub enum Request {
         /// It travels over a socket only its owner can open, to the agent
         /// that stores it anyway, and never appears in `Debug`.
         secret: String,
+        /// Explicit choice, or preserve the saved setting.
+        #[serde(default)]
+        broadcast: Option<bool>,
     },
 }
 
@@ -142,6 +152,10 @@ impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Request::Status => f.write_str("Status"),
+            Request::SetBroadcast {
+                network_id,
+                enabled,
+            } => write!(f, "SetBroadcast {{ {network_id}, enabled: {enabled} }}"),
             Request::SetHostname(name) => write!(f, "SetHostname({name})"),
             Request::Leave(network) => write!(f, "Leave({network})"),
             Request::SetActive { network_id, active } => {
@@ -162,6 +176,8 @@ impl std::fmt::Debug for Request {
 pub enum Response {
     /// A status report.
     Status(Box<StatusReport>),
+    /// Accepted local broadcast participation.
+    Broadcast(bool),
     /// The name the agent now answers to, after reducing it to canonical form.
     Hostname(String),
     /// A network was left.
@@ -274,6 +290,9 @@ pub struct DnsReport {
 /// One network.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkReport {
+    /// Whether this agent participates in LAN broadcasts in this network.
+    #[serde(default)]
+    pub broadcast: bool,
     /// Network name.
     pub name: String,
     /// Public network identifier.
@@ -455,8 +474,18 @@ pub trait ReportSource: Send + Sync + 'static {
         &self,
         _name: String,
         _secret: String,
+        _broadcast: Option<bool>,
     ) -> BoxFuture<'_, std::result::Result<JoinedReport, String>> {
         Box::pin(async move { Err("this agent cannot join a network".to_string()) })
+    }
+
+    /// Persists and applies local broadcast participation.
+    fn set_broadcast(
+        &self,
+        _network_id: String,
+        _enabled: bool,
+    ) -> BoxFuture<'_, std::result::Result<bool, String>> {
+        Box::pin(async move { Err("this agent cannot change broadcast participation".into()) })
     }
 
     /// Stops serving a network, or starts serving it again.
@@ -510,7 +539,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 13]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 14]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///
@@ -535,6 +564,13 @@ where
         };
     let response = match request {
         Request::Status => Response::Status(Box::new(source.report().await)),
+        Request::SetBroadcast {
+            network_id,
+            enabled,
+        } => match source.set_broadcast(network_id, enabled).await {
+            Ok(enabled) => Response::Broadcast(enabled),
+            Err(error) => Response::Error(error),
+        },
         Request::SetHostname(hostname) => match source.set_hostname(hostname).await {
             Ok(accepted) => Response::Hostname(accepted),
             Err(reason) => Response::Error(reason),
@@ -543,7 +579,11 @@ where
             Ok(report) => Response::Left(report),
             Err(reason) => Response::Error(reason),
         },
-        Request::Join { name, secret } => match source.join(name, secret).await {
+        Request::Join {
+            name,
+            secret,
+            broadcast,
+        } => match source.join(name, secret, broadcast).await {
             Ok(report) => Response::Joined(report),
             Err(reason) => Response::Error(reason),
         },
@@ -638,13 +678,43 @@ pub async fn join_network(
     secret: &str,
 ) -> Result<JoinedReport> {
     let path = path.as_ref();
+    join_network_with_broadcast(path, name, secret, None).await
+}
+
+/// Joins with an explicit per-network broadcast choice.
+pub async fn join_network_with_broadcast(
+    path: impl AsRef<Path>,
+    name: &str,
+    secret: &str,
+    broadcast: Option<bool>,
+) -> Result<JoinedReport> {
+    let path = path.as_ref();
     let request = Request::Join {
+        broadcast,
         name: name.to_string(),
         secret: secret.to_string(),
     };
     match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
         Response::Joined(report) => Ok(report),
         Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
+/// Changes one network's broadcast participation while the agent runs.
+pub async fn set_broadcast(
+    path: impl AsRef<Path>,
+    network_id: &str,
+    enabled: bool,
+) -> Result<bool> {
+    let path = path.as_ref();
+    let request = Request::SetBroadcast {
+        network_id: network_id.to_owned(),
+        enabled,
+    };
+    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
+        Response::Broadcast(enabled) => Ok(enabled),
+        Response::Error(message) => Err(Error::Storage(message)),
         other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
     }
 }

@@ -76,6 +76,15 @@ links. Real encrypted 1280-byte TCP packets travel in both directions while the
 middle TUNs remain empty. A direct A—D link is enabled, then removed; the route
 switches back to the chain without replacing end-to-end tunnels.
 
+Broadcast tests use limited and directed UDP game discovery packets over real
+WireGuard tunnels, including a missing direct link. Each willing peer gets one
+copy; disabling reception/origination works at runtime and unicast still works.
+IP-router tests cover source/destination domain checks, malformed UDP and the
+absence of reflection into outgoing fanout. SQLite migration tests preserve v3
+identity/settings and check opt-out after reopen/rejoin. CLI tests cover default
+on, per-network opt-out, runtime updates and conflicting flags. Actual games and
+host adapter selection are not simulated by these tests.
+
 The ignored `forwarding_benchmark` measures the synchronous transit routine in
 release mode, excluding crypto and socket I/O. Run it explicitly as described
 in [routing.md](routing.md); it has no timing threshold in the default suite.

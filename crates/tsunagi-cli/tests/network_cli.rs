@@ -250,3 +250,65 @@ fn up_is_the_agent_and_takes_no_network_at_all() {
         );
     }
 }
+#[test]
+fn broadcast_choice_is_per_network_live_persistent_and_preserved_by_rejoin() {
+    let agent = start_bare(0);
+    for args in [
+        vec!["join", "-n", "broadcast-default"],
+        vec!["join", "-n", "broadcast-off", "--no-broadcast"],
+    ] {
+        let result = agent.run(&args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let read = || {
+        tsunagi::storage::StateStore::open(agent.dir.path().join("state/state.sqlite"))
+            .unwrap()
+            .list_networks()
+            .unwrap()
+    };
+    let networks = read();
+    let enabled = networks
+        .iter()
+        .find(|n| n.name.as_str() == "broadcast-default")
+        .unwrap();
+    let disabled = networks
+        .iter()
+        .find(|n| n.name.as_str() == "broadcast-off")
+        .unwrap();
+    assert!(enabled.broadcast);
+    assert!(!disabled.broadcast);
+    assert!(agent.run(&["join", "-n", "broadcast-off"]).status.success());
+    assert!(
+        !read()
+            .iter()
+            .find(|n| n.name.as_str() == "broadcast-off")
+            .unwrap()
+            .broadcast
+    );
+    let id = disabled.network_id.to_string();
+    let change = agent.run(&["network", "broadcast", &id, "on"]);
+    assert!(
+        change.status.success(),
+        "{}",
+        String::from_utf8_lossy(&change.stderr)
+    );
+    assert!(read().iter().all(|n| n.broadcast));
+    let change = agent.run(&["join", "-n", "broadcast-off", "--no-broadcast"]);
+    assert!(
+        change.status.success(),
+        "{}",
+        String::from_utf8_lossy(&change.stderr)
+    );
+    let status = agent.run(&["network", "broadcast", &id]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("broadcast off"));
+    assert!(
+        !agent
+            .run(&["join", "-n", "conflict", "--broadcast", "--no-broadcast"])
+            .status
+            .success()
+    );
+}

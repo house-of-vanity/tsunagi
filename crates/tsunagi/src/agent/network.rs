@@ -62,6 +62,10 @@ pub(crate) enum NetCommand {
         reply: oneshot::Sender<Box<NetworkStatus>>,
     },
     Recheck,
+    SetBroadcast {
+        enabled: bool,
+        reply: oneshot::Sender<()>,
+    },
     /// Resend this agent's announcement to every peer of this network.
     Reannounce,
     /// Answer to a different name from now on.
@@ -95,6 +99,7 @@ impl std::fmt::Debug for NetCommand {
             NetCommand::Broadcast { message, .. } => write!(f, "Broadcast({})", kind(message)),
             NetCommand::Status { .. } => f.write_str("Status"),
             NetCommand::Recheck => f.write_str("Recheck"),
+            NetCommand::SetBroadcast { enabled, .. } => write!(f, "SetBroadcast({enabled})"),
             NetCommand::Reannounce => f.write_str("Reannounce"),
             NetCommand::SetHostname(_) => f.write_str("SetHostname"),
             NetCommand::Release { .. } => f.write_str("Release"),
@@ -122,6 +127,7 @@ impl NetworkHandle {
 
 /// Everything a network runtime needs to run.
 pub(crate) struct RuntimeParams {
+    pub(crate) broadcast: bool,
     pub(crate) keys: NetworkKeys,
     pub(crate) adapter: EndpointAdapter,
     pub(crate) storage: Storage,
@@ -454,6 +460,12 @@ impl Runtime {
             }
             NetCommand::Status { reply } => {
                 let _ = reply.send(Box::new(self.status()));
+            }
+            NetCommand::SetBroadcast { enabled, reply } => {
+                self.params.broadcast = enabled;
+                self.update_broadcast();
+                self.reannounce();
+                let _ = reply.send(());
             }
             NetCommand::Recheck => self.discovery_round().await,
             NetCommand::Reannounce => self.reannounce(),
@@ -1017,6 +1029,24 @@ impl Runtime {
         }
     }
 
+    fn broadcast_policy(&self) -> crate::overlay::broadcast::BroadcastPolicy {
+        crate::overlay::broadcast::BroadcastPolicy {
+            enabled: self.params.broadcast,
+            peers: self
+                .sessions
+                .values()
+                .filter(|session| session.broadcast)
+                .map(|session| session.peer)
+                .collect(),
+        }
+    }
+
+    fn update_broadcast(&self) {
+        self.params
+            .routes
+            .set_broadcast(self.network_id, self.broadcast_policy());
+    }
+
     /// Tells the plugins who holds which overlay address.
     async fn publish_allocations(&mut self) {
         let Some(range) = self.effective_range() else {
@@ -1039,6 +1069,7 @@ impl Runtime {
         // a packet for ourselves does not go over a tunnel.
         let local = self.state.address_of(&self.local_id);
         let routes = crate::overlay::NetworkRoutes {
+            broadcast: self.broadcast_policy(),
             range: Some(range),
             local,
             peers: allocations
@@ -1628,6 +1659,7 @@ impl Runtime {
         }
         capabilities.truncate(self.params.limits.max_capabilities);
         Announcement {
+            broadcast: self.params.broadcast,
             hostname: self.params.hostname.clone(),
             capabilities,
         }
@@ -1705,6 +1737,7 @@ impl Runtime {
                 }
                 self.metrics.disconnects += 1;
                 self.drop_links_for(peer);
+                self.update_broadcast();
                 self.update_paths();
                 self.announce_reach(false);
                 for plugin in &self.params.plugins {
@@ -1733,8 +1766,10 @@ impl Runtime {
                 let capabilities = announcement.capabilities.clone();
                 if let Some(session) = self.sessions.get_mut(&peer) {
                     session.hostname = Some(announcement.hostname.clone());
+                    session.broadcast = announcement.broadcast;
                     session.capabilities = capabilities.clone();
                 }
+                self.update_broadcast();
                 self.dispatch_capabilities(peer, &capabilities);
                 self.ensure_links();
                 self.update_paths();
@@ -1831,6 +1866,7 @@ impl Runtime {
             .map(|session| {
                 let snapshot = snapshot_connection(&session.conn);
                 PeerStatus {
+                    broadcast: session.broadcast,
                     endpoint_id: session.peer,
                     role: session.role,
                     hostname: session.hostname.clone(),
@@ -1898,6 +1934,7 @@ impl Runtime {
         members.dedup_by(|a, b| a.endpoint_id == b.endpoint_id);
 
         NetworkStatus {
+            broadcast: self.params.broadcast,
             descriptor: self.params.keys.descriptor(),
             name: self.params.keys.name().clone(),
             network_id: self.network_id,

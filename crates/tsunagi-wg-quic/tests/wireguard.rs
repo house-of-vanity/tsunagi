@@ -1627,3 +1627,120 @@ async fn a_chain_routes_through_two_transit_peers_without_touching_their_tuns() 
         agent.shutdown().await;
     }
 }
+#[tokio::test]
+async fn lan_broadcast_fanout_is_scoped_opt_in_and_does_not_reflood() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("lan-broadcast");
+    let cuts = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let a = WgAgent::spawn_cut_off(&discovery, "bca", cuts.clone()).await;
+    let b = WgAgent::spawn(&discovery, "bcb").await;
+    let c = WgAgent::spawn(&discovery, "bcc").await;
+    cuts.lock().unwrap().insert(c.endpoint_id());
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    c.agent.join_network(&name, &secret).await.unwrap();
+    for agent in [&a, &b, &c] {
+        agent.wait_for_tunnels(id, 2).await;
+    }
+    let addr = a.overlay(id).await;
+    let at = a.tun(id).await;
+    let bt = b.tun(id).await;
+    let ct = c.tun(id).await;
+    // Valid UDP discovery queries with game-like ports and an unchanged body.
+    fn query(source: std::net::Ipv4Addr, destination: std::net::Ipv4Addr) -> Bytes {
+        let mut bytes = vec![0u8; 36];
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&36u16.to_be_bytes());
+        bytes[8] = 1;
+        bytes[9] = 17;
+        bytes[12..16].copy_from_slice(&source.octets());
+        bytes[16..20].copy_from_slice(&destination.octets());
+        bytes[20..22].copy_from_slice(&27015u16.to_be_bytes());
+        bytes[22..24].copy_from_slice(&6112u16.to_be_bytes());
+        bytes[24..26].copy_from_slice(&16u16.to_be_bytes());
+        bytes[28..].copy_from_slice(b"LAN GAME");
+        // UDP checksum zero is valid for IPv4.
+        let sum: u32 = bytes[..20]
+            .chunks_exact(2)
+            .map(|w| u16::from_be_bytes([w[0], w[1]]) as u32)
+            .sum();
+        let checksum = !((sum & 0xffff) + (sum >> 16)) as u16;
+        bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
+        Bytes::from(bytes)
+    }
+    let range = a.agent.network_status(id).await.unwrap().range.unwrap();
+    let directed = std::net::Ipv4Addr::from(u32::from(range.base) | (u32::MAX >> range.prefix_len));
+    for destination in [std::net::Ipv4Addr::BROADCAST, directed] {
+        let packet = query(addr, destination);
+        at.push_from_os(packet.clone());
+        for tun in [&bt, &ct] {
+            assert_eq!(
+                tokio::time::timeout(tsunagi::testing::DEADLINE, tun.pop_to_os())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                packet
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), tun.pop_to_os())
+                    .await
+                    .is_err(),
+                "each recipient gets one copy"
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), at.pop_to_os())
+                .await
+                .is_err(),
+            "never reflect to the origin"
+        );
+    }
+    c.agent.set_broadcast(id, false).await.unwrap();
+    wait_until("broadcast opt-out reaches sender", || async {
+        a.agent
+            .network_status(id)
+            .await
+            .ok()?
+            .peers
+            .iter()
+            .find(|peer| peer.endpoint_id == c.endpoint_id())
+            .filter(|peer| !peer.broadcast)
+            .map(|_| ())
+    })
+    .await;
+    let packet = query(addr, std::net::Ipv4Addr::BROADCAST);
+    at.push_from_os(packet.clone());
+    assert_eq!(
+        tokio::time::timeout(tsunagi::testing::DEADLINE, bt.pop_to_os())
+            .await
+            .unwrap()
+            .unwrap(),
+        packet
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), ct.pop_to_os())
+            .await
+            .is_err()
+    );
+    // Disabling origin participation also stops outgoing copies.
+    a.agent.set_broadcast(id, false).await.unwrap();
+    at.push_from_os(packet);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), bt.pop_to_os())
+            .await
+            .is_err()
+    );
+    // Discovery's unicast reply still crosses the same multihop route.
+    let reply = tcp_packet(c.overlay(id).await, addr, 1280);
+    ct.push_from_os(reply.clone());
+    assert_eq!(
+        tokio::time::timeout(tsunagi::testing::DEADLINE, at.pop_to_os())
+            .await
+            .unwrap()
+            .unwrap(),
+        reply
+    );
+    for agent in [a, b, c] {
+        agent.shutdown().await;
+    }
+}

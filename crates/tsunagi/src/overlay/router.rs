@@ -20,9 +20,11 @@
 //! carries traffic for the same addresses and the table is the same whichever
 //! one is in use.
 
+use super::broadcast::{BroadcastPolicy, BroadcastTable};
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use iroh::EndpointId;
 
@@ -41,6 +43,8 @@ pub struct Route {
 /// What one network contributes to the table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkRoutes {
+    /// Local broadcast policy and authenticated willing recipients.
+    pub broadcast: BroadcastPolicy,
     /// The range this network allocates from, once it has agreed one.
     pub range: Option<Ipv4Range>,
     /// This agent's own address in the network.
@@ -73,6 +77,7 @@ pub enum RouteError {
 /// Address ownership across every network this agent is in.
 #[derive(Debug, Default)]
 pub struct RoutingTable {
+    broadcast: ArcSwap<BroadcastTable>,
     networks: RwLock<HashMap<NetworkId, NetworkRoutes>>,
 }
 
@@ -122,12 +127,54 @@ impl RoutingTable {
             }
         }
         networks.insert(network, routes);
+        self.broadcast
+            .store(Arc::new(BroadcastTable::build(&networks)));
         Ok(())
     }
 
     /// Forgets a network.
     pub fn remove_network(&self, network: NetworkId) {
-        self.write().remove(&network);
+        let mut networks = self.write();
+        networks.remove(&network);
+        self.broadcast
+            .store(Arc::new(BroadcastTable::build(&networks)));
+    }
+
+    /// Replaces only a network's broadcast participation, without changing addresses.
+    pub fn set_broadcast(&self, network: NetworkId, policy: BroadcastPolicy) {
+        let mut networks = self.write();
+        if let Some(routes) = networks.get_mut(&network) {
+            if routes.broadcast == policy {
+                return;
+            }
+            routes.broadcast = policy;
+            self.broadcast
+                .store(Arc::new(BroadcastTable::build(&networks)));
+        }
+    }
+
+    /// Recognizes limited and configured subnet broadcasts before unicast lookup.
+    pub fn is_broadcast(&self, destination: Ipv4Addr) -> bool {
+        self.broadcast.load().is_destination(destination)
+    }
+
+    /// A precomputed domain-scoped recipient list; no per-packet graph search.
+    pub fn broadcast_recipients(
+        &self,
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+    ) -> Option<Arc<[Route]>> {
+        self.broadcast.load().outgoing(source, destination)
+    }
+
+    /// Local admission after the plugin authenticated and decrypted the sender.
+    pub fn accepts_broadcast(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+        destination: Ipv4Addr,
+    ) -> bool {
+        self.broadcast.load().accepts(network, peer, destination)
     }
 
     /// The peer that holds a destination address, if anybody does.
@@ -162,6 +209,14 @@ impl RoutingTable {
                 .iter()
                 .any(|(address, holder)| *address == source && *holder == peer)
         })
+    }
+
+    /// Whether an ordinary packet terminates on this host in this network.
+    /// Exported LAN subnets must extend this admission policy explicitly later.
+    pub fn is_local_destination(&self, network: NetworkId, destination: Ipv4Addr) -> bool {
+        self.read()
+            .get(&network)
+            .is_some_and(|routes| routes.local == Some(destination))
     }
 
     /// Every address this agent should answer to, with its prefix length.
@@ -236,6 +291,7 @@ mod tests {
 
     fn routes() -> NetworkRoutes {
         NetworkRoutes {
+            broadcast: Default::default(),
             range: Some("10.13.37.0/24".parse().unwrap()),
             local: Some(addr(1)),
             peers: vec![(addr(2), peer(2)), (addr(3), peer(3))],
@@ -318,6 +374,7 @@ mod tests {
             .set_network(
                 second,
                 NetworkRoutes {
+                    broadcast: Default::default(),
                     range: Some("10.99.0.0/16".parse().unwrap()),
                     local: Some(Ipv4Addr::new(10, 99, 0, 1)),
                     peers: vec![(Ipv4Addr::new(10, 99, 0, 2), peer(4))],
@@ -362,6 +419,7 @@ mod tests {
             .set_network(
                 network("wide"),
                 NetworkRoutes {
+                    broadcast: Default::default(),
                     range: Some("10.0.0.0/8".parse().unwrap()),
                     ..Default::default()
                 },
@@ -373,6 +431,7 @@ mod tests {
                 .set_network(
                     network("narrow"),
                     NetworkRoutes {
+                        broadcast: Default::default(),
                         range: Some("10.13.37.0/24".parse().unwrap()),
                         ..Default::default()
                     }
@@ -414,6 +473,7 @@ mod tests {
             .set_network(
                 network("two"),
                 NetworkRoutes {
+                    broadcast: Default::default(),
                     range: Some("10.99.0.0/16".parse().unwrap()),
                     local: Some(Ipv4Addr::new(10, 99, 0, 1)),
                     peers: Vec::new(),

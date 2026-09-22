@@ -247,6 +247,7 @@ impl tsunagi::ipc::ReportSource for Control {
         &self,
         name: String,
         secret: String,
+        _broadcast: Option<bool>,
     ) -> BoxFuture<'_, Result<tsunagi::ipc::JoinedReport, String>> {
         Box::pin(async move {
             let name = tsunagi::identity::NetworkName::new(&name).map_err(|e| e.to_string())?;

@@ -9,7 +9,7 @@ Two versions exist and are independent:
 
 - **Identity scheme**, `tsunagi-network-id-v1`. Frozen. Changing it creates a
   different network space for the same name and secret.
-- **Control protocol**, ALPN `tsunagi/ctrl/2`, `PROTOCOL_VERSION = 2`.
+- **Control protocol**, ALPN `tsunagi/ctrl/3`, `PROTOCOL_VERSION = 3`.
 
 Upgrading the crate or bumping the control protocol must never change an
 existing `NetworkId`.
@@ -191,7 +191,7 @@ transport connection, not supplied by the frame. Intermediate nodes cannot
 decrypt or authenticate the inner WireGuard payload; the destination does that.
 Flow ids are routing hints, not authorization proofs.
 
-Control ALPN 2 carries `Reachable { links: [{ peer, protocol }] }`. Each row
+Control ALPN 3 carries `Reachable { links: [{ peer, protocol }] }`. Each row
 belongs to the authenticated sender and is replaced atomically, expires after
 90 seconds, and is withdrawn on session closure. Only compatible authenticated
 members enter a protocol's graph; local edges always come from actual links.
@@ -215,13 +215,18 @@ not affect other networks.
 
 | message | meaning |
 |---|---|
-| `Announce { hostname, capabilities }` | this agent's hostname and IP-plugin capabilities |
+| `Announce { hostname, capabilities, broadcast }` | this agent's hostname, IP-plugin capabilities and local broadcast participation |
 | `Ping { seq, payload }` | small request used to verify the exchange |
 | `Pong { seq, payload }` | the echoed reply |
 | `State { records }` | a snapshot of signed records, merged into what the receiver holds |
 | `Peers { peers }` | unverified member address hints, requiring their own handshake |
 | `Reachable { links }` | sender's current direct data links, scoped by protocol |
 | `Bye { reason }` | graceful goodbye; not a revocation of anything |
+
+`broadcast` is a per-network local opt-in, enabled by default and treated as
+false until an authenticated announcement arrives. It governs IP broadcast
+fanout and local admission; encrypted transit still uses the existing envelope.
+See [broadcast.md](broadcast.md) for scope and persistence.
 
 A `State` snapshot is merged, never substituted: an author missing from it is
 left untouched. Each record carries its own signature, so a peer forwarding
