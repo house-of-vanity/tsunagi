@@ -461,7 +461,16 @@ fn load_secret(
 }
 
 /// Port the local resolver listens on unless told otherwise.
-const DEFAULT_DNS_PORT: u16 = 5354;
+///
+/// On Windows the default is 53, because the Windows DNS client only ever asks
+/// on 53 and cannot be pointed at another port — a resolver on anything else
+/// cannot be wired into the system at all. This is the same choice Tailscale
+/// makes: a fixed, system-usable port plus an NRPT rule for the network's
+/// suffix. An explicit `--dns-port` still wins (so two agents on one host, and
+/// the tests, can each take a port of their own); this only decides what a
+/// plain `--dns` picks. Elsewhere the default is a high port that needs no
+/// privilege, since systemd-resolved can be pointed at any port.
+const DEFAULT_DNS_PORT: u16 = if cfg!(target_os = "windows") { 53 } else { 5354 };
 
 /// Settings key: whether the local resolver is wanted.
 const DNS_ENABLED: &str = "dns.enabled";
