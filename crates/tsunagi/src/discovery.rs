@@ -44,6 +44,18 @@ pub enum CandidateSource {
     Discovery,
     /// An address hint restored from the disposable cache.
     Cache,
+    /// An author of a signed record: somebody who belongs to this network,
+    /// learned from state that reached us through anybody.
+    ///
+    /// It carries no address of its own — the endpoint's own discovery has
+    /// to resolve it — but knowing that a member exists is what turns a
+    /// star around whoever was named on the command line into a mesh.
+    Member,
+    /// Passed on by a member we are talking to.
+    ///
+    /// A candidate like any other: an introduction is not a vouching, and
+    /// membership is still decided by the handshake.
+    Introduced,
 }
 
 /// An unverified candidate peer.

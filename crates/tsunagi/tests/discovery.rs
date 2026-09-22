@@ -137,3 +137,63 @@ async fn forgetting_a_network_removes_it_from_the_state_store() {
     drop(restarted);
     drop(dir);
 }
+
+#[tokio::test]
+async fn being_told_about_one_member_is_enough_to_meet_them_all() {
+    // A network is a mesh, and which member happened to be named on a
+    // command line must not decide who a device ends up talking to. The
+    // newcomer is given one address and nothing else; everybody else is
+    // learned from the members it meets.
+    let (name, secret) = network("introductions");
+
+    // Three that already know each other, and nothing that resolves by
+    // network: no shared discovery here, only what members pass on.
+    let first_dir = tempfile::TempDir::new().unwrap();
+    let first = Agent::spawn(local_config(first_dir.path())).await.unwrap();
+    let network_id = first.join_network(&name, &secret).await.unwrap();
+
+    let second_dir = tempfile::TempDir::new().unwrap();
+    let second = Agent::spawn(
+        local_config(second_dir.path())
+            .with_discovery(Arc::new(StaticBootstrap::new([first.local_addr()]))),
+    )
+    .await
+    .unwrap();
+    second.join_network(&name, &secret).await.unwrap();
+    wait_for_peers(&first, network_id, 1).await;
+
+    let third_dir = tempfile::TempDir::new().unwrap();
+    let third = Agent::spawn(
+        local_config(third_dir.path())
+            .with_discovery(Arc::new(StaticBootstrap::new([first.local_addr()]))),
+    )
+    .await
+    .unwrap();
+    third.join_network(&name, &secret).await.unwrap();
+
+    // Each of the two newcomers was given only the first one's address,
+    // and each ends up with both of the others.
+    wait_for_peers(&second, network_id, 2).await;
+    wait_for_peers(&third, network_id, 2).await;
+    wait_for_peers(&first, network_id, 2).await;
+
+    // And the one they were not told about is there as an introduction:
+    // a candidate like any other, still authenticated by the handshake.
+    let status = second.network_status(network_id).await.unwrap();
+    let introduced = status
+        .candidates
+        .iter()
+        .find(|candidate| candidate.endpoint_id == third.endpoint_id())
+        .map(|candidate| candidate.source);
+    assert!(
+        matches!(
+            introduced,
+            Some(CandidateSource::Introduced) | Some(CandidateSource::Member)
+        ),
+        "the third should have arrived from the others: {introduced:?}"
+    );
+
+    second.shutdown().await;
+    third.shutdown().await;
+    first.shutdown().await;
+}

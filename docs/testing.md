@@ -91,6 +91,10 @@ the way past, a name outside every zone is refused, each network gets a zone
 of its own as it is joined, and the resolver can be switched on and off
 while the agent runs.
 
+`tests/discovery.rs` also covers introductions: a device given one
+member's address meets every other member, and the ones it was not told
+about arrive as candidates that still pass the handshake like any other.
+
 `tests/discovery.rs` covers the discovery contract itself: a static bootstrap
 candidate is enough to join, several backends compose, entries are withdrawn
 when a network stops, and a forgotten network stays forgotten across a restart.

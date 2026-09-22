@@ -547,6 +547,23 @@ impl Runtime {
             }
         }
 
+        // Everybody the signed state says belongs here. Their records
+        // reached us through somebody, so we know they exist and who they
+        // are, even having never spoken to them; an id with no address is
+        // still dialable when the endpoint's own discovery can resolve
+        // one. This is what makes a network a mesh rather than a star
+        // around whoever was named on a command line.
+        for record in self.state.records() {
+            if let Ok(author) = record.author_id()
+                && author != self.local_id
+            {
+                candidates.push(Candidate::new(
+                    iroh::EndpointAddr::new(author),
+                    CandidateSource::Member,
+                ));
+            }
+        }
+
         // A stale or missing cache only changes which candidates we try first.
         // It never bypasses authentication.
         for hint in self.params.storage.hints_for_network(self.network_id).await {
@@ -574,6 +591,8 @@ impl Runtime {
         }
 
         self.start_dials();
+        // Last, so it carries what this round learned.
+        self.introduce_peers();
     }
 
     fn start_dials(&mut self) {
@@ -1147,6 +1166,112 @@ impl Runtime {
         }
     }
 
+    /// Takes in what another member knows about the rest.
+    ///
+    /// Returns how many of them were new here, which is the only reason to
+    /// start dialling again straight away.
+    fn learn_peers(&mut self, hints: &[crate::proto::message::PeerHint]) -> usize {
+        let mut learned = 0;
+        for hint in hints {
+            let Ok(peer) = EndpointId::from_bytes(&hint.endpoint) else {
+                continue;
+            };
+            if peer == self.local_id || self.sessions.contains_key(&peer) {
+                continue;
+            }
+            let mut addr = iroh::EndpointAddr::new(peer);
+            for text in &hint.addrs {
+                // The same decoder as the cache's hints: one spelling, one
+                // place it is read, nothing to drift.
+                if let Some(decoded) = decode_hint(peer, text) {
+                    merge_addr(&mut addr, &decoded);
+                }
+            }
+
+            let fresh = !self.candidate_addrs.contains_key(&peer);
+            self.candidate_addrs
+                .entry(peer)
+                .and_modify(|existing| merge_addr(existing, &addr))
+                .or_insert(addr);
+            self.dial_states
+                .entry(peer)
+                .or_insert_with(|| DialState::new(CandidateSource::Introduced));
+            if fresh {
+                learned += 1;
+            }
+        }
+        learned
+    }
+
+    /// Tells the peers it is talking to about the peers it knows.
+    ///
+    /// A device told about one member ends up talking to all of them: a
+    /// network is a mesh, and which member happened to be named on a
+    /// command line should not decide who anybody talks to. Sent on every
+    /// round, because it is cheap, bounded and self-repairing.
+    fn introduce_peers(&mut self) {
+        let mut hints: Vec<crate::proto::message::PeerHint> = Vec::new();
+
+        // What this agent can see for itself: where each peer it is
+        // talking to is right now. An agent that only ever accepts has no
+        // candidates of its own, and it is exactly the one everybody else
+        // was pointed at — so without this, introductions would come from
+        // nobody.
+        let mut observed: HashMap<EndpointId, iroh::EndpointAddr> = HashMap::new();
+        for session in self.sessions.values() {
+            let snapshot = crate::net::snapshot_connection(&session.conn);
+            let mut addr = iroh::EndpointAddr::new(session.peer);
+            for path in &snapshot.paths {
+                match &path.remote {
+                    crate::net::PathAddr::Ip(socket) => addr = addr.with_ip_addr(*socket),
+                    crate::net::PathAddr::Relay(url) => {
+                        if let Ok(url) = url.parse() {
+                            addr = addr.with_relay_url(url);
+                        }
+                    }
+                    crate::net::PathAddr::Other(_) => {}
+                }
+            }
+            observed.insert(session.peer, addr);
+        }
+        for (peer, addr) in &self.candidate_addrs {
+            observed
+                .entry(*peer)
+                .and_modify(|existing| merge_addr(existing, addr))
+                .or_insert_with(|| addr.clone());
+        }
+
+        for (peer, addr) in &observed {
+            if *peer == self.local_id {
+                continue;
+            }
+            // An id with no address at all is still worth passing on: the
+            // other side's own discovery may be able to resolve it.
+            hints.push(crate::proto::message::PeerHint {
+                endpoint: *peer.as_bytes(),
+                addrs: hint_addrs(addr),
+            });
+        }
+        // This agent, too: it is the one member the others cannot be told
+        // about by anybody else.
+        hints.push(crate::proto::message::PeerHint {
+            endpoint: *self.local_id.as_bytes(),
+            addrs: hint_addrs(&self.params.adapter.addr()),
+        });
+        hints.truncate(self.params.limits.max_state_records);
+        if hints.is_empty() {
+            return;
+        }
+
+        let message = ControlMessage::Peers { peers: hints };
+        let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
+        for peer in peers {
+            if let Err(err) = self.send_to(peer, message.clone()) {
+                tracing::debug!(%err, "could not queue an introduction");
+            }
+        }
+    }
+
     /// Tells peers which peers this agent has a live link with, when that
     /// has changed.
     ///
@@ -1595,6 +1720,15 @@ impl Runtime {
             ControlMessage::State { records } => {
                 self.pending_state.push((peer, records.clone()));
             }
+            // Members somebody else knows of. Candidates, nothing more:
+            // each still has to pass the handshake, and each is tried the
+            // same way as one from any other source.
+            ControlMessage::Peers { peers } => {
+                let learned = self.learn_peers(peers);
+                if learned > 0 {
+                    self.start_dials();
+                }
+            }
             // What that peer can reach, from that peer. Kept with the time
             // it was heard, so it can go stale on its own.
             ControlMessage::Reachable { peers } => {
@@ -1818,6 +1952,23 @@ fn encode_hint(addr: &PathAddr) -> Option<String> {
         PathAddr::Relay(url) => Some(format!("relay:{url}")),
         PathAddr::Other(_) => None,
     }
+}
+
+/// The addresses of a candidate, in the spelling hints use.
+///
+/// Bounded and sorted, so what goes on the wire is the same for the same
+/// address whatever order the transport happened to report it in.
+fn hint_addrs(addr: &iroh::EndpointAddr) -> Vec<String> {
+    let mut out: Vec<String> = addr
+        .addrs
+        .iter()
+        .map(|transport| transport.to_string())
+        .filter(|text| text.len() <= crate::proto::message::MAX_HINT_ADDR_LEN)
+        .collect();
+    out.sort();
+    out.dedup();
+    out.truncate(crate::proto::message::MAX_HINT_ADDRS);
+    out
 }
 
 /// Decodes a cache hint back into an address. Malformed hints are ignored.

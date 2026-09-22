@@ -95,12 +95,25 @@ and join the same network with the secret that was printed:
 ./target/release/tsunagi join --network lab --secret tsn1...
 ```
 
-**`--peer` is how the first meeting happens.** Two agents that have never
-met have nothing to go on: this project publishes nothing about who is in
-which network, by design. One of them has to be told the other's endpoint
-id — after that each remembers the other and finds it again by itself, so
-it is needed once. An agent with nobody to contact says so in `status`
-rather than sitting there looking patient.
+**`--peer` is how the first meeting happens, and only the first.** Two
+agents that have never met have nothing to go on: this project publishes
+nothing about who is in which network, by design. One of them has to be
+told the other's endpoint id — after that each remembers the other and
+finds it again by itself. Give several for redundancy; any one of them
+getting through is enough.
+
+**One introduction is enough for the whole network.** Members tell each
+other about the members they know, and every author of a signed record is
+somebody to try, so a device pointed at one member ends up talking to all
+of them rather than to the one that happened to be on its command line.
+What travels is a candidate — an address somebody has seen — and it is
+authenticated by the handshake like any other; being introduced grants
+nothing. It is deliberately the same shape a lookup in a distributed hash
+table would return, so that is a source to add beside this one rather than
+a redesign.
+
+An agent with nobody to contact says so in `status` rather than sitting
+there looking patient.
 
 Within a few seconds both print something like:
 
@@ -538,7 +551,9 @@ explicitly.
 
 ### Through somebody in the middle
 
-Two members can both reach a third and not each other: a blocked path, a
+Everybody tries everybody first: the mesh is pairwise, and a relay is only
+for the pair that cannot manage it. Two members can both reach a third and
+not each other: a blocked path, a
 relay that is unavailable, a network only reachable from inside somebody
 else's building. When that happens the pair is routed through a member that
 has both.

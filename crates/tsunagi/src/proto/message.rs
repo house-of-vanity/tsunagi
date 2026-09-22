@@ -129,6 +129,18 @@ pub enum ControlMessage {
         /// The records. Bounded by [`crate::config::Limits::max_state_records`].
         records: Vec<crate::state::SignedRecord>,
     },
+    /// Members this sender knows of, and where it has seen them.
+    ///
+    /// An introduction, not a vouching: everything here is an unverified
+    /// candidate, and membership is still decided by the handshake. It is
+    /// what turns a star around whoever was named on the command line into
+    /// a mesh — a device that was told about one member ends up talking to
+    /// all of them — and it is the same shape a lookup in a distributed
+    /// hash table would return.
+    Peers {
+        /// The members, with whatever addresses the sender has for them.
+        peers: Vec<PeerHint>,
+    },
     /// Which peers this sender has a live data link with, right now.
     ///
     /// First-hand and nothing else: a sender speaks only for itself, never
@@ -151,6 +163,29 @@ pub enum ControlMessage {
         reason: String,
     },
 }
+
+/// Somewhere a member has been seen.
+///
+/// Addresses are in iroh's own text form, which is what the endpoint takes
+/// back: this is a hint to try, never a fact about where anybody is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerHint {
+    /// The member's endpoint key.
+    pub endpoint: [u8; 32],
+    /// Where the sender has seen it, as `ip:<socket>` or `relay:<url>`.
+    ///
+    /// The same spelling the disposable cache uses, so one decoder serves
+    /// both and neither can drift from the other. An empty list is still
+    /// worth sending: an id alone is enough for a receiver whose endpoint
+    /// can resolve it.
+    pub addrs: Vec<String>,
+}
+
+/// Longest address text accepted in a hint.
+pub const MAX_HINT_ADDR_LEN: usize = 128;
+
+/// Most addresses accepted for one member in a hint.
+pub const MAX_HINT_ADDRS: usize = 8;
 
 /// A control message together with the network it belongs to.
 ///
@@ -210,6 +245,15 @@ pub fn validate_capability(
 /// network, the other networks or the agent.
 pub fn validate(message: &ControlMessage, limits: &Limits) -> Result<(), ProtocolError> {
     match message {
+        ControlMessage::Peers { peers } => {
+            check_len("peers", peers.len(), limits.max_state_records)?;
+            for hint in peers {
+                check_len("peers.addrs", hint.addrs.len(), MAX_HINT_ADDRS)?;
+                for addr in &hint.addrs {
+                    check_len("peers.addr", addr.len(), MAX_HINT_ADDR_LEN)?;
+                }
+            }
+        }
         ControlMessage::Reachable { peers } => {
             // One entry per member at most; a sender claiming more than a
             // network can hold is not describing this network.
@@ -254,6 +298,7 @@ pub fn kind(message: &ControlMessage) -> &'static str {
         ControlMessage::Pong { .. } => "pong",
         ControlMessage::State { .. } => "state",
         ControlMessage::Reachable { .. } => "reachable",
+        ControlMessage::Peers { .. } => "peers",
         ControlMessage::Bye { .. } => "bye",
     }
 }
