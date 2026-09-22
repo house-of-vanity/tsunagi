@@ -251,11 +251,12 @@ for the host running the agent, and binding an overlay address would put
 them in front of the whole mesh — an agent in two networks would then answer
 one network's questions about the other's names.
 
-The zone is the network name unless `--dns-zone` says otherwise. It is
-yours to choose, so a name that shadows a real public domain is reported and
-then used: `--dns-zone ru` warns that every public `.ru` name becomes
-unreachable from this host, and then does it. `.internal` is reserved for
-exactly this and is never mentioned.
+The zone is the network name, and it is yours to choose. A name that
+shadows a real public domain is reported and then used: a network called
+`ru` warns that every public `.ru` name becomes unreachable from this host,
+and then does it. Anything that collides with nothing — which is most names
+— is said nothing about, because a warning that fires on every private name
+anybody picks is how people learn to ignore warnings.
 
 On Linux the agent tells systemd-resolved to send questions for that suffix
 here, over D-Bus, scoped to the overlay interface and as a *routing* domain

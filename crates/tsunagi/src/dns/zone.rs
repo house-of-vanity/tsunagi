@@ -128,17 +128,14 @@ impl ZoneName {
                     .to_string(),
             );
         }
-        if tld::exist_case_insensitive(top) {
-            return Some(format!(
+        // A real top-level domain is the whole of it. A name that is not
+        // delegated today might be one day — and saying so fires on every
+        // private name anybody ever picks, which is a warning about
+        // nothing that teaches people to ignore warnings.
+        tld::exist_case_insensitive(top).then(|| {
+            format!(
                 "`.{top}` is a real top-level domain, so every public name under it \
                  becomes unreachable from this host while the overlay is up"
-            ));
-        }
-        // Not delegated today is not a promise about tomorrow.
-        (!self.0.contains('.')).then(|| {
-            format!(
-                "`.{top}` is not a delegated top-level domain today, but it could \
-                 become one; `.internal` is reserved for private use and never will"
             )
         })
     }
@@ -516,11 +513,13 @@ mod tests {
         let local = ZoneName::new("local").unwrap().collision().unwrap();
         assert!(local.contains("multicast DNS"), "{local}");
 
-        // An undelegated single label is a maybe, not a yes.
-        let lab = ZoneName::new("lab").unwrap().collision().unwrap();
-        assert!(lab.contains("could"), "{lab}");
-        // A multi-label name under something undelegated is not worth a word.
-        assert_eq!(ZoneName::new("a.lab").unwrap().collision(), None);
+        // A name that collides with nothing is said nothing about. It
+        // might be delegated one day, and warning about that fires on
+        // every private name anybody picks — a warning about nothing,
+        // which is how people learn to ignore warnings.
+        for quiet in ["lab", "a.lab", "pidar", "twar", "kitchen-table"] {
+            assert_eq!(ZoneName::new(quiet).unwrap().collision(), None, "{quiet}");
+        }
     }
 
     #[test]
