@@ -46,7 +46,7 @@ fn start_bare(port: u16) -> Running {
         .arg(dir.path().join("state"))
         .arg("--cache-dir")
         .arg(dir.path().join("cache"))
-        .args(["--reach", "local", "--no-tun"])
+        .args(["--reach", "local", "--no-tun", "--no-dns"])
         .arg("--bind")
         .arg(format!("127.0.0.1:{port}"))
         .args(["--log", "error", "--status-interval", "0"])

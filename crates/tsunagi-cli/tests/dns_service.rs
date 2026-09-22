@@ -22,6 +22,7 @@ const PORT_REBIND: u16 = 15362;
 const PORT_REFUSE: u16 = 15363;
 const PORT_TWO_ZONES: u16 = 15364;
 const PORT_SWITCH: u16 = 15365;
+const PORT_FLAGS: u16 = 15366;
 
 /// Asks, and returns the raw reply. Raw because a parsed packet borrows
 /// from the bytes it came out of.
@@ -73,6 +74,33 @@ struct Running {
 }
 
 impl Running {
+    fn wait_ready(&mut self) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let socket = tsunagi::ipc::control_socket_path(&self.dir.path().join("state"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !runtime.block_on(tsunagi::ipc::is_serving(&socket)) {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "the agent exited before becoming ready"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the control socket never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn restart(&mut self, dns_flag: Option<&str>) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.child = spawn_child(&self.dir, None, dns_flag);
+        self.wait_ready();
+    }
+
     /// Runs another `tsunagi` command against this agent's directory.
     fn run(&self, args: &[&str]) -> std::process::Output {
         std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
@@ -135,6 +163,17 @@ fn start_without_dns(network: &str) -> Running {
 /// The agent alone: `up` runs it, and what it belongs to is decided after.
 fn start_without_dns_at(_network: &str, dns_port: Option<u16>) -> Running {
     let dir = TempDir::new().unwrap();
+    let child = spawn_child(&dir, dns_port, dns_port.is_none().then_some("--no-dns"));
+    let mut agent = Running { child, dir };
+    agent.wait_ready();
+    agent
+}
+
+fn spawn_child(
+    dir: &TempDir,
+    dns_port: Option<u16>,
+    dns_flag: Option<&str>,
+) -> std::process::Child {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"));
     command
         .arg("up")
@@ -145,21 +184,21 @@ fn start_without_dns_at(_network: &str, dns_port: Option<u16>) -> Running {
         // No real interface and no internet: this is about the wiring.
         .args(["--reach", "local", "--no-tun"]);
     if let Some(port) = dns_port {
-        command.arg("--dns").args(["--dns-port", &port.to_string()]);
+        command.args(["--dns-port", &port.to_string()]);
     }
-    let child = command
+    if let Some(flag) = dns_flag {
+        command.arg(flag);
+    }
+    command
         .args(["--log", "error", "--status-interval", "0"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("the agent binary starts");
-    // Long enough for the control socket to be there to talk to.
-    std::thread::sleep(Duration::from_secs(2));
-    Running { child, dir }
+        .expect("the agent binary starts")
 }
 
 #[test]
-fn the_resolver_comes_up_even_with_no_overlay_interface_to_put_it_on() {
+fn the_resolver_is_on_by_default_even_without_an_overlay_interface() {
     // The promise is that the port is served whatever else fails: with
     // `--no-tun` there is no interface to attach a resolver setting to,
     // and the zone is answered on loopback all the same. Getting this
@@ -247,15 +286,11 @@ fn every_network_gets_a_zone_of_its_own() {
 
 #[test]
 fn the_resolver_can_be_switched_on_and_off_while_the_agent_runs() {
-    // Forgetting `--dns` on a command line should not be a decision that
-    // lasts until the next restart, and it is not: the setting belongs to
-    // the device, and turning it on takes effect at once.
+    // An intentional --no-dns can be reversed at runtime without restarting.
     let agent = start_without_dns("switch.internal");
     let server: SocketAddr = format!("127.0.0.1:{PORT_SWITCH}").parse().unwrap();
     let host = hostname();
 
-    // Give the agent time to be up before asking it anything.
-    std::thread::sleep(Duration::from_secs(1));
     assert!(
         query(server, &format!("{host}.switch.internal"), TYPE::A).is_none(),
         "nothing should be answering yet"
@@ -279,4 +314,34 @@ fn the_resolver_can_be_switched_on_and_off_while_the_agent_runs() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+#[test]
+fn explicit_dns_choices_override_the_saved_setting_and_survive_restart() {
+    let mut agent = start("flags.internal", PORT_FLAGS);
+    let server = format!("127.0.0.1:{PORT_FLAGS}").parse().unwrap();
+    let name = format!("{}.flags.internal", hostname());
+    wait_for_answer(server, &name);
+
+    for flag in [Some("--no-dns"), None] {
+        agent.restart(flag);
+        let state = agent.run(&["dns"]);
+        assert!(state.status.success());
+        assert!(String::from_utf8_lossy(&state.stdout).contains("not serving"));
+        assert!(query(server, &name, TYPE::A).is_none());
+    }
+    agent.restart(Some("--dns"));
+    wait_for_answer(server, &name);
+    agent.restart(None);
+    wait_for_answer(server, &name);
+}
+
+#[test]
+fn opposing_dns_flags_are_rejected() {
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+        .args(["up", "--dns", "--no-dns"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("cannot be used with"));
 }

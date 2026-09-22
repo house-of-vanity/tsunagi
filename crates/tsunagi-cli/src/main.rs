@@ -422,7 +422,7 @@ struct UpArgs {
     #[arg(long, value_name = "CIDR", help_heading = "System")]
     ipv4_range: Option<String>,
 
-    /// Serve a local DNS zone for every network this device is in.
+    /// Enable local DNS for every network (on by default).
     ///
     /// Each network becomes a zone named after it, and its members resolve
     /// as `<hostname>.<network>` from signed state, so a member that is
@@ -430,9 +430,15 @@ struct UpArgs {
     /// addresses; questions are taken on loopback of both families, over
     /// UDP and TCP.
     ///
-    /// Remembered: once on it stays on, and `tsunagi dns off` turns it off.
-    #[arg(long, help_heading = "System")]
+    /// Overrides a remembered opt-out. Use --no-dns or `tsunagi dns off` to disable.
+    #[arg(long, conflicts_with = "no_dns", help_heading = "System")]
     dns: bool,
+
+    /// Disable local DNS and remember this choice for future starts.
+    ///
+    /// Use --dns or `tsunagi dns on` to enable it again.
+    #[arg(long, conflicts_with = "dns", help_heading = "System")]
+    no_dns: bool,
 
     /// Port for the local DNS server, on loopback of both families.
     ///
@@ -505,7 +511,7 @@ struct DnsSetting {
 impl Default for DnsSetting {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             port: DEFAULT_DNS_PORT,
         }
     }
@@ -517,9 +523,9 @@ fn dns_setting(paths: &StoragePaths) -> DnsSetting {
         return DnsSetting::default();
     };
     DnsSetting {
-        enabled: matches!(
+        enabled: !matches!(
             store.get_setting(DNS_ENABLED).ok().flatten().as_deref(),
-            Some("1")
+            Some("0")
         ),
         port: store
             .get_setting(DNS_PORT)
@@ -3256,11 +3262,10 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ipv4_range = resolve_ipv4_range(args.ipv4_range.as_ref())?;
 
     // The resolver is a property of the device, not of this command line.
-    // `--dns` turns it on and it stays on; `tsunagi dns off` is what turns
-    // it off. Anything else means names work today and are gone tomorrow
-    // because a flag was not retyped.
+    // Enabled unless deliberately disabled. Explicit flags override the
+    // remembered choice, which otherwise survives subsequent restarts.
     let stored_dns = dns_setting(&paths);
-    let serve_dns = args.dns || stored_dns.enabled;
+    let serve_dns = !args.no_dns && (args.dns || stored_dns.enabled);
     let dns_port = args.dns_port.unwrap_or(stored_dns.port);
     if serve_dns != stored_dns.enabled || dns_port != stored_dns.port {
         // Written before the agent takes the directory, which it is about

@@ -199,7 +199,7 @@ belongs to, which `--help` shows as two sections:
 
 * **System** — what the agent itself does: how it reaches peers (`--reach`),
   the one overlay interface it owns (`--interface`, `--mtu`, `--no-tun`), the
-  address range (`--ipv4-range`), and the local resolver (`--dns`).
+  address range (`--ipv4-range`), and the local resolver (`--no-dns` to disable).
 * **Transport** — which protocols carry packets (`--protocol`, a list) and
   their own settings (`-o key=value`, or `-o protocol:key=value`).
 
@@ -228,20 +228,19 @@ session with no agreed protocol.
 
 ## Names
 
-`--dns` serves a local DNS zone for **every network this device is in**,
+DNS is enabled by default and serves a local zone for **every network this device is in**,
 each named after the network, so members can be reached by name instead of
 by address:
 
 ```bash
-tsunagi up --dns          # or `tsunagi dns on` against a running agent
+tsunagi up               # DNS is already enabled
 dig @127.0.0.1 -p 5354 music.lab
 ```
 
-It is remembered with the device rather than with the command line: once on
-it stays on across restarts, and `tsunagi dns off` is what turns it off. A
-resolver that quietly disappears because a flag was not retyped is worse
-than none, because the names simply stop working. `tsunagi dns on` also
-turns it on for an agent that is already running, without restarting it.
+An explicit choice is remembered across restarts. `--no-dns` or `tsunagi dns off`
+disables it; `--dns` or `tsunagi dns on` enables it again. Existing saved opt-outs
+remain respected. The `dns on` and `dns off` commands also take effect immediately
+on a running agent. `--dns` and `--no-dns` cannot be combined.
 
 The zone of a network is its name — `--dns-zone` is gone, because with
 several networks there is no single zone to name. A network name may contain
