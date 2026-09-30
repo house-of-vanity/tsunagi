@@ -66,6 +66,10 @@ pub fn local_ip_candidates() -> Vec<std::net::IpAddr> {
     let mut ips = Vec::new();
     for iface in netdev::get_interfaces() {
         if iface.is_up() && !iface.is_loopback() {
+            let name_lower = iface.name.to_lowercase();
+            if name_lower.starts_with("tsun") || name_lower.contains("tsunagi") {
+                continue;
+            }
             for ip in iface.ipv4 {
                 let addr = ip.addr();
                 if !addr.is_loopback() && !addr.is_unspecified() {

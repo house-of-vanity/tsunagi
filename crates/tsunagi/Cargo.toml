@@ -22,7 +22,6 @@ tun-device = [
     "dep:rtnetlink",
     "dep:caps",
     "dep:futures-util",
-    "dep:netdev",
 ]
 # Telling the operating system where to send its DNS questions. systemd-resolved
 # on Linux, the Name Resolution Policy Table on Windows; the zone and the
@@ -67,6 +66,7 @@ directories = "6.0"
 # forbidden `unsafe` and will not make one.
 gethostname = "1.1"
 netwatch = "0.19.3"
+netdev = "0.46"
 mainline = "8.0"
 futures-lite = "2.6"
 tun = { version = "0.8", features = ["async"], optional = true }
@@ -93,7 +93,6 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 # before deciding what to change. Creating an adapter needs the process to be
 # elevated and `wintun.dll` to be reachable at run time.
 [target.'cfg(target_os = "windows")'.dependencies]
-netdev = { version = "0.45", optional = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",

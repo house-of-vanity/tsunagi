@@ -240,6 +240,39 @@ impl EndpointAdapter {
             TransportPolicy::N0Defaults => builder.preset(presets::N0),
         };
 
+        if matches!(
+            config.transport,
+            TransportPolicy::N0Defaults | TransportPolicy::DirectOnly
+        ) {
+            let filter = iroh::address_lookup::AddrFilter::new(|addrs| {
+                let mut overlay_ips = std::collections::HashSet::new();
+                for iface in netdev::get_interfaces() {
+                    let name = iface.name.to_lowercase();
+                    if name.starts_with("tsun") || name.contains("tsunagi") {
+                        for ip in iface.ipv4 {
+                            overlay_ips.insert(std::net::IpAddr::V4(ip.addr()));
+                        }
+                        for ip in iface.ipv6 {
+                            overlay_ips.insert(std::net::IpAddr::V6(ip.addr()));
+                        }
+                    }
+                }
+                if overlay_ips.is_empty() {
+                    return std::borrow::Cow::Borrowed(addrs);
+                }
+                let filtered: Vec<iroh::TransportAddr> = addrs
+                    .iter()
+                    .filter(|addr| match addr {
+                        iroh::TransportAddr::Ip(sock) => !overlay_ips.contains(&sock.ip()),
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect();
+                std::borrow::Cow::Owned(filtered)
+            });
+            builder = builder.addr_filter(filter);
+        }
+
         #[cfg(feature = "testing")]
         if let Some(transport) = &config.test_quic_transport {
             builder = builder.transport_config(transport.clone());

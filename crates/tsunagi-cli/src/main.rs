@@ -2810,7 +2810,7 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
         // ordinary condition, so it is stated rather than flagged.
         let mut detail = "offline".to_string();
         if let Some(v4) = row.overlay_address_v4 {
-            detail.push_str(&format!("  ·  {v4} still reserved for it"));
+            detail = format!("{v4:<15}  offline  ·  {v4} still reserved for it");
         }
         let out = Row::new(Health::Info, row.label(), detail);
         return if row.failed_dials > 0 {
@@ -2829,12 +2829,13 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     let tunnel_up = row.tunnel.is_some_and(|tunnel| tunnel.is_up());
     let has_overlay = row.tunnel.is_some();
 
-    let mut detail = transport.to_lowercase();
+    let mut detail = String::new();
+    if let Some(v4) = row.overlay_address_v4 {
+        detail.push_str(&format!("{v4:<15}  "));
+    }
+    detail.push_str(&transport.to_lowercase());
     if let Some(rtt) = row.rtt_ms {
         detail.push_str(&format!("  rtt {rtt}ms"));
-    }
-    if let Some(v4) = row.overlay_address_v4 {
-        detail.push_str(&format!("  ·  {v4}"));
     }
 
     let health = if !direct || (has_overlay && !tunnel_up) {
@@ -2851,22 +2852,24 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
             &tunnel.protocol
         };
         out = out.with_note(match tunnel.handshake_secs_ago {
-            Some(secs) => format!(
-                "tunnel up ({proto}), {} tx {} rx {}{}  ·  {}",
-                if proto == "tcp-tls" {
-                    format!("uptime {secs}s,")
-                } else {
-                    format!("handshake {secs}s ago,")
-                },
-                tunnel.tx_packets,
-                tunnel.rx_packets,
-                if tunnel.dropped > 0 {
-                    format!(", {} dropped", tunnel.dropped)
-                } else {
-                    String::new()
-                },
-                tunnel.path
-            ),
+            Some(secs) => {
+                let stats = format!(
+                    "tunnel up ({proto}), {} tx {} rx {}{}",
+                    if proto == "tcp-tls" {
+                        format!("uptime {secs}s,")
+                    } else {
+                        format!("handshake {secs}s ago,")
+                    },
+                    tunnel.tx_packets,
+                    tunnel.rx_packets,
+                    if tunnel.dropped > 0 {
+                        format!(", {} dropped", tunnel.dropped)
+                    } else {
+                        String::new()
+                    },
+                );
+                format!("{stats:<48}  ·  {}", tunnel.path)
+            }
             None => {
                 if proto == "wg-quic" {
                     "no WireGuard handshake yet; the tunnel cannot carry traffic".to_string()
@@ -3408,7 +3411,16 @@ fn program_path() -> String {
 async fn netwatch_addresses() -> Vec<std::net::IpAddr> {
     // Best effort; used for diagnostics only.
     let state = netwatch::interfaces::State::new().await;
-    let mut addresses = state.local_addresses.regular;
+    let mut addresses = Vec::new();
+    for (name, iface) in &state.interfaces {
+        let name_lower = name.to_lowercase();
+        if name_lower.starts_with("tsun") || name_lower.contains("tsunagi") {
+            continue;
+        }
+        for prefix in iface.addrs() {
+            addresses.push(prefix.addr());
+        }
+    }
     addresses.sort();
     addresses.dedup();
     addresses
