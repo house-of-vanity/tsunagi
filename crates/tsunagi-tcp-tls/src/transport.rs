@@ -354,12 +354,12 @@ impl TcpTlsTransport {
                 tracing::info!(port = target_port, "TCP TLS listening");
                 Some(Arc::new(l))
             }
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(err) if requested_port.is_none() => {
                 let exe = std::env::current_exe()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "tsunagi".into());
 
-                if requested_port.is_none() {
+                if err.kind() == std::io::ErrorKind::PermissionDenied {
                     tracing::warn!(
                         port = target_port,
                         %err,
@@ -368,23 +368,49 @@ impl TcpTlsTransport {
                          sudo setcap cap_net_admin,cap_net_bind_service+p {exe}\n\
                          Falling back to port {FALLBACK_PORT}."
                     );
-
-                    let fallback_addr = SocketAddr::from(([0, 0, 0, 0], FALLBACK_PORT));
-                    let l = TcpListener::bind(fallback_addr).await?;
-                    tracing::info!(port = FALLBACK_PORT, "TCP TLS listening on fallback port");
-                    Some(Arc::new(l))
                 } else {
                     tracing::warn!(
                         port = target_port,
                         %err,
-                        "Cannot bind to requested port {target_port} without privileges. \
-                         To allow port {target_port} and TUN on Linux, grant capabilities once with:\n  \
-                         sudo setcap cap_net_admin,cap_net_bind_service+p {exe}"
+                        "Cannot bind to default port {target_port}: {err}. \
+                         Falling back to port {FALLBACK_PORT}."
                     );
-                    return Err(Box::new(err));
+                }
+
+                let fallback_addr = SocketAddr::from(([0, 0, 0, 0], FALLBACK_PORT));
+                match TcpListener::bind(fallback_addr).await {
+                    Ok(l) => {
+                        tracing::info!(port = FALLBACK_PORT, "TCP TLS listening on fallback port");
+                        Some(Arc::new(l))
+                    }
+                    Err(fallback_err) => {
+                        tracing::warn!(
+                            port = FALLBACK_PORT,
+                            err = %fallback_err,
+                            "Cannot bind to fallback port {FALLBACK_PORT}: {fallback_err}. \
+                             Falling back to ephemeral port."
+                        );
+                        let ephemeral_addr = SocketAddr::from(([0, 0, 0, 0], 0));
+                        let l = TcpListener::bind(ephemeral_addr).await?;
+                        let bound = l.local_addr()?.port();
+                        tracing::info!(port = bound, "TCP TLS listening on ephemeral port");
+                        Some(Arc::new(l))
+                    }
                 }
             }
-            Err(err) => return Err(Box::new(err)),
+            Err(err) => {
+                let exe = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "tsunagi".into());
+                tracing::warn!(
+                    port = target_port,
+                    %err,
+                    "Cannot bind to requested port {target_port}: {err}. \
+                     To allow port {target_port} and TUN on Linux, grant capabilities once with:\n  \
+                     sudo setcap cap_net_admin,cap_net_bind_service+p {exe}"
+                );
+                return Err(Box::new(err));
+            }
         };
 
         let bound_port = listener

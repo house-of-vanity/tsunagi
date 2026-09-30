@@ -424,7 +424,7 @@ struct UpArgs {
         long = "protocol",
         value_name = "LIST",
         value_delimiter = ',',
-        default_value = "wg-quic",
+        default_value = "tcp-tls,wg-quic",
         help_heading = "Transport"
     )]
     protocols: Vec<String>,
@@ -1176,17 +1176,17 @@ struct ProtocolSpec {
 /// Every protocol this build has.
 const PROTOCOLS: &[ProtocolSpec] = &[
     ProtocolSpec {
+        name: TCP_TLS_PROTOCOL,
+        version: TCP_TLS_VERSION,
+        summary: "Noise E2EE carried over TCP TLS 1.3 (port 443) disguised as HTTPS traffic",
+        options: TcpTlsCodec::OPTIONS,
+    },
+    ProtocolSpec {
         name: tsunagi_wg_quic::WIREGUARD_PROTOCOL,
         version: tsunagi_wg_quic::ANNOUNCEMENT_VERSION,
         summary: "WireGuard's cryptography carried in iroh's QUIC datagrams, so it \
                   crosses NAT and survives where plain WireGuard is blocked",
         options: WireguardPlugin::OPTIONS,
-    },
-    ProtocolSpec {
-        name: TCP_TLS_PROTOCOL,
-        version: TCP_TLS_VERSION,
-        summary: "Noise E2EE carried over TCP TLS 1.3 (port 443) disguised as HTTPS traffic",
-        options: TcpTlsCodec::OPTIONS,
     },
 ];
 
