@@ -26,6 +26,8 @@ pub const TCP_TLS_VERSION: u16 = 1;
 pub struct TcpTlsConfig {
     /// Requested port to bind.
     pub port: Option<u16>,
+    /// Custom SNI domain to disguise TLS connections.
+    pub sni: Option<String>,
 }
 
 impl TcpTlsConfig {
@@ -37,6 +39,12 @@ impl TcpTlsConfig {
     /// Sets the TCP listen port.
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = Some(port);
+        self
+    }
+
+    /// Sets the SNI domain used to disguise TLS connections.
+    pub fn with_sni(mut self, sni: impl Into<String>) -> Self {
+        self.sni = Some(sni.into());
         self
     }
 }
@@ -96,12 +104,20 @@ impl std::fmt::Debug for TcpTlsCodec {
 
 impl TcpTlsCodec {
     /// Supported options for `tcp-tls`.
-    pub const OPTIONS: &'static [ProtocolOption] = &[ProtocolOption {
-        key: "port",
-        value: "PORT",
-        help: "TCP port to listen on for TLS 1.3 connections",
-        default: Some("443"),
-    }];
+    pub const OPTIONS: &'static [ProtocolOption] = &[
+        ProtocolOption {
+            key: "port",
+            value: "PORT",
+            help: "TCP port to listen on for TLS 1.3 connections",
+            default: Some("443"),
+        },
+        ProtocolOption {
+            key: "sni",
+            value: "DOMAIN",
+            help: "Server Name Indication (SNI) domain to disguise TLS connections",
+            default: Some(crate::cert::DEFAULT_SNI),
+        },
+    ];
 
     /// Creates a new `TcpTlsCodec`.
     pub fn new(local_id: EndpointId, transport: Arc<TcpTlsTransport>) -> Self {
@@ -131,6 +147,13 @@ impl TcpTlsCodec {
                         .parse()
                         .map_err(|_| format!("invalid port `{value}`"))?;
                     config.port = Some(port);
+                }
+                "sni" => {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        return Err("sni domain cannot be empty".into());
+                    }
+                    config.sni = Some(trimmed.to_string());
                 }
                 other => return Err(format!("unknown option `{other}` for tcp-tls")),
             }

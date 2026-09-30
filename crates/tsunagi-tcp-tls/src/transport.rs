@@ -250,6 +250,7 @@ pub struct TcpTlsTransport {
     identity: DeviceIdentity,
     local_id: EndpointId,
     listen_port: u16,
+    sni: String,
     peer_addresses: std::sync::RwLock<HashMap<EndpointId, Vec<SocketAddr>>>,
     server_config: Arc<rustls::ServerConfig>,
     listener: Option<Arc<TcpListener>>,
@@ -260,6 +261,7 @@ impl std::fmt::Debug for TcpTlsTransport {
         f.debug_struct("TcpTlsTransport")
             .field("local_id", &self.local_id.fmt_short().to_string())
             .field("listen_port", &self.listen_port)
+            .field("sni", &self.sni)
             .finish()
     }
 }
@@ -319,12 +321,16 @@ impl Drop for NetBindServiceGuard {
 }
 
 impl TcpTlsTransport {
-    /// Binds a new TCP TLS transport using the device identity and configured port.
+    /// Binds a new TCP TLS transport using the device identity, configured port, and SNI domain.
     pub async fn bind(
         identity: &DeviceIdentity,
         requested_port: Option<u16>,
+        requested_sni: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let (cert, key) = generate_self_signed_cert(&identity.secret_bytes())?;
+        let sni = requested_sni
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| crate::cert::DEFAULT_SNI.to_string());
+        let (cert, key) = generate_self_signed_cert(&identity.secret_bytes(), &sni)?;
         let server_config = make_server_config(cert, key)?;
 
         let target_port = requested_port.unwrap_or(DEFAULT_PORT);
@@ -391,6 +397,7 @@ impl TcpTlsTransport {
             identity: identity.clone(),
             local_id: identity.endpoint_id(),
             listen_port: bound_port,
+            sni,
             peer_addresses: std::sync::RwLock::new(HashMap::new()),
             server_config,
             listener,
@@ -400,6 +407,11 @@ impl TcpTlsTransport {
     /// The port this transport is listening on.
     pub fn bound_port(&self) -> u16 {
         self.listen_port
+    }
+
+    /// The SNI domain this transport advertises during TLS handshake.
+    pub fn sni(&self) -> &str {
+        &self.sni
     }
 
     /// Records an observed TCP target address for a peer.
@@ -539,7 +551,7 @@ impl PacketTransport for TcpTlsTransport {
                 make_client_config(peer).map_err(|err| TransportError::Other(err.to_string()))?;
             let connector = TlsConnector::from(client_config);
 
-            let server_name = rustls::pki_types::ServerName::try_from("tsunagi.local")
+            let server_name = rustls::pki_types::ServerName::try_from(self.sni.as_str())
                 .map_err(|err| TransportError::Other(err.to_string()))?
                 .to_owned();
 

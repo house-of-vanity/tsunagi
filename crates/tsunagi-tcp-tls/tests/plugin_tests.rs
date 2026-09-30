@@ -41,14 +41,14 @@ async fn test_tcp_tls_plugin_end_to_end() {
 
     // Transports
     let transport_b = Arc::new(
-        TcpTlsTransport::bind(&identity_b, Some(0))
+        TcpTlsTransport::bind(&identity_b, Some(0), None)
             .await
             .expect("bind B"),
     );
     let port_b = transport_b.bound_port();
 
     let transport_a = Arc::new(
-        TcpTlsTransport::bind(&identity_a, Some(0))
+        TcpTlsTransport::bind(&identity_a, Some(0), None)
             .await
             .expect("bind A"),
     );

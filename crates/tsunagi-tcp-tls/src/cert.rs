@@ -81,10 +81,14 @@ impl ServerCertVerifier for PinnedEndpointVerifier {
     }
 }
 
+/// Default SNI domain used to disguise TLS connections.
+pub const DEFAULT_SNI: &str = "cloudflare.com";
+
 /// Generates a self-signed certificate and private key for TLS 1.3 using
-/// a given 32-byte Ed25519 secret key.
+/// a given 32-byte Ed25519 secret key and specified SNI domain.
 pub fn generate_self_signed_cert(
     secret_key_bytes: &[u8; 32],
+    sni: &str,
 ) -> Result<
     (
         CertificateDer<'static>,
@@ -103,10 +107,10 @@ pub fn generate_self_signed_cert(
 
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8);
     let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&key_der, &rcgen::PKCS_ED25519)?;
-    let mut params = rcgen::CertificateParams::new(vec!["tsunagi.local".to_string()])?;
+    let mut params = rcgen::CertificateParams::new(vec![sni.to_string()])?;
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "tsunagi-node");
+        .push(rcgen::DnType::CommonName, sni);
 
     let cert = params.self_signed(&key_pair)?;
     let cert_der = CertificateDer::from(cert.der().to_vec());
@@ -125,7 +129,7 @@ pub fn make_server_config(
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
-    config.alpn_protocols = vec![b"tsunagi-tls/1".to_vec()];
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -138,6 +142,6 @@ pub fn make_client_config(expected_peer: EndpointId) -> Result<Arc<ClientConfig>
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
-    config.alpn_protocols = vec![b"tsunagi-tls/1".to_vec()];
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }

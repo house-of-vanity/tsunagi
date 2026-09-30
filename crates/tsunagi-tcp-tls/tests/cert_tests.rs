@@ -11,11 +11,12 @@ fn test_generate_and_pin_certificate() {
     let identity = DeviceIdentity::generate();
     let peer_id = identity.endpoint_id();
 
-    let (cert, _key) = generate_self_signed_cert(&identity.secret_bytes())
-        .expect("cert generation should succeed");
+    let (cert, _key) =
+        generate_self_signed_cert(&identity.secret_bytes(), tsunagi_tcp_tls::cert::DEFAULT_SNI)
+            .expect("cert generation should succeed");
 
     let verifier = PinnedEndpointVerifier::new(peer_id);
-    let server_name = ServerName::try_from("tsunagi.local").unwrap();
+    let server_name = ServerName::try_from(tsunagi_tcp_tls::cert::DEFAULT_SNI).unwrap();
 
     let verified = verifier.verify_server_cert(&cert, &[], &server_name, &[], UnixTime::now());
 
@@ -41,7 +42,7 @@ fn test_make_client_and_server_config() {
     let identity = DeviceIdentity::generate();
     let peer_id = identity.endpoint_id();
 
-    let (cert, key) = generate_self_signed_cert(&identity.secret_bytes())
+    let (cert, key) = generate_self_signed_cert(&identity.secret_bytes(), "custom.example.com")
         .expect("cert generation should succeed");
 
     let server_config = tsunagi_tcp_tls::cert::make_server_config(cert, key);

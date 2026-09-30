@@ -221,7 +221,31 @@ impl TunDevice for MemoryTun {
 /// enough here: the agent chose the address, so anything else holding it is a
 /// problem in its own right.
 pub fn address_is_local(address: std::net::IpAddr) -> bool {
-    std::net::UdpSocket::bind((address, 0)).is_ok()
+    if std::net::UdpSocket::bind((address, 0)).is_ok() {
+        return true;
+    }
+    #[cfg(all(feature = "tun-device", target_os = "windows"))]
+    {
+        if let Ok(interfaces) = std::panic::catch_unwind(netdev::get_interfaces) {
+            for iface in interfaces {
+                if iface.is_up() {
+                    match address {
+                        std::net::IpAddr::V4(v4) => {
+                            if iface.ipv4.iter().any(|ip| ip.addr() == v4) {
+                                return true;
+                            }
+                        }
+                        std::net::IpAddr::V6(v6) => {
+                            if iface.ipv6.iter().any(|ip| ip.addr() == v6) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Creates [`MemoryTun`] devices.

@@ -23,19 +23,21 @@ async fn test_tcp_tls_transport_loopback() {
 
     // Bind transport B on port 0 (ephemeral)
     let transport_b = Arc::new(
-        TcpTlsTransport::bind(&identity_b, Some(0))
+        TcpTlsTransport::bind(&identity_b, Some(0), Some("custom.example.com".to_string()))
             .await
             .expect("bind server should succeed"),
     );
     let port_b = transport_b.bound_port();
     assert!(port_b > 0);
+    assert_eq!(transport_b.sni(), "custom.example.com");
 
     // Bind transport A on port 0 (ephemeral)
     let transport_a = Arc::new(
-        TcpTlsTransport::bind(&identity_a, Some(0))
+        TcpTlsTransport::bind(&identity_a, Some(0), Some("custom.example.com".to_string()))
             .await
             .expect("bind client should succeed"),
     );
+    assert_eq!(transport_a.sni(), "custom.example.com");
 
     // Register B's address on transport A
     let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();

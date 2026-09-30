@@ -1110,19 +1110,40 @@ impl Runtime {
         // wrong here before. Said once per address, not every round.
         // An in-memory interface has no addresses to be missing from: with
         // `--no-tun` this is the arrangement asked for, not a fault.
-        let missing = match local {
-            Some(address)
-                if interface.on_host()
-                    && !crate::overlay::address_is_local(std::net::IpAddr::V4(address)) =>
-            {
+        let is_missing = if let Some(address) = local {
+            if interface.on_host() {
+                let mut local_found =
+                    crate::overlay::address_is_local(std::net::IpAddr::V4(address));
+                // On Windows, duplicate address detection (DAD) and netsh/IP helper updates
+                // may take a short moment before a newly assigned address is ready for binding.
+                if !local_found && cfg!(target_os = "windows") {
+                    for _ in 0..10 {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        if crate::overlay::address_is_local(std::net::IpAddr::V4(address)) {
+                            local_found = true;
+                            break;
+                        }
+                    }
+                }
+                !local_found
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let missing = if is_missing {
+            if let Some(address) = local {
                 let already = self.reported_missing == Some(address);
                 self.reported_missing = Some(address);
                 (!already).then_some(address)
-            }
-            _ => {
-                self.reported_missing = None;
+            } else {
                 None
             }
+        } else {
+            self.reported_missing = None;
+            None
         };
         if let Some(address) = missing {
             self.emit(Event::PluginError {

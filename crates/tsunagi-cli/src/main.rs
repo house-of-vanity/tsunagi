@@ -3520,7 +3520,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let identity = tsunagi::storage::StateStore::open(paths.state_db())?
                     .load_or_create_device_identity()?;
                 let transport = Arc::new(
-                    TcpTlsTransport::bind(&identity, tls_cfg.port)
+                    TcpTlsTransport::bind(&identity, tls_cfg.port, tls_cfg.sni)
                         .await
                         .map_err(|err| err.to_string())?,
                 );
