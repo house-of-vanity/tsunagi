@@ -61,9 +61,18 @@ const ERROR_PIPE_BUSY: i32 = 231;
 /// - `S:(ML;;NW;;;ME)`: SACL Mandatory Label with Medium Integrity (`ME`) and No Write Up (`NW`).
 ///   This allows unprivileged user-space processes (Medium Integrity) to write to the
 ///   named pipe even when the agent runs as an elevated Administrator (High Integrity).
-#[derive(Debug)]
 struct PipeSecurityAttributes {
     attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+}
+
+impl std::fmt::Debug for PipeSecurityAttributes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipeSecurityAttributes")
+            .field("nLength", &self.attrs.nLength)
+            .field("lpSecurityDescriptor", &self.attrs.lpSecurityDescriptor)
+            .field("bInheritHandle", &self.attrs.bInheritHandle)
+            .finish()
+    }
 }
 
 impl PipeSecurityAttributes {
