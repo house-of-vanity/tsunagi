@@ -80,11 +80,12 @@ pub(crate) struct Session {
     pub(crate) bytes_received: u64,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
+    path_monitor: JoinHandle<()>,
     shutdown: Shutdown,
 }
 
 impl Session {
-    /// Signals both tasks to stop and waits for them, with a bounded grace
+    /// Signals all tasks to stop and waits for them, with a bounded grace
     /// period.
     ///
     /// A peer that stops reading must not be able to hold up shutdown, so the
@@ -94,6 +95,7 @@ impl Session {
             conn,
             reader,
             writer,
+            path_monitor,
             shutdown,
             ..
         } = self;
@@ -103,23 +105,27 @@ impl Session {
 
         let reader_abort = reader.abort_handle();
         let writer_abort = writer.abort_handle();
+        let path_abort = path_monitor.abort_handle();
         let joined = tokio::time::timeout(STOP_GRACE, async move {
             let _ = reader.await;
             let _ = writer.await;
+            let _ = path_monitor.await;
         })
         .await;
         if joined.is_err() {
             tracing::debug!("session tasks did not wind down in time; aborting them");
             reader_abort.abort();
             writer_abort.abort();
+            path_abort.abort();
         }
     }
 
-    /// Aborts both tasks without waiting. Used on replacement.
+    /// Aborts all tasks without waiting. Used on replacement.
     pub(crate) fn abort(&self) {
         self.shutdown.trigger();
         self.reader.abort();
         self.writer.abort();
+        self.path_monitor.abort();
     }
 }
 
@@ -155,6 +161,52 @@ pub(crate) fn spawn(
         parent_shutdown.clone(),
     ));
 
+    let path_conn = conn.clone();
+    let path_shutdown = shutdown.clone();
+    let path_parent = parent_shutdown.clone();
+    let path_monitor = tokio::spawn(async move {
+        use tokio_stream::StreamExt;
+        let mut events = path_conn.path_events();
+        loop {
+            tokio::select! {
+                biased;
+                _ = path_shutdown.wait() => break,
+                _ = path_parent.wait() => break,
+                ev = events.next() => {
+                    match ev {
+                        Some(iroh::endpoint::PathEvent::Selected { remote_addr, local_addr, .. }) => {
+                            tracing::debug!(
+                                peer = %peer.fmt_short(),
+                                remote = %remote_addr,
+                                local = ?local_addr,
+                                "Connection path selected (direct / relay / hole punch switch)"
+                            );
+                        }
+                        Some(iroh::endpoint::PathEvent::Opened { remote_addr, .. }) => {
+                            tracing::debug!(
+                                peer = %peer.fmt_short(),
+                                remote = %remote_addr,
+                                "Network path opened to peer"
+                            );
+                        }
+                        Some(iroh::endpoint::PathEvent::Closed { remote_addr, .. }) => {
+                            tracing::debug!(
+                                peer = %peer.fmt_short(),
+                                remote = %remote_addr,
+                                "Network path closed for peer"
+                            );
+                        }
+                        Some(iroh::endpoint::PathEvent::Lagged { missed, .. }) => {
+                            tracing::trace!(peer = %peer.fmt_short(), missed, "Path events lagged");
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
+
     let reader = tokio::spawn(reader_task(
         id,
         network_id,
@@ -182,6 +234,7 @@ pub(crate) fn spawn(
         bytes_received: 0,
         reader,
         writer,
+        path_monitor,
         shutdown,
     }
 }

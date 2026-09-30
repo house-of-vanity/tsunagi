@@ -259,6 +259,91 @@ impl EndpointAdapter {
             .await
             .map_err(|err| Error::Endpoint(format!("cannot bind endpoint: {err}")))?;
 
+        tracing::debug!(
+            endpoint = %endpoint.id().fmt_short(),
+            bound_sockets = ?endpoint.bound_sockets(),
+            "iroh endpoint bound locally"
+        );
+
+        let ep_id = endpoint.id();
+        let mut addr_watcher = endpoint.watch_addr();
+        let mut relay_watcher = endpoint.home_relay_status();
+        let close_token = endpoint.clone();
+        tokio::spawn(async move {
+            use iroh::Watcher;
+            let mut last_addrs: Vec<SocketAddr> = Vec::new();
+            let mut last_relays: Vec<String> = Vec::new();
+
+            let warn_timer = tokio::time::sleep(Duration::from_secs(12));
+            tokio::pin!(warn_timer);
+            let mut warned = false;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = close_token.closed() => {
+                        break;
+                    }
+                    () = &mut warn_timer, if !warned => {
+                        warned = true;
+                        if last_addrs.is_empty() && !last_relays.is_empty() {
+                            tracing::warn!(
+                                endpoint = %ep_id.fmt_short(),
+                                relays = ?last_relays,
+                                "No direct reflexive or UPnP addresses discovered after probe; communications will rely on relay servers"
+                            );
+                        } else if last_addrs.is_empty() && last_relays.is_empty() {
+                            tracing::warn!(
+                                endpoint = %ep_id.fmt_short(),
+                                "No reachability discovered (neither direct reflexive/UPnP addresses nor relay servers available)"
+                            );
+                        }
+                    }
+                    res = addr_watcher.updated() => {
+                        let addr = match res {
+                            Ok(a) => a,
+                            Err(_) => break,
+                        };
+                        let addrs: Vec<SocketAddr> = addr.ip_addrs().copied().collect();
+                        let relays: Vec<String> = addr.relay_urls().map(|u| u.to_string()).collect();
+
+                        if addrs != last_addrs || relays != last_relays {
+                            tracing::debug!(
+                                endpoint = %ep_id.fmt_short(),
+                                direct_addrs = ?addrs,
+                                relays = ?relays,
+                                "Discovered endpoint reachability (STUN/UPnP/local/relay)"
+                            );
+                            last_addrs = addrs;
+                            last_relays = relays;
+                        }
+                    }
+                    res = relay_watcher.updated() => {
+                        let relays = match res {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        };
+                        for relay in &relays {
+                            if relay.is_connected() {
+                                tracing::debug!(
+                                    endpoint = %ep_id.fmt_short(),
+                                    relay = %relay.url(),
+                                    "Connected to home relay server"
+                                );
+                            } else if let Some(err) = relay.last_error() {
+                                tracing::debug!(
+                                    endpoint = %ep_id.fmt_short(),
+                                    relay = %relay.url(),
+                                    error = %err,
+                                    "Relay connection attempt failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(Self { endpoint })
     }
 

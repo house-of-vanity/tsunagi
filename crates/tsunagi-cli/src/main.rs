@@ -33,13 +33,10 @@ use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 #[command(name = "tsunagi", version, about, long_about = None)]
 struct Cli {
     /// Log filter, for example `info` or `tsunagi=debug`.
-    #[arg(
-        long,
-        global = true,
-        env = "TSUNAGI_LOG",
-        default_value = "info,iroh=warn,quinn=warn,rustls=warn,boringtun=warn,mainline=off"
-    )]
-    log: String,
+    ///
+    /// Can also be set via the `TSUNAGI_LOG` or `RUST_LOG` environment variables.
+    #[arg(long, global = true)]
+    log: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -696,9 +693,19 @@ fn parse_peer(text: &str) -> Result<EndpointAddr, String> {
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
+    let log_filter = cli
+        .log
+        .or_else(|| std::env::var("TSUNAGI_LOG").ok())
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .unwrap_or_else(|| {
+            "info,iroh=warn,quinn=warn,rustls=warn,boringtun=warn,mainline=off".to_string()
+        });
+
+    let is_debug = log_filter.contains("debug") || log_filter.contains("trace");
+
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(&cli.log))
-        .with_target(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&log_filter))
+        .with_target(is_debug)
         .compact()
         .with_writer(std::io::stderr)
         .init();
