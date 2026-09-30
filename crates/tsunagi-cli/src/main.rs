@@ -33,7 +33,12 @@ use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 #[command(name = "tsunagi", version, about, long_about = None)]
 struct Cli {
     /// Log filter, for example `info` or `tsunagi=debug`.
-    #[arg(long, global = true, env = "TSUNAGI_LOG", default_value = "warn")]
+    #[arg(
+        long,
+        global = true,
+        env = "TSUNAGI_LOG",
+        default_value = "info,iroh=warn,quinn=warn,rustls=warn,boringtun=warn,mainline=warn"
+    )]
     log: String,
 
     #[command(subcommand)]
@@ -469,8 +474,8 @@ struct UpArgs {
     #[arg(long, value_name = "PORT", help_heading = "System")]
     dns_port: Option<u16>,
 
-    /// How often to print a status summary, in seconds. Zero disables it.
-    #[arg(long, default_value_t = 15)]
+    /// How often to log a periodic status summary in debug mode, in seconds. Zero disables it.
+    #[arg(long, default_value_t = 0)]
     status_interval: u64,
 
     /// Control socket to serve. Derived from the state directory by default.
@@ -693,6 +698,8 @@ fn main() -> std::process::ExitCode {
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&cli.log))
+        .with_target(false)
+        .compact()
         .with_writer(std::io::stderr)
         .init();
 
@@ -1270,6 +1277,7 @@ fn show_protocols() -> Result<(), Box<dyn std::error::Error>> {
 struct AgentControl {
     agent: Agent,
     plugin: Option<Arc<WireguardPlugin>>,
+    tcp_tls: Option<Arc<TcpTlsPlugin>>,
     /// The resolver, which this owns so it can be switched while running.
     dns: Arc<tokio::sync::Mutex<Option<DnsService>>>,
     /// Where the setting is remembered, so it survives a restart.
@@ -1280,7 +1288,13 @@ impl tsunagi::ipc::ReportSource for AgentControl {
     fn report(&self) -> tsunagi::BoxFuture<'_, tsunagi::ipc::StatusReport> {
         Box::pin(async move {
             let dns = self.dns_state().await;
-            build_report(&self.agent, self.plugin.as_deref(), dns).await
+            build_report(
+                &self.agent,
+                self.plugin.as_deref(),
+                self.tcp_tls.as_deref(),
+                dns,
+            )
+            .await
         })
     }
 
@@ -3460,6 +3474,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // was selected to carry traffic over it.
     let mut wireguard = None;
     let mut tcp_tls_transport = None;
+    let mut tcp_tls_plugin = None;
     if !wanted.is_empty() {
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
@@ -3501,13 +3516,14 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let codec = TcpTlsCodec::new(identity.endpoint_id(), Arc::clone(&transport));
                 let plugin = Arc::new(TcpTlsPlugin::new(codec));
                 config = config
-                    .with_plugin(plugin as Arc<dyn IpPlugin>)
+                    .with_plugin(plugin.clone() as Arc<dyn IpPlugin>)
                     .with_custom_transport(
                         TCP_TLS_PROTOCOL,
                         Arc::clone(&transport)
                             as Arc<dyn tsunagi::dataplane::transport::PacketTransport>,
                     );
                 tcp_tls_transport = Some(transport);
+                tcp_tls_plugin = Some(plugin);
             }
             other => return Err(format!("`{other}` is listed but not built in").into()),
         }
@@ -3561,9 +3577,15 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let protocol_names: Vec<&str> = wanted.iter().map(|p| p.name).collect();
+
     println!("tsunagi is up");
     println!("  endpoint id  {}", agent.endpoint_id());
     println!("  hostname     {}", agent.hostname());
+    println!(
+        "  protocols    {} (priority order)",
+        protocol_names.join(", ")
+    );
     // What this device belongs to is a separate question from whether its
     // agent is running, and `tsunagi join` answers it at any time.
     let configured = agent.list_networks().await.unwrap_or_default();
@@ -3591,10 +3613,12 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let control = {
         let agent = agent.clone();
         let plugin = wireguard.clone();
+        let tcp_tls = tcp_tls_plugin.clone();
         let dns = Arc::clone(&dns);
         let source: Arc<dyn tsunagi::ipc::ReportSource> = Arc::new(AgentControl {
             agent,
             plugin,
+            tcp_tls,
             dns,
             paths: paths.clone(),
         });
@@ -3613,6 +3637,13 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nPress Ctrl-C to stop.\n");
 
+    tracing::info!(
+        endpoint_id = %agent.endpoint_id(),
+        hostname = %agent.hostname(),
+        protocols = ?protocol_names,
+        "Agent started and listening"
+    );
+
     let status_every =
         (args.status_interval > 0).then(|| Duration::from_secs(args.status_interval));
     let mut ticker = status_every.map(tokio::time::interval);
@@ -3620,13 +3651,13 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             reason = stop_signal() => {
-                println!("\nstopping ({reason})...");
+                tracing::info!("Stopping agent ({reason})...");
                 break;
             }
             event = events.recv() => match event {
-                Ok(event) => print_event(&event),
+                Ok(event) => log_event(&event),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    println!("  (missed {skipped} events)");
+                    tracing::warn!("Event channel lagged, missed {skipped} events");
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
@@ -3636,7 +3667,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                     None => std::future::pending::<()>().await,
                 }
             }, if ticker.is_some() => {
-                print_status(&agent, None, wireguard.as_deref()).await;
+                log_status_summary(&agent, None).await;
             }
         }
     }
@@ -3650,7 +3681,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         dns.shutdown().await;
     }
     agent.shutdown().await;
-    println!("stopped.");
+    tracing::info!("Agent stopped.");
     Ok(())
 }
 
@@ -3660,6 +3691,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
 async fn build_report(
     agent: &Agent,
     wireguard: Option<&WireguardPlugin>,
+    tcp_tls: Option<&TcpTlsPlugin>,
     dns: Option<DnsState>,
 ) -> tsunagi::ipc::StatusReport {
     use tsunagi::ipc::{
@@ -3677,66 +3709,106 @@ async fn build_report(
         .networks
         .iter()
         .map(|network| {
-            let overlay = wireguard
-                .and_then(|plugin| plugin.overview(network.network_id))
-                .map(|view| OverlayReport {
+            let wg_view = wireguard.and_then(|plugin| plugin.overview(network.network_id));
+            let tcp_tls_peers = tcp_tls
+                .map(|p| p.active_peers(network.network_id))
+                .unwrap_or_default();
+
+            let overlay = if let Some(view) = wg_view {
+                let mut peers = Vec::new();
+                for peer in &view.peers {
+                    let active_tcp_tls_path = tcp_tls_peers
+                        .iter()
+                        .find(|(id, _)| *id == peer.endpoint_id)
+                        .map(|(_, path)| path.clone());
+
+                    let (path, handshake) = if let Some(path) = active_tcp_tls_path {
+                        (
+                            path,
+                            peer.tunnel
+                                .as_ref()
+                                .and_then(|t| t.health.since_handshake)
+                                .map(|s| s.as_secs())
+                                .or(Some(0)),
+                        )
+                    } else {
+                        (
+                            peer.tunnel
+                                .as_ref()
+                                .map(|t| t.path.clone())
+                                .unwrap_or_else(|| "no data link".into()),
+                            peer.tunnel
+                                .as_ref()
+                                .and_then(|t| t.health.since_handshake)
+                                .map(|s| s.as_secs()),
+                        )
+                    };
+
+                    peers.push(OverlayPeerReport {
+                        endpoint_id: peer.endpoint_id.to_string(),
+                        public_key: peer.public_key.to_string(),
+                        address: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                        handshake_secs_ago: handshake,
+                        tx_packets: peer.tunnel.as_ref().map_or(0, |t| t.stats.tx_packets),
+                        rx_packets: peer.tunnel.as_ref().map_or(0, |t| t.stats.rx_packets),
+                        dropped: peer.tunnel.as_ref().map_or(0, |t| {
+                            t.stats.dropped_wrong_source + t.stats.dropped_oversize
+                        }),
+                        protocol_errors: peer
+                            .tunnel
+                            .as_ref()
+                            .map_or(0, |t| t.stats.protocol_errors),
+                        path,
+                    });
+                }
+                Some(OverlayReport {
                     interface: overlay
                         .as_ref()
-                        .map_or_else(String::new, |overlay| overlay.interface.clone()),
-                    on_host: overlay.as_ref().is_some_and(|overlay| overlay.on_host),
-                    mtu: overlay.as_ref().map_or(0, |overlay| overlay.mtu),
+                        .map_or_else(String::new, |o| o.interface.clone()),
+                    on_host: overlay.as_ref().is_some_and(|o| o.on_host),
+                    mtu: overlay.as_ref().map_or(0, |o| o.mtu),
                     address: view.overlay_address_v4.map(|addr| addr.to_string()),
-                    prefix_len: view.ipv4_range.map_or(0, |range| range.prefix_len),
-                    peers: view
-                        .peers
-                        .iter()
-                        .map(|peer| OverlayPeerReport {
-                            endpoint_id: peer.endpoint_id.to_string(),
-                            public_key: peer.public_key.to_string(),
-                            address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                            handshake_secs_ago: peer
-                                .tunnel
-                                .as_ref()
-                                .and_then(|tunnel| tunnel.health.since_handshake)
-                                .map(|since| since.as_secs()),
-                            tx_packets: peer
-                                .tunnel
-                                .as_ref()
-                                .map_or(0, |tunnel| tunnel.stats.tx_packets),
-                            rx_packets: peer
-                                .tunnel
-                                .as_ref()
-                                .map_or(0, |tunnel| tunnel.stats.rx_packets),
-                            dropped: peer.tunnel.as_ref().map_or(0, |tunnel| {
-                                tunnel.stats.dropped_wrong_source + tunnel.stats.dropped_oversize
-                            }),
-                            protocol_errors: peer
-                                .tunnel
-                                .as_ref()
-                                .map_or(0, |tunnel| tunnel.stats.protocol_errors),
-                            path: peer
-                                .tunnel
-                                .as_ref()
-                                .map(|tunnel| tunnel.path.clone())
-                                .unwrap_or_else(|| "no data link".into()),
-                        })
-                        .collect(),
-                    // The interface belongs to the agent, so the counters
-                    // about it come from there and are the same for every
-                    // network sharing it.
-                    unroutable_packets: overlay
+                    prefix_len: view.ipv4_range.map_or(0, |r| r.prefix_len),
+                    peers,
+                    unroutable_packets: overlay.as_ref().map_or(0, |o| o.counters.unroutable),
+                    multicast_packets: overlay.as_ref().map_or(0, |o| o.counters.multicast),
+                    unroutable_sample: overlay
                         .as_ref()
-                        .map_or(0, |overlay| overlay.counters.unroutable),
-                    multicast_packets: overlay
+                        .and_then(|o| o.counters.unroutable_sample.map(|a| a.to_string())),
+                })
+            } else if overlay.is_some() && !tcp_tls_peers.is_empty() {
+                let peers = tcp_tls_peers
+                    .into_iter()
+                    .map(|(id, path)| OverlayPeerReport {
+                        endpoint_id: id.to_string(),
+                        public_key: String::new(),
+                        address: None,
+                        handshake_secs_ago: Some(0),
+                        tx_packets: 0,
+                        rx_packets: 0,
+                        dropped: 0,
+                        protocol_errors: 0,
+                        path,
+                    })
+                    .collect();
+                Some(OverlayReport {
+                    interface: overlay
                         .as_ref()
-                        .map_or(0, |overlay| overlay.counters.multicast),
-                    unroutable_sample: overlay.as_ref().and_then(|overlay| {
-                        overlay
-                            .counters
-                            .unroutable_sample
-                            .map(|address| address.to_string())
-                    }),
-                });
+                        .map_or_else(String::new, |o| o.interface.clone()),
+                    on_host: overlay.as_ref().is_some_and(|o| o.on_host),
+                    mtu: overlay.as_ref().map_or(0, |o| o.mtu),
+                    address: None,
+                    prefix_len: 0,
+                    peers,
+                    unroutable_packets: overlay.as_ref().map_or(0, |o| o.counters.unroutable),
+                    multicast_packets: overlay.as_ref().map_or(0, |o| o.counters.multicast),
+                    unroutable_sample: overlay
+                        .as_ref()
+                        .and_then(|o| o.counters.unroutable_sample.map(|a| a.to_string())),
+                })
+            } else {
+                None
+            };
 
             NetworkReport {
                 broadcast: network.broadcast,
@@ -3865,60 +3937,120 @@ fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error
     .into())
 }
 
-fn print_event(event: &Event) {
+fn log_event(event: &Event) {
     match event {
+        Event::NetworkActivated { network } => {
+            tracing::info!(network = %network.fmt_short(), "Network activated");
+        }
+        Event::NetworkDeactivated { network } => {
+            tracing::info!(network = %network.fmt_short(), "Network deactivated");
+        }
         Event::PeerConnected {
+            network,
             peer,
             transport,
             rtt,
             ..
-        } => println!(
-            "  + peer {} connected over {transport:?} rtt={rtt:?}",
-            peer.fmt_short()
-        ),
-        Event::PeerDisconnected { peer, reason, .. } => {
-            println!("  - peer {} gone: {reason}", peer.fmt_short())
+        } => {
+            let rtt_str = rtt
+                .map(|d| format!("{:.1}ms", d.as_secs_f64() * 1000.0))
+                .unwrap_or_else(|| "unknown".into());
+            tracing::info!(
+                network = %network.fmt_short(),
+                peer = %peer.fmt_short(),
+                "Peer connected via {transport:?} (rtt: {rtt_str})"
+            );
+        }
+        Event::PeerDisconnected {
+            network,
+            peer,
+            reason,
+        } => {
+            tracing::info!(
+                network = %network.fmt_short(),
+                peer = %peer.fmt_short(),
+                "Peer disconnected: {reason}"
+            );
         }
         Event::DataLinkUp {
+            network,
             peer,
             protocol,
             path,
             max_datagram,
-            ..
-        } => println!(
-            "  + data link to {} for {protocol}: {path}, datagram {max_datagram}",
-            peer.fmt_short()
-        ),
+        } => {
+            tracing::info!(
+                network = %network.fmt_short(),
+                peer = %peer.fmt_short(),
+                "Data link established for {protocol} ({path}, MTU datagram: {max_datagram}B)"
+            );
+        }
         Event::DataLinkDown {
+            network,
             peer,
             protocol,
             reason,
-            ..
-        } => println!(
-            "  - data link to {} for {protocol}: {reason}",
-            peer.fmt_short()
-        ),
-        Event::HandshakeRejected { peer, reason, .. } => println!(
-            "  ! rejected {}: {reason}",
-            peer.map(|peer| peer.fmt_short().to_string())
-                .unwrap_or_else(|| "a caller".into())
-        ),
+        } => {
+            tracing::info!(
+                network = %network.fmt_short(),
+                peer = %peer.fmt_short(),
+                "Data link closed for {protocol}: {reason}"
+            );
+        }
+        Event::DialFailed {
+            network,
+            peer,
+            reason,
+        } => {
+            tracing::debug!(
+                network = %network.fmt_short(),
+                peer = %peer.fmt_short(),
+                "Outbound dial failed: {reason}"
+            );
+        }
+        Event::HandshakeRejected {
+            network,
+            peer,
+            reason,
+        } => {
+            let peer_str = peer
+                .map(|p| p.fmt_short().to_string())
+                .unwrap_or_else(|| "unknown".into());
+            tracing::warn!(
+                network = ?network.map(|n| n.fmt_short().to_string()),
+                peer = %peer_str,
+                "Handshake rejected: {reason}"
+            );
+        }
+        Event::ProtocolViolation {
+            network,
+            peer,
+            reason,
+        } => {
+            let peer_str = peer
+                .map(|p| p.fmt_short().to_string())
+                .unwrap_or_else(|| "unknown".into());
+            tracing::warn!(
+                network = ?network.map(|n| n.fmt_short().to_string()),
+                peer = %peer_str,
+                "Protocol violation from {peer_str}: {reason}"
+            );
+        }
         Event::PluginError {
-            protocol, reason, ..
-        } => println!("  ! {protocol}: {reason}"),
-        Event::CacheReset { reason } => println!("  ! cache was reset: {reason}"),
+            network,
+            protocol,
+            reason,
+        } => {
+            tracing::warn!(network = %network.fmt_short(), %protocol, "Data plane plugin error: {reason}");
+        }
+        Event::CacheReset { reason } => {
+            tracing::warn!("Disposable cache was reset: {reason}");
+        }
         _ => {}
     }
 }
 
-async fn print_status(
-    agent: &Agent,
-    network: Option<NetworkId>,
-    wireguard: Option<&WireguardPlugin>,
-) {
-    // The network this command line named, or — when it named none — the
-    // first one the agent has, since there is no other candidate for "the"
-    // network and `tsunagi status` covers the whole picture anyway.
+async fn log_status_summary(agent: &Agent, network: Option<NetworkId>) {
     let network = match network {
         Some(network) => network,
         None => match agent.list_networks().await {
@@ -3929,80 +4061,14 @@ async fn print_status(
             Err(_) => return,
         },
     };
-    let Ok(status) = agent.network_status(network).await else {
-        return;
-    };
-    println!("\n--- status ---");
-    println!(
-        "control: {} peer(s), {} dial failure(s), {} handshake failure(s)",
-        status.peers.len(),
-        status.metrics.dial_failures,
-        status.metrics.handshake_failures
-    );
-    for peer in &status.peers {
-        println!(
-            "  {} {} {:?} rtt={:?}",
-            peer.endpoint_id.fmt_short(),
-            peer.hostname.as_deref().unwrap_or("?"),
-            peer.transport,
-            peer.rtt
+    if let Ok(status) = agent.network_status(network).await {
+        tracing::debug!(
+            peers = status.peers.len(),
+            dial_failures = status.metrics.dial_failures,
+            handshake_failures = status.metrics.handshake_failures,
+            "Network status tick"
         );
     }
-
-    if let Some(plugin) = wireguard
-        && let Some(view) = plugin.overview(network)
-    {
-        println!(
-            "{}: {} on {}/{} mtu {}, {}/{} tunnel(s) established",
-            plugin.protocol_id(),
-            agent
-                .overlay()
-                .map_or_else(|| "no interface".to_string(), |overlay| overlay.interface),
-            view.overlay_address_v4
-                .map_or_else(|| "no address yet".to_string(), |addr| addr.to_string()),
-            view.ipv4_range.map_or(0, |range| range.prefix_len),
-            view.mtu,
-            view.established_peers(),
-            view.peers.len()
-        );
-        for peer in &view.peers {
-            match &peer.tunnel {
-                Some(tunnel) => println!(
-                    "  {} {} {} tx={} rx={} dropped={} path={}",
-                    peer.public_key.fmt_short(),
-                    peer.overlay_address_v4
-                        .map_or_else(|| "no address".to_string(), |addr| addr.to_string()),
-                    match tunnel.health.since_handshake {
-                        Some(since) => format!("handshake {}s ago", since.as_secs()),
-                        None => "NOT HANDSHAKEN".to_string(),
-                    },
-                    tunnel.stats.tx_packets,
-                    tunnel.stats.rx_packets,
-                    tunnel.stats.dropped_wrong_source + tunnel.stats.dropped_oversize,
-                    tunnel.path
-                ),
-                None => println!(
-                    "  {} {} waiting for a data link",
-                    peer.public_key.fmt_short(),
-                    peer.overlay_address_v4
-                        .map_or_else(|| "no address".to_string(), |addr| addr.to_string())
-                ),
-            }
-        }
-    }
-    if let Some(overlay) = agent.overlay()
-        && overlay.counters.unroutable > 0
-    {
-        println!(
-            "  {} packet(s) for unknown addresses{}",
-            overlay.counters.unroutable,
-            match overlay.counters.unroutable_sample {
-                Some(sample) => format!(" (for example {sample})"),
-                None => String::new(),
-            }
-        );
-    }
-    println!();
 }
 
 #[cfg(test)]

@@ -101,6 +101,19 @@ impl<C: TunnelCodec> GenericTunnelPlugin<C> {
     pub fn codec(&self) -> &C {
         &self.codec
     }
+
+    /// Returns the active peers with established data links for a network.
+    pub fn active_peers(&self, network: NetworkId) -> Vec<(EndpointId, String)> {
+        let guard = match self.links.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard
+            .iter()
+            .filter(|((net, _), _)| *net == network)
+            .map(|((_, peer), link)| (*peer, link.path_description()))
+            .collect()
+    }
 }
 
 impl<C: TunnelCodec> std::fmt::Debug for GenericTunnelPlugin<C> {
