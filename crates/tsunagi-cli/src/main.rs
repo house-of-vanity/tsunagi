@@ -2842,10 +2842,18 @@ fn host_section() -> report::Section {
     use report::{Health, Row, Section};
 
     let mut host = Section::new("host");
+    let protocols: Vec<String> = PROTOCOLS
+        .iter()
+        .map(|spec| format!("{} (wire v{})", spec.name, spec.version))
+        .collect();
+    host.push(
+        Row::new(Health::Info, "protocols", protocols.join(", "))
+            .with_note("run `tsunagi protocols` to see what each one takes"),
+    );
     host.push(Row::new(
         Health::Info,
         "implementation",
-        "userspace WireGuard (boringtun); no kernel module needed",
+        "userspace overlay (boringtun WireGuard, TCP TLS 1.3); no kernel module needed",
     ));
     {
         if cfg!(target_os = "linux") {
