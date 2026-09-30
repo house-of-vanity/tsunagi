@@ -394,7 +394,9 @@ pub struct OverlayPeerReport {
     /// The peer's control plane identity, so a tunnel can be matched to the
     /// session and the member it belongs to.
     pub endpoint_id: String,
-    /// The peer's WireGuard public key.
+    /// Protocol carrying overlay traffic for this peer (e.g. "tcp-tls", "wg-quic").
+    pub protocol: String,
+    /// The peer's WireGuard public key (if applicable).
     pub public_key: String,
     /// The overlay address the network agreed it holds.
     pub address: Option<String>,

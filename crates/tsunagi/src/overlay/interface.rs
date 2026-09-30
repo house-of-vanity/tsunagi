@@ -288,15 +288,16 @@ impl Interface {
     pub async fn remove(&self) {
         // The packet loop holds the device open, and it ends only when the
         // device reports end of stream — which a real interface never does
-        // while it exists. So it is stopped here, not left to notice.
+        // while it exists. Stop it directly before destroying the interface.
         let task = match self.task.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
-        self.factory.destroy(self.device.name()).await;
         if let Some(task) = task {
-            crate::task::wind_down(task, crate::task::TASK_GRACE, "overlay packet loop").await;
+            task.abort();
+            let _ = task.await;
         }
+        self.factory.destroy(self.device.name()).await;
     }
 
     /// The counters as they stand.

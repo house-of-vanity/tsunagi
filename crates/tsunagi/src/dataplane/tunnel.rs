@@ -8,6 +8,7 @@
 //! [`GenericTunnelPlugin`] adapts any [`TunnelCodec`] into a full [`super::IpPlugin`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
@@ -78,11 +79,38 @@ pub trait TunnelCodec: Send + Sync + 'static {
     }
 }
 
+struct TunnelPeerState {
+    link: SharedLink,
+    tx_packets: AtomicU64,
+    rx_packets: AtomicU64,
+    dropped: AtomicU64,
+    established_at: std::time::Instant,
+}
+
+/// Statistics and status for one active peer in [`GenericTunnelPlugin`].
+#[derive(Debug, Clone)]
+pub struct TunnelPeerReport {
+    /// Peer endpoint identity.
+    pub peer: EndpointId,
+    /// Protocol identifier.
+    pub protocol: String,
+    /// Human-readable path description.
+    pub path: String,
+    /// Packets successfully encrypted and sent.
+    pub tx_packets: u64,
+    /// Packets successfully received and decrypted.
+    pub rx_packets: u64,
+    /// Packets dropped due to encryption/decryption/send failures.
+    pub dropped: u64,
+    /// Uptime in seconds since the data link was established.
+    pub uptime_secs: u64,
+}
+
 /// Generic wrapper that turns a [`TunnelCodec`] into a full [`IpPlugin`].
 pub struct GenericTunnelPlugin<C: TunnelCodec> {
     codec: Arc<C>,
     context: Mutex<Option<PluginContext>>,
-    links: RwLock<HashMap<(NetworkId, EndpointId), SharedLink>>,
+    links: RwLock<HashMap<(NetworkId, EndpointId), Arc<TunnelPeerState>>>,
     tasks: Mutex<HashMap<(NetworkId, EndpointId), JoinHandle<()>>>,
 }
 
@@ -103,7 +131,7 @@ impl<C: TunnelCodec> GenericTunnelPlugin<C> {
     }
 
     /// Returns the active peers with established data links for a network.
-    pub fn active_peers(&self, network: NetworkId) -> Vec<(EndpointId, String)> {
+    pub fn active_peers(&self, network: NetworkId) -> Vec<TunnelPeerReport> {
         let guard = match self.links.read() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -111,7 +139,15 @@ impl<C: TunnelCodec> GenericTunnelPlugin<C> {
         guard
             .iter()
             .filter(|((net, _), _)| *net == network)
-            .map(|((_, peer), link)| (*peer, link.path_description()))
+            .map(|((_, peer), state)| TunnelPeerReport {
+                peer: *peer,
+                protocol: self.codec.protocol_id().to_string(),
+                path: state.link.path_description(),
+                tx_packets: state.tx_packets.load(Ordering::Relaxed),
+                rx_packets: state.rx_packets.load(Ordering::Relaxed),
+                dropped: state.dropped.load(Ordering::Relaxed),
+                uptime_secs: state.established_at.elapsed().as_secs(),
+            })
             .collect()
     }
 }
@@ -171,7 +207,7 @@ impl<C: TunnelCodec> IpPlugin for GenericTunnelPlugin<C> {
     }
 
     fn carry(&self, network: NetworkId, peer: EndpointId, packet: bytes::Bytes) -> bool {
-        let link = {
+        let state = {
             let guard = match self.links.read() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
@@ -179,13 +215,22 @@ impl<C: TunnelCodec> IpPlugin for GenericTunnelPlugin<C> {
             guard.get(&(network, peer)).cloned()
         };
 
-        let Some(link) = link else {
+        let Some(state) = state else {
             return false;
         };
 
         match self.codec.encrypt(network, peer, &packet) {
-            Ok(ciphertext) => link.send(ciphertext).is_ok(),
+            Ok(ciphertext) => {
+                if state.link.send(ciphertext).is_ok() {
+                    state.tx_packets.fetch_add(1, Ordering::Relaxed);
+                    true
+                } else {
+                    state.dropped.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            }
             Err(err) => {
+                state.dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(%peer, %err, "tunnel encrypt failed");
                 false
             }
@@ -193,12 +238,19 @@ impl<C: TunnelCodec> IpPlugin for GenericTunnelPlugin<C> {
     }
 
     fn on_peer_link(&self, network: NetworkId, peer: EndpointId, link: SharedLink) {
+        let state = Arc::new(TunnelPeerState {
+            link: Arc::clone(&link),
+            tx_packets: AtomicU64::new(0),
+            rx_packets: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            established_at: std::time::Instant::now(),
+        });
         {
             let mut guard = match self.links.write() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            guard.insert((network, peer), Arc::clone(&link));
+            guard.insert((network, peer), Arc::clone(&state));
         }
 
         self.codec.on_peer_link_up(network, peer, &link);
@@ -210,15 +262,18 @@ impl<C: TunnelCodec> IpPlugin for GenericTunnelPlugin<C> {
         };
 
         let rx_link = Arc::clone(&link);
+        let rx_state = Arc::clone(&state);
         let handle = tokio::spawn(async move {
             while let Some(payload) = rx_link.recv().await {
                 match codec.decrypt(network, peer, &payload) {
                     Ok(packet) => {
+                        rx_state.rx_packets.fetch_add(1, Ordering::Relaxed);
                         if let Some(ref sink) = sink {
                             sink.deliver(network, peer, packet).await;
                         }
                     }
                     Err(err) => {
+                        rx_state.dropped.fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(%peer, %err, "tunnel decrypt failed");
                     }
                 }

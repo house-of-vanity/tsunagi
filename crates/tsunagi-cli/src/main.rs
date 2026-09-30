@@ -2824,9 +2824,19 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
 
     let mut out = Row::new(health, row.label(), detail);
     if let Some(tunnel) = row.tunnel {
+        let proto = if tunnel.protocol.is_empty() {
+            "wg-quic"
+        } else {
+            &tunnel.protocol
+        };
         out = out.with_note(match tunnel.handshake_secs_ago {
             Some(secs) => format!(
-                "tunnel up, handshake {secs}s ago, tx {} rx {}{}  ·  {}",
+                "tunnel up ({proto}), {} tx {} rx {}{}  ·  {}",
+                if proto == "tcp-tls" {
+                    format!("uptime {secs}s,")
+                } else {
+                    format!("handshake {secs}s ago,")
+                },
                 tunnel.tx_packets,
                 tunnel.rx_packets,
                 if tunnel.dropped > 0 {
@@ -2836,7 +2846,13 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
                 },
                 tunnel.path
             ),
-            None => "no WireGuard handshake yet; the tunnel cannot carry traffic".to_string(),
+            None => {
+                if proto == "wg-quic" {
+                    "no WireGuard handshake yet; the tunnel cannot carry traffic".to_string()
+                } else {
+                    format!("no {proto} handshake yet; the tunnel cannot carry traffic")
+                }
+            }
         });
     }
     out
@@ -3710,56 +3726,81 @@ async fn build_report(
         .iter()
         .map(|network| {
             let wg_view = wireguard.and_then(|plugin| plugin.overview(network.network_id));
-            let tcp_tls_peers = tcp_tls
+            let tcp_tls_reports = tcp_tls
                 .map(|p| p.active_peers(network.network_id))
                 .unwrap_or_default();
 
             let overlay = if let Some(view) = wg_view {
                 let mut peers = Vec::new();
                 for peer in &view.peers {
-                    let active_tcp_tls_path = tcp_tls_peers
-                        .iter()
-                        .find(|(id, _)| *id == peer.endpoint_id)
-                        .map(|(_, path)| path.clone());
+                    let tcp_tls_match = tcp_tls_reports.iter().find(|r| r.peer == peer.endpoint_id);
 
-                    let (path, handshake) = if let Some(path) = active_tcp_tls_path {
-                        (
-                            path,
-                            peer.tunnel
-                                .as_ref()
-                                .and_then(|t| t.health.since_handshake)
-                                .map(|s| s.as_secs())
-                                .or(Some(0)),
-                        )
+                    if let Some(tcp_tls) = tcp_tls_match {
+                        peers.push(OverlayPeerReport {
+                            endpoint_id: peer.endpoint_id.to_string(),
+                            protocol: tcp_tls.protocol.clone(),
+                            public_key: peer.public_key.to_string(),
+                            address: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                            handshake_secs_ago: Some(tcp_tls.uptime_secs),
+                            tx_packets: tcp_tls.tx_packets,
+                            rx_packets: tcp_tls.rx_packets,
+                            dropped: tcp_tls.dropped,
+                            protocol_errors: 0,
+                            path: tcp_tls.path.clone(),
+                        });
+                    } else if let Some(tunnel) = &peer.tunnel {
+                        peers.push(OverlayPeerReport {
+                            endpoint_id: peer.endpoint_id.to_string(),
+                            protocol: "wg-quic".into(),
+                            public_key: peer.public_key.to_string(),
+                            address: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                            handshake_secs_ago: tunnel.health.since_handshake.map(|s| s.as_secs()),
+                            tx_packets: tunnel.stats.tx_packets,
+                            rx_packets: tunnel.stats.rx_packets,
+                            dropped: tunnel.stats.dropped_wrong_source
+                                + tunnel.stats.dropped_oversize,
+                            protocol_errors: tunnel.stats.protocol_errors,
+                            path: tunnel.path.clone(),
+                        });
                     } else {
-                        (
-                            peer.tunnel
-                                .as_ref()
-                                .map(|t| t.path.clone())
-                                .unwrap_or_else(|| "no data link".into()),
-                            peer.tunnel
-                                .as_ref()
-                                .and_then(|t| t.health.since_handshake)
-                                .map(|s| s.as_secs()),
-                        )
-                    };
-
-                    peers.push(OverlayPeerReport {
-                        endpoint_id: peer.endpoint_id.to_string(),
-                        public_key: peer.public_key.to_string(),
-                        address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                        handshake_secs_ago: handshake,
-                        tx_packets: peer.tunnel.as_ref().map_or(0, |t| t.stats.tx_packets),
-                        rx_packets: peer.tunnel.as_ref().map_or(0, |t| t.stats.rx_packets),
-                        dropped: peer.tunnel.as_ref().map_or(0, |t| {
-                            t.stats.dropped_wrong_source + t.stats.dropped_oversize
-                        }),
-                        protocol_errors: peer
-                            .tunnel
-                            .as_ref()
-                            .map_or(0, |t| t.stats.protocol_errors),
-                        path,
-                    });
+                        peers.push(OverlayPeerReport {
+                            endpoint_id: peer.endpoint_id.to_string(),
+                            protocol: "wg-quic".into(),
+                            public_key: peer.public_key.to_string(),
+                            address: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                            handshake_secs_ago: None,
+                            tx_packets: 0,
+                            rx_packets: 0,
+                            dropped: 0,
+                            protocol_errors: 0,
+                            path: "no data link".into(),
+                        });
+                    }
+                }
+                for report in &tcp_tls_reports {
+                    if !peers
+                        .iter()
+                        .any(|p| p.endpoint_id == report.peer.to_string())
+                    {
+                        let address = network
+                            .members
+                            .iter()
+                            .find(|m| m.endpoint_id == report.peer)
+                            .and_then(|m| m.overlay_address_v4)
+                            .map(|a| a.to_string());
+                        peers.push(OverlayPeerReport {
+                            endpoint_id: report.peer.to_string(),
+                            protocol: report.protocol.clone(),
+                            public_key: String::new(),
+                            address,
+                            handshake_secs_ago: Some(report.uptime_secs),
+                            tx_packets: report.tx_packets,
+                            rx_packets: report.rx_packets,
+                            dropped: report.dropped,
+                            protocol_errors: 0,
+                            path: report.path.clone(),
+                        });
+                    }
                 }
                 Some(OverlayReport {
                     interface: overlay
@@ -3776,19 +3817,28 @@ async fn build_report(
                         .as_ref()
                         .and_then(|o| o.counters.unroutable_sample.map(|a| a.to_string())),
                 })
-            } else if overlay.is_some() && !tcp_tls_peers.is_empty() {
-                let peers = tcp_tls_peers
+            } else if overlay.is_some() && !tcp_tls_reports.is_empty() {
+                let peers = tcp_tls_reports
                     .into_iter()
-                    .map(|(id, path)| OverlayPeerReport {
-                        endpoint_id: id.to_string(),
-                        public_key: String::new(),
-                        address: None,
-                        handshake_secs_ago: Some(0),
-                        tx_packets: 0,
-                        rx_packets: 0,
-                        dropped: 0,
-                        protocol_errors: 0,
-                        path,
+                    .map(|report| {
+                        let address = network
+                            .members
+                            .iter()
+                            .find(|m| m.endpoint_id == report.peer)
+                            .and_then(|m| m.overlay_address_v4)
+                            .map(|a| a.to_string());
+                        OverlayPeerReport {
+                            endpoint_id: report.peer.to_string(),
+                            protocol: report.protocol,
+                            public_key: String::new(),
+                            address,
+                            handshake_secs_ago: Some(report.uptime_secs),
+                            tx_packets: report.tx_packets,
+                            rx_packets: report.rx_packets,
+                            dropped: report.dropped,
+                            protocol_errors: 0,
+                            path: report.path,
+                        }
                     })
                     .collect();
                 Some(OverlayReport {
@@ -3797,8 +3847,13 @@ async fn build_report(
                         .map_or_else(String::new, |o| o.interface.clone()),
                     on_host: overlay.as_ref().is_some_and(|o| o.on_host),
                     mtu: overlay.as_ref().map_or(0, |o| o.mtu),
-                    address: None,
-                    prefix_len: 0,
+                    address: network
+                        .members
+                        .iter()
+                        .find(|m| m.endpoint_id == status.endpoint_id)
+                        .and_then(|m| m.overlay_address_v4)
+                        .map(|a| a.to_string()),
+                    prefix_len: network.range.map_or(0, |r| r.prefix_len),
                     peers,
                     unroutable_packets: overlay.as_ref().map_or(0, |o| o.counters.unroutable),
                     multicast_packets: overlay.as_ref().map_or(0, |o| o.counters.multicast),
@@ -4398,6 +4453,26 @@ mod status_tests {
         let text = out.render(false);
         assert_eq!(out.worst(), Health::Degraded, "{text}");
         assert!(text.contains("same secret"), "{text}");
+    }
+
+    #[test]
+    fn a_tcp_tls_tunnel_shows_healthy_state_and_metrics() {
+        let mut network = network_after_a_peer_returned();
+        let mut t = tunnel(ONLINE, Some(42));
+        t.protocol = "tcp-tls".into();
+        t.path = "tcp-tls via 192.0.2.1:443".into();
+        t.tx_packets = 100;
+        t.rx_packets = 200;
+        network.overlay = Some(overlay(vec![t]));
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert_eq!(out.worst(), Health::Good, "{text}");
+        assert!(text.contains("tunnel up (tcp-tls)"), "{text}");
+        assert!(text.contains("uptime 42s"), "{text}");
+        assert!(text.contains("tx 100 rx 200"), "{text}");
+        assert!(text.contains("tcp-tls via 192.0.2.1:443"), "{text}");
     }
 }
 
