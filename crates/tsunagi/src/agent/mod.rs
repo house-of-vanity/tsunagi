@@ -385,10 +385,7 @@ impl Agent {
     /// waits to adopt whatever it settles on. One agent has one interface, so
     /// proposing a range it could not route would be worse than having none:
     /// the lowest author's range wins, and the collision would spread.
-    fn reserve_range(&self, network: NetworkId) -> RangePlan {
-        let Some(configured) = self.inner.config.overlay_ipv4_range else {
-            return RangePlan::default();
-        };
+    async fn reserve_range(&self, network: NetworkId) -> RangePlan {
         let reserve = |wanted: Ipv4Range| {
             let reservation = crate::overlay::NetworkRoutes {
                 broadcast: Default::default(),
@@ -397,6 +394,44 @@ impl Agent {
                 peers: Vec::new(),
             };
             self.inner.routes.set_network(network, reservation).is_ok()
+        };
+
+        // If this network already has signed records in storage, check if its
+        // members have already agreed on a range. If so, preserve and reserve
+        // THAT range rather than preemptively seizing the default configured range.
+        let stored_records = self
+            .inner
+            .storage
+            .signed_records(network)
+            .await
+            .unwrap_or_default();
+        let mut state_set = crate::state::StateSet::new();
+        state_set.merge_all(network, stored_records);
+        if let Some(agreed) = state_set.agreed_range() {
+            if reserve(agreed) {
+                return RangePlan {
+                    propose: if Some(agreed) == self.inner.config.overlay_ipv4_range {
+                        Some(agreed)
+                    } else {
+                        None
+                    },
+                    ..RangePlan::default()
+                };
+            } else {
+                tracing::warn!(
+                    %network,
+                    range = %agreed,
+                    "agreed range for this network overlaps another network already active on this interface"
+                );
+                return RangePlan {
+                    conflict: Some(agreed),
+                    ..RangePlan::default()
+                };
+            }
+        }
+
+        let Some(configured) = self.inner.config.overlay_ipv4_range else {
+            return RangePlan::default();
         };
 
         // The configured range first, so a network a device has always had
@@ -610,7 +645,7 @@ impl Agent {
             return Err(Error::NetworkAlreadyActive(network_id));
         }
 
-        let range = self.reserve_range(network_id);
+        let range = self.reserve_range(network_id).await;
         let mut backends = Vec::new();
         if let Some(discovery) = &self.inner.config.discovery {
             backends.push(discovery.clone());
