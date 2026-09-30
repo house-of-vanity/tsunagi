@@ -1185,28 +1185,27 @@ impl Runtime {
             });
         }
 
-        // Both the name and the version have to match. A peer offering
-        // `wg-quic` at a version this build does not speak is not a peer to
-        // carry traffic with, and a link opened anyway would fail later and
-        // say less about why.
-        let wanted: Vec<(EndpointId, String)> = self
-            .sessions
-            .values()
-            .flat_map(|session| {
-                let peer = session.peer;
-                session
+        // Choose the highest priority mutually supported protocol for each peer.
+        // If a direct data link is already open or opening, do not dial another.
+        let mut wanted: Vec<(EndpointId, String)> = Vec::new();
+        for session in self.sessions.values() {
+            let peer = session.peer;
+            if self.links.keys().any(|(p, _)| *p == peer)
+                || self.opening.iter().any(|(p, _)| *p == peer)
+            {
+                continue;
+            }
+            for (name, ours) in &served {
+                let matches = session
                     .capabilities
                     .iter()
-                    .filter(|capability| capability.enabled)
-                    .map(move |capability| (peer, capability.protocol.clone(), capability.version))
-            })
-            .filter(|(_, protocol, version)| {
-                served
-                    .iter()
-                    .any(|(name, ours)| name == protocol && ours == version)
-            })
-            .map(|(peer, protocol, _)| (peer, protocol))
-            .collect();
+                    .any(|c| c.enabled && c.protocol == *name && c.version == *ours);
+                if matches {
+                    wanted.push((peer, name.clone()));
+                    break;
+                }
+            }
+        }
 
         for (peer, protocol) in wanted {
             let key = (peer, protocol.clone());

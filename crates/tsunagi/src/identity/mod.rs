@@ -49,9 +49,14 @@ impl DeviceIdentity {
         self.secret.public()
     }
 
-    /// The raw secret key bytes, for persistence only.
-    pub(crate) fn secret_bytes(&self) -> [u8; 32] {
+    /// The raw secret key bytes, for persistence and transport certificate generation.
+    pub fn secret_bytes(&self) -> [u8; 32] {
         self.secret.to_bytes()
+    }
+
+    /// Signs a message with the device's persistent secret key.
+    pub fn sign(&self, message: &[u8]) -> iroh::Signature {
+        self.secret.sign(message)
     }
 
     /// A clone of the iroh secret key, for endpoint construction only.

@@ -22,6 +22,7 @@
 pub mod relay;
 pub mod routing;
 pub mod transport;
+pub mod tunnel;
 
 use std::sync::Arc;
 
@@ -31,7 +32,10 @@ use tokio::sync::mpsc;
 use crate::BoxFuture;
 use crate::identity::NetworkId;
 
-pub use transport::{PacketLink, PacketTransport, SharedLink, TransportError};
+pub use transport::{
+    MultiPacketTransport, PacketLink, PacketTransport, SharedLink, TransportError,
+};
+pub use tunnel::{GenericTunnelPlugin, TunnelCodec};
 
 /// Maximum length of a plugin protocol identifier.
 pub const MAX_PROTOCOL_ID_LEN: usize = 32;
@@ -176,6 +180,15 @@ impl PluginContext {
             sender: None,
             local: None,
             sink: None,
+        }
+    }
+
+    /// A context configured with a custom packet sink.
+    pub fn with_sink(sink: Arc<dyn PacketSink>) -> Self {
+        Self {
+            sender: None,
+            local: None,
+            sink: Some(sink),
         }
     }
 

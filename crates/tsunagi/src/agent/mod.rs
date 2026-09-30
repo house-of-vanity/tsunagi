@@ -281,11 +281,19 @@ impl Agent {
         // The data plane rides on iroh too, which is where it gets hole
         // punching and relay fallback from. It is a separate ALPN and a
         // separate connection, so the two planes stay independent.
-        let transport: Arc<dyn PacketTransport> = Arc::new(IrohTransport::new(
+        let iroh_transport: Arc<dyn PacketTransport> = Arc::new(IrohTransport::new(
             inner.adapter.clone(),
             Arc::clone(&inner.limits),
             Arc::new(TransportCtx(Arc::downgrade(&inner))) as Arc<dyn TransportContext>,
         ));
+        let transport: Arc<dyn PacketTransport> = if inner.config.custom_transports.is_empty() {
+            iroh_transport
+        } else {
+            Arc::new(crate::dataplane::MultiPacketTransport::new(
+                iroh_transport,
+                inner.config.custom_transports.clone(),
+            ))
+        };
         let _ = inner.transport.set(transport);
 
         if let CacheOutcome::Reset(reason) = inner.storage.cache_outcome().clone() {
@@ -344,6 +352,26 @@ impl Agent {
     /// handed literal addresses, as in the test suite.
     pub fn local_addr(&self) -> EndpointAddr {
         self.inner.adapter.loopback_addr()
+    }
+
+    /// Delivers an inbound data plane link to the matching network runtime.
+    pub async fn install_inbound_link(
+        &self,
+        inbound: crate::dataplane::transport::InboundLink,
+    ) -> Result<()> {
+        let network = inbound.network;
+        let sender = {
+            let networks = self.inner.networks.read().await;
+            networks.get(&network).map(|handle| handle.commands.clone())
+        };
+        let Some(sender) = sender else {
+            return Err(Error::NetworkNotActive(network));
+        };
+        sender
+            .send(NetCommand::InboundLink(Box::new(inbound)))
+            .await
+            .map_err(|_| Error::NetworkNotActive(network))?;
+        Ok(())
     }
 
     /// Reserves the configured overlay range for a network, if it can.
@@ -1200,8 +1228,23 @@ async fn handle_inbound_data(inner: Arc<Inner>, conn: iroh::endpoint::Connection
         conn.close(5u32.into(), b"data plane not ready");
         return;
     };
-    // Downcasting is avoided by keeping the accept side on the concrete type.
-    let Some(iroh_transport) = transport.as_ref().as_any().downcast_ref::<IrohTransport>() else {
+    let iroh_transport =
+        if let Some(iroh) = transport.as_ref().as_any().downcast_ref::<IrohTransport>() {
+            Some(iroh)
+        } else if let Some(multi) = transport
+            .as_ref()
+            .as_any()
+            .downcast_ref::<crate::dataplane::MultiPacketTransport>()
+        {
+            multi
+                .default_transport()
+                .as_ref()
+                .as_any()
+                .downcast_ref::<IrohTransport>()
+        } else {
+            None
+        };
+    let Some(iroh_transport) = iroh_transport else {
         conn.close(5u32.into(), b"unsupported data transport");
         return;
     };

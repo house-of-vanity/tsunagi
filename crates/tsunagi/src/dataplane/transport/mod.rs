@@ -32,6 +32,8 @@
 mod fragments;
 pub mod iroh_link;
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use iroh::EndpointId;
 
@@ -154,4 +156,52 @@ pub trait PacketTransport: Send + Sync + std::fmt::Debug + 'static {
         peer: EndpointId,
         protocol: &'a str,
     ) -> BoxFuture<'a, Result<SharedLink, TransportError>>;
+}
+
+/// A composite packet transport that dispatches requests by protocol id.
+#[derive(Debug)]
+pub struct MultiPacketTransport {
+    default: Arc<dyn PacketTransport>,
+    by_protocol: std::collections::HashMap<String, Arc<dyn PacketTransport>>,
+}
+
+impl MultiPacketTransport {
+    /// Creates a new composite transport with a default fallback transport.
+    pub fn new(
+        default: Arc<dyn PacketTransport>,
+        by_protocol: std::collections::HashMap<String, Arc<dyn PacketTransport>>,
+    ) -> Self {
+        Self {
+            default,
+            by_protocol,
+        }
+    }
+
+    /// Access the default underlying transport.
+    pub fn default_transport(&self) -> &Arc<dyn PacketTransport> {
+        &self.default
+    }
+}
+
+impl PacketTransport for MultiPacketTransport {
+    fn name(&self) -> &str {
+        "multi"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn open<'a>(
+        &'a self,
+        network: NetworkId,
+        peer: EndpointId,
+        protocol: &'a str,
+    ) -> BoxFuture<'a, Result<SharedLink, TransportError>> {
+        if let Some(transport) = self.by_protocol.get(protocol) {
+            transport.open(network, peer, protocol)
+        } else {
+            self.default.open(network, peer, protocol)
+        }
+    }
 }

@@ -18,6 +18,7 @@ doc = false
 [dependencies]
 tsunagi = { path = "../tsunagi", version = "0.1.0", features = ["tun-device", "dns-publish"] }
 tsunagi-wg-quic = { path = "../tsunagi-wg-quic", version = "0.1.0" }
+tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls", version = "0.1.0" }
 iroh.workspace = true
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal"] }
 tracing.workspace = true

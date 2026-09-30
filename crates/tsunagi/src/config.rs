@@ -304,6 +304,9 @@ pub struct AgentConfig {
     pub reconnect: ReconnectPolicy,
     /// IP plugins whose capabilities are announced and dispatched.
     pub plugins: Vec<SharedPlugin>,
+    /// Custom packet transports registered per protocol.
+    pub custom_transports:
+        std::collections::HashMap<String, Arc<dyn crate::dataplane::PacketTransport>>,
     /// Where the overlay interface comes from, when the agent should have one.
     ///
     /// One agent, one interface: it belongs here rather than to a protocol,
@@ -345,6 +348,7 @@ impl AgentConfig {
             limits: Limits::default(),
             reconnect: ReconnectPolicy::default(),
             plugins: Vec::new(),
+            custom_transports: std::collections::HashMap::new(),
             tun_factory: None,
             interface_name: "tsun0".to_string(),
             interface_mtu: 1280,
@@ -427,6 +431,16 @@ impl AgentConfig {
     /// Registers an IP plugin.
     pub fn with_plugin(mut self, plugin: SharedPlugin) -> Self {
         self.plugins.push(plugin);
+        self
+    }
+
+    /// Registers a custom packet transport for a specific protocol.
+    pub fn with_custom_transport(
+        mut self,
+        protocol: impl Into<String>,
+        transport: Arc<dyn crate::dataplane::PacketTransport>,
+    ) -> Self {
+        self.custom_transports.insert(protocol.into(), transport);
         self
     }
 

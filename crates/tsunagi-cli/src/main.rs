@@ -23,6 +23,9 @@ use tsunagi::iroh_types::EndpointAddr;
 use tsunagi::overlay::{MemoryTunFactory, TunFactory};
 use tsunagi::state::Ipv4Range;
 use tsunagi::{Agent, NetworkId};
+use tsunagi_tcp_tls::{
+    TCP_TLS_PROTOCOL, TCP_TLS_VERSION, TcpTlsCodec, TcpTlsConfig, TcpTlsPlugin, TcpTlsTransport,
+};
 use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 
 /// A small agent for private mesh networks.
@@ -1164,13 +1167,21 @@ struct ProtocolSpec {
 }
 
 /// Every protocol this build has.
-const PROTOCOLS: &[ProtocolSpec] = &[ProtocolSpec {
-    name: tsunagi_wg_quic::WIREGUARD_PROTOCOL,
-    version: tsunagi_wg_quic::ANNOUNCEMENT_VERSION,
-    summary: "WireGuard's cryptography carried in iroh's QUIC datagrams, so it \
-              crosses NAT and survives where plain WireGuard is blocked",
-    options: WireguardPlugin::OPTIONS,
-}];
+const PROTOCOLS: &[ProtocolSpec] = &[
+    ProtocolSpec {
+        name: tsunagi_wg_quic::WIREGUARD_PROTOCOL,
+        version: tsunagi_wg_quic::ANNOUNCEMENT_VERSION,
+        summary: "WireGuard's cryptography carried in iroh's QUIC datagrams, so it \
+                  crosses NAT and survives where plain WireGuard is blocked",
+        options: WireguardPlugin::OPTIONS,
+    },
+    ProtocolSpec {
+        name: TCP_TLS_PROTOCOL,
+        version: TCP_TLS_VERSION,
+        summary: "Noise E2EE carried over TCP TLS 1.3 (port 443) disguised as HTTPS traffic",
+        options: TcpTlsCodec::OPTIONS,
+    },
+];
 
 /// One `-o` setting, and the protocol it was aimed at.
 struct Setting {
@@ -3375,7 +3386,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let discovery: Arc<dyn NetworkDiscovery> =
         Arc::new(CompositeDiscovery::new([
-            Arc::new(StaticBootstrap::new(bootstrap)) as Arc<dyn NetworkDiscovery>,
+            Arc::new(StaticBootstrap::new(bootstrap.clone())) as Arc<dyn NetworkDiscovery>,
         ]));
 
     let mut config = AgentConfig::new(paths.clone())
@@ -3436,6 +3447,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // The interface belongs to the agent, so it is configured once whatever
     // was selected to carry traffic over it.
     let mut wireguard = None;
+    let mut tcp_tls_transport = None;
     if !wanted.is_empty() {
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
@@ -3458,6 +3470,32 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let plugin = WireguardPlugin::open(wg).await?;
                 config = config.with_plugin(plugin.clone() as Arc<dyn IpPlugin>);
                 wireguard = Some(plugin);
+            }
+            TCP_TLS_PROTOCOL => {
+                let tls_cfg = TcpTlsConfig::new();
+                let tls_cfg = TcpTlsCodec::configure(tls_cfg, &options)?;
+                let identity = tsunagi::storage::StateStore::open(paths.state_db())?
+                    .load_or_create_device_identity()?;
+                let transport = Arc::new(
+                    TcpTlsTransport::bind(&identity, tls_cfg.port)
+                        .await
+                        .map_err(|err| err.to_string())?,
+                );
+                for ep_addr in &bootstrap {
+                    for ip in ep_addr.ip_addrs() {
+                        transport.set_peer_addr(ep_addr.id, *ip);
+                    }
+                }
+                let codec = TcpTlsCodec::new(identity.endpoint_id(), Arc::clone(&transport));
+                let plugin = Arc::new(TcpTlsPlugin::new(codec));
+                config = config
+                    .with_plugin(plugin as Arc<dyn IpPlugin>)
+                    .with_custom_transport(
+                        TCP_TLS_PROTOCOL,
+                        Arc::clone(&transport)
+                            as Arc<dyn tsunagi::dataplane::transport::PacketTransport>,
+                    );
+                tcp_tls_transport = Some(transport);
             }
             other => return Err(format!("`{other}` is listed but not built in").into()),
         }
@@ -3494,6 +3532,22 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // From here on every exit goes through `agent.shutdown()`, so the endpoint
     // is never dropped without being closed.
     let mut events = agent.subscribe();
+
+    if let Some(transport) = tcp_tls_transport {
+        let agent_inbound = agent.clone();
+        tokio::spawn(async move {
+            transport
+                .accept_loop(move |inbound| {
+                    let agent = agent_inbound.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = agent.install_inbound_link(inbound).await {
+                            tracing::debug!(%err, "failed to install inbound tcp-tls link");
+                        }
+                    });
+                })
+                .await;
+        });
+    }
 
     println!("tsunagi is up");
     println!("  endpoint id  {}", agent.endpoint_id());
