@@ -239,6 +239,24 @@ const REACH_EXPIRY: Duration = Duration::from_secs(90);
 /// can arrive and be adopted instead.
 const RANGE_PROPOSAL_GRACE: Duration = Duration::from_secs(3);
 
+#[derive(Debug, Clone)]
+struct ProtocolDialState {
+    failures: u32,
+    cooldown_until: std::time::Instant,
+}
+
+const DATA_LINK_BASE_BACKOFF: Duration = Duration::from_secs(3);
+const DATA_LINK_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+fn data_link_backoff(failures: u32) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let shift = (failures - 1).min(5);
+    let secs = (DATA_LINK_BASE_BACKOFF.as_secs() << shift).min(DATA_LINK_MAX_BACKOFF.as_secs());
+    Duration::from_secs(secs)
+}
+
 struct Runtime {
     discovery_worker: Option<DiscoveryWorker>,
     discovery_candidates: mpsc::Receiver<Candidate>,
@@ -284,6 +302,8 @@ struct Runtime {
     opening: HashSet<(EndpointId, String)>,
     link_results_tx: mpsc::Sender<LinkOutcome>,
     link_results_rx: mpsc::Receiver<LinkOutcome>,
+    /// Protocol dial failure count and backoff cooldown per peer and protocol.
+    protocol_dial_states: HashMap<(EndpointId, String), ProtocolDialState>,
     /// Peers already told about a protocol version that cannot match, so it
     /// is said once rather than on every announcement.
     reported_mismatch: HashSet<(EndpointId, String)>,
@@ -346,6 +366,7 @@ impl Runtime {
             opening: HashSet::new(),
             link_results_tx,
             link_results_rx,
+            protocol_dial_states: HashMap::new(),
             reported_mismatch: HashSet::new(),
             released: false,
             reported_missing: None,
@@ -422,6 +443,7 @@ impl Runtime {
         self.session_events_rx.close();
         self.hub.close();
         self.links.clear();
+        self.protocol_dial_states.clear();
         let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
         for peer in peers {
             if let Some(session) = self.sessions.remove(&peer) {
@@ -1173,6 +1195,25 @@ impl Runtime {
             .collect()
     }
 
+    fn record_protocol_failure(&mut self, peer: EndpointId, protocol: &str) {
+        let key = (peer, protocol.to_string());
+        let entry = self
+            .protocol_dial_states
+            .entry(key)
+            .or_insert(ProtocolDialState {
+                failures: 0,
+                cooldown_until: std::time::Instant::now(),
+            });
+        entry.failures = entry.failures.saturating_add(1);
+        let backoff = data_link_backoff(entry.failures);
+        entry.cooldown_until = std::time::Instant::now() + backoff;
+    }
+
+    fn record_protocol_success(&mut self, peer: EndpointId, protocol: &str) {
+        self.protocol_dial_states
+            .remove(&(peer, protocol.to_string()));
+    }
+
     /// Opens whatever data plane links are missing, and forgets dead ones.
     ///
     /// Only one side dials, chosen by a rule both sides compute the same way,
@@ -1198,6 +1239,7 @@ impl Runtime {
             // reachable through somebody is decided below; the protocol's
             // link stays either way.
             self.hub.clear_direct(peer, &protocol);
+            self.record_protocol_failure(peer, &protocol);
             self.emit(Event::DataLinkDown {
                 network: self.network_id,
                 peer,
@@ -1208,6 +1250,9 @@ impl Runtime {
 
         // Choose the highest priority mutually supported protocol for each peer.
         // If a direct data link is already open or opening, do not dial another.
+        // If a protocol recently failed, fall back to other mutually supported
+        // protocols according to backoff cooldown.
+        let now = std::time::Instant::now();
         let mut wanted: Vec<(EndpointId, String)> = Vec::new();
         for session in self.sessions.values() {
             let peer = session.peer;
@@ -1216,29 +1261,45 @@ impl Runtime {
             {
                 continue;
             }
-            for (name, ours) in &served {
-                let matches = session
-                    .capabilities
-                    .iter()
-                    .any(|c| c.enabled && c.protocol == *name && c.version == *ours);
-                if matches {
-                    wanted.push((peer, name.clone()));
-                    break;
-                }
-            }
-        }
-
-        for (peer, protocol) in wanted {
-            let key = (peer, protocol.clone());
-            if self.links.contains_key(&key) || self.opening.contains(&key) {
-                continue;
-            }
             if self.no_direct_data(peer) {
                 continue;
             }
             // The smaller endpoint id dials; the other side accepts. Both
             // compute this identically, so exactly one link is created.
             if self.local_id.as_bytes() >= peer.as_bytes() {
+                continue;
+            }
+
+            let supported: Vec<String> = served
+                .iter()
+                .filter(|(name, ours)| {
+                    session
+                        .capabilities
+                        .iter()
+                        .any(|c| c.enabled && c.protocol == *name && c.version == *ours)
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            if supported.is_empty() {
+                continue;
+            }
+
+            let chosen = supported.iter().find(|proto| {
+                match self.protocol_dial_states.get(&(peer, (*proto).clone())) {
+                    Some(state) => state.cooldown_until <= now,
+                    None => true,
+                }
+            });
+
+            if let Some(proto) = chosen {
+                wanted.push((peer, proto.clone()));
+            }
+        }
+
+        for (peer, protocol) in wanted {
+            let key = (peer, protocol.clone());
+            if self.links.contains_key(&key) || self.opening.contains(&key) {
                 continue;
             }
             self.opening.insert(key);
@@ -1475,6 +1536,7 @@ impl Runtime {
         self.opening.remove(&key);
         match outcome.result {
             Ok(link) => {
+                self.record_protocol_success(outcome.peer, &outcome.protocol);
                 self.adopt_link(outcome.peer, outcome.protocol, link);
                 // A new link is both a path for us and one we can offer
                 // others, so it changes what we route and what we say.
@@ -1484,12 +1546,15 @@ impl Runtime {
             Err(reason) => {
                 // A data plane that cannot be set up is reported, never fatal.
                 self.metrics.data_link_failures += 1;
+                self.record_protocol_failure(outcome.peer, &outcome.protocol);
                 self.emit(Event::DataLinkDown {
                     network: self.network_id,
                     peer: outcome.peer,
                     protocol: outcome.protocol,
                     reason,
                 });
+                // Fall back to other mutually supported protocols immediately.
+                self.ensure_links();
             }
         }
     }
@@ -1517,6 +1582,7 @@ impl Runtime {
         if self.no_direct_data(inbound.peer) {
             return;
         }
+        self.record_protocol_success(inbound.peer, &inbound.protocol);
         self.adopt_link(inbound.peer, inbound.protocol, inbound.link);
         self.update_paths();
         self.announce_reach(false);
@@ -1564,6 +1630,7 @@ impl Runtime {
         // protocol's link goes with it.
         self.hub.remove_peer(peer);
         self.reachable.remove(&peer);
+        self.protocol_dial_states.retain(|(p, _), _| *p != peer);
         let keys: Vec<(EndpointId, String)> = self
             .links
             .keys()
@@ -2077,5 +2144,22 @@ fn merge_addr(existing: &mut iroh::EndpointAddr, incoming: &iroh::EndpointAddr) 
     }
     for addr in &incoming.addrs {
         existing.addrs.insert(addr.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_data_link_backoff_progression() {
+        assert_eq!(data_link_backoff(0), Duration::ZERO);
+        assert_eq!(data_link_backoff(1), Duration::from_secs(3));
+        assert_eq!(data_link_backoff(2), Duration::from_secs(6));
+        assert_eq!(data_link_backoff(3), Duration::from_secs(12));
+        assert_eq!(data_link_backoff(4), Duration::from_secs(24));
+        assert_eq!(data_link_backoff(5), Duration::from_secs(48));
+        assert_eq!(data_link_backoff(6), Duration::from_secs(60));
+        assert_eq!(data_link_backoff(10), Duration::from_secs(60));
     }
 }

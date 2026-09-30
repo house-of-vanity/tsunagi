@@ -527,6 +527,9 @@ impl PacketTransport for TcpTlsTransport {
             let mut connected_socket = None;
             let mut connected_addr = None;
             for addr in &target_addrs {
+                if addr.ip().is_loopback() && addr.port() == self.listen_port {
+                    continue;
+                }
                 match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(*addr)).await
                 {
                     Ok(Ok(socket)) => {

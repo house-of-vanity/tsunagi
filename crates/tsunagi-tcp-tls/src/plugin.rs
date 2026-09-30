@@ -80,7 +80,6 @@ pub fn local_ip_candidates() -> Vec<std::net::IpAddr> {
             }
         }
     }
-    ips.push(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     ips
 }
 
@@ -198,13 +197,6 @@ impl TunnelCodec for TcpTlsCodec {
             self.transport
                 .set_peer_addr(peer, std::net::SocketAddr::new(*ip, announcement.port));
         }
-        self.transport.set_peer_addr(
-            peer,
-            std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                announcement.port,
-            ),
-        );
 
         let peer_noise_pubkey = PublicKey::from(announcement.noise_public);
         let cipher = Arc::new(PeerCipher::new(

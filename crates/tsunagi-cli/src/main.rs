@@ -37,7 +37,7 @@ struct Cli {
         long,
         global = true,
         env = "TSUNAGI_LOG",
-        default_value = "info,iroh=warn,quinn=warn,rustls=warn,boringtun=warn,mainline=warn"
+        default_value = "info,iroh=warn,quinn=warn,rustls=warn,boringtun=warn,mainline=off"
     )]
     log: String,
 
