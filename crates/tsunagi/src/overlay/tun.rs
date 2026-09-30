@@ -435,7 +435,7 @@ mod system {
                  start `tsunagi up` there."
             } else if cfg!(target_os = "linux") {
                 "Start `tsunagi up` as root or grant CAP_NET_ADMIN with \
-                 `sudo setcap cap_net_admin+p /path/to/tsunagi`."
+                 `sudo setcap cap_net_admin,cap_net_bind_service+p /path/to/tsunagi`."
             } else {
                 "Start `tsunagi up` with the privileges required to create a TUN interface."
             };
@@ -455,7 +455,7 @@ mod system {
     fn open_hint() -> &'static str {
         #[cfg(target_os = "linux")]
         {
-            "Creating one needs CAP_NET_ADMIN; grant it with `setcap cap_net_admin+p`, \
+            "Creating one needs CAP_NET_ADMIN; grant it with `setcap cap_net_admin,cap_net_bind_service+p`, \
              or run with `--no-tun` to keep the tunnels off the operating system."
         }
         #[cfg(target_os = "windows")]

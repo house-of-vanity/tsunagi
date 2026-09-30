@@ -29,6 +29,9 @@ thiserror.workspace = true
 hex.workspace = true
 netdev = "0.46"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = "0.5"
+
 [dev-dependencies]
 tsunagi = { path = "../tsunagi", features = ["testing"] }
 tempfile.workspace = true

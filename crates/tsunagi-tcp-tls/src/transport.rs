@@ -264,6 +264,60 @@ impl std::fmt::Debug for TcpTlsTransport {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct NetBindServiceGuard {
+    raised: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl NetBindServiceGuard {
+    fn acquire() -> Self {
+        let already = caps::has_cap(
+            None,
+            caps::CapSet::Effective,
+            caps::Capability::CAP_NET_BIND_SERVICE,
+        )
+        .unwrap_or(false);
+
+        if already {
+            return Self { raised: false };
+        }
+
+        let permitted = caps::has_cap(
+            None,
+            caps::CapSet::Permitted,
+            caps::Capability::CAP_NET_BIND_SERVICE,
+        )
+        .unwrap_or(false);
+
+        if permitted
+            && caps::raise(
+                None,
+                caps::CapSet::Effective,
+                caps::Capability::CAP_NET_BIND_SERVICE,
+            )
+            .is_ok()
+        {
+            Self { raised: true }
+        } else {
+            Self { raised: false }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NetBindServiceGuard {
+    fn drop(&mut self) {
+        if self.raised {
+            let _ = caps::drop(
+                None,
+                caps::CapSet::Effective,
+                caps::Capability::CAP_NET_BIND_SERVICE,
+            );
+        }
+    }
+}
+
 impl TcpTlsTransport {
     /// Binds a new TCP TLS transport using the device identity and configured port.
     pub async fn bind(
@@ -276,8 +330,21 @@ impl TcpTlsTransport {
         let target_port = requested_port.unwrap_or(DEFAULT_PORT);
         let bind_addr = SocketAddr::from(([0, 0, 0, 0], target_port));
 
-        let listener = match TcpListener::bind(bind_addr).await {
-            Ok(l) => {
+        let bind_result = {
+            #[cfg(target_os = "linux")]
+            let _guard = if target_port < 1024 {
+                Some(NetBindServiceGuard::acquire())
+            } else {
+                None
+            };
+
+            std::net::TcpListener::bind(bind_addr)
+        };
+
+        let listener = match bind_result {
+            Ok(std_listener) => {
+                std_listener.set_nonblocking(true)?;
+                let l = TcpListener::from_std(std_listener)?;
                 tracing::info!(port = target_port, "TCP TLS listening");
                 Some(Arc::new(l))
             }
@@ -286,21 +353,28 @@ impl TcpTlsTransport {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "tsunagi".into());
 
-                tracing::warn!(
-                    port = target_port,
-                    %err,
-                    "Cannot bind to port {target_port} without privileges. \
-                     To allow port 443 and TUN on Linux, grant capabilities once with:\n  \
-                     sudo setcap cap_net_admin,cap_net_bind_service+p {exe}\n\
-                     Falling back to port {FALLBACK_PORT}."
-                );
-
                 if requested_port.is_none() {
+                    tracing::warn!(
+                        port = target_port,
+                        %err,
+                        "Cannot bind to default port {target_port} without privileges. \
+                         To allow port 443 and TUN on Linux, grant capabilities once with:\n  \
+                         sudo setcap cap_net_admin,cap_net_bind_service+p {exe}\n\
+                         Falling back to port {FALLBACK_PORT}."
+                    );
+
                     let fallback_addr = SocketAddr::from(([0, 0, 0, 0], FALLBACK_PORT));
                     let l = TcpListener::bind(fallback_addr).await?;
                     tracing::info!(port = FALLBACK_PORT, "TCP TLS listening on fallback port");
                     Some(Arc::new(l))
                 } else {
+                    tracing::warn!(
+                        port = target_port,
+                        %err,
+                        "Cannot bind to requested port {target_port} without privileges. \
+                         To allow port {target_port} and TUN on Linux, grant capabilities once with:\n  \
+                         sudo setcap cap_net_admin,cap_net_bind_service+p {exe}"
+                    );
                     return Err(Box::new(err));
                 }
             }

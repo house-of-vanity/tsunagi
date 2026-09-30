@@ -15,7 +15,7 @@
 //! Grant it with:
 //!
 //! ```text
-//! sudo setcap cap_net_admin+p /usr/local/bin/tsunagi
+//! sudo setcap cap_net_admin,cap_net_bind_service+p /usr/local/bin/tsunagi
 //! ```
 //!
 //! `+p` rather than `+ep`: with `+p` the capability is permitted but not
@@ -49,7 +49,7 @@ impl Privilege {
     /// How to obtain it, for a diagnostic.
     pub fn how_to_grant(program: &str) -> String {
         format!(
-            "Grant it once with `sudo setcap cap_net_admin+p {program}` \
+            "Grant it once with `sudo setcap cap_net_admin,cap_net_bind_service+p {program}` \
              and the agent manages its own interface. Without it, run with \
              `--no-tun`: the tunnels still form, they just do not reach the \
              operating system."
@@ -181,7 +181,9 @@ mod tests {
     #[test]
     fn the_grant_instructions_name_the_program() {
         let text = Privilege::how_to_grant("/usr/local/bin/tsunagi");
-        assert!(text.contains("setcap cap_net_admin+p /usr/local/bin/tsunagi"));
+        assert!(
+            text.contains("setcap cap_net_admin,cap_net_bind_service+p /usr/local/bin/tsunagi")
+        );
         assert!(text.contains("--no-tun"), "the fallback is offered too");
     }
 

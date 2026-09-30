@@ -2890,8 +2890,12 @@ fn host_section() -> report::Section {
                 // explanation belongs in the runtime error, not in a column
                 // the eye is meant to scan.
                 host.push(
-                    Row::new(Health::Degraded, "privileges", "CAP_NET_ADMIN not held")
-                        .with_note(format!("sudo setcap cap_net_admin+p {}", program_path())),
+                    Row::new(Health::Degraded, "privileges", "CAP_NET_ADMIN not held").with_note(
+                        format!(
+                            "sudo setcap cap_net_admin,cap_net_bind_service+p {}",
+                            program_path()
+                        ),
+                    ),
                 );
                 host.push(Row::new(
                     Health::Degraded,
