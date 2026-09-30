@@ -19,7 +19,7 @@ repository = "https://github.com/tsunagi-net/tsunagi"
 
 [workspace.lints.rust]
 missing_docs = "warn"
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"

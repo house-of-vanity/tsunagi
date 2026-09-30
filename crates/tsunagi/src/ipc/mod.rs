@@ -82,6 +82,33 @@ pub fn control_socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join("agent.sock")
 }
 
+/// Where the default system control socket lives on this platform.
+///
+/// On Windows, the system-wide `%ProgramData%\tsunagi\agent.sock` is used so that
+/// any local user, tray application, or CLI tool can manage the running agent
+/// without needing to know which user account or service started it.
+/// On Unix, this derives from the default per-user state directory.
+pub fn default_control_socket_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(program_data) = std::env::var_os("ProgramData") {
+            let pd = PathBuf::from(program_data);
+            if pd.is_absolute() {
+                return pd.join("tsunagi").join("agent.sock");
+            }
+        }
+        PathBuf::from(r"C:\ProgramData\tsunagi\agent.sock")
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(paths) = crate::config::StoragePaths::user_default() {
+            control_socket_path(&paths.state_dir)
+        } else {
+            PathBuf::from("/run/tsunagi/agent.sock")
+        }
+    }
+}
+
 /// What a client asks for.
 ///
 /// `Debug` is written by hand rather than derived: one of these carries a

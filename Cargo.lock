@@ -4231,6 +4231,7 @@ dependencies = [
  "tracing-subscriber",
  "tsunagi",
  "tun",
+ "windows-sys 0.61.2",
  "zbus",
  "zeroize",
 ]

@@ -94,6 +94,11 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 # elevated and `wintun.dll` to be reachable at run time.
 [target.'cfg(target_os = "windows")'.dependencies]
 netdev = { version = "0.45", optional = true }
+windows-sys = { version = "0.61", features = [
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Foundation",
+] }
 
 [dev-dependencies]
 # Its own tests use the harness it publishes.

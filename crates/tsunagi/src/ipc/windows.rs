@@ -18,15 +18,16 @@
 //!
 //! # Who may connect
 //!
-//! The pipe rejects clients from other machines, and takes the process's
-//! default security, under which the creating user has full access. Narrowing
-//! that further with an explicit ACL needs a raw security-descriptor call this
-//! crate forbids, so it is not attempted; on a single-user machine, and against
-//! other unprivileged users, the default is the practical equivalent of the
-//! owner-only Unix socket. There is no leftover to clean up: a pipe exists only
-//! while its server does.
-//! Commands must run as the same Windows user with the same elevation as the
-//! agent. A permission denial is reported as such, never as an absent agent.
+//! The pipe rejects clients from other machines (`reject_remote_clients(true)`).
+//! An explicit SDDL security descriptor grants Full Control to Administrators
+//! and LocalSystem, while granting Read and Write (`GRGW`) to all local users
+//! with a Medium Integrity SACL label (`S:(ML;;NW;;;ME)`). This allows unprivileged
+//! user-space tools (such as tray applications, status monitors, or CLI commands
+//! launched by regular users) to connect to the agent even when the agent was
+//! started by an elevated Administrator or as a system service.
+//! A permission denial is reported as such, never as an absent agent.
+
+#![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,6 +51,82 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 /// is there; the client only has to wait for a free instance.
 const ERROR_PIPE_BUSY: i32 = 231;
 
+/// RAII wrapper for Windows named pipe security attributes with permissive local ACL.
+///
+/// SDDL specification:
+/// - `D:(A;;GRGW;;;WD)`: DACL allows Generic Read and Generic Write to Everyone (`WD`).
+///   Full control (`GA`) remains reserved to Administrators and LocalSystem.
+/// - `(A;;GA;;;BA)`: DACL allows Generic All to Builtin Administrators (`BA`).
+/// - `(A;;GA;;;SY)`: DACL allows Generic All to LocalSystem (`SY`).
+/// - `S:(ML;;NW;;;ME)`: SACL Mandatory Label with Medium Integrity (`ME`) and No Write Up (`NW`).
+///   This allows unprivileged user-space processes (Medium Integrity) to write to the
+///   named pipe even when the agent runs as an elevated Administrator (High Integrity).
+#[derive(Debug)]
+struct PipeSecurityAttributes {
+    attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+}
+
+impl PipeSecurityAttributes {
+    fn new() -> Result<Self> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+
+        const SDDL: &str = "D:(A;;GRGW;;;WD)(A;;GA;;;BA)(A;;GA;;;SY)S:(ML;;NW;;;ME)";
+        let wide: Vec<u16> = OsStr::new(SDDL)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut p_sd = std::ptr::null_mut();
+        // SAFETY: We pass a valid null-terminated wide string, standard revision 1,
+        // and a valid pointer to receive the descriptor.
+        let success = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut p_sd,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if success == 0 || p_sd.is_null() {
+            let err = std::io::Error::last_os_error();
+            return Err(Error::Storage(format!(
+                "cannot create pipe security descriptor: {err}"
+            )));
+        }
+
+        let attrs = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                as u32,
+            lpSecurityDescriptor: p_sd,
+            bInheritHandle: 0,
+        };
+
+        Ok(Self { attrs })
+    }
+
+    fn as_raw_mut(&mut self) -> *mut std::ffi::c_void {
+        &mut self.attrs as *mut _ as *mut std::ffi::c_void
+    }
+}
+
+impl Drop for PipeSecurityAttributes {
+    fn drop(&mut self) {
+        if !self.attrs.lpSecurityDescriptor.is_null() {
+            // SAFETY: The descriptor was allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW
+            // and must be freed with LocalFree.
+            unsafe {
+                windows_sys::Win32::Foundation::LocalFree(self.attrs.lpSecurityDescriptor);
+            }
+            self.attrs.lpSecurityDescriptor = std::ptr::null_mut();
+        }
+    }
+}
+
 /// Serves the local control interface on a named pipe.
 #[derive(Debug)]
 pub struct ControlSocket {
@@ -67,11 +144,14 @@ impl ControlSocket {
         let path = path.as_ref().to_path_buf();
         let name = pipe_name(&path);
 
-        let server = match ServerOptions::new()
-            .first_pipe_instance(true)
-            .reject_remote_clients(true)
-            .create(&name)
-        {
+        let mut sec_attrs = PipeSecurityAttributes::new()?;
+        // SAFETY: sec_attrs points to valid initialized SECURITY_ATTRIBUTES.
+        let server = match unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(&name, sec_attrs.as_raw_mut())
+        } {
             Ok(server) => server,
             Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
                 return Err(Error::StateLocked { path });
@@ -155,10 +235,19 @@ async fn serve(
 /// Creates the next pipe instance, or `None` if the name can no longer be
 /// served.
 fn next_instance(name: &str) -> Option<tokio::net::windows::named_pipe::NamedPipeServer> {
-    match ServerOptions::new()
-        .reject_remote_clients(true)
-        .create(name)
-    {
+    let mut sec_attrs = match PipeSecurityAttributes::new() {
+        Ok(attrs) => attrs,
+        Err(err) => {
+            tracing::debug!(%err, "cannot build pipe security attributes for next instance");
+            return None;
+        }
+    };
+    // SAFETY: sec_attrs points to valid initialized SECURITY_ATTRIBUTES.
+    match unsafe {
+        ServerOptions::new()
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(name, sec_attrs.as_raw_mut())
+    } {
         Ok(server) => Some(server),
         Err(err) => {
             tracing::debug!(%err, "cannot create the next control pipe instance");

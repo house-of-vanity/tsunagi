@@ -82,7 +82,7 @@ struct DnsArgs {
     paths: PathArgs,
 
     /// Control socket to talk to. Derived from the state directory by default.
-    #[arg(long, global = true)]
+    #[arg(long, env = "TSUNAGI_CONTROL_SOCKET", global = true)]
     control_socket: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -107,7 +107,7 @@ struct NetworkArgs {
     paths: PathArgs,
 
     /// Control socket to talk to. Derived from the state directory by default.
-    #[arg(long, global = true)]
+    #[arg(long, env = "TSUNAGI_CONTROL_SOCKET", global = true)]
     control_socket: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -132,7 +132,7 @@ struct JoinArgs {
     paths: PathArgs,
 
     /// Control socket to talk to. Derived from the state directory by default.
-    #[arg(long)]
+    #[arg(long, env = "TSUNAGI_CONTROL_SOCKET")]
     control_socket: Option<PathBuf>,
 
     /// Network name. Must be identical on every participant.
@@ -233,7 +233,7 @@ struct WipeArgs {
     paths: PathArgs,
 
     /// Control socket to check for a running agent.
-    #[arg(long)]
+    #[arg(long, env = "TSUNAGI_CONTROL_SOCKET")]
     control_socket: Option<PathBuf>,
 
     /// Actually remove it. Without this the command only says what it would.
@@ -247,7 +247,7 @@ struct IdArgs {
     paths: PathArgs,
 
     /// Control socket to talk to. Derived from the state directory by default.
-    #[arg(long, global = true)]
+    #[arg(long, env = "TSUNAGI_CONTROL_SOCKET", global = true)]
     control_socket: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -284,7 +284,7 @@ struct StatusArgs {
     paths: PathArgs,
 
     /// Control socket to talk to. Derived from the state directory by default.
-    #[arg(long)]
+    #[arg(long, env = "TSUNAGI_CONTROL_SOCKET")]
     control_socket: Option<PathBuf>,
 }
 
@@ -476,7 +476,7 @@ struct UpArgs {
     status_interval: u64,
 
     /// Control socket to serve. Derived from the state directory by default.
-    #[arg(long)]
+    #[arg(long, env = "TSUNAGI_CONTROL_SOCKET")]
     control_socket: Option<PathBuf>,
 }
 
@@ -745,11 +745,19 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Path of the local control socket for a state directory.
-fn control_socket(paths: &StoragePaths, override_path: Option<&PathBuf>) -> PathBuf {
-    match override_path {
-        Some(path) => path.clone(),
-        None => tsunagi::ipc::control_socket_path(&paths.state_dir),
+fn control_socket(
+    paths: &StoragePaths,
+    override_path: Option<&PathBuf>,
+    _is_custom_state_dir: bool,
+) -> PathBuf {
+    if let Some(path) = override_path {
+        return path.clone();
     }
+    #[cfg(windows)]
+    if !_is_custom_state_dir {
+        return tsunagi::ipc::default_control_socket_path();
+    }
+    tsunagi::ipc::control_socket_path(&paths.state_dir)
 }
 
 /// What could be learned about this device, and from where.
@@ -1580,7 +1588,8 @@ fn resolve_network<'a>(
 /// `tsunagi network`: what this device belongs to, and leaving it.
 async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
-    let socket = control_socket(&paths, args.control_socket.as_ref());
+    let is_custom_state = args.paths.state_dir.is_some();
+    let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
     match args.action {
         None => show_networks(&paths, &socket).await,
         Some(NetworkAction::Broadcast { network, choice }) => {
@@ -1614,7 +1623,8 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
 /// `tsunagi join`: make a network or join one.
 async fn join_command(args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
-    let socket = control_socket(&paths, args.control_socket.as_ref());
+    let is_custom_state = args.paths.state_dir.is_some();
+    let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
     let name = NetworkName::new(args.network)?;
     // A name this device already has means that network; a name nobody
     // has means a new one, and no secret is needed to make a network with
@@ -2000,7 +2010,8 @@ fn forget_protocol_state(paths: &StoragePaths, network: tsunagi::NetworkId) {
 /// `tsunagi wipe`: back to a device that has never joined anything.
 async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
-    let socket = control_socket(&paths, args.control_socket.as_ref());
+    let is_custom_state = args.paths.state_dir.is_some();
+    let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
     if tsunagi::ipc::is_serving(&socket).await {
         return Err(
             "stop the agent first: a wipe removes the state it is using, and leaving a \
@@ -2060,7 +2071,8 @@ async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// `tsunagi dns`: the local resolver, and turning it on or off.
 async fn dns_command(args: DnsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
-    let socket = control_socket(&paths, args.control_socket.as_ref());
+    let is_custom_state = args.paths.state_dir.is_some();
+    let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
 
     let enable = match args.action {
         None => return show_dns(&paths, &socket).await,
@@ -2152,7 +2164,8 @@ async fn show_dns(
 /// `tsunagi id`: what this device is, and what changes it.
 async fn id(args: IdArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
-    let socket = control_socket(&paths, args.control_socket.as_ref());
+    let is_custom_state = args.paths.state_dir.is_some();
+    let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
 
     match args.action {
         None => show_identity(&paths, &socket).await,
@@ -2343,7 +2356,8 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     use report::{Health, Report, Row, Section};
 
     let paths = args.paths.resolve()?;
-    let socket = control_socket(&paths, args.control_socket.as_ref());
+    let is_custom_state = args.paths.state_dir.is_some();
+    let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
     let observed = observe(&paths, &socket).await;
 
     let mut out = Report::new();
@@ -3559,7 +3573,8 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         // agent that is already running, so the lock on its own is an
         // answer to a question nobody asked.
         Err(tsunagi::Error::StateLocked { path }) => {
-            let socket = control_socket(&paths, args.control_socket.as_ref());
+            let is_custom_state = args.paths.state_dir.is_some();
+            let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
             if tsunagi::ipc::is_serving(&socket).await {
                 return Err(format!(
                     "an agent is already running for {}, and one state directory is one \
@@ -3645,7 +3660,8 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             dns,
             paths: paths.clone(),
         });
-        let path = control_socket(&paths, args.control_socket.as_ref());
+        let is_custom_state = args.paths.state_dir.is_some();
+        let path = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
         match tsunagi::ipc::ControlSocket::bind(path, source).await {
             Ok(socket) => {
                 println!("  control      {}", socket.path().display());
