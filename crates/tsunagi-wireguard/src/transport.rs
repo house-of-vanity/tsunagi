@@ -71,7 +71,8 @@ impl WireguardLink {
                 if msg.len() > MAX_UDP_DATAGRAM_SIZE {
                     continue;
                 }
-                if confirmed_r.load(Ordering::Acquire) {
+                let is_handshake_init = msg.first() == Some(&1);
+                if confirmed_r.load(Ordering::Acquire) && !is_handshake_init {
                     let target = match target_r.read() {
                         Ok(g) => *g,
                         Err(p) => *p.into_inner(),
@@ -127,16 +128,21 @@ impl WireguardLink {
     /// Updates candidate addresses for this peer.
     pub fn update_candidates(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
         if let Ok(mut guard) = self.candidates.write() {
-            for addr in addrs {
-                if !guard.contains(&addr) {
-                    guard.push(addr);
-                }
+            let new_candidates: Vec<SocketAddr> = addrs
+                .into_iter()
+                .filter(|a| !a.ip().is_unspecified())
+                .collect();
+            if !new_candidates.is_empty() {
+                *guard = new_candidates;
             }
         }
     }
 
     /// Updates the target socket address (roaming / NAT hole punch update).
     pub fn update_target(&self, new_target: SocketAddr) {
+        if new_target.ip().is_unspecified() {
+            return;
+        }
         self.confirmed.store(true, Ordering::Release);
         if let Ok(mut guard) = self.target_addr.write()
             && *guard != new_target
@@ -278,7 +284,7 @@ impl WireguardTransport {
 
     /// Records an observed UDP target address for a peer.
     pub fn set_peer_addr(&self, peer: EndpointId, addr: SocketAddr) {
-        if !addr.is_ipv4() {
+        if !addr.is_ipv4() || addr.ip().is_unspecified() {
             return;
         }
         if let Ok(mut guard) = self.peer_addresses.write() {
@@ -293,7 +299,7 @@ impl WireguardTransport {
         if let Ok(mut guard) = self.peer_addresses.write() {
             let entry = guard.entry(peer).or_default();
             for addr in addrs {
-                if addr.is_ipv4() && !entry.contains(&addr) {
+                if addr.is_ipv4() && !addr.ip().is_unspecified() && !entry.contains(&addr) {
                     entry.push(addr);
                 }
             }
@@ -380,6 +386,9 @@ impl WireguardTransport {
         let mut buf = [0u8; MAX_UDP_DATAGRAM_SIZE];
 
         while let Ok((len, src_addr)) = socket.recv_from(&mut buf).await {
+            if src_addr.ip().is_unspecified() {
+                continue;
+            }
             let datagram = Bytes::copy_from_slice(&buf[..len]);
 
             // 1. Identify which peer this packet comes from.
@@ -390,9 +399,7 @@ impl WireguardTransport {
                 };
                 links_guard
                     .values()
-                    .find(|link| {
-                        link.target_addr() == src_addr || link.target_addr().ip() == src_addr.ip()
-                    })
+                    .find(|link| link.target_addr() == src_addr)
                     .map(|link| link.peer())
                     .or_else(|| {
                         let addrs_guard = match self.peer_addresses.read() {
@@ -401,12 +408,22 @@ impl WireguardTransport {
                         };
                         addrs_guard
                             .iter()
-                            .find(|(_, addrs)| {
-                                addrs
-                                    .iter()
-                                    .any(|a| *a == src_addr || a.ip() == src_addr.ip())
-                            })
+                            .find(|(_, addrs)| addrs.contains(&src_addr))
                             .map(|(peer, _)| *peer)
+                            .or_else(|| {
+                                links_guard
+                                    .values()
+                                    .find(|link| link.target_addr().ip() == src_addr.ip())
+                                    .map(|link| link.peer())
+                                    .or_else(|| {
+                                        addrs_guard
+                                            .iter()
+                                            .find(|(_, addrs)| {
+                                                addrs.iter().any(|a| a.ip() == src_addr.ip())
+                                            })
+                                            .map(|(peer, _)| *peer)
+                                    })
+                            })
                     })
             };
 

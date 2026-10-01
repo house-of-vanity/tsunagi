@@ -63,28 +63,145 @@ pub struct TcpTlsAnnouncement {
 
 /// Discovers local network interface IPs to announce to peers.
 pub fn local_ip_candidates() -> Vec<std::net::IpAddr> {
-    let mut ips = Vec::new();
+    let mut candidates = Vec::new();
     for iface in netdev::get_interfaces() {
-        if iface.is_up() && !iface.is_loopback() {
-            let name_lower = iface.name.to_lowercase();
-            if name_lower.starts_with("tsun") || name_lower.contains("tsunagi") {
-                continue;
+        if !is_candidate_interface(&iface) {
+            continue;
+        }
+        for ip in &iface.ipv4 {
+            let addr = ip.addr();
+            if is_candidate_ipv4(addr) {
+                let priority = ip_priority(&iface, std::net::IpAddr::V4(addr));
+                candidates.push((priority, std::net::IpAddr::V4(addr)));
             }
-            for ip in iface.ipv4 {
-                let addr = ip.addr();
-                if !addr.is_loopback() && !addr.is_unspecified() {
-                    ips.push(std::net::IpAddr::V4(addr));
-                }
-            }
-            for ip in iface.ipv6 {
-                let addr = ip.addr();
-                if !addr.is_loopback() && !addr.is_unspecified() {
-                    ips.push(std::net::IpAddr::V6(addr));
-                }
+        }
+        for ip in &iface.ipv6 {
+            let addr = ip.addr();
+            if is_candidate_ip(std::net::IpAddr::V6(addr)) {
+                let priority = ip_priority(&iface, std::net::IpAddr::V6(addr));
+                candidates.push((priority, std::net::IpAddr::V6(addr)));
             }
         }
     }
+    // Sort descending by priority so best interface IP is candidate #0
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
+    let mut seen = std::collections::HashSet::new();
+    let mut ips = Vec::new();
+    for (_, ip) in candidates {
+        if seen.insert(ip) {
+            ips.push(ip);
+        }
+    }
     ips
+}
+
+pub(crate) fn is_candidate_interface(iface: &netdev::Interface) -> bool {
+    if !iface.is_up() || iface.is_loopback() {
+        return false;
+    }
+
+    let name = iface.name.to_lowercase();
+    let friendly = iface
+        .friendly_name
+        .as_deref()
+        .map(str::to_lowercase)
+        .unwrap_or_default();
+    let desc = iface
+        .description
+        .as_deref()
+        .map(str::to_lowercase)
+        .unwrap_or_default();
+
+    // Skip Tsunagi / Wintun overlay interfaces
+    if name.starts_with("tsun")
+        || name.contains("tsunagi")
+        || name.contains("wintun")
+        || friendly.starts_with("tsun")
+        || friendly.contains("tsunagi")
+        || friendly.contains("wintun")
+        || desc.contains("wintun")
+        || desc.contains("tsunagi")
+    {
+        return false;
+    }
+
+    // Skip container, VM, and virtual bridge interfaces
+    if name.starts_with("docker")
+        || name.starts_with("br-")
+        || name.starts_with("veth")
+        || name.starts_with("virbr")
+        || name.starts_with("cni")
+        || name.starts_with("flannel")
+        || name.starts_with("cali")
+        || name.starts_with("kube")
+        || name.starts_with("dummy")
+        || name.starts_with("lxc")
+        || name.starts_with("podman")
+        || friendly.contains("vethernet")
+        || friendly.contains("vboxnet")
+        || friendly.contains("vmnet")
+        || desc.contains("virtualbox")
+        || desc.contains("hyper-v")
+        || desc.contains("vmware")
+    {
+        return false;
+    }
+
+    true
+}
+
+pub(crate) fn is_candidate_ipv4(addr: std::net::Ipv4Addr) -> bool {
+    if addr.is_loopback() || addr.is_unspecified() || addr.is_link_local() || addr.is_broadcast() {
+        return false;
+    }
+    if addr.is_documentation() {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn is_candidate_ip(addr: std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(v4) => is_candidate_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return false;
+            }
+            let segments = v6.segments();
+            // Filter link-local fe80::/10
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+pub(crate) fn ip_priority(iface: &netdev::Interface, ip: std::net::IpAddr) -> u32 {
+    let has_gateway = iface.gateway.is_some();
+    let base = if has_gateway { 100 } else { 0 };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // Tailscale: 100.64.0.0/10
+            let is_tailscale = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+            let is_private = v4.is_private();
+            if !is_private && !is_tailscale {
+                base + 50
+            } else if has_gateway && is_private {
+                base + 40
+            } else if is_tailscale {
+                base + 30
+            } else {
+                base + 10
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            let is_global = (segments[0] & 0xe000) == 0x2000;
+            if is_global { base + 45 } else { base + 20 }
+        }
+    }
 }
 
 /// The codec implementing cryptographic transformation and announcements for `tcp-tls`.
@@ -198,8 +315,10 @@ impl TunnelCodec for TcpTlsCodec {
             .map_err(|err| PluginError::Rejected(format!("invalid announcement: {err}")))?;
 
         for ip in &announcement.addrs {
-            self.transport
-                .set_peer_addr(peer, std::net::SocketAddr::new(*ip, announcement.port));
+            if is_candidate_ip(*ip) {
+                self.transport
+                    .set_peer_addr(peer, std::net::SocketAddr::new(*ip, announcement.port));
+            }
         }
 
         let peer_noise_pubkey = PublicKey::from(announcement.noise_public);
@@ -271,3 +390,141 @@ impl TunnelCodec for TcpTlsCodec {
 
 /// The complete `tcp-tls` plugin.
 pub type TcpTlsPlugin = GenericTunnelPlugin<TcpTlsCodec>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_is_candidate_interface_filters_overlay_and_bridges() {
+        let mut iface = netdev::Interface::dummy();
+        iface.flags = 1; // UP
+
+        // Standard Ethernet - should pass
+        iface.name = "eth0".to_string();
+        assert!(is_candidate_interface(&iface));
+
+        // Windows Ethernet with GUID name - should pass
+        iface.name = "{B6149D2C-1234-5678-9ABC-DEF012345678}".to_string();
+        iface.friendly_name = Some("Ethernet".to_string());
+        iface.description = Some("Intel(R) Ethernet Connection".to_string());
+        assert!(is_candidate_interface(&iface));
+
+        // Linux tsun0 overlay - must be filtered
+        iface.name = "tsun0".to_string();
+        iface.friendly_name = None;
+        iface.description = None;
+        assert!(!is_candidate_interface(&iface));
+
+        // Windows Wintun overlay (GUID name with tsun0 friendly name) - must be filtered!
+        iface.name = "{72D85D76-F1A5-42AC-BC49-2169527CDDDF}".to_string();
+        iface.friendly_name = Some("tsun0".to_string());
+        iface.description = Some("Wintun Userspace Tunnel".to_string());
+        assert!(!is_candidate_interface(&iface));
+
+        // Windows Wintun overlay with description containing Wintun - must be filtered!
+        iface.friendly_name = Some("Local Area Connection 2".to_string());
+        iface.description = Some("Wintun Userspace Tunnel".to_string());
+        assert!(!is_candidate_interface(&iface));
+
+        // Docker bridge - must be filtered
+        iface.name = "docker0".to_string();
+        iface.friendly_name = None;
+        iface.description = None;
+        assert!(!is_candidate_interface(&iface));
+
+        // Docker network bridge br-* - must be filtered
+        iface.name = "br-4f6d3a9b1c2e".to_string();
+        assert!(!is_candidate_interface(&iface));
+
+        // Virtual ethernet veth* - must be filtered
+        iface.name = "veth12345".to_string();
+        assert!(!is_candidate_interface(&iface));
+
+        // Libvirt NAT bridge virbr* - must be filtered
+        iface.name = "virbr0".to_string();
+        assert!(!is_candidate_interface(&iface));
+
+        // CNI bridge - must be filtered
+        iface.name = "cni0".to_string();
+        assert!(!is_candidate_interface(&iface));
+
+        // Hyper-V / WSL vEthernet switch on Windows - must be filtered
+        iface.name = "{A1B2C3D4-E5F6-7890-1234-567890ABCDEF}".to_string();
+        iface.friendly_name = Some("vEthernet (WSL)".to_string());
+        iface.description = Some("Hyper-V Virtual Ethernet Adapter".to_string());
+        assert!(!is_candidate_interface(&iface));
+
+        // Down interface - must be filtered
+        let mut down_iface = netdev::Interface::dummy();
+        down_iface.flags = 0; // Not UP
+        down_iface.name = "eth0".to_string();
+        assert!(!is_candidate_interface(&down_iface));
+    }
+
+    #[test]
+    fn test_is_candidate_ip() {
+        // Valid LAN IP
+        assert!(is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 117
+        ))));
+        // Valid Tailscale IP
+        assert!(is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
+            100, 77, 155, 120
+        ))));
+        // Valid Public IP
+        assert!(is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
+            1, 1, 1, 1
+        ))));
+        // Valid IPv6 GUA
+        assert!(is_candidate_ip(std::net::IpAddr::V6(Ipv6Addr::new(
+            0x2a01, 0x4b00, 0xb8e3, 0x4e00, 0, 0, 0, 1
+        ))));
+
+        // Loopback - must be rejected
+        assert!(!is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(!is_candidate_ip(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        // Unspecified - must be rejected
+        assert!(!is_candidate_ip(std::net::IpAddr::V4(
+            Ipv4Addr::UNSPECIFIED
+        )));
+        assert!(!is_candidate_ip(std::net::IpAddr::V6(
+            Ipv6Addr::UNSPECIFIED
+        )));
+
+        // Link-local - must be rejected
+        assert!(!is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 1
+        ))));
+        assert!(!is_candidate_ip(std::net::IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0x1ff, 0xfe00, 1
+        ))));
+
+        // Broadcast - must be rejected
+        assert!(!is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::BROADCAST)));
+    }
+
+    #[test]
+    fn test_ip_priority_ordering() {
+        let mut iface_lan = netdev::Interface::dummy();
+        iface_lan.flags = 1;
+        iface_lan.gateway = Some(netdev::net::device::NetworkDevice::new());
+
+        let mut iface_vpn = netdev::Interface::dummy();
+        iface_vpn.flags = 1;
+        iface_vpn.name = "tailscale0".to_string();
+
+        let lan_ip = std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 117));
+        let tailscale_ip = std::net::IpAddr::V4(Ipv4Addr::new(100, 77, 155, 120));
+
+        let p_lan = ip_priority(&iface_lan, lan_ip);
+        let p_ts = ip_priority(&iface_vpn, tailscale_ip);
+
+        // LAN IP with gateway should score higher than VPN IP without gateway
+        assert!(p_lan > p_ts);
+    }
+}

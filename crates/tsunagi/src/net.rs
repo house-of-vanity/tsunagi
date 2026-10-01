@@ -248,7 +248,25 @@ impl EndpointAdapter {
                 let mut overlay_ips = std::collections::HashSet::new();
                 for iface in netdev::get_interfaces() {
                     let name = iface.name.to_lowercase();
-                    if name.starts_with("tsun") || name.contains("tsunagi") {
+                    let friendly = iface
+                        .friendly_name
+                        .as_deref()
+                        .map(str::to_lowercase)
+                        .unwrap_or_default();
+                    let desc = iface
+                        .description
+                        .as_deref()
+                        .map(str::to_lowercase)
+                        .unwrap_or_default();
+                    if name.starts_with("tsun")
+                        || name.contains("tsunagi")
+                        || name.contains("wintun")
+                        || friendly.starts_with("tsun")
+                        || friendly.contains("tsunagi")
+                        || friendly.contains("wintun")
+                        || desc.contains("wintun")
+                        || desc.contains("tsunagi")
+                    {
                         for ip in iface.ipv4 {
                             overlay_ips.insert(std::net::IpAddr::V4(ip.addr()));
                         }
