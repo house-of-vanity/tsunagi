@@ -3,7 +3,7 @@
 //! Provides [`WireguardTransport`] implementing [`PacketTransport`]
 //! and [`WireguardLink`] implementing [`PacketLink`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -31,6 +31,8 @@ pub struct WireguardLink {
     network: NetworkId,
     peer: EndpointId,
     target_addr: Arc<RwLock<SocketAddr>>,
+    candidates: Arc<RwLock<Vec<SocketAddr>>>,
+    confirmed: Arc<AtomicBool>,
     tx: mpsc::Sender<Bytes>,
     inbound_tx: mpsc::Sender<Bytes>,
     rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
@@ -44,18 +46,23 @@ impl WireguardLink {
         network: NetworkId,
         peer: EndpointId,
         target_addr: SocketAddr,
+        candidates: Vec<SocketAddr>,
         socket: Arc<UdpSocket>,
     ) -> Self {
         let (tx_out, mut rx_out) = mpsc::channel::<Bytes>(1024);
         let (tx_in, rx_in) = mpsc::channel::<Bytes>(1024);
 
         let is_closed = Arc::new(AtomicBool::new(false));
+        let confirmed = Arc::new(AtomicBool::new(false));
         let closed_notify = Arc::new(Notify::new());
 
         let target_holder = Arc::new(RwLock::new(target_addr));
+        let candidates_holder = Arc::new(RwLock::new(candidates));
 
         let socket_w = Arc::clone(&socket);
         let target_r = Arc::clone(&target_holder);
+        let candidates_r = Arc::clone(&candidates_holder);
+        let confirmed_r = Arc::clone(&confirmed);
         let is_closed_w = Arc::clone(&is_closed);
         let closed_notify_w = Arc::clone(&closed_notify);
 
@@ -64,12 +71,30 @@ impl WireguardLink {
                 if msg.len() > MAX_UDP_DATAGRAM_SIZE {
                     continue;
                 }
-                let target = match target_r.read() {
-                    Ok(g) => *g,
-                    Err(p) => *p.into_inner(),
-                };
-                if let Err(err) = socket_w.send_to(&msg, target).await {
-                    tracing::trace!(%err, %target, "failed to send WireGuard UDP datagram");
+                if confirmed_r.load(Ordering::Acquire) {
+                    let target = match target_r.read() {
+                        Ok(g) => *g,
+                        Err(p) => *p.into_inner(),
+                    };
+                    if let Err(err) = socket_w.send_to(&msg, target).await {
+                        tracing::trace!(%err, %target, "failed to send WireGuard UDP datagram");
+                    }
+                } else {
+                    let targets = match candidates_r.read() {
+                        Ok(g) => g.clone(),
+                        Err(p) => p.into_inner().clone(),
+                    };
+                    if targets.is_empty() {
+                        let target = match target_r.read() {
+                            Ok(g) => *g,
+                            Err(p) => *p.into_inner(),
+                        };
+                        let _ = socket_w.send_to(&msg, target).await;
+                    } else {
+                        for target in targets {
+                            let _ = socket_w.send_to(&msg, target).await;
+                        }
+                    }
                 }
             }
             is_closed_w.store(true, Ordering::Release);
@@ -80,6 +105,8 @@ impl WireguardLink {
             network,
             peer,
             target_addr: target_holder,
+            candidates: candidates_holder,
+            confirmed,
             tx: tx_out,
             inbound_tx: tx_in,
             rx: tokio::sync::Mutex::new(rx_in),
@@ -93,12 +120,24 @@ impl WireguardLink {
         if self.is_closed.load(Ordering::Acquire) {
             return false;
         }
-        // If queue is full, dropping is normal for an unreliable datagram link
+        self.confirmed.store(true, Ordering::Release);
         self.inbound_tx.try_send(payload).is_ok()
+    }
+
+    /// Updates candidate addresses for this peer.
+    pub fn update_candidates(&self, addrs: impl IntoIterator<Item = SocketAddr>) {
+        if let Ok(mut guard) = self.candidates.write() {
+            for addr in addrs {
+                if !guard.contains(&addr) {
+                    guard.push(addr);
+                }
+            }
+        }
     }
 
     /// Updates the target socket address (roaming / NAT hole punch update).
     pub fn update_target(&self, new_target: SocketAddr) {
+        self.confirmed.store(true, Ordering::Release);
         if let Ok(mut guard) = self.target_addr.write()
             && *guard != new_target
         {
@@ -177,7 +216,7 @@ pub struct WireguardTransport {
     listen_port: u16,
     socket: Arc<UdpSocket>,
     peer_addresses: RwLock<HashMap<EndpointId, Vec<SocketAddr>>>,
-    peer_networks: RwLock<HashMap<EndpointId, NetworkId>>,
+    peer_networks: RwLock<HashMap<EndpointId, HashSet<NetworkId>>>,
     links: RwLock<HashMap<(NetworkId, EndpointId), Arc<WireguardLink>>>,
     inbound_cb: Arc<Mutex<Option<InboundCallback>>>,
 }
@@ -233,12 +272,15 @@ impl WireguardTransport {
     /// Associates a peer with a network ID.
     pub fn set_peer_network(&self, peer: EndpointId, network: NetworkId) {
         if let Ok(mut guard) = self.peer_networks.write() {
-            guard.insert(peer, network);
+            guard.entry(peer).or_default().insert(network);
         }
     }
 
     /// Records an observed UDP target address for a peer.
     pub fn set_peer_addr(&self, peer: EndpointId, addr: SocketAddr) {
+        if !addr.is_ipv4() {
+            return;
+        }
         if let Ok(mut guard) = self.peer_addresses.write() {
             let addrs = guard.entry(peer).or_default();
             addrs.retain(|a| *a != addr);
@@ -251,7 +293,7 @@ impl WireguardTransport {
         if let Ok(mut guard) = self.peer_addresses.write() {
             let entry = guard.entry(peer).or_default();
             for addr in addrs {
-                if !entry.contains(&addr) {
+                if addr.is_ipv4() && !entry.contains(&addr) {
                     entry.push(addr);
                 }
             }
@@ -278,12 +320,18 @@ impl WireguardTransport {
         addrs: &[SocketAddr],
         we_accept: bool,
     ) {
-        if let Ok(mut guard) = self.peer_networks.write() {
-            guard.insert(peer, network);
-        }
-        self.set_peer_addrs(peer, addrs.iter().copied());
+        self.set_peer_network(peer, network);
+        let ipv4_addrs: Vec<SocketAddr> = addrs.iter().copied().filter(|a| a.is_ipv4()).collect();
+        self.set_peer_addrs(peer, ipv4_addrs.iter().copied());
 
-        if we_accept && !addrs.is_empty() {
+        // Update candidate addresses on any existing link for this peer
+        if let Ok(guard) = self.links.read()
+            && let Some(link) = guard.get(&(network, peer))
+        {
+            link.update_candidates(ipv4_addrs.iter().copied());
+        }
+
+        if we_accept && !ipv4_addrs.is_empty() {
             let mut guard = match self.links.write() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
@@ -292,7 +340,8 @@ impl WireguardTransport {
                 let link = Arc::new(WireguardLink::new(
                     network,
                     peer,
-                    addrs[0],
+                    ipv4_addrs[0],
+                    ipv4_addrs,
                     Arc::clone(&self.socket),
                 ));
                 entry.insert(Arc::clone(&link));
@@ -333,89 +382,109 @@ impl WireguardTransport {
         while let Ok((len, src_addr)) = socket.recv_from(&mut buf).await {
             let datagram = Bytes::copy_from_slice(&buf[..len]);
 
-            // 1. Check if an active link exists matching this peer / target
-            let matched_link = {
+            // 1. Identify which peer this packet comes from.
+            let matched_peer = {
+                let links_guard = match self.links.read() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                links_guard
+                    .values()
+                    .find(|link| {
+                        link.target_addr() == src_addr || link.target_addr().ip() == src_addr.ip()
+                    })
+                    .map(|link| link.peer())
+                    .or_else(|| {
+                        let addrs_guard = match self.peer_addresses.read() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        addrs_guard
+                            .iter()
+                            .find(|(_, addrs)| {
+                                addrs
+                                    .iter()
+                                    .any(|a| *a == src_addr || a.ip() == src_addr.ip())
+                            })
+                            .map(|(peer, _)| *peer)
+                    })
+            };
+
+            let Some(peer) = matched_peer else {
+                continue;
+            };
+
+            // 2. Deliver to ALL active links for this peer (across all networks this peer shares with us).
+            let peer_links: Vec<Arc<WireguardLink>> = {
                 let guard = match self.links.read() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
                 guard
                     .values()
-                    .find(|link| {
-                        link.target_addr() == src_addr || link.target_addr().ip() == src_addr.ip()
-                    })
+                    .filter(|l| l.peer() == peer && !l.is_closed())
                     .cloned()
+                    .collect()
             };
 
-            if let Some(link) = matched_link {
-                link.update_target(src_addr);
-                link.deliver_inbound(datagram);
+            if !peer_links.is_empty() {
+                for link in peer_links {
+                    link.update_target(src_addr);
+                    link.deliver_inbound(datagram.clone());
+                }
                 continue;
             }
 
-            // 2. Check if a peer has candidate addresses matching src_addr
-            let matched_peer = {
-                let guard = match self.peer_addresses.read() {
+            // 3. If no active link exists for this peer yet, create inbound links for all networks known for this peer.
+            let networks: Vec<NetworkId> = {
+                let guard = match self.peer_networks.read() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
                 guard
-                    .iter()
-                    .find(|(_, addrs)| {
-                        addrs
-                            .iter()
-                            .any(|a| *a == src_addr || a.ip() == src_addr.ip())
-                    })
-                    .map(|(peer, _)| *peer)
+                    .get(&peer)
+                    .map(|s| s.iter().copied().collect())
+                    .unwrap_or_default()
             };
 
-            if let Some(peer) = matched_peer {
-                let network = {
-                    let guard = match self.peer_networks.read() {
+            for network in networks {
+                let link = {
+                    let mut guard = match self.links.write() {
                         Ok(g) => g,
                         Err(p) => p.into_inner(),
                     };
-                    guard.get(&peer).copied().or_else(|| {
-                        if guard.len() == 1 {
-                            guard.values().next().copied()
-                        } else {
-                            match self.links.read() {
-                                Ok(g) => g.keys().next().map(|(net, _)| *net),
-                                Err(p) => p.into_inner().keys().next().map(|(net, _)| *net),
-                            }
-                        }
-                    })
-                };
-
-                if let Some(network) = network {
+                    if let Some(existing) = guard.get(&(network, peer))
+                        && !existing.is_closed()
+                    {
+                        existing.update_target(src_addr);
+                        existing.deliver_inbound(datagram.clone());
+                        continue;
+                    }
+                    let candidates = self.peer_addrs(peer);
                     let link = Arc::new(WireguardLink::new(
                         network,
                         peer,
                         src_addr,
+                        candidates,
                         Arc::clone(&self.socket),
                     ));
-                    link.deliver_inbound(datagram);
+                    link.update_target(src_addr);
+                    link.deliver_inbound(datagram.clone());
+                    guard.insert((network, peer), Arc::clone(&link));
+                    link
+                };
 
-                    {
-                        let mut guard = match self.links.write() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
-                        guard.insert((network, peer), Arc::clone(&link));
-                    }
-
-                    let cb_guard = match self.inbound_cb.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    if let Some(ref cb) = *cb_guard {
-                        cb(InboundLink {
-                            network,
-                            peer,
-                            protocol: crate::announcement::WG_PROTOCOL.to_string(),
-                            link,
-                        });
-                    }
+                let cb_guard = match self.inbound_cb.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                if let Some(ref cb) = *cb_guard {
+                    cb(InboundLink {
+                        network,
+                        peer,
+                        protocol: crate::announcement::WG_PROTOCOL.to_string(),
+                        link,
+                    });
                 }
             }
         }
@@ -454,12 +523,14 @@ impl PacketTransport for WireguardTransport {
                 if let Some(existing) = guard.get(&(network, peer))
                     && !existing.is_closed()
                 {
+                    existing.update_candidates(addrs);
                     return Ok(Arc::clone(existing) as SharedLink);
                 }
                 let link = Arc::new(WireguardLink::new(
                     network,
                     peer,
                     target,
+                    addrs,
                     Arc::clone(&self.socket),
                 ));
                 guard.insert((network, peer), Arc::clone(&link));

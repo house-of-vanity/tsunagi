@@ -204,3 +204,175 @@ async fn test_wireguard_plugin_end_to_end() {
     assert_eq!(received_a.1, peer_b);
     assert_eq!(received_a.2, packet_b_to_a);
 }
+
+#[tokio::test]
+async fn test_wireguard_two_networks_same_peers() {
+    let identity_a = DeviceIdentity::generate();
+    let peer_a = identity_a.endpoint_id();
+
+    let identity_b = DeviceIdentity::generate();
+    let peer_b = identity_b.endpoint_id();
+
+    let net1 = NetworkId::from_bytes([11u8; 32]);
+    let net2 = NetworkId::from_bytes([22u8; 32]);
+
+    let tmp_a = tempfile::tempdir().expect("tmp A");
+    let tmp_b = tempfile::tempdir().expect("tmp B");
+
+    let transport_b = Arc::new(
+        WireguardTransport::bind(&identity_b, Some(0))
+            .await
+            .expect("bind B"),
+    );
+    let port_b = transport_b.bound_port();
+
+    let transport_a = Arc::new(
+        WireguardTransport::bind(&identity_a, Some(0))
+            .await
+            .expect("bind A"),
+    );
+    let port_a = transport_a.bound_port();
+
+    let plugin_a =
+        WireguardPlugin::open(WireguardConfig::new(tmp_a.path()), Arc::clone(&transport_a))
+            .await
+            .expect("open plugin A");
+
+    let plugin_b =
+        WireguardPlugin::open(WireguardConfig::new(tmp_b.path()), Arc::clone(&transport_b))
+            .await
+            .expect("open plugin B");
+
+    let (sink_a_tx, mut sink_a_rx) = mpsc::channel(20);
+    plugin_a.attach(PluginContext::with_sink(Arc::new(TestSink {
+        delivered: sink_a_tx,
+    })));
+
+    let (sink_b_tx, mut sink_b_rx) = mpsc::channel(20);
+    plugin_b.attach(PluginContext::with_sink(Arc::new(TestSink {
+        delivered: sink_b_tx,
+    })));
+
+    // Activate both networks
+    for net in [net1, net2] {
+        plugin_a.on_network_activated(net);
+        plugin_b.on_network_activated(net);
+    }
+
+    // Exchange capabilities for both networks
+    for net in [net1, net2] {
+        let cap_a = loop {
+            if let Some(cap) = plugin_a.local_capability(net).expect("cap A") {
+                break cap;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let cap_b = loop {
+            if let Some(cap) = plugin_b.local_capability(net).expect("cap B") {
+                break cap;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        plugin_a
+            .on_peer_capability(net, peer_b, &cap_b)
+            .expect("A on cap B");
+        plugin_b
+            .on_peer_capability(net, peer_a, &cap_a)
+            .expect("B on cap A");
+    }
+
+    let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
+    transport_a.set_peer_addr(peer_b, addr_b);
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
+    transport_b.set_peer_addr(peer_a, addr_a);
+
+    // Accept loops
+    let transport_a_clone = Arc::clone(&transport_a);
+    tokio::spawn(async move {
+        transport_a_clone.accept_loop(|_| {}).await;
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundLink>(10);
+    let transport_b_clone = Arc::clone(&transport_b);
+    tokio::spawn(async move {
+        transport_b_clone
+            .accept_loop(move |inbound| {
+                let _ = inbound_tx.try_send(inbound);
+            })
+            .await;
+    });
+
+    // Open links for both networks from A to B
+    for net in [net1, net2] {
+        let link_a = transport_a
+            .open(net, peer_b, "wg")
+            .await
+            .expect("open A link");
+        plugin_a.on_peer_link(net, peer_b, link_a);
+    }
+
+    // Deliver inbound links to B
+    for _ in 0..2 {
+        let inbound = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+            .await
+            .expect("inbound timeout")
+            .expect("inbound option");
+        plugin_b.on_peer_link(inbound.network, peer_a, inbound.link);
+    }
+
+    // Wait for both handshakes to complete on both networks
+    for net in [net1, net2] {
+        let mut up = false;
+        for _ in 0..50 {
+            if let Some(overview) = plugin_a.overview(net)
+                && overview.peers.iter().any(|p| p.is_up())
+            {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(up, "handshake on {net:?} should complete");
+    }
+
+    // Send on net1
+    let pkt1 = sample_ipv4_packet();
+    assert!(plugin_a.carry(net1, peer_b, pkt1.clone()));
+    let recv1 = tokio::time::timeout(Duration::from_secs(5), sink_b_rx.recv())
+        .await
+        .expect("recv1 timeout")
+        .expect("recv1 option");
+    assert_eq!(recv1.0, net1);
+    assert_eq!(recv1.2, pkt1);
+
+    // Send on net2 from A to B
+    let mut pkt2_bytes = sample_ipv4_packet().to_vec();
+    pkt2_bytes[15] = 99; // different byte
+    let pkt2 = Bytes::from(pkt2_bytes);
+    assert!(plugin_a.carry(net2, peer_b, pkt2.clone()));
+    let recv2 = tokio::time::timeout(Duration::from_secs(5), sink_b_rx.recv())
+        .await
+        .expect("recv2 timeout")
+        .expect("recv2 option");
+    assert_eq!(recv2.0, net2);
+    assert_eq!(recv2.2, pkt2);
+
+    // Send reply on net1 from B to A
+    assert!(plugin_b.carry(net1, peer_a, pkt1.clone()));
+    let reply1 = tokio::time::timeout(Duration::from_secs(5), sink_a_rx.recv())
+        .await
+        .expect("reply1 timeout")
+        .expect("reply1 option");
+    assert_eq!(reply1.0, net1);
+    assert_eq!(reply1.2, pkt1);
+
+    // Send reply on net2 from B to A
+    assert!(plugin_b.carry(net2, peer_a, pkt2.clone()));
+    let reply2 = tokio::time::timeout(Duration::from_secs(5), sink_a_rx.recv())
+        .await
+        .expect("reply2 timeout")
+        .expect("reply2 option");
+    assert_eq!(reply2.0, net2);
+    assert_eq!(reply2.2, pkt2);
+}

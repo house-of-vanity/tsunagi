@@ -19,7 +19,7 @@ use tsunagi::discovery::{
     CompositeDiscovery, MainlineDiscovery, NetworkDiscovery, StaticBootstrap,
 };
 use tsunagi::identity::{NetworkName, NetworkSecret};
-use tsunagi::iroh_types::EndpointAddr;
+use tsunagi::iroh_types::{EndpointAddr, EndpointId};
 use tsunagi::overlay::{MemoryTunFactory, TunFactory};
 use tsunagi::state::Ipv4Range;
 use tsunagi::{Agent, NetworkId};
@@ -3864,125 +3864,137 @@ async fn build_report(
             let overlay = if has_any_plugin && overlay.is_some() {
                 let mut peers: Vec<OverlayPeerReport> = Vec::new();
 
-                // 1. Peers known to the wg-quic plugin.
-                if let Some(ref view) = wg_view {
-                    for peer in &view.peers {
-                        let tcp_tls_match =
-                            tcp_tls_reports.iter().find(|r| r.peer == peer.endpoint_id);
-
-                        if let Some(tcp_tls) = tcp_tls_match {
-                            peers.push(OverlayPeerReport {
-                                endpoint_id: peer.endpoint_id.to_string(),
-                                protocol: tcp_tls.protocol.clone(),
-                                public_key: peer.public_key.to_string(),
-                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                                handshake_secs_ago: Some(tcp_tls.uptime_secs),
-                                tx_packets: tcp_tls.tx_packets,
-                                rx_packets: tcp_tls.rx_packets,
-                                dropped: tcp_tls.dropped,
-                                protocol_errors: 0,
-                                path: tcp_tls.path.clone(),
-                            });
-                        } else if let Some(tunnel) = &peer.tunnel {
-                            peers.push(OverlayPeerReport {
-                                endpoint_id: peer.endpoint_id.to_string(),
-                                protocol: "wg-quic".into(),
-                                public_key: peer.public_key.to_string(),
-                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                                handshake_secs_ago: tunnel
-                                    .health
-                                    .since_handshake
-                                    .map(|s| s.as_secs()),
-                                tx_packets: tunnel.stats.tx_packets,
-                                rx_packets: tunnel.stats.rx_packets,
-                                dropped: tunnel.stats.dropped_wrong_source
-                                    + tunnel.stats.dropped_oversize,
-                                protocol_errors: tunnel.stats.protocol_errors,
-                                path: tunnel.path.clone(),
-                            });
-                        } else {
-                            peers.push(OverlayPeerReport {
-                                endpoint_id: peer.endpoint_id.to_string(),
-                                protocol: "wg-quic".into(),
-                                public_key: peer.public_key.to_string(),
-                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                                handshake_secs_ago: None,
-                                tx_packets: 0,
-                                rx_packets: 0,
-                                dropped: 0,
-                                protocol_errors: 0,
-                                path: "no data link".into(),
-                            });
-                        }
+                // Collect all unique peer IDs known in this network.
+                let mut all_peer_ids: Vec<EndpointId> = Vec::new();
+                for member in &network.members {
+                    if member.endpoint_id != status.endpoint_id
+                        && !all_peer_ids.contains(&member.endpoint_id)
+                    {
+                        all_peer_ids.push(member.endpoint_id);
                     }
                 }
-
-                // 2. Peers known to the pure WG plugin but not yet covered.
                 if let Some(ref view) = pure_wg_view {
                     for peer in &view.peers {
-                        if peers
-                            .iter()
-                            .any(|p| p.endpoint_id == peer.endpoint_id.to_string())
-                        {
-                            continue;
-                        }
-                        if let Some(tunnel) = &peer.tunnel {
-                            peers.push(OverlayPeerReport {
-                                endpoint_id: peer.endpoint_id.to_string(),
-                                protocol: "wg".into(),
-                                public_key: peer.public_key.to_string(),
-                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                                handshake_secs_ago: tunnel
-                                    .health
-                                    .since_handshake
-                                    .map(|s| s.as_secs()),
-                                tx_packets: tunnel.stats.tx_packets,
-                                rx_packets: tunnel.stats.rx_packets,
-                                dropped: tunnel.stats.dropped_wrong_source
-                                    + tunnel.stats.dropped_oversize,
-                                protocol_errors: tunnel.stats.protocol_errors,
-                                path: tunnel.path.clone(),
-                            });
-                        } else {
-                            peers.push(OverlayPeerReport {
-                                endpoint_id: peer.endpoint_id.to_string(),
-                                protocol: "wg".into(),
-                                public_key: peer.public_key.to_string(),
-                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                                handshake_secs_ago: None,
-                                tx_packets: 0,
-                                rx_packets: 0,
-                                dropped: 0,
-                                protocol_errors: 0,
-                                path: "no data link".into(),
-                            });
+                        if !all_peer_ids.contains(&peer.endpoint_id) {
+                            all_peer_ids.push(peer.endpoint_id);
                         }
                     }
                 }
-
-                // 3. tcp-tls peers not yet covered by either WG view.
+                if let Some(ref view) = wg_view {
+                    for peer in &view.peers {
+                        if !all_peer_ids.contains(&peer.endpoint_id) {
+                            all_peer_ids.push(peer.endpoint_id);
+                        }
+                    }
+                }
                 for report in &tcp_tls_reports {
-                    if !peers
+                    if !all_peer_ids.contains(&report.peer) {
+                        all_peer_ids.push(report.peer);
+                    }
+                }
+
+                for peer_id in all_peer_ids {
+                    let pure_wg_match = pure_wg_view
+                        .as_ref()
+                        .and_then(|v| v.peers.iter().find(|p| p.endpoint_id == peer_id));
+                    let tcp_tls_match = tcp_tls_reports.iter().find(|r| r.peer == peer_id);
+                    let wg_quic_match = wg_view
+                        .as_ref()
+                        .and_then(|v| v.peers.iter().find(|p| p.endpoint_id == peer_id));
+
+                    let member_addr = network
+                        .members
                         .iter()
-                        .any(|p| p.endpoint_id == report.peer.to_string())
+                        .find(|m| m.endpoint_id == peer_id)
+                        .and_then(|m| m.overlay_address_v4)
+                        .map(|a| a.to_string());
+
+                    if let Some(pure_peer) = pure_wg_match
+                        && let Some(tunnel) = &pure_peer.tunnel
                     {
-                        let address = network
-                            .members
-                            .iter()
-                            .find(|m| m.endpoint_id == report.peer)
-                            .and_then(|m| m.overlay_address_v4)
-                            .map(|a| a.to_string());
                         peers.push(OverlayPeerReport {
-                            endpoint_id: report.peer.to_string(),
-                            protocol: report.protocol.clone(),
-                            public_key: String::new(),
-                            address,
-                            handshake_secs_ago: Some(report.uptime_secs),
-                            tx_packets: report.tx_packets,
-                            rx_packets: report.rx_packets,
-                            dropped: report.dropped,
+                            endpoint_id: peer_id.to_string(),
+                            protocol: "wg".into(),
+                            public_key: pure_peer.public_key.to_string(),
+                            address: pure_peer
+                                .overlay_address_v4
+                                .map(|a| a.to_string())
+                                .or(member_addr),
+                            handshake_secs_ago: tunnel.health.since_handshake.map(|s| s.as_secs()),
+                            tx_packets: tunnel.stats.tx_packets,
+                            rx_packets: tunnel.stats.rx_packets,
+                            dropped: tunnel.stats.dropped_wrong_source
+                                + tunnel.stats.dropped_oversize,
+                            protocol_errors: tunnel.stats.protocol_errors,
+                            path: tunnel.path.clone(),
+                        });
+                    } else if let Some(tcp_tls) = tcp_tls_match {
+                        let pubkey = pure_wg_match
+                            .map(|p| p.public_key.to_string())
+                            .or_else(|| wg_quic_match.map(|p| p.public_key.to_string()))
+                            .unwrap_or_default();
+                        peers.push(OverlayPeerReport {
+                            endpoint_id: peer_id.to_string(),
+                            protocol: tcp_tls.protocol.clone(),
+                            public_key: pubkey,
+                            address: member_addr,
+                            handshake_secs_ago: Some(tcp_tls.uptime_secs),
+                            tx_packets: tcp_tls.tx_packets,
+                            rx_packets: tcp_tls.rx_packets,
+                            dropped: tcp_tls.dropped,
                             protocol_errors: 0,
-                            path: report.path.clone(),
+                            path: tcp_tls.path.clone(),
+                        });
+                    } else if let Some(wg_peer) = wg_quic_match
+                        && let Some(tunnel) = &wg_peer.tunnel
+                    {
+                        peers.push(OverlayPeerReport {
+                            endpoint_id: peer_id.to_string(),
+                            protocol: "wg-quic".into(),
+                            public_key: wg_peer.public_key.to_string(),
+                            address: wg_peer
+                                .overlay_address_v4
+                                .map(|a| a.to_string())
+                                .or(member_addr),
+                            handshake_secs_ago: tunnel.health.since_handshake.map(|s| s.as_secs()),
+                            tx_packets: tunnel.stats.tx_packets,
+                            rx_packets: tunnel.stats.rx_packets,
+                            dropped: tunnel.stats.dropped_wrong_source
+                                + tunnel.stats.dropped_oversize,
+                            protocol_errors: tunnel.stats.protocol_errors,
+                            path: tunnel.path.clone(),
+                        });
+                    } else if let Some(pure_peer) = pure_wg_match {
+                        peers.push(OverlayPeerReport {
+                            endpoint_id: peer_id.to_string(),
+                            protocol: "wg".into(),
+                            public_key: pure_peer.public_key.to_string(),
+                            address: pure_peer
+                                .overlay_address_v4
+                                .map(|a| a.to_string())
+                                .or(member_addr),
+                            handshake_secs_ago: None,
+                            tx_packets: 0,
+                            rx_packets: 0,
+                            dropped: 0,
+                            protocol_errors: 0,
+                            path: "no data link".into(),
+                        });
+                    } else if let Some(wg_peer) = wg_quic_match {
+                        peers.push(OverlayPeerReport {
+                            endpoint_id: peer_id.to_string(),
+                            protocol: "wg-quic".into(),
+                            public_key: wg_peer.public_key.to_string(),
+                            address: wg_peer
+                                .overlay_address_v4
+                                .map(|a| a.to_string())
+                                .or(member_addr),
+                            handshake_secs_ago: None,
+                            tx_packets: 0,
+                            rx_packets: 0,
+                            dropped: 0,
+                            protocol_errors: 0,
+                            path: "no data link".into(),
                         });
                     }
                 }

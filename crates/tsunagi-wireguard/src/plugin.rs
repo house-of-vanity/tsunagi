@@ -51,12 +51,6 @@ pub fn local_ip_candidates() -> Vec<IpAddr> {
                     ips.push(IpAddr::V4(addr));
                 }
             }
-            for ip in iface.ipv6 {
-                let addr = ip.addr();
-                if !addr.is_loopback() && !addr.is_unspecified() {
-                    ips.push(IpAddr::V6(addr));
-                }
-            }
         }
     }
     ips
