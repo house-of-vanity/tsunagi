@@ -14,20 +14,28 @@ use bytes::Bytes;
 use iroh::EndpointId;
 use tokio::task::JoinHandle;
 
-use tsunagi::dataplane::PacketSink;
-use tsunagi::dataplane::PluginError;
 use tsunagi::dataplane::routing::{FlowId, flow::ip_flow};
 use tsunagi::dataplane::transport::{SharedLink, TransportError};
+use tsunagi::dataplane::{PacketSink, PluginContext, PluginError};
 use tsunagi::identity::NetworkId;
 
 use crate::keys::{WgPublicKey, WgSecretKey};
+use crate::transport::WireguardTransport;
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(250);
 const SCRATCH: usize = 4096;
 
+/// Maximum consecutive rekey timeout retransmissions before declaring a tunnel dead.
+pub const MAX_REKEY_TIMEOUTS: u32 = 3;
+
+/// Overall maximum duration trying to establish or rekey a handshake before declaring it dead.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 struct FlowTunnel {
     tunn: Tunn,
     queued: VecDeque<FlowId>,
+    handshake_started_at: Option<std::time::Instant>,
+    rekey_timeouts: u32,
 }
 
 fn is_data(result: &TunnResult<'_>) -> bool {
@@ -45,6 +53,12 @@ impl FlowTunnel {
         if is_data(&result) {
             return (result, flow);
         }
+        if matches!(result, TunnResult::WriteToNetwork(ref b) if !b.is_empty() && b[0] == 1)
+            && self.handshake_started_at.is_none()
+        {
+            self.handshake_started_at = Some(std::time::Instant::now());
+            self.rekey_timeouts = 0;
+        }
         if self.queued.len() < 256 {
             self.queued.push_back(flow);
         }
@@ -57,6 +71,10 @@ impl FlowTunnel {
         scratch: &'a mut [u8],
     ) -> (TunnResult<'a>, FlowId) {
         let result = self.tunn.decapsulate(None, packet, scratch);
+        if self.tunn.time_since_last_handshake().is_some() {
+            self.handshake_started_at = None;
+            self.rekey_timeouts = 0;
+        }
         let mut flow = 0;
         if packet.is_empty() {
             if is_data(&result) {
@@ -68,15 +86,37 @@ impl FlowTunnel {
         (result, flow)
     }
 
-    fn update_timers<'a>(&mut self, scratch: &'a mut [u8]) -> TunnResult<'a> {
+    fn update_timers<'a>(&mut self, scratch: &'a mut [u8]) -> (TunnResult<'a>, bool) {
         let result = self.tunn.update_timers(scratch);
         if matches!(
             result,
             TunnResult::Err(boringtun::noise::errors::WireGuardError::ConnectionExpired)
-        ) {
+        ) || self.tunn.is_expired()
+        {
             self.queued.clear();
+            self.handshake_started_at = None;
+            self.rekey_timeouts = 0;
+            return (result, true);
         }
-        result
+
+        if let TunnResult::WriteToNetwork(ref bytes) = result
+            && !bytes.is_empty()
+            && bytes[0] == 1
+            && self.handshake_started_at.is_none()
+        {
+            self.handshake_started_at = Some(std::time::Instant::now());
+        }
+
+        if let Some(started) = self.handshake_started_at
+            && started.elapsed() >= HANDSHAKE_TIMEOUT
+        {
+            self.queued.clear();
+            self.handshake_started_at = None;
+            self.rekey_timeouts = 0;
+            return (result, true);
+        }
+
+        (result, false)
     }
 }
 
@@ -205,7 +245,21 @@ struct Inner {
     private_key: WgSecretKey,
     peers: RwLock<HashMap<WgPublicKey, Arc<Peer>>>,
     sink: Arc<dyn PacketSink>,
+    transport: Arc<WireguardTransport>,
+    context: PluginContext,
     next_index: AtomicU32,
+}
+
+impl Inner {
+    fn on_tunnel_failed(&self, peer: EndpointId) {
+        self.transport.close_link(self.network, peer);
+        self.context.report_peer_protocol_failure(
+            self.network,
+            peer,
+            crate::announcement::WG_PROTOCOL,
+            "WireGuard rekey timeout",
+        );
+    }
 }
 
 impl std::fmt::Debug for Inner {
@@ -225,12 +279,20 @@ pub struct WireguardDevice {
 
 impl WireguardDevice {
     /// Starts the WireGuard tunnels for one network.
-    pub fn start(network: NetworkId, private_key: WgSecretKey, sink: Arc<dyn PacketSink>) -> Self {
+    pub fn start(
+        network: NetworkId,
+        private_key: WgSecretKey,
+        sink: Arc<dyn PacketSink>,
+        transport: Arc<WireguardTransport>,
+        context: PluginContext,
+    ) -> Self {
         let inner = Arc::new(Inner {
             network,
             private_key,
             peers: RwLock::new(HashMap::new()),
             sink,
+            transport,
+            context,
             next_index: AtomicU32::new(1),
         });
 
@@ -312,6 +374,8 @@ impl WireguardDevice {
             tunn: Mutex::new(FlowTunnel {
                 tunn,
                 queued: VecDeque::new(),
+                handshake_started_at: None,
+                rekey_timeouts: 0,
             }),
             link,
             counters: Arc::new(PeerCounters::default()),
@@ -405,7 +469,11 @@ fn kick_handshake(peer: &Peer) {
             Err(poisoned) => poisoned.into_inner(),
         };
         match tunn.tunn.format_handshake_initiation(&mut scratch, false) {
-            TunnResult::WriteToNetwork(out) => Some(out.len()),
+            TunnResult::WriteToNetwork(out) => {
+                tunn.handshake_started_at = Some(std::time::Instant::now());
+                tunn.rekey_timeouts = 0;
+                Some(out.len())
+            }
             _ => None,
         }
     };
@@ -505,23 +573,92 @@ async fn drive_timers(inner: Arc<Inner>) {
         let peers: Vec<Arc<Peer>> = read_lock(&inner.peers).values().cloned().collect();
         for peer in peers {
             let mut scratch = vec![0u8; SCRATCH];
-            let len = {
+            let (len, failed) = {
                 let mut tunn = match peer.tunn.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                match tunn.update_timers(&mut scratch) {
+                let (result, failed) = tunn.update_timers(&mut scratch);
+                let len = match result {
                     TunnResult::WriteToNetwork(out) => Some(out.len()),
                     TunnResult::Err(err) => {
                         tracing::trace!(?err, "WireGuard timer error");
                         None
                     }
                     _ => None,
-                }
+                };
+                (len, failed)
             };
             if let Some(len) = len {
                 send_to_peer(&peer, &scratch[..len]);
             }
+            if failed {
+                tracing::warn!(
+                    peer = %peer.endpoint_id.fmt_short(),
+                    "WireGuard tunnel failed due to rekey timeout, triggering fallback"
+                );
+                inner.on_tunnel_failed(peer.endpoint_id);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flow_tunnel_rekey_timeout_triggers_failure() {
+        let my_secret = WgSecretKey::generate();
+        let their_secret = WgSecretKey::generate();
+        let their_public = their_secret.public();
+        let tunn = Tunn::new(
+            my_secret.to_static_secret(),
+            their_public.into_x25519(),
+            None,
+            None,
+            1,
+            None,
+        );
+
+        let mut tunnel = FlowTunnel {
+            tunn,
+            queued: VecDeque::new(),
+            handshake_started_at: Some(std::time::Instant::now() - Duration::from_secs(16)),
+            rekey_timeouts: 0,
+        };
+
+        let mut scratch = vec![0u8; SCRATCH];
+        // When handshake timeout exceeds HANDSHAKE_TIMEOUT (15s), update_timers returns true (failed)
+        let (_, failed) = tunnel.update_timers(&mut scratch);
+        assert!(failed, "handshake timeout should report failure");
+        assert!(tunnel.handshake_started_at.is_none());
+    }
+
+    #[test]
+    fn test_flow_tunnel_reset_on_handshake() {
+        let my_secret = WgSecretKey::generate();
+        let their_secret = WgSecretKey::generate();
+        let their_public = their_secret.public();
+        let tunn = Tunn::new(
+            my_secret.to_static_secret(),
+            their_public.into_x25519(),
+            None,
+            None,
+            1,
+            None,
+        );
+
+        let mut tunnel = FlowTunnel {
+            tunn,
+            queued: VecDeque::new(),
+            handshake_started_at: Some(std::time::Instant::now()),
+            rekey_timeouts: 2,
+        };
+
+        let mut scratch = vec![0u8; SCRATCH];
+        let _ = tunnel.decapsulate(&[], &mut scratch);
+        // decapsulate without handshake response doesn't establish session
+        assert_eq!(tunnel.rekey_timeouts, 2);
     }
 }

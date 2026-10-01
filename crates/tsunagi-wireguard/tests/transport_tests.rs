@@ -144,3 +144,77 @@ async fn test_wireguard_transport_unreachable_probe_times_out() {
         other => panic!("expected Unreachable error, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_wireguard_link_close_and_transport_close_link() {
+    let identity_a = DeviceIdentity::generate();
+    let peer_a = identity_a.endpoint_id();
+    let identity_b = DeviceIdentity::generate();
+    let peer_b = identity_b.endpoint_id();
+    let network = NetworkId::from_bytes([55u8; 32]);
+
+    let transport_b = Arc::new(
+        WireguardTransport::bind(&identity_b, Some(0))
+            .await
+            .unwrap(),
+    );
+    let port_b = transport_b.bound_port();
+
+    let transport_a = Arc::new(
+        WireguardTransport::bind(&identity_a, Some(0))
+            .await
+            .unwrap(),
+    );
+    let port_a = transport_a.bound_port();
+
+    let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
+    transport_a.set_peer_addr(peer_b, addr_b);
+    transport_a.set_peer_network(peer_b, network);
+
+    let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
+    transport_b.set_peer_addr(peer_a, addr_a);
+    transport_b.set_peer_network(peer_a, network);
+
+    let transport_a_clone = Arc::clone(&transport_a);
+    tokio::spawn(async move {
+        transport_a_clone.accept_loop(|_| {}).await;
+    });
+
+    let transport_b_clone = Arc::clone(&transport_b);
+    tokio::spawn(async move {
+        transport_b_clone.accept_loop(|_| {}).await;
+    });
+
+    let link_a = transport_a
+        .open(network, peer_b, "wg")
+        .await
+        .expect("open link A");
+    assert!(!link_a.is_closed());
+
+    // Spawn a reader task waiting on recv()
+    let link_a_clone = Arc::clone(&link_a);
+    let recv_task = tokio::spawn(async move { link_a_clone.recv().await });
+
+    // Explicitly closing via transport.close_link()
+    transport_a.close_link(network, peer_b);
+    assert!(link_a.is_closed());
+
+    // Wait on closed() notification
+    tokio::time::timeout(Duration::from_secs(1), link_a.closed())
+        .await
+        .expect("link.closed() should resolve promptly");
+
+    // recv() must have returned None
+    let recv_res = tokio::time::timeout(Duration::from_secs(1), recv_task)
+        .await
+        .expect("recv task should complete")
+        .expect("task join");
+    assert_eq!(recv_res, None);
+
+    // Send after close must return Closed error
+    let send_res = link_a.send(Bytes::from_static(b"after close"));
+    assert!(matches!(
+        send_res,
+        Err(tsunagi::dataplane::transport::TransportError::Closed)
+    ));
+}

@@ -86,6 +86,12 @@ pub(crate) enum NetCommand {
         /// Human readable reason, free of secrets.
         reason: String,
     },
+    /// An IP plugin reported that data plane connectivity or a tunnel for a peer failed.
+    ProtocolFailure {
+        peer: EndpointId,
+        protocol: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Debug for NetCommand {
@@ -104,6 +110,9 @@ impl std::fmt::Debug for NetCommand {
             NetCommand::SetHostname(_) => f.write_str("SetHostname"),
             NetCommand::Release { .. } => f.write_str("Release"),
             NetCommand::PluginError { protocol, .. } => write!(f, "PluginError({protocol})"),
+            NetCommand::ProtocolFailure { peer, protocol, .. } => {
+                write!(f, "ProtocolFailure({}, {protocol})", peer.fmt_short())
+            }
         }
     }
 }
@@ -521,6 +530,26 @@ impl Runtime {
                     protocol,
                     reason,
                 });
+            }
+            NetCommand::ProtocolFailure {
+                peer,
+                protocol,
+                reason,
+            } => {
+                if self.links.remove(&(peer, protocol.clone())).is_some() {
+                    self.hub.clear_direct(peer, &protocol);
+                }
+                self.metrics.data_link_failures += 1;
+                self.record_protocol_failure(peer, &protocol);
+                self.emit(Event::DataLinkDown {
+                    network: self.network_id,
+                    peer,
+                    protocol,
+                    reason,
+                });
+                self.ensure_links();
+                self.update_paths();
+                self.announce_reach(false);
             }
         }
     }
@@ -2161,5 +2190,71 @@ mod tests {
         assert_eq!(data_link_backoff(5), Duration::from_secs(48));
         assert_eq!(data_link_backoff(6), Duration::from_secs(60));
         assert_eq!(data_link_backoff(10), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_protocol_dial_state_cooldown_and_fallback_selection() {
+        let peer = crate::identity::DeviceIdentity::generate().endpoint_id();
+        let supported = ["wg", "tcp-tls", "wg-quic"];
+        let mut states: HashMap<(EndpointId, String), ProtocolDialState> = HashMap::new();
+
+        let now = std::time::Instant::now();
+
+        // 1. Without cooldown, the highest priority protocol "wg" is chosen
+        let chosen =
+            supported
+                .iter()
+                .find(|proto| match states.get(&(peer, (*proto).to_string())) {
+                    Some(state) => state.cooldown_until <= now,
+                    None => true,
+                });
+        assert_eq!(chosen.copied(), Some("wg"));
+
+        // 2. Record failure for "wg" putting it on cooldown
+        states.insert(
+            (peer, "wg".to_string()),
+            ProtocolDialState {
+                failures: 1,
+                cooldown_until: now + Duration::from_secs(3),
+            },
+        );
+
+        // With "wg" on cooldown, selection must fall back to next priority "tcp-tls"
+        let chosen_after_failure =
+            supported
+                .iter()
+                .find(|proto| match states.get(&(peer, (*proto).to_string())) {
+                    Some(state) => state.cooldown_until <= now,
+                    None => true,
+                });
+        assert_eq!(chosen_after_failure.copied(), Some("tcp-tls"));
+
+        // 3. If "tcp-tls" also fails, selection falls back to "wg-quic"
+        states.insert(
+            (peer, "tcp-tls".to_string()),
+            ProtocolDialState {
+                failures: 1,
+                cooldown_until: now + Duration::from_secs(3),
+            },
+        );
+        let chosen_quic =
+            supported
+                .iter()
+                .find(|proto| match states.get(&(peer, (*proto).to_string())) {
+                    Some(state) => state.cooldown_until <= now,
+                    None => true,
+                });
+        assert_eq!(chosen_quic.copied(), Some("wg-quic"));
+
+        // 4. Once success is recorded (entry removed), "wg" is preferred again
+        states.remove(&(peer, "wg".to_string()));
+        let chosen_restored =
+            supported
+                .iter()
+                .find(|proto| match states.get(&(peer, (*proto).to_string())) {
+                    Some(state) => state.cooldown_until <= now,
+                    None => true,
+                });
+        assert_eq!(chosen_restored.copied(), Some("wg"));
     }
 }

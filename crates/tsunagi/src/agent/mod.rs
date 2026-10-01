@@ -1118,6 +1118,26 @@ async fn plugin_request_loop(weak: Weak<Inner>, mut requests: mpsc::Receiver<Plu
                     }
                 }
             }
+            PluginRequest::ProtocolFailure {
+                network,
+                peer,
+                protocol,
+                reason,
+            } => {
+                let sender = {
+                    let networks = inner.networks.read().await;
+                    networks.get(&network).map(|handle| handle.commands.clone())
+                };
+                if let Some(sender) = sender {
+                    let _ = sender
+                        .send(NetCommand::ProtocolFailure {
+                            peer,
+                            protocol,
+                            reason,
+                        })
+                        .await;
+                }
+            }
         }
     }
 }

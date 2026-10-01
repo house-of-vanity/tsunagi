@@ -222,6 +222,13 @@ impl WireguardLink {
         }
     }
 
+    /// Explicitly closes this link, notifying any pending readers or waiters.
+    pub fn close(&self) {
+        if !self.is_closed.swap(true, Ordering::AcqRel) {
+            self.closed_notify.notify_waiters();
+        }
+    }
+
     /// Returns the current target address.
     pub fn target_addr(&self) -> SocketAddr {
         match self.target_addr.read() {
@@ -261,8 +268,17 @@ impl PacketLink for WireguardLink {
 
     fn recv(&self) -> BoxFuture<'_, Option<Bytes>> {
         Box::pin(async move {
-            let mut guard = self.rx.lock().await;
-            guard.recv().await
+            if self.is_closed.load(Ordering::Acquire) {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = self.closed_notify.notified() => None,
+                msg = async {
+                    let mut guard = self.rx.lock().await;
+                    guard.recv().await
+                } => msg,
+            }
         })
     }
 
@@ -386,6 +402,20 @@ impl WireguardTransport {
             Err(p) => p.into_inner(),
         };
         guard.get(&peer).cloned().unwrap_or_default()
+    }
+
+    /// Explicitly closes any active direct link for the given network and peer.
+    pub fn close_link(&self, network: NetworkId, peer: EndpointId) {
+        let link = {
+            let guard = match self.links.read() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.get(&(network, peer)).cloned()
+        };
+        if let Some(link) = link {
+            link.close();
+        }
     }
 
     /// Notifies the transport that a peer's capability was announced.

@@ -576,7 +576,18 @@ impl Worker {
             Some(sink) => Arc::clone(sink),
             None => Arc::new(tsunagi::dataplane::DiscardPackets) as Arc<dyn PacketSink>,
         };
-        let device = Arc::new(WireguardDevice::start(network, key, sink));
+        let context = self
+            .context
+            .get()
+            .cloned()
+            .unwrap_or_else(PluginContext::detached);
+        let device = Arc::new(WireguardDevice::start(
+            network,
+            key,
+            sink,
+            Arc::clone(&self.transport),
+            context,
+        ));
 
         let mut shared = self.lock_shared();
         if let Some(state) = shared.networks.get_mut(&network) {

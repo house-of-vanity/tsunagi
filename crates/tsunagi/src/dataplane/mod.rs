@@ -119,7 +119,7 @@ pub enum PluginError {
 
 /// A request a plugin makes of the agent that owns it.
 #[derive(Debug)]
-pub(crate) enum PluginRequest {
+pub enum PluginRequest {
     /// Re-send this agent's announcement to every peer of a network.
     Reannounce(NetworkId),
     /// Surface a plugin error on the agent's event stream.
@@ -129,6 +129,17 @@ pub(crate) enum PluginRequest {
         /// Plugin protocol id.
         protocol: String,
         /// Human readable reason, free of secrets.
+        reason: String,
+    },
+    /// A plugin reported that a data link or tunnel for a peer failed.
+    ProtocolFailure {
+        /// Network the failure occurred in.
+        network: NetworkId,
+        /// Peer whose protocol failed.
+        peer: EndpointId,
+        /// Protocol that failed.
+        protocol: String,
+        /// Human readable reason.
         reason: String,
     },
 }
@@ -192,6 +203,20 @@ impl PluginContext {
         }
     }
 
+    /// A context configured with a channel for plugin requests and custom sink, for tests.
+    #[cfg(feature = "testing")]
+    pub fn for_test(
+        sender: mpsc::Sender<PluginRequest>,
+        local: EndpointId,
+        sink: Option<Arc<dyn PacketSink>>,
+    ) -> Self {
+        Self {
+            sender: Some(sender),
+            local: Some(local),
+            sink,
+        }
+    }
+
     /// This agent's own endpoint id, when the context is attached.
     ///
     /// A plugin needs it to find itself in the agreed allocation.
@@ -229,6 +254,22 @@ impl PluginContext {
     ) {
         self.send(PluginRequest::Error {
             network,
+            protocol: protocol.into(),
+            reason: reason.into(),
+        });
+    }
+
+    /// Reports that data plane connectivity or a tunnel for a peer has failed.
+    pub fn report_peer_protocol_failure(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+        protocol: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        self.send(PluginRequest::ProtocolFailure {
+            network,
+            peer,
             protocol: protocol.into(),
             reason: reason.into(),
         });
