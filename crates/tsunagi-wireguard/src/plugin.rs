@@ -605,6 +605,8 @@ impl Worker {
             return;
         };
 
+        state.links.retain(|_, link| !link.is_closed());
+
         let allocations = state.allocations.clone();
         let mut wanted: Vec<WgPublicKey> = Vec::new();
         for (endpoint_id, announcement) in &state.announcements {

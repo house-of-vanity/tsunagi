@@ -36,6 +36,7 @@ struct FlowTunnel {
     queued: VecDeque<FlowId>,
     handshake_started_at: Option<std::time::Instant>,
     rekey_timeouts: u32,
+    failed: bool,
 }
 
 fn is_data(result: &TunnResult<'_>) -> bool {
@@ -58,6 +59,7 @@ impl FlowTunnel {
         {
             self.handshake_started_at = Some(std::time::Instant::now());
             self.rekey_timeouts = 0;
+            self.failed = false;
         }
         if self.queued.len() < 256 {
             self.queued.push_back(flow);
@@ -74,6 +76,7 @@ impl FlowTunnel {
         if self.tunn.time_since_last_handshake().is_some() {
             self.handshake_started_at = None;
             self.rekey_timeouts = 0;
+            self.failed = false;
         }
         let mut flow = 0;
         if packet.is_empty() {
@@ -87,12 +90,17 @@ impl FlowTunnel {
     }
 
     fn update_timers<'a>(&mut self, scratch: &'a mut [u8]) -> (TunnResult<'a>, bool) {
+        if self.failed {
+            return (TunnResult::Done, false);
+        }
+
         let result = self.tunn.update_timers(scratch);
         if matches!(
             result,
             TunnResult::Err(boringtun::noise::errors::WireGuardError::ConnectionExpired)
         ) || self.tunn.is_expired()
         {
+            self.failed = true;
             self.queued.clear();
             self.handshake_started_at = None;
             self.rekey_timeouts = 0;
@@ -110,6 +118,7 @@ impl FlowTunnel {
         if let Some(started) = self.handshake_started_at
             && started.elapsed() >= HANDSHAKE_TIMEOUT
         {
+            self.failed = true;
             self.queued.clear();
             self.handshake_started_at = None;
             self.rekey_timeouts = 0;
@@ -251,8 +260,9 @@ struct Inner {
 }
 
 impl Inner {
-    fn on_tunnel_failed(&self, peer: EndpointId) {
+    fn on_tunnel_failed(&self, peer: EndpointId, public_key: WgPublicKey) {
         self.transport.close_link(self.network, peer);
+        write_lock(&self.peers).remove(&public_key);
         self.context.report_peer_protocol_failure(
             self.network,
             peer,
@@ -376,6 +386,7 @@ impl WireguardDevice {
                 queued: VecDeque::new(),
                 handshake_started_at: None,
                 rekey_timeouts: 0,
+                failed: false,
             }),
             link,
             counters: Arc::new(PeerCounters::default()),
@@ -472,6 +483,7 @@ fn kick_handshake(peer: &Peer) {
             TunnResult::WriteToNetwork(out) => {
                 tunn.handshake_started_at = Some(std::time::Instant::now());
                 tunn.rekey_timeouts = 0;
+                tunn.failed = false;
                 Some(out.len())
             }
             _ => None,
@@ -597,7 +609,7 @@ async fn drive_timers(inner: Arc<Inner>) {
                     peer = %peer.endpoint_id.fmt_short(),
                     "WireGuard tunnel failed due to rekey timeout, triggering fallback"
                 );
-                inner.on_tunnel_failed(peer.endpoint_id);
+                inner.on_tunnel_failed(peer.endpoint_id, peer.public_key);
             }
         }
     }
@@ -626,6 +638,7 @@ mod tests {
             queued: VecDeque::new(),
             handshake_started_at: Some(std::time::Instant::now() - Duration::from_secs(16)),
             rekey_timeouts: 0,
+            failed: false,
         };
 
         let mut scratch = vec![0u8; SCRATCH];
@@ -633,6 +646,14 @@ mod tests {
         let (_, failed) = tunnel.update_timers(&mut scratch);
         assert!(failed, "handshake timeout should report failure");
         assert!(tunnel.handshake_started_at.is_none());
+        assert!(tunnel.failed, "tunnel should be marked as failed");
+
+        // Subsequent timer tick must not report failure again
+        let (_, failed_again) = tunnel.update_timers(&mut scratch);
+        assert!(
+            !failed_again,
+            "subsequent timer tick should not re-trigger failure"
+        );
     }
 
     #[test]
@@ -654,6 +675,7 @@ mod tests {
             queued: VecDeque::new(),
             handshake_started_at: Some(std::time::Instant::now()),
             rekey_timeouts: 2,
+            failed: true,
         };
 
         let mut scratch = vec![0u8; SCRATCH];

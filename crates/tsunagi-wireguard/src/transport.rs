@@ -122,16 +122,8 @@ impl WireguardLink {
                 if msg.len() > MAX_UDP_DATAGRAM_SIZE {
                     continue;
                 }
-                // Check if this is a WireGuard handshake initiation packet:
-                // An enveloped packet has a 74-byte header (envelope::HEADER).
-                // A raw packet may directly have WireGuard type at index 0.
-                let is_handshake_init = if msg.len() >= 74 + 4 && msg[0] == 1 {
-                    msg[74] == 1
-                } else if !msg.is_empty() {
-                    msg[0] == 1
-                } else {
-                    false
-                };
+                // In WireGuard protocol, type 1 is Handshake Initiation (148 bytes).
+                let is_handshake_init = !msg.is_empty() && msg[0] == 1;
                 if confirmed_r.load(Ordering::Acquire) && !is_handshake_init {
                     let target = match target_r.read() {
                         Ok(g) => *g,
@@ -570,52 +562,38 @@ impl WireguardTransport {
 
             // Identify which peer this packet comes from
             let matched_peer = {
-                // If it's an envelope packet (VERSION 1, len >= 74), read source endpoint ID directly
-                let from_envelope = if len >= 74 && buf[0] == 1 {
-                    let dest = &buf[34..66];
-                    if dest == self.local_id.as_bytes() {
-                        EndpointId::from_bytes(&buf[2..34].try_into().unwrap_or([0u8; 32])).ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                let links_guard = match self.links.read() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
                 };
-
-                from_envelope.or_else(|| {
-                    let links_guard = match self.links.read() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    links_guard
-                        .values()
-                        .find(|link| link.target_addr() == src_addr)
-                        .map(|link| link.peer())
-                        .or_else(|| {
-                            let addrs_guard = match self.peer_addresses.read() {
-                                Ok(g) => g,
-                                Err(p) => p.into_inner(),
-                            };
-                            addrs_guard
-                                .iter()
-                                .find(|(_, addrs)| addrs.contains(&src_addr))
-                                .map(|(peer, _)| *peer)
-                                .or_else(|| {
-                                    links_guard
-                                        .values()
-                                        .find(|link| link.target_addr().ip() == src_addr.ip())
-                                        .map(|link| link.peer())
-                                        .or_else(|| {
-                                            addrs_guard
-                                                .iter()
-                                                .find(|(_, addrs)| {
-                                                    addrs.iter().any(|a| a.ip() == src_addr.ip())
-                                                })
-                                                .map(|(peer, _)| *peer)
-                                        })
-                                })
-                        })
-                })
+                links_guard
+                    .values()
+                    .find(|link| link.target_addr() == src_addr)
+                    .map(|link| link.peer())
+                    .or_else(|| {
+                        let addrs_guard = match self.peer_addresses.read() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        addrs_guard
+                            .iter()
+                            .find(|(_, addrs)| addrs.contains(&src_addr))
+                            .map(|(peer, _)| *peer)
+                            .or_else(|| {
+                                links_guard
+                                    .values()
+                                    .find(|link| link.target_addr().ip() == src_addr.ip())
+                                    .map(|link| link.peer())
+                                    .or_else(|| {
+                                        addrs_guard
+                                            .iter()
+                                            .find(|(_, addrs)| {
+                                                addrs.iter().any(|a| a.ip() == src_addr.ip())
+                                            })
+                                            .map(|(peer, _)| *peer)
+                                    })
+                            })
+                    })
             };
 
             let Some(peer) = matched_peer else {
