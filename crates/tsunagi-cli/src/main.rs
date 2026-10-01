@@ -702,7 +702,7 @@ fn main() -> std::process::ExitCode {
         .or_else(|| std::env::var("TSUNAGI_LOG").ok())
         .or_else(|| std::env::var("RUST_LOG").ok())
         .unwrap_or_else(|| {
-            "info,iroh=warn,quinn=warn,rustls=warn,boringtun=warn,mainline=off".to_string()
+            "info,iroh=warn,iroh::net_report=error,quinn=warn,rustls=warn,boringtun=error,mainline=off".to_string()
         });
 
     let is_debug = log_filter.contains("debug") || log_filter.contains("trace");
