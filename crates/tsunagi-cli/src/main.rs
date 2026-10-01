@@ -2722,6 +2722,25 @@ fn network_section(
         "broadcast",
         if network.broadcast { "on" } else { "off" },
     ));
+    if network.broadcast
+        && let Some(rules) = network
+            .overlay
+            .as_ref()
+            .and_then(|o| o.broadcast_rules.as_ref())
+    {
+        section.push(Row::new(
+            if rules.ok {
+                Health::Good
+            } else {
+                Health::Degraded
+            },
+            "broadcast rules",
+            broadcast_rules_line(
+                rules,
+                network.overlay.as_ref().and_then(|o| o.address.as_deref()),
+            ),
+        ));
+    }
     let relayed = network.relay_forwarded + network.relay_sent_via + network.relay_received_via;
     if relayed > 0 {
         section.push(Row::new(
@@ -4087,6 +4106,14 @@ async fn build_report(
                     unroutable_sample: overlay
                         .as_ref()
                         .and_then(|o| o.counters.unroutable_sample.map(|a| a.to_string())),
+                    broadcast_rules: overlay
+                        .as_ref()
+                        .and_then(|o| o.broadcast_rules.as_ref())
+                        .map(|rules| tsunagi::ipc::HostRulesReport {
+                            ok: rules.is_ok(),
+                            detail: rules.summary(),
+                            source: rules.plan.source.to_string(),
+                        }),
                 })
             } else {
                 None
@@ -4155,6 +4182,21 @@ async fn build_report(
     }
 }
 
+/// The status line for the host rules, saying so when they are bound to
+/// another network's address.
+fn broadcast_rules_line(
+    rules: &tsunagi::ipc::HostRulesReport,
+    own_address: Option<&str>,
+) -> String {
+    match own_address {
+        Some(own) if own != rules.source => format!(
+            "{}  ·  route source is {}, another network's address",
+            rules.detail, rules.source
+        ),
+        _ => rules.detail.clone(),
+    }
+}
+
 /// Resolves when the process is asked to stop.
 ///
 /// Both Ctrl-C and `SIGTERM` are handled, so a service manager stopping the
@@ -4193,16 +4235,22 @@ async fn stop_signal() -> &'static str {
 fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     use tsunagi::overlay::{ManagedTunFactory, NetlinkProvisioner};
     let provisioner = NetlinkProvisioner::new()?;
-    Ok(Arc::new(ManagedTunFactory::new(Arc::new(provisioner))))
+    let rules = Arc::new(provisioner.host_rules());
+    Ok(Arc::new(
+        ManagedTunFactory::new(Arc::new(provisioner)).with_host_rules(rules),
+    ))
 }
 
 /// The Wintun adapter, created and configured by the agent and removed when it
 /// exits, the same as the Linux one.
 #[cfg(target_os = "windows")]
 fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
-    use tsunagi::overlay::{ManagedTunFactory, WintunProvisioner};
+    use tsunagi::overlay::{ManagedTunFactory, WindowsHostRules, WintunProvisioner};
     let provisioner = WintunProvisioner::new()?;
-    Ok(Arc::new(ManagedTunFactory::new(Arc::new(provisioner))))
+    Ok(Arc::new(
+        ManagedTunFactory::new(Arc::new(provisioner))
+            .with_host_rules(Arc::new(WindowsHostRules::new())),
+    ))
 }
 
 /// There is no provisioner for this platform yet.
@@ -4450,6 +4498,55 @@ mod status_tests {
         );
         assert!(text.contains("also called `LAB`"), "{text}");
         assert!(text.contains("mistyped secret"), "{text}");
+    }
+
+    #[test]
+    fn broadcast_rules_are_reported_with_the_reason_when_incomplete() {
+        let mut network = network_after_a_peer_returned();
+        network.broadcast = true;
+        let render = |network: &tsunagi::ipc::NetworkReport| {
+            let mut out = report::Report::new();
+            out.push(network_section(network, OWN, false));
+            (out.render(false), out.worst())
+        };
+
+        // Nothing installed (in-memory interface, or broadcast just off): no row.
+        let (text, _) = render(&network);
+        assert!(!text.contains("broadcast rules"), "{text}");
+
+        let overlay = network.overlay.as_mut().unwrap();
+        overlay.broadcast_rules = Some(tsunagi::ipc::HostRulesReport {
+            ok: true,
+            detail: "ok (route + firewall)".into(),
+            source: "10.13.37.69".into(),
+        });
+        let (text, worst) = render(&network);
+        assert!(text.contains("broadcast rules"), "{text}");
+        assert!(text.contains("ok (route + firewall)"), "{text}");
+        assert_ne!(worst, Health::Degraded, "{text}");
+
+        let overlay = network.overlay.as_mut().unwrap();
+        overlay.broadcast_rules = Some(tsunagi::ipc::HostRulesReport {
+            ok: false,
+            detail: "incomplete; route ok; firewall failed: iptables not found".into(),
+            source: "10.13.37.69".into(),
+        });
+        let (text, worst) = render(&network);
+        assert!(
+            text.contains("firewall failed: iptables not found"),
+            "{text}"
+        );
+        assert_eq!(worst, Health::Degraded, "{text}");
+
+        // Bound to another network's address: said, not hidden.
+        network.overlay.as_mut().unwrap().address = Some("10.99.0.5".into());
+        let (text, _) = render(&network);
+        assert!(text.contains("another network's address"), "{text}");
+
+        // Broadcast off for this network: the line is not shown.
+        network.broadcast = false;
+        let (text, _) = render(&network);
+        assert!(!text.contains("broadcast rules"), "{text}");
     }
 
     #[test]

@@ -481,6 +481,7 @@ impl Agent {
             mtu: interface.mtu(),
             addresses: interface.wanted_addresses(),
             counters: interface.counters(),
+            broadcast_rules: interface.broadcast_rules(),
         })
     }
 
@@ -729,6 +730,9 @@ impl Agent {
             && let Err(err) = interface.sync_addresses().await
         {
             tracing::warn!(%err, "cannot update the overlay addresses");
+        }
+        if let Some(interface) = self.inner.interface.get() {
+            interface.sync_broadcast_rules().await;
         }
         self.inner.storage.set_auto_start(network_id, false).await?;
         Ok(())

@@ -230,6 +230,23 @@ impl RoutingTable {
         addresses
     }
 
+    /// The one network whose address the limited broadcast route is bound to.
+    ///
+    /// The host has a single `255.255.255.255` route per interface, and one
+    /// interface carries every network, so only one overlay address can be its
+    /// source. The choice is the lowest [`NetworkId`] among networks that have
+    /// broadcast enabled, a range and a local address: deterministic, so two
+    /// runs with the same networks pick the same one.
+    pub fn broadcast_host_target(&self) -> Option<(Ipv4Addr, Ipv4Range)> {
+        let networks = self.read();
+        networks
+            .iter()
+            .filter(|(_, routes)| routes.broadcast.enabled)
+            .filter_map(|(network, routes)| Some((*network, routes.local?, routes.range?)))
+            .min_by_key(|(network, _, _)| *network)
+            .map(|(_, local, range)| (local, range))
+    }
+
     /// Whether a range would collide with one another network already uses.
     ///
     /// Asked before proposing a range rather than after: with one interface
@@ -391,6 +408,65 @@ mod tests {
         );
         // And the first network still answers for its own.
         assert_eq!(table.route(addr(2)).map(|route| route.network), Some(first));
+    }
+
+    #[test]
+    fn the_host_broadcast_target_is_the_lowest_enabled_network_with_an_address() {
+        let table = RoutingTable::new();
+        assert_eq!(table.broadcast_host_target(), None);
+
+        let (low, high) = {
+            let (a, b) = (network("first"), network("second"));
+            if a < b { (a, b) } else { (b, a) }
+        };
+        let mk = |enabled: bool, base: [u8; 4], local: Option<Ipv4Addr>| NetworkRoutes {
+            broadcast: BroadcastPolicy {
+                enabled,
+                ..Default::default()
+            },
+            range: Some(
+                format!("{}.{}.{}.0/24", base[0], base[1], base[2])
+                    .parse()
+                    .unwrap(),
+            ),
+            local,
+            peers: Vec::new(),
+        };
+        let a = Ipv4Addr::new(10, 1, 0, 1);
+        let b = Ipv4Addr::new(10, 2, 0, 1);
+
+        // The lower id has broadcast off, so the higher one is chosen.
+        table
+            .set_network(low, mk(false, [10, 1, 0, 0], Some(a)))
+            .unwrap();
+        table
+            .set_network(high, mk(true, [10, 2, 0, 0], Some(b)))
+            .unwrap();
+        assert_eq!(
+            table.broadcast_host_target(),
+            Some((b, "10.2.0.0/24".parse().unwrap()))
+        );
+
+        // Both enabled: the lowest id wins, whatever the insertion order.
+        table
+            .set_network(low, mk(true, [10, 1, 0, 0], Some(a)))
+            .unwrap();
+        assert_eq!(
+            table.broadcast_host_target(),
+            Some((a, "10.1.0.0/24".parse().unwrap()))
+        );
+
+        // No local address yet: it cannot be the route's source.
+        table
+            .set_network(low, mk(true, [10, 1, 0, 0], None))
+            .unwrap();
+        assert_eq!(
+            table.broadcast_host_target(),
+            Some((b, "10.2.0.0/24".parse().unwrap()))
+        );
+
+        table.remove_network(high);
+        assert_eq!(table.broadcast_host_target(), None);
     }
 
     #[test]

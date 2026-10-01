@@ -604,8 +604,12 @@ tsunagi network broadcast games on
 ```
 
 The choice persists across restarts and a plain `join`. It can be changed while
-the agent runs; `status` shows it for each network. The game must send through
-the Tsunagi interface. Physical LAN capture/subnet sharing is not implemented.
+the agent runs; `status` shows it for each network. While broadcast is on, the
+agent routes `255.255.255.255` through the Tsunagi interface and allows inbound
+UDP from the overlay range on it (Linux and Windows, needs the same privilege as
+the interface), and removes both when it is turned off or the agent stops. Games
+bound to a physical address still bypass it. Physical LAN capture/subnet sharing
+is not implemented.
 See [broadcast.md](docs/broadcast.md) for domain isolation and future LAN gateways.
 
 ## How peers find each other

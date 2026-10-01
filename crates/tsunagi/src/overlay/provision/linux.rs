@@ -39,7 +39,7 @@
 //! capability is raised immediately before that call and lowered immediately
 //! after, and the connection task lives and dies inside it.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, mpsc};
 
 use futures_util::TryStreamExt;
@@ -47,7 +47,8 @@ use futures_util::TryStreamExt;
 // of step with the client that sends them.
 use rtnetlink::packet_route::address::{AddressAttribute, AddressMessage};
 use rtnetlink::packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage};
-use rtnetlink::{LinkMessageBuilder, LinkUnspec};
+use rtnetlink::packet_route::route::RouteScope;
+use rtnetlink::{LinkMessageBuilder, LinkUnspec, RouteMessageBuilder};
 
 use crate::BoxFuture;
 use crate::overlay::OverlayError;
@@ -67,6 +68,10 @@ enum Command {
     Delete(String, Reply<()>),
     /// Apply MTU, link state and addresses.
     Configure(Box<Configure>, Reply<()>),
+    /// Route `255.255.255.255/32` through this interface from this address.
+    SetBroadcastRoute(String, Ipv4Addr, Reply<()>),
+    /// Remove that route from this interface.
+    DelBroadcastRoute(String, Reply<()>),
     /// Stop the thread.
     Stop,
 }
@@ -133,13 +138,18 @@ impl NetlinkProvisioner {
         &self,
         make: impl FnOnce(Reply<T>) -> Command,
     ) -> Result<T, OverlayError> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.commands
-            .send(make(reply_tx))
-            .map_err(|_| OverlayError::Unavailable("the netlink thread has stopped".to_string()))?;
-        reply_rx.recv().map_err(|_| {
-            OverlayError::Unavailable("the netlink thread stopped mid-request".to_string())
-        })?
+        call_thread(&self.commands, make)
+    }
+
+    /// The broadcast host rules for this host.
+    ///
+    /// The route is added by this provisioner's netlink thread, because it is
+    /// the only one that ever holds `CAP_NET_ADMIN`, and only for the duration
+    /// of a call. Keep the provisioner alive for as long as the rules are used.
+    pub fn host_rules(&self) -> crate::overlay::hostrules::LinuxHostRules {
+        crate::overlay::hostrules::LinuxHostRules::new(RouteHandle {
+            commands: self.commands.clone(),
+        })
     }
 
     fn is_ours(&self, name: &str) -> bool {
@@ -154,6 +164,44 @@ impl NetlinkProvisioner {
         let request = TunRequest::bare(plan.name.clone(), plan.mtu);
         let _guard = NetAdmin::acquire()?;
         super::super::tun::open_tun(&request)
+    }
+}
+
+fn call_thread<T: Send + 'static>(
+    commands: &mpsc::Sender<Command>,
+    make: impl FnOnce(Reply<T>) -> Command,
+) -> Result<T, OverlayError> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    commands
+        .send(make(reply_tx))
+        .map_err(|_| OverlayError::Unavailable("the netlink thread has stopped".to_string()))?;
+    reply_rx.recv().map_err(|_| {
+        OverlayError::Unavailable("the netlink thread stopped mid-request".to_string())
+    })?
+}
+
+/// Adds and removes the limited-broadcast route on the netlink thread.
+#[derive(Debug, Clone)]
+pub(crate) struct RouteHandle {
+    commands: mpsc::Sender<Command>,
+}
+
+impl RouteHandle {
+    /// Routes `255.255.255.255/32` through `interface`, preferring `source`.
+    /// Replaces a route this agent added earlier, so it can be repeated.
+    pub(crate) fn set(&self, interface: &str, source: Ipv4Addr) -> Result<(), OverlayError> {
+        let interface = interface.to_string();
+        call_thread(&self.commands, |reply| {
+            Command::SetBroadcastRoute(interface, source, reply)
+        })
+    }
+
+    /// Removes the route. Succeeds when it, or the interface, is gone.
+    pub(crate) fn clear(&self, interface: &str) -> Result<(), OverlayError> {
+        let interface = interface.to_string();
+        call_thread(&self.commands, |reply| {
+            Command::DelBroadcastRoute(interface, reply)
+        })
     }
 }
 
@@ -273,7 +321,10 @@ fn netlink_thread(requests: mpsc::Receiver<Command>) {
                     Command::Observe(_, reply) => {
                         let _ = reply.send(Err(OverlayError::Unavailable(message)));
                     }
-                    Command::Delete(_, reply) | Command::Configure(_, reply) => {
+                    Command::Delete(_, reply)
+                    | Command::Configure(_, reply)
+                    | Command::SetBroadcastRoute(_, _, reply)
+                    | Command::DelBroadcastRoute(_, reply) => {
                         let _ = reply.send(Err(OverlayError::Unavailable(message)));
                     }
                     Command::Stop => return,
@@ -301,6 +352,22 @@ fn netlink_thread(requests: mpsc::Receiver<Command>) {
             Command::Configure(configure, reply) => {
                 let result = NetAdmin::acquire().and_then(|guard| {
                     let result = runtime.block_on(configure_link(&configure));
+                    drop(guard);
+                    result
+                });
+                let _ = reply.send(result);
+            }
+            Command::SetBroadcastRoute(name, source, reply) => {
+                let result = NetAdmin::acquire().and_then(|guard| {
+                    let result = runtime.block_on(set_broadcast_route(&name, source));
+                    drop(guard);
+                    result
+                });
+                let _ = reply.send(result);
+            }
+            Command::DelBroadcastRoute(name, reply) => {
+                let result = NetAdmin::acquire().and_then(|guard| {
+                    let result = runtime.block_on(del_broadcast_route(&name));
                     drop(guard);
                     result
                 });
@@ -451,6 +518,80 @@ async fn delete_link(name: &str) -> Result<(), OverlayError> {
         handle.link().del(index).execute().await.map_err(|err| {
             OverlayError::Unavailable(format!("cannot remove interface `{name}`: {err}"))
         })
+    })
+    .await
+}
+
+/// The message that names the limited-broadcast route on an interface.
+///
+/// On-link scope is what the kernel requires of a route with no gateway, and
+/// what `ip route add 255.255.255.255/32 dev <if>` produces. Deleting needs the
+/// same scope or the kernel finds no match.
+fn broadcast_route_message(
+    index: u32,
+    source: Option<Ipv4Addr>,
+) -> rtnetlink::packet_route::route::RouteMessage {
+    let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(Ipv4Addr::BROADCAST, 32)
+        .output_interface(index)
+        .scope(RouteScope::Link);
+    if let Some(source) = source {
+        builder = builder.pref_source(source);
+    }
+    builder.build()
+}
+
+async fn link_index(handle: &rtnetlink::Handle, name: &str) -> Option<u32> {
+    let mut links = handle.link().get().match_name(name.to_string()).execute();
+    links
+        .try_next()
+        .await
+        .ok()
+        .flatten()
+        .map(|message| message.header.index)
+}
+
+async fn set_broadcast_route(name: &str, source: Ipv4Addr) -> Result<(), OverlayError> {
+    with_netlink(|handle| async move {
+        let index = link_index(&handle, name).await.ok_or_else(|| {
+            OverlayError::Unavailable(format!(
+                "interface `{name}` disappeared before its broadcast route could be added"
+            ))
+        })?;
+        handle
+            .route()
+            .add(broadcast_route_message(index, Some(source)))
+            .replace()
+            .execute()
+            .await
+            .map_err(|err| {
+                OverlayError::Unavailable(format!(
+                    "cannot route 255.255.255.255 through `{name}` from {source}: {err}"
+                ))
+            })
+    })
+    .await
+}
+
+async fn del_broadcast_route(name: &str) -> Result<(), OverlayError> {
+    with_netlink(|handle| async move {
+        // An interface that is gone took its routes with it.
+        let Some(index) = link_index(&handle, name).await else {
+            return Ok(());
+        };
+        match handle
+            .route()
+            .del(broadcast_route_message(index, None))
+            .execute()
+            .await
+        {
+            Ok(()) => Ok(()),
+            // "No such process": there was no such route, which is the goal.
+            Err(err) if err.to_string().contains("No such process") => Ok(()),
+            Err(err) => Err(OverlayError::Unavailable(format!(
+                "cannot remove the 255.255.255.255 route from `{name}`: {err}"
+            ))),
+        }
     })
     .await
 }

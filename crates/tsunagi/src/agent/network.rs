@@ -495,6 +495,9 @@ impl Runtime {
             NetCommand::SetBroadcast { enabled, reply } => {
                 self.params.broadcast = enabled;
                 self.update_broadcast();
+                if let Some(interface) = self.params.interface.clone() {
+                    interface.sync_broadcast_rules().await;
+                }
                 self.reannounce();
                 let _ = reply.send(());
             }
@@ -1210,6 +1213,12 @@ impl Runtime {
                     interface.name()
                 ),
             });
+        }
+
+        // The broadcast route names this address as its source, so it goes in
+        // only once the address is really on the interface.
+        if !is_missing {
+            interface.sync_broadcast_rules().await;
         }
     }
 

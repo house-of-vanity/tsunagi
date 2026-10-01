@@ -90,6 +90,12 @@ Keep these separate. Crossing them is the main thing to review for.
   transaction, **before** the record is announced.
 - **Plugins own their system objects.** A plugin creates and removes its own
   interface and nothing else. Never touch routing, DNS or firewall settings.
+  The one exception is the system level, not a plugin: while a network's
+  broadcast is on, `overlay::hostrules` may install exactly a
+  `255.255.255.255/32` route and an inbound UDP firewall allowance (overlay range
+  only) for the interface the agent owns. Both are tagged `tsunagi:<interface>`,
+  reversible, removed on broadcast off, leave and shutdown, and computed from
+  local state, never from a remote announcement.
 - **Device identity vs network identity.** The iroh endpoint id is the device's
   public key. `NetworkId` is derived from name + secret only. Never conflate
   them, and never let one change the other.
@@ -137,7 +143,8 @@ Keep these separate. Crossing them is the main thing to review for.
    up shutdown. Wind tasks down with a grace period and then abort.
 10. **Nothing from a remote announcement becomes a shell command, a filesystem
     path or an OS setting.** The agent never touches interfaces or OS settings
-    it did not create.
+    it did not create (the tagged broadcast host rules above are for its own
+    interface).
 
 ## Where things live
 
@@ -150,7 +157,7 @@ Keep these separate. Crossing them is the main thing to review for.
 | `crates/tsunagi/src/net.rs`        | iroh endpoint adapter and observability snapshots |
 | `crates/tsunagi/src/agent/`        | agent lifecycle, per-network runtimes, sessions, events, status |
 | `crates/tsunagi/src/state/`        | signed records that outlive a session, their merge rules and address allocation |
-| `crates/tsunagi/src/overlay/`   | the one interface an agent owns: provisioning, the TUN, routing, source checks |
+| `crates/tsunagi/src/overlay/`   | the one interface an agent owns: provisioning, the TUN, routing, source checks, broadcast host rules |
 | `crates/tsunagi/src/dataplane/` | the protocol contract and the authenticated packet transport |
 | `crates/tsunagi/src/dns/`       | the DNS view of a network: zone, server, resolver publication |
 | `crates/tsunagi-wg-quic/`       | the `wg-quic` protocol: its keys, its announcement, its tunnels |

@@ -11,6 +11,8 @@
 //!
 //! * [`provision`] creates the interface and configures it, and removes it
 //!   again. Platform mechanics behind one decision function.
+//! * [`hostrules`] installs the route and firewall allowance that let a
+//!   game's LAN discovery reach the interface, while broadcast is on.
 //! * [`tun`] is the packet interface itself, real or in memory.
 //! * [`packet`] reads just enough of an IP header to route by it.
 //! * [`config`] names interfaces and describes addresses.
@@ -38,6 +40,7 @@ pub enum OverlayError {
 
 pub mod broadcast;
 pub mod config;
+pub mod hostrules;
 pub mod interface;
 pub mod packet;
 pub mod provision;
@@ -45,6 +48,10 @@ pub mod router;
 pub mod tun;
 
 pub use config::{Cidr, DEFAULT_INTERFACE_PREFIX, MAX_INTERFACE_NAME_LEN, interface_name};
+pub use hostrules::{
+    BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport, MockHostRules, RuleOutcome,
+    UnsupportedHostRules,
+};
 pub use interface::{Counters, Interface, PacketCarrier, Rejected};
 pub use packet::IpHeader;
 pub use provision::{
@@ -55,6 +62,10 @@ pub use provision::{
 pub use router::{NetworkRoutes, Route, RouteError, RoutingTable};
 pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest, address_is_local};
 
+#[cfg(all(feature = "tun-device", target_os = "linux"))]
+pub use hostrules::LinuxHostRules;
+#[cfg(all(feature = "tun-device", target_os = "windows"))]
+pub use hostrules::WindowsHostRules;
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 pub use provision::NetlinkProvisioner;
 

@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 
 use crate::identity::NetworkId;
 
+use super::hostrules::{BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport};
 use super::packet::IpHeader;
 use super::router::{Route, RoutingTable};
 use super::tun::{TunDevice, TunFactory, TunRequest};
@@ -153,6 +154,10 @@ pub struct Interface {
     applied: std::sync::Mutex<Vec<Cidr>>,
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
     sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The host rules for this interface, when the factory manages the host.
+    host_rules: Option<Arc<dyn BroadcastHostRules>>,
+    /// What those rules last reported, `None` while none are installed.
+    rules_report: std::sync::Mutex<Option<BroadcastRulesReport>>,
 }
 
 impl Interface {
@@ -165,6 +170,7 @@ impl Interface {
         carrier: Arc<dyn PacketCarrier>,
     ) -> Result<Self, OverlayError> {
         let name = name.into();
+        let host_rules = factory.host_rules();
         let device = factory.create(TunRequest::bare(name.clone(), mtu)).await?;
         let tally = Arc::new(Tally::default());
 
@@ -230,7 +236,79 @@ impl Interface {
             applied: std::sync::Mutex::new(Vec::new()),
             task: std::sync::Mutex::new(Some(task)),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            host_rules,
+            rules_report: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Brings the broadcast route and firewall allowance in line with the
+    /// routing table: installed while some network has broadcast on and an
+    /// address, removed when none does.
+    ///
+    /// Called after the addresses are synced, because the route's preferred
+    /// source has to be on the interface already. A plan that has not changed
+    /// is not re-applied, so this is cheap to call whenever the table moves.
+    /// It never fails: the outcome is kept for [`Self::broadcast_rules`].
+    pub async fn sync_broadcast_rules(&self) {
+        let Some(rules) = &self.host_rules else {
+            return;
+        };
+        let _guard = self.sync_lock.lock().await;
+        let desired =
+            self.routes
+                .broadcast_host_target()
+                .map(|(source, range)| BroadcastRulesPlan {
+                    interface: self.name.clone(),
+                    source,
+                    range,
+                });
+        let current = self.current_rules_report();
+        match (desired, current) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                rules.clear(&self.name).await;
+                self.store_rules_report(None);
+                tracing::info!(interface = %self.name, "broadcast host rules removed");
+            }
+            (Some(plan), Some(report)) if report.plan == plan => {}
+            (Some(plan), _) => {
+                let report = rules.apply(&plan).await;
+                if report.is_ok() {
+                    tracing::info!(
+                        interface = %self.name,
+                        source = %plan.source,
+                        "broadcast host rules applied"
+                    );
+                } else {
+                    tracing::warn!(
+                        interface = %self.name,
+                        "broadcast host rules are incomplete: {}",
+                        report.summary()
+                    );
+                }
+                self.store_rules_report(Some(report));
+            }
+        }
+    }
+
+    /// What the broadcast host rules achieved, `None` when none are installed
+    /// or this interface has no host to configure.
+    pub fn broadcast_rules(&self) -> Option<BroadcastRulesReport> {
+        self.current_rules_report()
+    }
+
+    fn current_rules_report(&self) -> Option<BroadcastRulesReport> {
+        match self.rules_report.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn store_rules_report(&self, report: Option<BroadcastRulesReport>) {
+        match self.rules_report.lock() {
+            Ok(mut guard) => *guard = report,
+            Err(poisoned) => *poisoned.into_inner() = report,
+        }
     }
 
     /// Brings the addresses on the host in line with the routing table.
@@ -289,6 +367,12 @@ impl Interface {
 
     /// Removes the interface from the host.
     pub async fn remove(&self) {
+        // The route goes with the interface; the firewall rule does not, so
+        // it is taken out explicitly while the interface is still known.
+        if let Some(rules) = &self.host_rules {
+            rules.clear(&self.name).await;
+            self.store_rules_report(None);
+        }
         // The packet loop holds the device open, and it ends only when the
         // device reports end of stream — which a real interface never does
         // while it exists. Stop it directly before destroying the interface.
@@ -431,6 +515,9 @@ mod tests {
         interface.remove().await;
     }
     use crate::identity::{NetworkKeys, NetworkName, NetworkSecret};
+    use crate::overlay::broadcast::BroadcastPolicy;
+    use crate::overlay::hostrules::{MockHostRules, RuleOutcome};
+    use crate::overlay::provision::{ManagedTunFactory, MockProvisioner};
     use crate::overlay::router::NetworkRoutes;
     use crate::overlay::tun::{MemoryTun, MemoryTunFactory};
 
@@ -750,5 +837,138 @@ mod tests {
             interface.wanted_addresses(),
             vec![Cidr::new(addr(9).into(), 24).unwrap()]
         );
+    }
+
+    async fn managed_interface(
+        rules: &MockHostRules,
+        broadcast_enabled: bool,
+    ) -> (Interface, Arc<RoutingTable>, NetworkId) {
+        let id = network("rules");
+        let routes = Arc::new(RoutingTable::new());
+        routes
+            .set_network(
+                id,
+                NetworkRoutes {
+                    broadcast: BroadcastPolicy {
+                        enabled: broadcast_enabled,
+                        ..Default::default()
+                    },
+                    range: Some("10.13.37.0/24".parse().unwrap()),
+                    local: Some(addr(1)),
+                    peers: vec![(addr(2), peer(2))],
+                },
+            )
+            .unwrap();
+        let factory = Arc::new(
+            ManagedTunFactory::new(Arc::new(MockProvisioner::default()))
+                .with_host_rules(Arc::new(rules.clone())),
+        );
+        let interface = Interface::start(
+            factory as Arc<dyn TunFactory>,
+            "tsunrules",
+            1280,
+            Arc::clone(&routes),
+            Arc::new(Recorder::default()) as Arc<dyn PacketCarrier>,
+        )
+        .await
+        .unwrap();
+        (interface, routes, id)
+    }
+
+    #[tokio::test]
+    async fn host_rules_follow_broadcast_policy_address_and_interface_lifetime() {
+        let rules = MockHostRules::new();
+        let (interface, routes, id) = managed_interface(&rules, true).await;
+        assert!(
+            interface.broadcast_rules().is_none(),
+            "nothing before a sync"
+        );
+
+        interface.sync_broadcast_rules().await;
+        let installed = rules.installed();
+        assert_eq!(installed["tsunrules"].source, addr(1));
+        assert_eq!(
+            installed["tsunrules"].range,
+            "10.13.37.0/24".parse().unwrap()
+        );
+        assert!(interface.broadcast_rules().unwrap().is_ok());
+
+        // Unchanged: not applied a second time.
+        interface.sync_broadcast_rules().await;
+        interface.sync_broadcast_rules().await;
+        assert_eq!(rules.calls(), ["apply:tsunrules"]);
+
+        // A new address replaces the plan, it does not stack a second one.
+        routes
+            .set_network(
+                id,
+                NetworkRoutes {
+                    broadcast: BroadcastPolicy::default(),
+                    range: Some("10.13.37.0/24".parse().unwrap()),
+                    local: Some(addr(9)),
+                    peers: vec![(addr(2), peer(2))],
+                },
+            )
+            .unwrap();
+        interface.sync_broadcast_rules().await;
+        assert_eq!(rules.installed()["tsunrules"].source, addr(9));
+        assert_eq!(rules.installed().len(), 1);
+
+        // Turning broadcast off takes the rules away.
+        routes.set_broadcast(
+            id,
+            BroadcastPolicy {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        interface.sync_broadcast_rules().await;
+        assert!(rules.installed().is_empty());
+        assert!(interface.broadcast_rules().is_none());
+
+        // And on again puts them back; leaving the agent removes them once more.
+        routes.set_broadcast(id, BroadcastPolicy::default());
+        interface.sync_broadcast_rules().await;
+        assert_eq!(rules.installed().len(), 1);
+        interface.remove().await;
+        assert!(rules.installed().is_empty(), "shutdown clears the host");
+        assert!(interface.broadcast_rules().is_none());
+    }
+
+    #[tokio::test]
+    async fn host_rules_are_not_installed_while_broadcast_is_off() {
+        let rules = MockHostRules::new();
+        let (interface, _routes, _id) = managed_interface(&rules, false).await;
+        interface.sync_broadcast_rules().await;
+        assert!(rules.installed().is_empty());
+        assert!(rules.calls().is_empty(), "the host was not even asked");
+        interface.remove().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_firewall_step_is_reported_and_does_not_undo_the_route() {
+        let rules = MockHostRules::new();
+        rules.fail_firewall("iptables not found");
+        let (interface, _routes, _id) = managed_interface(&rules, true).await;
+        interface.sync_broadcast_rules().await;
+        let report = interface.broadcast_rules().unwrap();
+        assert!(report.route.is_applied());
+        assert_eq!(
+            report.firewall,
+            RuleOutcome::Failed("iptables not found".into())
+        );
+        assert!(!report.is_ok());
+        // Not retried on every sync: the plan is the same.
+        interface.sync_broadcast_rules().await;
+        assert_eq!(rules.calls(), ["apply:tsunrules"]);
+        interface.remove().await;
+    }
+
+    #[tokio::test]
+    async fn an_interface_without_a_host_has_no_host_rules() {
+        let (interface, _device, _routes, _carrier, _id) = interface(false).await;
+        interface.sync_broadcast_rules().await;
+        assert!(interface.broadcast_rules().is_none());
+        interface.remove().await;
     }
 }

@@ -52,6 +52,8 @@ pub use mock::{MockHost, MockProvisioner};
 mod linux;
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 pub use linux::NetlinkProvisioner;
+#[cfg(all(feature = "tun-device", target_os = "linux"))]
+pub(crate) use linux::RouteHandle;
 
 #[cfg(all(feature = "tun-device", target_os = "windows"))]
 mod windows;

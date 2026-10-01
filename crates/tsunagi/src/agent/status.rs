@@ -53,6 +53,10 @@ pub struct OverlayStatus {
     pub addresses: Vec<crate::overlay::Cidr>,
     /// What has happened on it.
     pub counters: crate::overlay::Counters,
+    /// The route and firewall allowance installed for LAN broadcast, when
+    /// some network has broadcast on and the interface is on the host.
+    /// `None` is "none installed", not "unknown".
+    pub broadcast_rules: Option<crate::overlay::BroadcastRulesReport>,
 }
 
 /// A member the signed state knows about, connected or not.

@@ -61,13 +61,47 @@ routers cannot inspect another pair's encrypted IP payload.
 
 ## Host behavior and verification
 
-The game must send discovery through the Tsunagi interface. Traffic bound to a
-physical adapter never reaches this TUN, and this feature does not capture it.
+A game's discovery packet only reaches Tsunagi if the operating system sends it
+through the Tsunagi interface, and its reply only reaches the game if the host
+firewall admits it. While a network has broadcast on, the agent installs
+exactly two things for the interface it owns, and removes them when broadcast
+is turned off, the network is left or stopped, or the agent exits:
+
+- **Route** `255.255.255.255/32` through the overlay interface, with the
+  overlay address as its source (Linux: netlink, `ip route add 255.255.255.255/32
+  dev tsun0 src <overlay-ip>`; Windows: `New-NetRoute`, metric 1, active store).
+  Limited broadcasts from every program then go to the overlay and not to the
+  physical LAN while this is installed; this is the price of the feature.
+- **Firewall allowance** for inbound **UDP only**, from the overlay range only,
+  on that interface only (Linux: an `iptables -I INPUT` rule tagged
+  `tsunagi:<interface>`; Windows: a Defender rule of that name). Replies to a
+  broadcast come from another address than the request went to, so a stateful
+  firewall never matches them to it. TCP services such as SSH stay unexposed.
+
+Both are tagged, idempotent and reversible, and are never derived from a remote
+announcement. A rule left by a crashed run is replaced on the next apply. If
+`iptables` is missing (for example a host with only `nft`) or the process is not
+privileged, the route is still installed and `status` prints a
+`broadcast rules` line saying which half is missing and why. To undo it all,
+turn broadcast off for the network: `tsunagi network broadcast <network> off`.
+
+**One interface, several networks.** The host has one `255.255.255.255` route
+per interface, so only one overlay address can be its source. The lowest network
+id among broadcast-enabled networks with an address is used; `status` says when
+that is not the network being shown. Directed broadcasts (`10.13.37.255`) follow
+the ordinary connected route and are not affected.
+
+**What it cannot fix.** A game that binds its socket to a physical address or
+device, or sends to the physical subnet's broadcast address, still bypasses the
+TUN. The Windows implementation could not be run while it was written; its
+scripts are unit-tested only.
+
 The suite tests real agents, authenticated iroh links and WireGuard encryption
 with memory TUNs: limited/directed UDP discovery, multihop fanout, single-copy
 delivery, opt-out, unicast replies, malformed input, source validation and
-network isolation. It does not launch CS 1.6 or Warcraft III or establish that
-every game/host chooses the virtual adapter automatically.
+network isolation. Host rules are tested through a mock host and a scripted
+`iptables`; the default suite changes no OS setting. It does not launch CS 1.6 or
+Warcraft III.
 
 ## Future exported LANs
 

@@ -413,6 +413,21 @@ pub struct OverlayReport {
     pub multicast_packets: u64,
     /// One destination nobody owned, if there was one.
     pub unroutable_sample: Option<String>,
+    /// The broadcast route and firewall allowance on this host, when the
+    /// agent installed them. `None` means none are installed.
+    pub broadcast_rules: Option<HostRulesReport>,
+}
+
+/// What the agent installed on the host so LAN broadcast reaches the overlay.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostRulesReport {
+    /// Whether both the route and the firewall allowance are in place.
+    pub ok: bool,
+    /// One line: `ok (route + firewall)`, or what is missing and why.
+    pub detail: String,
+    /// The overlay address the `255.255.255.255` route is bound to. With
+    /// several networks on one interface only one address can be its source.
+    pub source: String,
 }
 
 /// One overlay peer.
@@ -568,7 +583,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 14]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 15]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::BoxFuture;
 use crate::overlay::OverlayError;
 
+use super::super::hostrules::BroadcastHostRules;
 use super::super::tun::{TunDevice, TunFactory, TunRequest};
 use super::{InterfacePlan, InterfaceProvisioner};
 
@@ -30,12 +31,23 @@ fn plan_for(request: &TunRequest) -> Result<InterfacePlan, OverlayError> {
 #[derive(Debug)]
 pub struct ManagedTunFactory {
     provisioner: Arc<dyn InterfaceProvisioner>,
+    host_rules: Option<Arc<dyn BroadcastHostRules>>,
 }
 
 impl ManagedTunFactory {
     /// Wraps a provisioner.
     pub fn new(provisioner: Arc<dyn InterfaceProvisioner>) -> Self {
-        Self { provisioner }
+        Self {
+            provisioner,
+            host_rules: None,
+        }
+    }
+
+    /// Lets the agent install the broadcast route and firewall allowance for
+    /// the interface this factory manages.
+    pub fn with_host_rules(mut self, rules: Arc<dyn BroadcastHostRules>) -> Self {
+        self.host_rules = Some(rules);
+        self
     }
 
     /// The provisioner underneath.
@@ -52,6 +64,10 @@ impl TunFactory for ManagedTunFactory {
     /// It creates the interface on the host and holds it open.
     fn on_host(&self) -> bool {
         true
+    }
+
+    fn host_rules(&self) -> Option<Arc<dyn BroadcastHostRules>> {
+        self.host_rules.clone()
     }
 
     fn create<'a>(

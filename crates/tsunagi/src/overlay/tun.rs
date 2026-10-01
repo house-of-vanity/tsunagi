@@ -109,6 +109,14 @@ pub trait TunFactory: Send + Sync + std::fmt::Debug + 'static {
         Box::pin(async move { Ok(()) })
     }
 
+    /// The host rules for this factory's interface, when it manages the host.
+    ///
+    /// `None` for an in-memory device or an interface somebody else prepared:
+    /// there is nothing of ours to route or to open in a firewall.
+    fn host_rules(&self) -> Option<Arc<dyn super::hostrules::BroadcastHostRules>> {
+        None
+    }
+
     /// Removes an interface this factory created.
     ///
     /// Runs on the teardown path, so it reports rather than fails: there is
