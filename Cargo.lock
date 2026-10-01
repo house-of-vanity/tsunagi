@@ -4253,6 +4253,7 @@ dependencies = [
  "tsunagi",
  "tsunagi-tcp-tls",
  "tsunagi-wg-quic",
+ "tsunagi-wireguard",
 ]
 
 [[package]]
@@ -4299,6 +4300,30 @@ dependencies = [
  "rusqlite",
  "serde",
  "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tsunagi",
+ "zeroize",
+]
+
+[[package]]
+name = "tsunagi-wireguard"
+version = "0.1.0"
+dependencies = [
+ "boringtun",
+ "bytes",
+ "data-encoding",
+ "hex",
+ "iroh",
+ "netdev 0.46.3",
+ "postcard",
+ "rand 0.10.3",
+ "rusqlite",
+ "serde",
  "subtle",
  "tempfile",
  "thiserror 2.0.20",

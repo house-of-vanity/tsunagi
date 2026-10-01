@@ -1,0 +1,35 @@
+[package]
+name = "tsunagi-wireguard"
+version = "0.1.0"
+description = "Pure WireGuard direct UDP transport and protocol plugin for tsunagi mesh networks."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tsunagi = { path = "../tsunagi", version = "0.1.0" }
+iroh.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros"] }
+serde.workspace = true
+postcard.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+data-encoding.workspace = true
+hex.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+subtle = "2.6"
+zeroize = { version = "1.9", features = ["derive"] }
+rand = "0.10"
+boringtun = { version = "0.7.1", default-features = false }
+netdev = "0.46"
+
+[dev-dependencies]
+tsunagi = { path = "../tsunagi", features = ["testing"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

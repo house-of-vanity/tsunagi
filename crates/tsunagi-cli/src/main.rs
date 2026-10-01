@@ -27,6 +27,10 @@ use tsunagi_tcp_tls::{
     TCP_TLS_PROTOCOL, TCP_TLS_VERSION, TcpTlsCodec, TcpTlsConfig, TcpTlsPlugin, TcpTlsTransport,
 };
 use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
+use tsunagi_wireguard::{
+    WG_PROTOCOL, WG_WIRE_VERSION, WireguardConfig as PureWgConfig, WireguardPlugin as PureWgPlugin,
+    WireguardTransport as PureWgTransport,
+};
 
 /// A small agent for private mesh networks.
 #[derive(Debug, Parser)]
@@ -421,7 +425,7 @@ struct UpArgs {
         long = "protocol",
         value_name = "LIST",
         value_delimiter = ',',
-        default_value = "tcp-tls,wg-quic",
+        default_value = "wg,tcp-tls,wg-quic",
         help_heading = "Transport"
     )]
     protocols: Vec<String>,
@@ -1191,6 +1195,12 @@ struct ProtocolSpec {
 /// Every protocol this build has.
 const PROTOCOLS: &[ProtocolSpec] = &[
     ProtocolSpec {
+        name: WG_PROTOCOL,
+        version: WG_WIRE_VERSION,
+        summary: "Pure WireGuard direct UDP transport for uncensored networks and maximum performance",
+        options: PureWgPlugin::OPTIONS,
+    },
+    ProtocolSpec {
         name: TCP_TLS_PROTOCOL,
         version: TCP_TLS_VERSION,
         summary: "Noise E2EE carried over TCP TLS 1.3 (port 443) disguised as HTTPS traffic",
@@ -1291,6 +1301,7 @@ fn show_protocols() -> Result<(), Box<dyn std::error::Error>> {
 /// published.
 struct AgentControl {
     agent: Agent,
+    pure_wg: Option<Arc<PureWgPlugin>>,
     plugin: Option<Arc<WireguardPlugin>>,
     tcp_tls: Option<Arc<TcpTlsPlugin>>,
     /// The resolver, which this owns so it can be switched while running.
@@ -1305,6 +1316,7 @@ impl tsunagi::ipc::ReportSource for AgentControl {
             let dns = self.dns_state().await;
             build_report(
                 &self.agent,
+                self.pure_wg.as_deref(),
                 self.plugin.as_deref(),
                 self.tcp_tls.as_deref(),
                 dns,
@@ -2004,6 +2016,19 @@ fn forget_protocol_state(paths: &StoragePaths, network: tsunagi::NetworkId) {
             let _ = err;
         }
         Err(err) => eprintln!("warning: the wg-quic key store could not be opened: {err}"),
+    }
+
+    let pure_store = PureWgConfig::new(paths.state_dir.join("wg"));
+    match tsunagi_wireguard::WgKeyStore::open(pure_store.key_store_path()) {
+        Ok(store) => {
+            if let Err(err) = store.forget(network) {
+                eprintln!("warning: the wg key for it could not be removed: {err}");
+            }
+        }
+        Err(err) if !pure_store.key_store_path().exists() => {
+            let _ = err;
+        }
+        Err(err) => eprintln!("warning: the wg key store could not be opened: {err}"),
     }
 }
 
@@ -2871,7 +2896,7 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
                 format!("{stats:<48}  ·  {}", tunnel.path)
             }
             None => {
-                if proto == "wg-quic" {
+                if proto == "wg-quic" || proto == "wg" {
                     "no WireGuard handshake yet; the tunnel cannot carry traffic".to_string()
                 } else {
                     format!("no {proto} handshake yet; the tunnel cannot carry traffic")
@@ -3489,7 +3514,13 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .filter(|name| !name.eq_ignore_ascii_case("none"))
         {
-            let Some(spec) = PROTOCOLS.iter().find(|spec| spec.name == name.as_str()) else {
+            // Accept "wireguard" as a convenience alias for the canonical "wg".
+            let canonical = if name.eq_ignore_ascii_case("wireguard") {
+                WG_PROTOCOL
+            } else {
+                name.as_str()
+            };
+            let Some(spec) = PROTOCOLS.iter().find(|spec| spec.name == canonical) else {
                 let known: Vec<&str> = PROTOCOLS.iter().map(|spec| spec.name).collect();
                 return Err(format!(
                     "this build has no protocol called `{name}`; it has {}. \
@@ -3524,6 +3555,8 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut wireguard = None;
     let mut tcp_tls_transport = None;
     let mut tcp_tls_plugin = None;
+    let mut pure_wg_plugin: Option<Arc<PureWgPlugin>> = None;
+    let mut pure_wg_transport: Option<Arc<PureWgTransport>> = None;
     if !wanted.is_empty() {
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
@@ -3573,6 +3606,35 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 tcp_tls_transport = Some(transport);
                 tcp_tls_plugin = Some(plugin);
+            }
+            WG_PROTOCOL => {
+                let mut wg_cfg = PureWgConfig::new(paths.state_dir.join("wg"));
+                if let Some(mtu) = args.mtu {
+                    wg_cfg = wg_cfg.with_mtu(mtu);
+                }
+                let wg_cfg = PureWgPlugin::configure(wg_cfg, &options)?;
+                let identity = tsunagi::storage::StateStore::open(paths.state_db())?
+                    .load_or_create_device_identity()?;
+                let transport = Arc::new(
+                    PureWgTransport::bind(&identity, wg_cfg.port)
+                        .await
+                        .map_err(|err| err.to_string())?,
+                );
+                for ep_addr in &bootstrap {
+                    for addr in ep_addr.ip_addrs() {
+                        transport.set_peer_addr(ep_addr.id, *addr);
+                    }
+                }
+                let plugin = PureWgPlugin::open(wg_cfg, Arc::clone(&transport)).await?;
+                config = config
+                    .with_plugin(plugin.clone() as Arc<dyn IpPlugin>)
+                    .with_custom_transport(
+                        WG_PROTOCOL,
+                        Arc::clone(&transport)
+                            as Arc<dyn tsunagi::dataplane::transport::PacketTransport>,
+                    );
+                pure_wg_transport = Some(transport);
+                pure_wg_plugin = Some(plugin);
             }
             other => return Err(format!("`{other}` is listed but not built in").into()),
         }
@@ -3626,6 +3688,21 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                 .await;
         });
     }
+    if let Some(transport) = pure_wg_transport {
+        let agent_inbound = agent.clone();
+        tokio::spawn(async move {
+            transport
+                .accept_loop(move |inbound| {
+                    let agent = agent_inbound.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = agent.install_inbound_link(inbound).await {
+                            tracing::debug!(%err, "failed to install inbound wg link");
+                        }
+                    });
+                })
+                .await;
+        });
+    }
 
     let protocol_names: Vec<&str> = wanted.iter().map(|p| p.name).collect();
 
@@ -3662,11 +3739,13 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // is not fatal: the agent itself works fine without it.
     let control = {
         let agent = agent.clone();
+        let pure_wg = pure_wg_plugin.clone();
         let plugin = wireguard.clone();
         let tcp_tls = tcp_tls_plugin.clone();
         let dns = Arc::clone(&dns);
         let source: Arc<dyn tsunagi::ipc::ReportSource> = Arc::new(AgentControl {
             agent,
+            pure_wg,
             plugin,
             tcp_tls,
             dns,
@@ -3741,6 +3820,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// both.
 async fn build_report(
     agent: &Agent,
+    pure_wg: Option<&PureWgPlugin>,
     wireguard: Option<&WireguardPlugin>,
     tcp_tls: Option<&TcpTlsPlugin>,
     dns: Option<DnsState>,
@@ -3761,57 +3841,126 @@ async fn build_report(
         .iter()
         .map(|network| {
             let wg_view = wireguard.and_then(|plugin| plugin.overview(network.network_id));
+            let pure_wg_view = pure_wg.and_then(|plugin| plugin.overview(network.network_id));
             let tcp_tls_reports = tcp_tls
                 .map(|p| p.active_peers(network.network_id))
                 .unwrap_or_default();
 
-            let overlay = if let Some(view) = wg_view {
-                let mut peers = Vec::new();
-                for peer in &view.peers {
-                    let tcp_tls_match = tcp_tls_reports.iter().find(|r| r.peer == peer.endpoint_id);
+            // Use whichever WireGuard view is available for the overlay
+            // address and range — wg-quic and pure wg both derive them
+            // identically from the control plane's allocations.
+            let wg_overlay_addr = wg_view
+                .as_ref()
+                .and_then(|v| v.overlay_address_v4)
+                .or_else(|| pure_wg_view.as_ref().and_then(|v| v.overlay_address_v4));
+            let wg_prefix_len = wg_view
+                .as_ref()
+                .and_then(|v| v.ipv4_range)
+                .or_else(|| pure_wg_view.as_ref().and_then(|v| v.ipv4_range))
+                .map_or(0, |r| r.prefix_len);
+            let has_any_plugin =
+                wg_view.is_some() || pure_wg_view.is_some() || !tcp_tls_reports.is_empty();
 
-                    if let Some(tcp_tls) = tcp_tls_match {
-                        peers.push(OverlayPeerReport {
-                            endpoint_id: peer.endpoint_id.to_string(),
-                            protocol: tcp_tls.protocol.clone(),
-                            public_key: peer.public_key.to_string(),
-                            address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                            handshake_secs_ago: Some(tcp_tls.uptime_secs),
-                            tx_packets: tcp_tls.tx_packets,
-                            rx_packets: tcp_tls.rx_packets,
-                            dropped: tcp_tls.dropped,
-                            protocol_errors: 0,
-                            path: tcp_tls.path.clone(),
-                        });
-                    } else if let Some(tunnel) = &peer.tunnel {
-                        peers.push(OverlayPeerReport {
-                            endpoint_id: peer.endpoint_id.to_string(),
-                            protocol: "wg-quic".into(),
-                            public_key: peer.public_key.to_string(),
-                            address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                            handshake_secs_ago: tunnel.health.since_handshake.map(|s| s.as_secs()),
-                            tx_packets: tunnel.stats.tx_packets,
-                            rx_packets: tunnel.stats.rx_packets,
-                            dropped: tunnel.stats.dropped_wrong_source
-                                + tunnel.stats.dropped_oversize,
-                            protocol_errors: tunnel.stats.protocol_errors,
-                            path: tunnel.path.clone(),
-                        });
-                    } else {
-                        peers.push(OverlayPeerReport {
-                            endpoint_id: peer.endpoint_id.to_string(),
-                            protocol: "wg-quic".into(),
-                            public_key: peer.public_key.to_string(),
-                            address: peer.overlay_address_v4.map(|addr| addr.to_string()),
-                            handshake_secs_ago: None,
-                            tx_packets: 0,
-                            rx_packets: 0,
-                            dropped: 0,
-                            protocol_errors: 0,
-                            path: "no data link".into(),
-                        });
+            let overlay = if has_any_plugin && overlay.is_some() {
+                let mut peers: Vec<OverlayPeerReport> = Vec::new();
+
+                // 1. Peers known to the wg-quic plugin.
+                if let Some(ref view) = wg_view {
+                    for peer in &view.peers {
+                        let tcp_tls_match =
+                            tcp_tls_reports.iter().find(|r| r.peer == peer.endpoint_id);
+
+                        if let Some(tcp_tls) = tcp_tls_match {
+                            peers.push(OverlayPeerReport {
+                                endpoint_id: peer.endpoint_id.to_string(),
+                                protocol: tcp_tls.protocol.clone(),
+                                public_key: peer.public_key.to_string(),
+                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                                handshake_secs_ago: Some(tcp_tls.uptime_secs),
+                                tx_packets: tcp_tls.tx_packets,
+                                rx_packets: tcp_tls.rx_packets,
+                                dropped: tcp_tls.dropped,
+                                protocol_errors: 0,
+                                path: tcp_tls.path.clone(),
+                            });
+                        } else if let Some(tunnel) = &peer.tunnel {
+                            peers.push(OverlayPeerReport {
+                                endpoint_id: peer.endpoint_id.to_string(),
+                                protocol: "wg-quic".into(),
+                                public_key: peer.public_key.to_string(),
+                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                                handshake_secs_ago: tunnel
+                                    .health
+                                    .since_handshake
+                                    .map(|s| s.as_secs()),
+                                tx_packets: tunnel.stats.tx_packets,
+                                rx_packets: tunnel.stats.rx_packets,
+                                dropped: tunnel.stats.dropped_wrong_source
+                                    + tunnel.stats.dropped_oversize,
+                                protocol_errors: tunnel.stats.protocol_errors,
+                                path: tunnel.path.clone(),
+                            });
+                        } else {
+                            peers.push(OverlayPeerReport {
+                                endpoint_id: peer.endpoint_id.to_string(),
+                                protocol: "wg-quic".into(),
+                                public_key: peer.public_key.to_string(),
+                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                                handshake_secs_ago: None,
+                                tx_packets: 0,
+                                rx_packets: 0,
+                                dropped: 0,
+                                protocol_errors: 0,
+                                path: "no data link".into(),
+                            });
+                        }
                     }
                 }
+
+                // 2. Peers known to the pure WG plugin but not yet covered.
+                if let Some(ref view) = pure_wg_view {
+                    for peer in &view.peers {
+                        if peers
+                            .iter()
+                            .any(|p| p.endpoint_id == peer.endpoint_id.to_string())
+                        {
+                            continue;
+                        }
+                        if let Some(tunnel) = &peer.tunnel {
+                            peers.push(OverlayPeerReport {
+                                endpoint_id: peer.endpoint_id.to_string(),
+                                protocol: "wg".into(),
+                                public_key: peer.public_key.to_string(),
+                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                                handshake_secs_ago: tunnel
+                                    .health
+                                    .since_handshake
+                                    .map(|s| s.as_secs()),
+                                tx_packets: tunnel.stats.tx_packets,
+                                rx_packets: tunnel.stats.rx_packets,
+                                dropped: tunnel.stats.dropped_wrong_source
+                                    + tunnel.stats.dropped_oversize,
+                                protocol_errors: tunnel.stats.protocol_errors,
+                                path: tunnel.path.clone(),
+                            });
+                        } else {
+                            peers.push(OverlayPeerReport {
+                                endpoint_id: peer.endpoint_id.to_string(),
+                                protocol: "wg".into(),
+                                public_key: peer.public_key.to_string(),
+                                address: peer.overlay_address_v4.map(|addr| addr.to_string()),
+                                handshake_secs_ago: None,
+                                tx_packets: 0,
+                                rx_packets: 0,
+                                dropped: 0,
+                                protocol_errors: 0,
+                                path: "no data link".into(),
+                            });
+                        }
+                    }
+                }
+
+                // 3. tcp-tls peers not yet covered by either WG view.
                 for report in &tcp_tls_reports {
                     if !peers
                         .iter()
@@ -3837,58 +3986,29 @@ async fn build_report(
                         });
                     }
                 }
-                Some(OverlayReport {
-                    interface: overlay
-                        .as_ref()
-                        .map_or_else(String::new, |o| o.interface.clone()),
-                    on_host: overlay.as_ref().is_some_and(|o| o.on_host),
-                    mtu: overlay.as_ref().map_or(0, |o| o.mtu),
-                    address: view.overlay_address_v4.map(|addr| addr.to_string()),
-                    prefix_len: view.ipv4_range.map_or(0, |r| r.prefix_len),
-                    peers,
-                    unroutable_packets: overlay.as_ref().map_or(0, |o| o.counters.unroutable),
-                    multicast_packets: overlay.as_ref().map_or(0, |o| o.counters.multicast),
-                    unroutable_sample: overlay
-                        .as_ref()
-                        .and_then(|o| o.counters.unroutable_sample.map(|a| a.to_string())),
-                })
-            } else if overlay.is_some() && !tcp_tls_reports.is_empty() {
-                let peers = tcp_tls_reports
-                    .into_iter()
-                    .map(|report| {
-                        let address = network
+
+                let (address, prefix_len) = if wg_overlay_addr.is_some() {
+                    (wg_overlay_addr.map(|addr| addr.to_string()), wg_prefix_len)
+                } else {
+                    (
+                        network
                             .members
                             .iter()
-                            .find(|m| m.endpoint_id == report.peer)
+                            .find(|m| m.endpoint_id == status.endpoint_id)
                             .and_then(|m| m.overlay_address_v4)
-                            .map(|a| a.to_string());
-                        OverlayPeerReport {
-                            endpoint_id: report.peer.to_string(),
-                            protocol: report.protocol,
-                            public_key: String::new(),
-                            address,
-                            handshake_secs_ago: Some(report.uptime_secs),
-                            tx_packets: report.tx_packets,
-                            rx_packets: report.rx_packets,
-                            dropped: report.dropped,
-                            protocol_errors: 0,
-                            path: report.path,
-                        }
-                    })
-                    .collect();
+                            .map(|a| a.to_string()),
+                        network.range.map_or(0, |r| r.prefix_len),
+                    )
+                };
+
                 Some(OverlayReport {
                     interface: overlay
                         .as_ref()
                         .map_or_else(String::new, |o| o.interface.clone()),
                     on_host: overlay.as_ref().is_some_and(|o| o.on_host),
                     mtu: overlay.as_ref().map_or(0, |o| o.mtu),
-                    address: network
-                        .members
-                        .iter()
-                        .find(|m| m.endpoint_id == status.endpoint_id)
-                        .and_then(|m| m.overlay_address_v4)
-                        .map(|a| a.to_string()),
-                    prefix_len: network.range.map_or(0, |r| r.prefix_len),
+                    address,
+                    prefix_len,
                     peers,
                     unroutable_packets: overlay.as_ref().map_or(0, |o| o.counters.unroutable),
                     multicast_packets: overlay.as_ref().map_or(0, |o| o.counters.multicast),
