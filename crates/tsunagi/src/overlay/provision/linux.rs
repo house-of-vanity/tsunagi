@@ -520,16 +520,19 @@ async fn configure_link(configure: &Configure) -> Result<(), OverlayError> {
         }
 
         for cidr in &configure.add {
-            handle
+            let res = handle
                 .address()
                 .add(index, cidr.addr, cidr.prefix_len)
                 .execute()
-                .await
-                .map_err(|err| {
-                    OverlayError::Unavailable(format!(
+                .await;
+            if let Err(err) = res {
+                let err_str = err.to_string();
+                if !err_str.contains("File exists") && !err_str.contains("os error 17") {
+                    return Err(OverlayError::Unavailable(format!(
                         "cannot add {cidr} to interface `{name}`: {err}"
-                    ))
-                })?;
+                    )));
+                }
+            }
         }
 
         Ok(())

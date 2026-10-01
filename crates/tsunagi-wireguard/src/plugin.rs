@@ -93,11 +93,10 @@ pub(crate) fn is_candidate_interface(iface: &netdev::Interface) -> bool {
         return false;
     }
 
-    // Skip container, VM, and virtual bridge interfaces
+    // Skip container interfaces and virtual bridges purely internal to container engines
     if name.starts_with("docker")
         || name.starts_with("br-")
         || name.starts_with("veth")
-        || name.starts_with("virbr")
         || name.starts_with("cni")
         || name.starts_with("flannel")
         || name.starts_with("cali")
@@ -105,17 +104,49 @@ pub(crate) fn is_candidate_interface(iface: &netdev::Interface) -> bool {
         || name.starts_with("dummy")
         || name.starts_with("lxc")
         || name.starts_with("podman")
-        || friendly.contains("vethernet")
-        || friendly.contains("vboxnet")
-        || friendly.contains("vmnet")
-        || desc.contains("virtualbox")
-        || desc.contains("hyper-v")
-        || desc.contains("vmware")
+        || friendly.contains("wsl")
     {
         return false;
     }
 
     true
+}
+
+/// Reorders candidate addresses so that candidates on the same local subnet as one of our
+/// active network interfaces appear first.
+pub fn prioritize_local_subnet(candidates: &mut [SocketAddr]) {
+    let local_subnets: Vec<(Ipv4Addr, u8)> = netdev::get_interfaces()
+        .into_iter()
+        .filter(|iface| iface.is_up() && !iface.is_loopback())
+        .flat_map(|iface| {
+            iface
+                .ipv4
+                .into_iter()
+                .map(|net| (net.addr(), net.prefix_len()))
+        })
+        .collect();
+
+    candidates.sort_by_key(|addr| {
+        let is_local = match addr.ip() {
+            IpAddr::V4(v4) => local_subnets
+                .iter()
+                .any(|(local_ip, prefix_len)| matches_subnet(*local_ip, *prefix_len, v4)),
+            IpAddr::V6(_) => false,
+        };
+        if is_local { 0 } else { 1 }
+    });
+}
+
+fn matches_subnet(local_ip: Ipv4Addr, prefix_len: u8, target_ip: Ipv4Addr) -> bool {
+    if prefix_len == 0 {
+        return false;
+    }
+    let mask = if prefix_len >= 32 {
+        !0u32
+    } else {
+        !0u32 << (32 - prefix_len)
+    };
+    (u32::from(local_ip) & mask) == (u32::from(target_ip) & mask)
 }
 
 pub(crate) fn is_candidate_ipv4(addr: std::net::Ipv4Addr) -> bool {
@@ -925,15 +956,15 @@ mod tests {
         iface.name = "veth12345".to_string();
         assert!(!is_candidate_interface(&iface));
 
-        // Libvirt NAT bridge virbr* - must be filtered
+        // Libvirt NAT bridge virbr* - allowed for VM guests/hosts
         iface.name = "virbr0".to_string();
-        assert!(!is_candidate_interface(&iface));
+        assert!(is_candidate_interface(&iface));
 
         // CNI bridge - must be filtered
         iface.name = "cni0".to_string();
         assert!(!is_candidate_interface(&iface));
 
-        // Hyper-V / WSL vEthernet switch on Windows - must be filtered
+        // WSL vEthernet switch on Windows - must be filtered
         iface.name = "{A1B2C3D4-E5F6-7890-1234-567890ABCDEF}".to_string();
         iface.friendly_name = Some("vEthernet (WSL)".to_string());
         iface.description = Some("Hyper-V Virtual Ethernet Adapter".to_string());
@@ -997,5 +1028,15 @@ mod tests {
 
         // LAN IP with gateway should score higher than VPN IP without gateway
         assert!(p_lan > p_ts);
+    }
+
+    #[test]
+    fn test_matches_subnet() {
+        let local_ip = Ipv4Addr::new(192, 168, 122, 151);
+        let same_subnet = Ipv4Addr::new(192, 168, 122, 1);
+        let diff_subnet = Ipv4Addr::new(192, 168, 1, 2);
+
+        assert!(matches_subnet(local_ip, 24, same_subnet));
+        assert!(!matches_subnet(local_ip, 24, diff_subnet));
     }
 }

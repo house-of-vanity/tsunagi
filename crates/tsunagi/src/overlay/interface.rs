@@ -152,6 +152,7 @@ pub struct Interface {
     /// re-applied on every pass.
     applied: std::sync::Mutex<Vec<Cidr>>,
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    sync_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Interface {
@@ -228,6 +229,7 @@ impl Interface {
             tally,
             applied: std::sync::Mutex::new(Vec::new()),
             task: std::sync::Mutex::new(Some(task)),
+            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -237,6 +239,7 @@ impl Interface {
     /// The interface is never recreated for it: that would drop every tunnel
     /// riding on it for the sake of one address.
     pub async fn sync_addresses(&self) -> Result<(), OverlayError> {
+        let _guard = self.sync_lock.lock().await;
         let wanted = self.wanted_addresses();
         {
             let applied = match self.applied.lock() {

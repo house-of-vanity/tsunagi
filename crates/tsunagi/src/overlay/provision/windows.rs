@@ -262,7 +262,12 @@ async fn configure(plan: &InterfacePlan, changes: &super::Changes) -> Result<(),
         set_mtu(&plan.name, mtu).await?;
     }
     for cidr in &changes.add {
-        address_add(&plan.name, *cidr).await?;
+        if let Err(err) = address_add(&plan.name, *cidr).await {
+            let err_str = err.to_string();
+            if !err_str.contains("already exists") && !err_str.contains("0x80071392") {
+                return Err(err);
+            }
+        }
     }
     if changes.bring_up {
         // Best effort: a Wintun adapter with a session is up already, and a

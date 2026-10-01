@@ -5,5 +5,7 @@ pub mod crypto;
 pub mod plugin;
 pub mod transport;
 
-pub use plugin::{TCP_TLS_PROTOCOL, TCP_TLS_VERSION, TcpTlsCodec, TcpTlsConfig, TcpTlsPlugin};
+pub use plugin::{
+    TCP_TLS_PROTOCOL, TCP_TLS_VERSION, TcpTlsCodec, TcpTlsConfig, TcpTlsPlugin, local_ip_candidates,
+};
 pub use transport::TcpTlsTransport;

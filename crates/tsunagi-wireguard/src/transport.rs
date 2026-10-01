@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use bytes::Bytes;
 use iroh::EndpointId;
 use tokio::net::UdpSocket;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use tsunagi::BoxFuture;
 use tsunagi::dataplane::transport::{
@@ -24,6 +24,57 @@ pub const DEFAULT_PORT: u16 = 51820;
 
 /// Maximum payload length for a single framed datagram over UDP.
 pub const MAX_UDP_DATAGRAM_SIZE: usize = 65507;
+
+const PROBE_MAGIC: &[u8; 19] = b"TSUNAGI_WG_PROBE_V1";
+const PROBE_TYPE_PING: u8 = 1;
+const PROBE_TYPE_PONG: u8 = 2;
+const PROBE_LEN: usize = 19 + 1 + 32 + 32 + 32 + 8; // 124 bytes
+
+fn encode_probe(
+    msg_type: u8,
+    sender: EndpointId,
+    receiver: EndpointId,
+    network: NetworkId,
+    cookie: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(PROBE_LEN);
+    buf.extend_from_slice(PROBE_MAGIC);
+    buf.push(msg_type);
+    buf.extend_from_slice(sender.as_bytes());
+    buf.extend_from_slice(receiver.as_bytes());
+    buf.extend_from_slice(network.as_bytes());
+    buf.extend_from_slice(&cookie.to_be_bytes());
+    buf
+}
+
+struct DecodedProbe {
+    msg_type: u8,
+    sender: EndpointId,
+    receiver: EndpointId,
+    network: NetworkId,
+    cookie: u64,
+}
+
+fn decode_probe(bytes: &[u8]) -> Option<DecodedProbe> {
+    if bytes.len() < PROBE_LEN || &bytes[..19] != PROBE_MAGIC {
+        return None;
+    }
+    let msg_type = bytes[19];
+    if msg_type != PROBE_TYPE_PING && msg_type != PROBE_TYPE_PONG {
+        return None;
+    }
+    let sender = EndpointId::from_bytes(&bytes[20..52].try_into().ok()?).ok()?;
+    let receiver = EndpointId::from_bytes(&bytes[52..84].try_into().ok()?).ok()?;
+    let network = NetworkId::from_bytes(bytes[84..116].try_into().ok()?);
+    let cookie = u64::from_be_bytes(bytes[116..124].try_into().ok()?);
+    Some(DecodedProbe {
+        msg_type,
+        sender,
+        receiver,
+        network,
+        cookie,
+    })
+}
 
 /// An authenticated datagram link carried over direct UDP.
 #[derive(Debug)]
@@ -71,7 +122,16 @@ impl WireguardLink {
                 if msg.len() > MAX_UDP_DATAGRAM_SIZE {
                     continue;
                 }
-                let is_handshake_init = msg.first() == Some(&1);
+                // Check if this is a WireGuard handshake initiation packet:
+                // An enveloped packet has a 74-byte header (envelope::HEADER).
+                // A raw packet may directly have WireGuard type at index 0.
+                let is_handshake_init = if msg.len() >= 74 + 4 && msg[0] == 1 {
+                    msg[74] == 1
+                } else if !msg.is_empty() {
+                    msg[0] == 1
+                } else {
+                    false
+                };
                 if confirmed_r.load(Ordering::Acquire) && !is_handshake_init {
                     let target = match target_r.read() {
                         Ok(g) => *g,
@@ -123,6 +183,16 @@ impl WireguardLink {
         }
         self.confirmed.store(true, Ordering::Release);
         self.inbound_tx.try_send(payload).is_ok()
+    }
+
+    /// Marks this link as confirmed by a probe response or verified packet.
+    pub fn confirm(&self) {
+        self.confirmed.store(true, Ordering::Release);
+    }
+
+    /// Whether this link has had verified two-way direct connectivity.
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed.load(Ordering::Acquire)
     }
 
     /// Updates candidate addresses for this peer.
@@ -215,6 +285,7 @@ impl PacketLink for WireguardLink {
 }
 
 type InboundCallback = Box<dyn Fn(InboundLink) + Send + Sync + 'static>;
+type PendingProbes = Arc<Mutex<HashMap<(NetworkId, EndpointId, u64), oneshot::Sender<SocketAddr>>>>;
 
 /// Direct UDP WireGuard packet transport.
 pub struct WireguardTransport {
@@ -225,6 +296,7 @@ pub struct WireguardTransport {
     peer_networks: RwLock<HashMap<EndpointId, HashSet<NetworkId>>>,
     links: RwLock<HashMap<(NetworkId, EndpointId), Arc<WireguardLink>>>,
     inbound_cb: Arc<Mutex<Option<InboundCallback>>>,
+    pending_probes: PendingProbes,
 }
 
 impl std::fmt::Debug for WireguardTransport {
@@ -267,6 +339,7 @@ impl WireguardTransport {
             peer_networks: RwLock::new(HashMap::new()),
             links: RwLock::new(HashMap::new()),
             inbound_cb: Arc::new(Mutex::new(None)),
+            pending_probes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -317,8 +390,9 @@ impl WireguardTransport {
 
     /// Notifies the transport that a peer's capability was announced.
     ///
-    /// When `we_accept` is true (i.e. `local_id > peer`), the transport can proactively
-    /// create and install an inbound link so both ends are ready and can punch NAT.
+    /// When `we_accept` is true, sends a hole-punch probe to candidate addresses
+    /// to open stateful NAT firewalls, but does NOT create an unverified direct link
+    /// in the hub before packets actually flow.
     pub fn notify_peer_capability(
         &self,
         network: NetworkId,
@@ -337,35 +411,17 @@ impl WireguardTransport {
             link.update_candidates(ipv4_addrs.iter().copied());
         }
 
+        // Send hole punching probe if we accept and have candidate addresses.
         if we_accept && !ipv4_addrs.is_empty() {
-            let mut guard = match self.links.write() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry((network, peer)) {
-                let link = Arc::new(WireguardLink::new(
-                    network,
-                    peer,
-                    ipv4_addrs[0],
-                    ipv4_addrs,
-                    Arc::clone(&self.socket),
-                ));
-                entry.insert(Arc::clone(&link));
-                drop(guard);
-
-                let cb_guard = match self.inbound_cb.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                if let Some(ref cb) = *cb_guard {
-                    cb(InboundLink {
-                        network,
-                        peer,
-                        protocol: crate::announcement::WG_PROTOCOL.to_string(),
-                        link,
-                    });
+            let socket = Arc::clone(&self.socket);
+            let local_id = self.local_id;
+            tokio::spawn(async move {
+                let cookie: u64 = rand::random();
+                let probe = encode_probe(PROBE_TYPE_PING, local_id, peer, network, cookie);
+                for addr in ipv4_addrs {
+                    let _ = socket.send_to(&probe, addr).await;
                 }
-            }
+            });
         }
     }
 
@@ -389,49 +445,156 @@ impl WireguardTransport {
             if src_addr.ip().is_unspecified() {
                 continue;
             }
-            let datagram = Bytes::copy_from_slice(&buf[..len]);
 
-            // 1. Identify which peer this packet comes from.
-            let matched_peer = {
-                let links_guard = match self.links.read() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                links_guard
-                    .values()
-                    .find(|link| link.target_addr() == src_addr)
-                    .map(|link| link.peer())
-                    .or_else(|| {
-                        let addrs_guard = match self.peer_addresses.read() {
+            // 1. Direct UDP probe packet handling
+            if len >= PROBE_LEN
+                && &buf[..19] == PROBE_MAGIC
+                && let Some(probe) = decode_probe(&buf[..len])
+            {
+                if probe.receiver != self.local_id {
+                    continue;
+                }
+
+                if probe.msg_type == PROBE_TYPE_PING {
+                    let is_known = {
+                        let guard = match self.peer_networks.read() {
                             Ok(g) => g,
                             Err(p) => p.into_inner(),
                         };
-                        addrs_guard
-                            .iter()
-                            .find(|(_, addrs)| addrs.contains(&src_addr))
-                            .map(|(peer, _)| *peer)
-                            .or_else(|| {
-                                links_guard
-                                    .values()
-                                    .find(|link| link.target_addr().ip() == src_addr.ip())
-                                    .map(|link| link.peer())
-                                    .or_else(|| {
-                                        addrs_guard
-                                            .iter()
-                                            .find(|(_, addrs)| {
-                                                addrs.iter().any(|a| a.ip() == src_addr.ip())
-                                            })
-                                            .map(|(peer, _)| *peer)
-                                    })
-                            })
-                    })
+                        guard
+                            .get(&probe.sender)
+                            .is_some_and(|nets| nets.contains(&probe.network))
+                    };
+                    if is_known {
+                        let pong = encode_probe(
+                            PROBE_TYPE_PONG,
+                            self.local_id,
+                            probe.sender,
+                            probe.network,
+                            probe.cookie,
+                        );
+                        let _ = socket.send_to(&pong, src_addr).await;
+
+                        self.set_peer_addr(probe.sender, src_addr);
+
+                        let link = {
+                            let mut guard = match self.links.write() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            if let Some(existing) = guard.get(&(probe.network, probe.sender))
+                                && !existing.is_closed()
+                            {
+                                existing.update_target(src_addr);
+                                existing.confirm();
+                                None
+                            } else {
+                                let candidates = self.peer_addrs(probe.sender);
+                                let link = Arc::new(WireguardLink::new(
+                                    probe.network,
+                                    probe.sender,
+                                    src_addr,
+                                    candidates,
+                                    Arc::clone(&self.socket),
+                                ));
+                                link.confirm();
+                                guard.insert((probe.network, probe.sender), Arc::clone(&link));
+                                Some(link)
+                            }
+                        };
+
+                        if let Some(link) = link {
+                            let cb_guard = match self.inbound_cb.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            if let Some(ref cb) = *cb_guard {
+                                cb(InboundLink {
+                                    network: probe.network,
+                                    peer: probe.sender,
+                                    protocol: crate::announcement::WG_PROTOCOL.to_string(),
+                                    link,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                } else if probe.msg_type == PROBE_TYPE_PONG {
+                    self.set_peer_addr(probe.sender, src_addr);
+                    let waiter = {
+                        let mut probes = match self.pending_probes.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        probes.remove(&(probe.network, probe.sender, probe.cookie))
+                    };
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(src_addr);
+                    }
+                    continue;
+                }
+            }
+
+            // 2. Data / handshake packet handling
+            let datagram = Bytes::copy_from_slice(&buf[..len]);
+
+            // Identify which peer this packet comes from
+            let matched_peer = {
+                // If it's an envelope packet (VERSION 1, len >= 74), read source endpoint ID directly
+                let from_envelope = if len >= 74 && buf[0] == 1 {
+                    let dest = &buf[34..66];
+                    if dest == self.local_id.as_bytes() {
+                        EndpointId::from_bytes(&buf[2..34].try_into().unwrap_or([0u8; 32])).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                from_envelope.or_else(|| {
+                    let links_guard = match self.links.read() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    links_guard
+                        .values()
+                        .find(|link| link.target_addr() == src_addr)
+                        .map(|link| link.peer())
+                        .or_else(|| {
+                            let addrs_guard = match self.peer_addresses.read() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            addrs_guard
+                                .iter()
+                                .find(|(_, addrs)| addrs.contains(&src_addr))
+                                .map(|(peer, _)| *peer)
+                                .or_else(|| {
+                                    links_guard
+                                        .values()
+                                        .find(|link| link.target_addr().ip() == src_addr.ip())
+                                        .map(|link| link.peer())
+                                        .or_else(|| {
+                                            addrs_guard
+                                                .iter()
+                                                .find(|(_, addrs)| {
+                                                    addrs.iter().any(|a| a.ip() == src_addr.ip())
+                                                })
+                                                .map(|(peer, _)| *peer)
+                                        })
+                                })
+                        })
+                })
             };
 
             let Some(peer) = matched_peer else {
                 continue;
             };
 
-            // 2. Deliver to ALL active links for this peer (across all networks this peer shares with us).
+            self.set_peer_addr(peer, src_addr);
+
+            // Deliver to ALL active links for this peer (across all networks this peer shares with us)
             let peer_links: Vec<Arc<WireguardLink>> = {
                 let guard = match self.links.read() {
                     Ok(g) => g,
@@ -452,7 +615,7 @@ impl WireguardTransport {
                 continue;
             }
 
-            // 3. If no active link exists for this peer yet, create inbound links for all networks known for this peer.
+            // If no active link exists for this peer yet, create inbound links for all networks known for this peer
             let networks: Vec<NetworkId> = {
                 let guard = match self.peer_networks.read() {
                     Ok(g) => g,
@@ -524,13 +687,75 @@ impl PacketTransport for WireguardTransport {
         _protocol: &'a str,
     ) -> BoxFuture<'a, Result<SharedLink, TransportError>> {
         Box::pin(async move {
-            let addrs = self.peer_addrs(peer);
-            let Some(target) = addrs.first().copied() else {
+            let mut addrs = self.peer_addrs(peer);
+            if addrs.is_empty() {
                 return Err(TransportError::Unreachable(format!(
                     "no candidate UDP address known for peer {}",
                     peer.fmt_short()
                 )));
-            };
+            }
+            crate::plugin::prioritize_local_subnet(&mut addrs);
+
+            // If an existing confirmed link is alive, reuse it
+            {
+                let guard = match self.links.read() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                if let Some(existing) = guard.get(&(network, peer))
+                    && !existing.is_closed()
+                    && existing.is_confirmed()
+                {
+                    existing.update_candidates(addrs);
+                    return Ok(Arc::clone(existing) as SharedLink);
+                }
+            }
+
+            // Probe candidate addresses with PING
+            let cookie: u64 = rand::random();
+            let (tx, rx) = oneshot::channel::<SocketAddr>();
+            {
+                let mut probes = match self.pending_probes.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                probes.insert((network, peer, cookie), tx);
+            }
+
+            let probe_ping = encode_probe(PROBE_TYPE_PING, self.local_id, peer, network, cookie);
+            let socket = Arc::clone(&self.socket);
+            let candidates = addrs.clone();
+
+            let probe_task = tokio::spawn(async move {
+                for i in 0..3 {
+                    for target in &candidates {
+                        let _ = socket.send_to(&probe_ping, *target).await;
+                    }
+                    if i < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                    }
+                }
+            });
+
+            let confirmed_addr =
+                match tokio::time::timeout(std::time::Duration::from_millis(1200), rx).await {
+                    Ok(Ok(addr)) => {
+                        probe_task.abort();
+                        addr
+                    }
+                    _ => {
+                        probe_task.abort();
+                        let mut probes = match self.pending_probes.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        probes.remove(&(network, peer, cookie));
+                        return Err(TransportError::Unreachable(format!(
+                            "direct UDP probe to peer {} timed out",
+                            peer.fmt_short()
+                        )));
+                    }
+                };
 
             let link = {
                 let mut guard = match self.links.write() {
@@ -540,16 +765,19 @@ impl PacketTransport for WireguardTransport {
                 if let Some(existing) = guard.get(&(network, peer))
                     && !existing.is_closed()
                 {
+                    existing.update_target(confirmed_addr);
                     existing.update_candidates(addrs);
+                    existing.confirm();
                     return Ok(Arc::clone(existing) as SharedLink);
                 }
                 let link = Arc::new(WireguardLink::new(
                     network,
                     peer,
-                    target,
+                    confirmed_addr,
                     addrs,
                     Arc::clone(&self.socket),
                 ));
+                link.confirm();
                 guard.insert((network, peer), Arc::clone(&link));
                 link
             };

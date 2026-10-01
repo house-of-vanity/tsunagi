@@ -110,3 +110,37 @@ async fn test_wireguard_transport_loopback() {
     assert!(link_a.path_description().contains("wireguard via"));
     assert!(link_b.path_description().contains("wireguard via"));
 }
+
+#[tokio::test]
+async fn test_wireguard_transport_unreachable_probe_times_out() {
+    let identity_a = DeviceIdentity::generate();
+    let identity_b = DeviceIdentity::generate();
+    let peer_b = identity_b.endpoint_id();
+    let network = NetworkId::from_bytes([99u8; 32]);
+
+    let transport_a = Arc::new(
+        WireguardTransport::bind(&identity_a, Some(0))
+            .await
+            .expect("bind client should succeed"),
+    );
+
+    // Register a non-responsive address for peer B (TEST-NET-1 documentation IP which drops packets)
+    let unreachable_addr: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+    transport_a.set_peer_addr(peer_b, unreachable_addr);
+    transport_a.set_peer_network(peer_b, network);
+
+    // Spawn accept loop on A
+    let transport_a_clone = Arc::clone(&transport_a);
+    tokio::spawn(async move {
+        transport_a_clone.accept_loop(|_| {}).await;
+    });
+
+    // Opening to unreachable candidate must fail with Unreachable rather than returning a dead direct link
+    let result = transport_a.open(network, peer_b, "wg").await;
+    match result {
+        Err(tsunagi::dataplane::transport::TransportError::Unreachable(msg)) => {
+            assert!(msg.contains("timed out"));
+        }
+        other => panic!("expected Unreachable error, got {other:?}"),
+    }
+}

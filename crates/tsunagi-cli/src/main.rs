@@ -3015,23 +3015,73 @@ async fn addresses_section() -> report::Section {
     use report::{Health, Row, Section};
 
     let mut addresses = Section::new("local addresses");
-    let found = netwatch_addresses().await;
-    if found.is_empty() {
+    let found = netwatch_interface_addresses().await;
+
+    let mut candidates = tsunagi_wireguard::local_ip_candidates();
+    for ip in tsunagi_tcp_tls::local_ip_candidates() {
+        if !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+
+    if found.is_empty() && candidates.is_empty() {
         addresses.push(
             Row::new(Health::Degraded, "interfaces", "none found")
                 .with_note("best effort; the agent may still find a way out"),
         );
+        return addresses;
     }
-    for addr in found {
-        // Loopback alone reaches nobody, but on a host that also has a real
-        // address it is unremarkable, so it is labelled rather than flagged.
-        let kind = match (addr.is_loopback(), addr.is_ipv4()) {
-            (true, _) => "loopback",
-            (false, true) => "ipv4",
-            (false, false) => "ipv6",
-        };
-        addresses.push(Row::new(Health::Info, kind, addr.to_string()));
+
+    let mut iface_map: std::collections::HashMap<std::net::IpAddr, String> =
+        std::collections::HashMap::new();
+    for item in &found {
+        iface_map.insert(item.addr, item.iface.clone());
     }
+
+    // 1. Announced peer candidate addresses (in candidate priority order)
+    let mut seen = std::collections::HashSet::new();
+    for (idx, &cand) in candidates.iter().enumerate() {
+        if seen.insert(cand) {
+            let note = iface_map
+                .get(&cand)
+                .map(|iface| format!("{iface} · candidate #{}", idx + 1));
+            let row = Row::new(Health::Info, "announced", cand.to_string());
+            addresses.push(match note {
+                Some(n) => row.with_note(n),
+                None => row,
+            });
+        }
+    }
+
+    // 2. Unannounced local addresses
+    let mut unannounced = Vec::new();
+    let mut loopbacks = Vec::new();
+
+    for item in &found {
+        if seen.contains(&item.addr) {
+            continue;
+        }
+        if item.addr.is_loopback() {
+            loopbacks.push(item);
+        } else {
+            unannounced.push(item);
+        }
+    }
+
+    unannounced.sort_by_key(|item| item.addr);
+    for item in unannounced {
+        let note = format!("{} · not announced to peers", item.iface);
+        addresses
+            .push(Row::new(Health::Info, "not announced", item.addr.to_string()).with_note(note));
+    }
+
+    // 3. Loopback addresses
+    loopbacks.sort_by_key(|item| item.addr);
+    for item in loopbacks {
+        addresses
+            .push(Row::new(Health::Info, "loopback", item.addr.to_string()).with_note(&item.iface));
+    }
+
     addresses
 }
 
@@ -3433,21 +3483,31 @@ fn program_path() -> String {
         .unwrap_or_else(|| "tsunagi".to_string())
 }
 
-async fn netwatch_addresses() -> Vec<std::net::IpAddr> {
+struct LocalAddressInfo {
+    addr: std::net::IpAddr,
+    iface: String,
+}
+
+async fn netwatch_interface_addresses() -> Vec<LocalAddressInfo> {
     // Best effort; used for diagnostics only.
     let state = netwatch::interfaces::State::new().await;
     let mut addresses = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for (name, iface) in &state.interfaces {
         let name_lower = name.to_lowercase();
         if name_lower.starts_with("tsun") || name_lower.contains("tsunagi") {
             continue;
         }
         for prefix in iface.addrs() {
-            addresses.push(prefix.addr());
+            let addr = prefix.addr();
+            if seen.insert(addr) {
+                addresses.push(LocalAddressInfo {
+                    addr,
+                    iface: name.clone(),
+                });
+            }
         }
     }
-    addresses.sort();
-    addresses.dedup();
     addresses
 }
 
