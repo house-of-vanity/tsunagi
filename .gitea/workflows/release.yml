@@ -45,7 +45,6 @@ jobs:
             deb: true
             deb_arch: arm64
             pkg_arch: aarch64
-            gnu_target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: tsunagi-macos-aarch64
@@ -111,11 +110,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export RUSTFLAGS="${RUSTFLAGS:-} -A linker_messages"
           if [[ "${{ runner.os }}" == "Linux" ]]; then
-            rustup target add "${{ matrix.gnu_target }}"
-            cargo zigbuild --release --locked \
-              --target "${{ matrix.gnu_target }}.2.28" --bin tsunagi-tray
+            if [[ -n "${{ matrix.gnu_target }}" ]]; then
+              # tray-icon links GTK and libappindicator through pkg-config, which
+              # has no cross story under zig, so the Linux GUI is built natively
+              # (x86_64 only) against the runner's glibc.
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends \
+                libgtk-3-dev libayatana-appindicator3-dev
+              cargo build --release --locked \
+                --target "${{ matrix.gnu_target }}" --bin tsunagi-tray
+            else
+              echo "no GUI build for ${{ matrix.target }}"
+            fi
           else
             cargo build --release --locked --target "${{ matrix.target }}" --bin tsunagi-tray
           fi
@@ -133,11 +140,13 @@ jobs:
           [[ "${{ runner.os }}" == "Windows" ]] && bin="tsunagi.exe"
           cp "target/${{ matrix.target }}/release/${bin}" "$stage/"
 
-          # The tray GUI alongside it: glibc build on Linux, native elsewhere.
+          # The tray GUI alongside it, where it was built (Linux: x86_64 only).
           tray="tsunagi-tray"
           [[ "${{ runner.os }}" == "Windows" ]] && tray="tsunagi-tray.exe"
           if [[ "${{ runner.os }}" == "Linux" ]]; then
-            cp "target/${{ matrix.gnu_target }}/release/${tray}" "$stage/"
+            if [[ -n "${{ matrix.gnu_target }}" ]]; then
+              cp "target/${{ matrix.gnu_target }}/release/${tray}" "$stage/"
+            fi
           else
             cp "target/${{ matrix.target }}/release/${tray}" "$stage/"
           fi
@@ -201,7 +210,7 @@ jobs:
       # The GUI variants: the same agent plus the tray binary and a desktop
       # launcher, named tsunagi-gui (conflicting with the headless packages).
       - name: Build the GUI packages
-        if: matrix.deb
+        if: matrix.gnu_target
         shell: bash
         run: |
           set -euo pipefail
