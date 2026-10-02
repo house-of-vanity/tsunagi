@@ -26,6 +26,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 egui-phosphor = "0.9"
 
+# Linux only: tray-icon (already GTK-based there) needs the app to initialise
+# GTK and run its main loop, which eframe/winit do not do.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
 # macOS only: set the app's activation policy to Accessory so it lives in the
 # menu bar with no Dock icon. Pinned to eframe's winit so the types unify.
 [target.'cfg(target_os = "macos")'.dependencies]
