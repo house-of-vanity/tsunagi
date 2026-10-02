@@ -88,6 +88,12 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ matrix.zig }}" == "true" ]]; then
+            # zig's linker ignores the `-O1` GNU-ld optimization flag Rust passes
+            # and says so on stderr, which rustc now surfaces as a linker_messages
+            # warning. It is cosmetic — the binary is correct — so quiet just that
+            # one lint to keep the musl build log clean. A real link error still
+            # fails the build.
+            export RUSTFLAGS="${RUSTFLAGS:-} -A linker_messages"
             cargo zigbuild --release --locked --target "${{ matrix.target }}" --bin tsunagi
           else
             cargo build --release --locked --target "${{ matrix.target }}" --bin tsunagi
