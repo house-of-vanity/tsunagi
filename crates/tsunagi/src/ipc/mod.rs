@@ -472,6 +472,10 @@ pub struct OverlayPeerReport {
     pub tx_packets: u64,
     /// Packets decrypted from this peer.
     pub rx_packets: u64,
+    /// Plaintext bytes encrypted and sent to this peer.
+    pub tx_bytes: u64,
+    /// Plaintext bytes decrypted from this peer.
+    pub rx_bytes: u64,
     /// Data packets dropped: wrong source address, or too large for the path.
     pub dropped: u64,
     /// WireGuard protocol errors.
@@ -605,7 +609,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 15]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 16]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///

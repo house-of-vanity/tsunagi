@@ -83,6 +83,8 @@ struct TunnelPeerState {
     link: SharedLink,
     tx_packets: AtomicU64,
     rx_packets: AtomicU64,
+    tx_bytes: AtomicU64,
+    rx_bytes: AtomicU64,
     dropped: AtomicU64,
     established_at: std::time::Instant,
 }
@@ -100,6 +102,10 @@ pub struct TunnelPeerReport {
     pub tx_packets: u64,
     /// Packets successfully received and decrypted.
     pub rx_packets: u64,
+    /// Plaintext bytes successfully encrypted and sent.
+    pub tx_bytes: u64,
+    /// Plaintext bytes successfully received and decrypted.
+    pub rx_bytes: u64,
     /// Packets dropped due to encryption/decryption/send failures.
     pub dropped: u64,
     /// Uptime in seconds since the data link was established.
@@ -145,6 +151,8 @@ impl<C: TunnelCodec> GenericTunnelPlugin<C> {
                 path: state.link.path_description(),
                 tx_packets: state.tx_packets.load(Ordering::Relaxed),
                 rx_packets: state.rx_packets.load(Ordering::Relaxed),
+                tx_bytes: state.tx_bytes.load(Ordering::Relaxed),
+                rx_bytes: state.rx_bytes.load(Ordering::Relaxed),
                 dropped: state.dropped.load(Ordering::Relaxed),
                 uptime_secs: state.established_at.elapsed().as_secs(),
             })
@@ -223,6 +231,9 @@ impl<C: TunnelCodec> IpPlugin for GenericTunnelPlugin<C> {
             Ok(ciphertext) => {
                 if state.link.send(ciphertext).is_ok() {
                     state.tx_packets.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .tx_bytes
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
                     true
                 } else {
                     state.dropped.fetch_add(1, Ordering::Relaxed);
@@ -242,6 +253,8 @@ impl<C: TunnelCodec> IpPlugin for GenericTunnelPlugin<C> {
             link: Arc::clone(&link),
             tx_packets: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             established_at: std::time::Instant::now(),
         });
@@ -268,6 +281,9 @@ impl<C: TunnelCodec> IpPlugin for GenericTunnelPlugin<C> {
                 match codec.decrypt(network, peer, &payload) {
                     Ok(packet) => {
                         rx_state.rx_packets.fetch_add(1, Ordering::Relaxed);
+                        rx_state
+                            .rx_bytes
+                            .fetch_add(packet.len() as u64, Ordering::Relaxed);
                         if let Some(ref sink) = sink {
                             sink.deliver(network, peer, packet).await;
                         }
