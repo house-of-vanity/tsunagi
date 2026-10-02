@@ -1,6 +1,6 @@
 //! The per-network devices window: full detail about one network — its
-//! settings and counters, every connected peer in a table with an inline
-//! traffic plot, and the members that are currently offline below.
+//! settings and counters, and one table of every device, online first, with
+//! inline traffic plots for the connected ones.
 //!
 //! Rendered in a separate OS window (an egui viewport) opened from a tile in
 //! the main window.
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
-use tsunagi::ipc::NetworkReport;
+use tsunagi::ipc::{NetworkReport, OverlayPeerReport};
 
 use crate::agent::AgentClient;
 use crate::format;
@@ -18,6 +18,19 @@ use crate::stats::{Traffic, Unit};
 /// A readable title for a network's window.
 pub(crate) fn title(network: &NetworkReport) -> String {
     format!("tsunagi · {}", network.name)
+}
+
+/// One row of the device table, built from a tunnel and/or a signed member.
+struct Device<'a> {
+    online: bool,
+    name: String,
+    /// What clicking the name copies: `hostname.network` so it resolves, or
+    /// the short id when there is no hostname.
+    copy: String,
+    proto: &'a str,
+    address: Option<String>,
+    handshake_secs: Option<u64>,
+    overlay: Option<&'a OverlayPeerReport>,
 }
 
 /// Draws the window body into its viewport.
@@ -39,6 +52,7 @@ pub(crate) fn show(
         });
         // A copy of the chosen unit for the read-only rendering below.
         let unit = *unit;
+
         summary(ui, network);
         ui.add_space(6.0);
 
@@ -46,36 +60,21 @@ pub(crate) fn show(
         format::sparkline(ui, traffic.network(&network.network_id), unit, 48.0);
         ui.add_space(8.0);
 
-        let hostnames: HashMap<&str, &str> = network
-            .peers
-            .iter()
-            .filter_map(|p| p.hostname.as_deref().map(|h| (p.endpoint_id.as_str(), h)))
-            .collect();
-
-        let overlay = network.overlay.as_ref();
-        let online = overlay.map(|o| o.peers.as_slice()).unwrap_or(&[]);
-
-        ui.label(egui::RichText::new(format!("connected peers ({})", online.len())).strong());
+        let devices = devices(network);
+        let online = devices.iter().filter(|d| d.online).count();
+        ui.label(
+            egui::RichText::new(format!(
+                "devices ({} online / {} known)",
+                online,
+                devices.len()
+            ))
+            .strong(),
+        );
         egui::ScrollArea::vertical()
-            .max_height(260.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                connected_table(ui, unit, &network.network_id, online, &hostnames, traffic);
+                device_table(ui, unit, &network.network_id, &devices, traffic);
             });
-
-        // Members with no live tunnel right now.
-        let online_ids: std::collections::HashSet<&str> =
-            online.iter().map(|p| p.endpoint_id.as_str()).collect();
-        let offline: Vec<_> = network
-            .members
-            .iter()
-            .filter(|m| !online_ids.contains(m.endpoint_id.as_str()))
-            .collect();
-        if !offline.is_empty() {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new(format!("offline members ({})", offline.len())).strong());
-            offline_table(ui, &offline, &hostnames);
-        }
     });
 }
 
@@ -124,26 +123,86 @@ fn summary(ui: &mut egui::Ui, network: &NetworkReport) {
         });
 }
 
-/// The table of peers with a live tunnel.
-fn connected_table(
+/// Builds the device list: every endpoint known from a live tunnel or the
+/// signed membership, online ones first.
+fn devices(network: &NetworkReport) -> Vec<Device<'_>> {
+    let hostnames: HashMap<&str, &str> = network
+        .peers
+        .iter()
+        .filter_map(|p| p.hostname.as_deref().map(|h| (p.endpoint_id.as_str(), h)))
+        .collect();
+    let overlay_peers = network
+        .overlay
+        .as_ref()
+        .map(|o| o.peers.as_slice())
+        .unwrap_or(&[]);
+
+    let mut ids: Vec<&str> = Vec::new();
+    for peer in overlay_peers {
+        if !ids.contains(&peer.endpoint_id.as_str()) {
+            ids.push(&peer.endpoint_id);
+        }
+    }
+    for member in &network.members {
+        if !ids.contains(&member.endpoint_id.as_str()) {
+            ids.push(&member.endpoint_id);
+        }
+    }
+
+    let mut devices: Vec<Device> = ids
+        .into_iter()
+        .map(|id| {
+            let overlay = overlay_peers.iter().find(|p| p.endpoint_id == id);
+            let member = network.members.iter().find(|m| m.endpoint_id == id);
+            let online = overlay.is_some_and(|p| p.handshake_secs_ago.is_some());
+            let hostname = hostnames.get(id).copied();
+            let name = hostname.map_or_else(
+                || format::short(overlay.map_or(id, |p| p.public_key.as_str())),
+                str::to_string,
+            );
+            let copy = hostname.map_or_else(|| name.clone(), |h| format!("{h}.{}", network.name));
+            Device {
+                online,
+                name,
+                copy,
+                proto: overlay.map_or("—", |p| p.protocol.as_str()),
+                address: overlay
+                    .and_then(|p| p.address.clone())
+                    .or_else(|| member.and_then(|m| m.overlay_address_v4.clone())),
+                handshake_secs: overlay.and_then(|p| p.handshake_secs_ago),
+                overlay,
+            }
+        })
+        .collect();
+
+    devices.sort_by(|a, b| {
+        b.online
+            .cmp(&a.online)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    devices
+}
+
+/// One table of all devices: online rows carry live counters and a plot,
+/// offline rows show what is known (name and address) and dashes.
+fn device_table(
     ui: &mut egui::Ui,
     unit: Unit,
     network_id: &str,
-    peers: &[tsunagi::ipc::OverlayPeerReport],
-    hostnames: &HashMap<&str, &str>,
+    devices: &[Device<'_>],
     traffic: &Traffic,
 ) {
-    if peers.is_empty() {
+    if devices.is_empty() {
         ui.weak("none");
         return;
     }
-    egui::Grid::new("connected")
+    egui::Grid::new("devices")
         .num_columns(8)
         .striped(true)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
             for header in [
-                "peer",
+                "device",
                 "proto",
                 "address",
                 "handshake",
@@ -156,69 +215,41 @@ fn connected_table(
             }
             ui.end_row();
 
-            for peer in peers {
-                let name = hostnames
-                    .get(peer.endpoint_id.as_str())
-                    .map_or_else(|| format::short(&peer.public_key), |h| (*h).to_string());
-                format::copy_field(ui, &name, &name);
-                ui.label(&peer.protocol);
-                match &peer.address {
+            for device in devices {
+                format::copy_field(ui, &device.name, &device.copy);
+                ui.label(device.proto);
+                match &device.address {
                     Some(address) => format::copy_field(ui, address, address),
                     None => {
                         ui.weak("—");
                     }
                 }
                 ui.label(
-                    peer.handshake_secs_ago
-                        .map_or_else(|| "never".to_string(), format::age),
+                    device
+                        .handshake_secs
+                        .map_or_else(|| "offline".to_string(), format::age),
                 );
-                ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
-                ui.label(format!(
-                    "{} / {}",
-                    format::bytes(peer.tx_bytes as f64),
-                    format::bytes(peer.rx_bytes as f64)
-                ));
-                let series = traffic.peer(network_id, &peer.public_key);
-                // Rate and plot are separate grid columns, so the plot column
-                // starts at the same x on every row regardless of the rate's
-                // text width.
-                ui.add(egui::Label::new(format::series_rate(series, unit)).truncate());
-                ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
-                    format::sparkline(ui, series, unit, 18.0);
-                });
-                ui.end_row();
-            }
-        });
-}
 
-/// The table of members with no current tunnel.
-fn offline_table(
-    ui: &mut egui::Ui,
-    members: &[&tsunagi::ipc::MemberReport],
-    hostnames: &HashMap<&str, &str>,
-) {
-    egui::Grid::new("offline")
-        .num_columns(3)
-        .striped(true)
-        .spacing([10.0, 4.0])
-        .show(ui, |ui| {
-            for header in ["member", "address", "failed dials"] {
-                ui.weak(header);
-            }
-            ui.end_row();
-
-            for member in members {
-                let name = hostnames
-                    .get(member.endpoint_id.as_str())
-                    .map_or_else(|| format::short(&member.endpoint_id), |h| (*h).to_string());
-                format::copy_field(ui, &name, &member.endpoint_id);
-                match &member.overlay_address_v4 {
-                    Some(address) => format::copy_field(ui, address, address),
+                match device.overlay.filter(|_| device.online) {
+                    Some(peer) => {
+                        ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
+                        ui.label(format!(
+                            "{} / {}",
+                            format::bytes(peer.tx_bytes as f64),
+                            format::bytes(peer.rx_bytes as f64)
+                        ));
+                        let series = traffic.peer(network_id, &peer.public_key);
+                        ui.add(egui::Label::new(format::series_rate(series, unit)).truncate());
+                        ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
+                            format::sparkline(ui, series, unit, 18.0);
+                        });
+                    }
                     None => {
-                        ui.weak("—");
+                        for _ in 0..4 {
+                            ui.weak("—");
+                        }
                     }
                 }
-                ui.label(member.failed_dials.to_string());
                 ui.end_row();
             }
         });

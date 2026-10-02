@@ -1,5 +1,5 @@
 //! Formatting and small shared widgets: humanized ages, byte sizes and rates,
-//! a fixed-size sparkline, and a click-to-copy field with "Copied" feedback.
+//! a fixed-size sparkline, and a click-to-copy field with a green-flash feedback.
 
 use std::time::{Duration, Instant};
 
@@ -9,9 +9,9 @@ use crate::stats::{Series, Unit};
 
 /// Sparkline accent.
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x80, 0xd8);
-/// The green a field flashes when its value is copied.
+/// The green a field flashes to when its value is copied.
 const COPIED_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xb0, 0x4a);
-/// How long the "Copied" feedback stays.
+/// How long the copy flash takes to fade back to normal.
 const FLASH: Duration = Duration::from_secs(1);
 
 /// A short, readable prefix of a long identifier (char-safe, no panic).
@@ -73,17 +73,24 @@ pub(crate) fn series_rate(series: Option<&Series>, unit: Unit) -> String {
 }
 
 /// A label whose text is `display` and which copies `value` to the clipboard
-/// when clicked, flashing green with "Copied" for a second as feedback. The
-/// copy affordance is the field itself — no separate button.
+/// when clicked. Feedback is a green flash that fades back over a second — the
+/// text itself never changes, so a dense table does not reflow on a copy.
 pub(crate) fn copy_field(ui: &mut egui::Ui, display: &str, value: &str) {
     let id = ui.make_persistent_id(("copy", value, display));
     let copied_at: Option<Instant> = ui.memory(|memory| memory.data.get_temp(id));
-    let flashing = copied_at.is_some_and(|at| at.elapsed() < FLASH);
+    // 1.0 right after the click, fading to 0.0 a second later.
+    let flash = copied_at.and_then(|at| {
+        let elapsed = at.elapsed().as_secs_f32();
+        let span = FLASH.as_secs_f32();
+        (elapsed < span).then(|| 1.0 - elapsed / span)
+    });
 
-    let text = if flashing {
-        egui::RichText::new(format!("{display}  Copied")).color(COPIED_GREEN)
-    } else {
-        egui::RichText::new(display)
+    let text = match flash {
+        Some(factor) => {
+            let base = ui.visuals().text_color();
+            egui::RichText::new(display).color(lerp_color(base, COPIED_GREEN, factor))
+        }
+        None => egui::RichText::new(display),
     };
     let response = ui
         .add(egui::Label::new(text).sense(egui::Sense::click()))
@@ -93,10 +100,17 @@ pub(crate) fn copy_field(ui: &mut egui::Ui, display: &str, value: &str) {
         ui.ctx().copy_text(value.to_owned());
         ui.memory_mut(|memory| memory.data.insert_temp(id, Instant::now()));
     }
-    if flashing {
-        // Keep repainting so the flash clears itself a second after the click.
-        ui.ctx().request_repaint_after(Duration::from_millis(120));
+    if flash.is_some() {
+        // Animate the fade smoothly until it completes.
+        ui.ctx().request_repaint();
     }
+}
+
+/// Linear blend between two colours, `t` in `0.0..=1.0` toward `b`.
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * t).round() as u8;
+    egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 /// A fixed-height sparkline of a series' recent rate, with the peak (top-left)
