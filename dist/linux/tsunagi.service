@@ -1,0 +1,26 @@
+[Unit]
+Description=tsunagi mesh agent
+Documentation=https://github.com/Ultradesu/tsunagi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tsunagi up
+Restart=on-failure
+RestartSec=5
+
+# This unit runs the agent as root, which covers everything it needs: creating
+# the TUN interface (CAP_NET_ADMIN), binding low ports, and configuring
+# systemd-resolved — root is not subject to polkit, so no polkit rule is needed.
+#
+# To run as a non-root user instead, uncomment the three lines below, set a
+# User=, and install the polkit rule that `tsunagi dns` prints (resolved decides
+# by user id, not capability, so the rule is what lets a non-root agent set the
+# resolver):
+#User=tsunagi
+#AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+#CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
