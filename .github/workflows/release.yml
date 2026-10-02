@@ -38,6 +38,7 @@ jobs:
             deb: true
             deb_arch: amd64
             pkg_arch: x86_64
+            gnu_target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             asset: tsunagi-linux-aarch64
@@ -46,6 +47,7 @@ jobs:
             deb: true
             deb_arch: arm64
             pkg_arch: aarch64
+            gnu_target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: tsunagi-macos-aarch64
@@ -104,6 +106,22 @@ jobs:
             cargo build --release --locked --target "${{ matrix.target }}" --bin tsunagi
           fi
 
+      # The tray GUI. On Linux it is built against glibc (an old baseline for
+      # portability), not musl: a GUI must dlopen libGL/X11/Wayland at runtime,
+      # which a static musl binary cannot. macOS and Windows build it natively.
+      - name: Build the tray GUI
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="${RUSTFLAGS:-} -A linker_messages"
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            rustup target add "${{ matrix.gnu_target }}"
+            cargo zigbuild --release --locked \
+              --target "${{ matrix.gnu_target }}.2.28" --bin tsunagi-tray
+          else
+            cargo build --release --locked --target "${{ matrix.target }}" --bin tsunagi-tray
+          fi
+
       - name: Package
         shell: bash
         run: |
@@ -116,6 +134,15 @@ jobs:
           bin="tsunagi"
           [[ "${{ runner.os }}" == "Windows" ]] && bin="tsunagi.exe"
           cp "target/${{ matrix.target }}/release/${bin}" "$stage/"
+
+          # The tray GUI alongside it: glibc build on Linux, native elsewhere.
+          tray="tsunagi-tray"
+          [[ "${{ runner.os }}" == "Windows" ]] && tray="tsunagi-tray.exe"
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            cp "target/${{ matrix.gnu_target }}/release/${tray}" "$stage/"
+          else
+            cp "target/${{ matrix.target }}/release/${tray}" "$stage/"
+          fi
 
           # The top-level README, plus the per-OS install notes and integration
           # files, so the archive carries what the platform needs to set up.
@@ -172,6 +199,25 @@ jobs:
             "${{ matrix.pkg_arch }}" \
             "$version" \
             "tsunagi-${pkgver}-1-${{ matrix.pkg_arch }}.pkg.tar.zst"
+
+      # The GUI variants: the same agent plus the tray binary and a desktop
+      # launcher, named tsunagi-gui (conflicting with the headless packages).
+      - name: Build the GUI packages
+        if: matrix.deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          pkgver="${version//-/_}"
+          tray="target/${{ matrix.gnu_target }}/release/tsunagi-tray"
+          bash dist/deb/build-deb.sh \
+            "target/${{ matrix.target }}/release/tsunagi" \
+            "${{ matrix.deb_arch }}" "$version" \
+            "tsunagi-gui_${version}_${{ matrix.deb_arch }}.deb" "$tray"
+          bash dist/arch/build-pkg.sh \
+            "target/${{ matrix.target }}/release/tsunagi" \
+            "${{ matrix.pkg_arch }}" "$version" \
+            "tsunagi-gui-${pkgver}-1-${{ matrix.pkg_arch }}.pkg.tar.zst" "$tray"
 
       - name: Upload the build outputs as run artifacts
         uses: actions/upload-artifact@v7

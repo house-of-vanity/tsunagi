@@ -148,10 +148,17 @@ pub fn default_control_socket_path() -> PathBuf {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        // Prefer a running system service's socket when it is present, so a
+        // GUI or CLI reaches the packaged daemon with no configuration; fall
+        // back to the per-user location otherwise.
+        let system = PathBuf::from("/run/tsunagi/agent.sock");
+        if system.exists() {
+            return system;
+        }
         if let Ok(paths) = crate::config::StoragePaths::user_default() {
             control_socket_path(&paths.state_dir)
         } else {
-            PathBuf::from("/run/tsunagi/agent.sock")
+            system
         }
     }
 }

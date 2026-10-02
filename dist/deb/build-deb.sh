@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# Assemble a dependency-free Debian package from a prebuilt static tsunagi
-# binary, using only dpkg-deb (no cargo-deb, no nfpm). The binary is statically
-# linked, so the package declares no Depends and runs on any Debian/Ubuntu.
+# Assemble a dependency-free Debian package from prebuilt tsunagi binaries,
+# using only dpkg-deb (no cargo-deb, no nfpm).
 #
-# Usage: build-deb.sh <binary> <deb_arch> <version> <output.deb>
-#   <binary>   path to the built tsunagi executable
-#   <deb_arch> Debian architecture: amd64 or arm64
-#   <version>  package version (the tag without its leading v)
-#   <output>   path to write the .deb to
+# Usage: build-deb.sh <binary> <deb_arch> <version> <output.deb> [tray_binary]
+#   <binary>      path to the built tsunagi (agent/CLI) executable
+#   <deb_arch>    Debian architecture: amd64 or arm64
+#   <version>     package version (the tag without its leading v)
+#   <output>      path to write the .deb to
+#   [tray_binary] optional path to the tsunagi-tray GUI executable; when given,
+#                 the package also installs the tray and a desktop launcher and
+#                 is named tsunagi-gui (conflicting with the headless tsunagi).
 set -euo pipefail
 
 binary="$1"
 arch="$2"
 version="$3"
 output="$4"
+tray="${5:-}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(mktemp -d)"
@@ -34,22 +37,38 @@ install -D -m 0644 "$here/../linux/50-tsunagi-resolved.rules" \
 install -D -m 0644 "$here/../../README.md" "$root/usr/share/doc/tsunagi/README.md"
 install -D -m 0644 "$here/../linux/README.md" "$root/usr/share/doc/tsunagi/INSTALL.md"
 
+pkgname=tsunagi
+extra_control=""
+desc_gui=""
+if [ -n "$tray" ]; then
+    pkgname=tsunagi-gui
+    # The GUI package is a superset of the headless one and must not coexist
+    # with it (both ship /usr/bin/tsunagi).
+    extra_control=$'Conflicts: tsunagi\nReplaces: tsunagi\nProvides: tsunagi\n'
+    desc_gui=" It also installs the tray GUI (tsunagi-tray) and a desktop launcher so it can be started from the applications menu."
+    install -D -m 0755 "$tray" "$root/usr/bin/tsunagi-tray"
+    install -D -m 0644 "$here/../linux/tsunagi-tray.desktop" \
+        "$root/usr/share/applications/tsunagi-tray.desktop"
+    install -D -m 0644 "$here/../linux/tsunagi.svg" \
+        "$root/usr/share/icons/hicolor/scalable/apps/tsunagi.svg"
+fi
+
 mkdir -p "$root/DEBIAN"
 
 cat > "$root/DEBIAN/control" <<CTRL
-Package: tsunagi
+Package: ${pkgname}
 Version: ${version}
 Architecture: ${arch}
 Maintainer: AB <ab@hexor.cy>
 Section: net
 Priority: optional
 Homepage: https://github.com/Ultradesu/tsunagi
-Description: Serverless private mesh networking agent
+${extra_control}Description: Serverless private mesh networking agent
  tsunagi forms small private mesh IP networks between peers, with NAT
  traversal and no central server. This package installs a static,
- dependency-free binary, a systemd service that runs the agent as a dedicated
+ dependency-free agent, a systemd service that runs it as a dedicated
  unprivileged "tsunagi" user with only CAP_NET_ADMIN and CAP_NET_BIND_SERVICE,
- and a polkit rule for the local DNS resolver.
+ and a polkit rule for the local DNS resolver.${desc_gui}
 CTRL
 
 # The dedicated system user the service runs as. It is in the "tsunagi" group,
@@ -68,8 +87,19 @@ fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
-exit 0
 POSTINST
+
+if [ -n "$tray" ]; then
+    cat >> "$root/DEBIAN/postinst" <<'POSTINST_GUI'
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+POSTINST_GUI
+fi
+echo "exit 0" >> "$root/DEBIAN/postinst"
 
 cat > "$root/DEBIAN/prerm" <<'PRERM'
 #!/bin/sh

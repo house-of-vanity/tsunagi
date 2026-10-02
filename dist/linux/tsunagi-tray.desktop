@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=tsunagi
+GenericName=Mesh network manager
+Comment=Manage tsunagi networks from the tray
+Exec=tsunagi-tray
+Icon=tsunagi
+Terminal=false
+Categories=Network;Utility;
+Keywords=mesh;vpn;overlay;network;
+StartupNotify=false
