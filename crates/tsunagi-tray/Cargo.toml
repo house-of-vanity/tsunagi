@@ -1,0 +1,29 @@
+[package]
+name = "tsunagi-tray"
+version = "0.1.0"
+description = "Tray application to manage a running tsunagi agent."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tsunagi-tray"
+path = "src/main.rs"
+
+[dependencies]
+# The agent control client and the report types: the GUI is a thin client over
+# the same local control interface the CLI uses, so it reuses these directly
+# and never re-implements the protocol.
+tsunagi = { path = "../tsunagi", version = "0.1.0" }
+# Native, lightweight GUI — no web engine. eframe re-exports egui.
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+# Cross-platform tray icon + menu (Windows tray, macOS menu bar, Linux SNI).
+tray-icon = "0.21"
+# Background worker that talks to the agent off the UI thread.
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
