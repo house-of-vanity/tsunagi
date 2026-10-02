@@ -4435,7 +4435,12 @@ fn log_event(event: &Event) {
             let peer_str = peer
                 .map(|p| p.fmt_short().to_string())
                 .unwrap_or_else(|| "unknown".into());
-            tracing::warn!(
+            // Routine and remotely triggerable: a peer dialing a network this
+            // agent does not serve — one it never had, or has left and the peer
+            // has not learned yet — a stranger, or an old client. Rejecting is
+            // correct and contained (one session), so this is debug rather than
+            // a warning any peer could spam into the log.
+            tracing::debug!(
                 network = ?network.map(|n| n.fmt_short().to_string()),
                 peer = %peer_str,
                 "Handshake rejected: {reason}"
