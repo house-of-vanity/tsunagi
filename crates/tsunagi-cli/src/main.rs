@@ -3033,6 +3033,16 @@ fn host_section() -> report::Section {
     host
 }
 
+/// Whether an address is link-local — `fe80::/10` or `169.254.0.0/16` — which
+/// the operating system assigns per interface and which is never a peer
+/// candidate.
+fn is_link_local(addr: std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
 /// The addresses this host could reach a peer from.
 async fn addresses_section() -> report::Section {
     use report::{Health, Row, Section};
@@ -3087,6 +3097,10 @@ async fn addresses_section() -> report::Section {
         }
         if item.addr.is_loopback() {
             loopbacks.push(item);
+        } else if is_link_local(item.addr) {
+            // Link-local (fe80::/10, 169.254.0.0/16) is never a peer candidate,
+            // so one per interface is noise rather than information.
+            continue;
         } else {
             unannounced.push(item);
         }
