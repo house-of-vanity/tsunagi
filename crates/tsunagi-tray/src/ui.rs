@@ -15,6 +15,7 @@ use egui_phosphor::regular as icon;
 use tsunagi::ipc::{NetworkReport, StatusReport};
 
 use crate::agent::{AgentClient, Command, Snapshot};
+use crate::devices;
 use crate::format;
 use crate::stats::{Traffic, Unit};
 
@@ -114,7 +115,7 @@ pub(crate) fn draw(
                         ui.weak("No networks yet — join one below.");
                     }
                     for network in &report.networks {
-                        draw_network(ui, agent, state, traffic, network);
+                        draw_network(ui, agent, state, traffic, network, &report.endpoint_id);
                     }
                 });
         }
@@ -191,6 +192,7 @@ fn draw_network(
     state: &mut UiState,
     traffic: &Traffic,
     network: &NetworkReport,
+    own_id: &str,
 ) {
     ui.add_space(6.0);
     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -233,7 +235,7 @@ fn draw_network(
                 ui.label(format!(
                     "{} connected · {} known",
                     network.peers.len(),
-                    network.members.len()
+                    devices::known_count(network, own_id)
                 ));
                 ui.end_row();
             });
