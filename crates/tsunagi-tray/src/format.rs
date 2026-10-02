@@ -1,5 +1,7 @@
 //! Formatting and small shared widgets: humanized ages, byte sizes and rates,
-//! a fixed-size sparkline, and click-to-copy labels.
+//! a fixed-size sparkline, and a click-to-copy field with "Copied" feedback.
+
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -7,6 +9,10 @@ use crate::stats::{Series, Unit};
 
 /// Sparkline accent.
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x80, 0xd8);
+/// The green a field flashes when its value is copied.
+const COPIED_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xb0, 0x4a);
+/// How long the "Copied" feedback stays.
+const FLASH: Duration = Duration::from_secs(1);
 
 /// A short, readable prefix of a long identifier (char-safe, no panic).
 pub(crate) fn short(id: &str) -> String {
@@ -58,6 +64,38 @@ pub(crate) fn rate(value: f32, unit: Unit) -> String {
             }
         }
         Unit::Bytes => format!("{}/s", bytes(f64::from(value))),
+    }
+}
+
+/// The current rate of a series as a string, or a dash when unsampled.
+pub(crate) fn series_rate(series: Option<&Series>, unit: Unit) -> String {
+    series.map_or_else(|| "—".to_string(), |s| rate(s.rate(unit), unit))
+}
+
+/// A label whose text is `display` and which copies `value` to the clipboard
+/// when clicked, flashing green with "Copied" for a second as feedback. The
+/// copy affordance is the field itself — no separate button.
+pub(crate) fn copy_field(ui: &mut egui::Ui, display: &str, value: &str) {
+    let id = ui.make_persistent_id(("copy", value, display));
+    let copied_at: Option<Instant> = ui.memory(|memory| memory.data.get_temp(id));
+    let flashing = copied_at.is_some_and(|at| at.elapsed() < FLASH);
+
+    let text = if flashing {
+        egui::RichText::new(format!("{display}  Copied")).color(COPIED_GREEN)
+    } else {
+        egui::RichText::new(display)
+    };
+    let response = ui
+        .add(egui::Label::new(text).sense(egui::Sense::click()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("click to copy");
+    if response.clicked() {
+        ui.ctx().copy_text(value.to_owned());
+        ui.memory_mut(|memory| memory.data.insert_temp(id, Instant::now()));
+    }
+    if flashing {
+        // Keep repainting so the flash clears itself a second after the click.
+        ui.ctx().request_repaint_after(Duration::from_millis(120));
     }
 }
 
@@ -115,30 +153,4 @@ pub(crate) fn sparkline(ui: &mut egui::Ui, series: Option<&Series>, unit: Unit, 
         egui::FontId::proportional(10.0),
         visuals.strong_text_color(),
     );
-}
-
-/// A label that copies `value` to the clipboard when clicked.
-pub(crate) fn copy_label(ui: &mut egui::Ui, display: &str, value: &str) {
-    let response = ui
-        .add(egui::Label::new(display).sense(egui::Sense::click()))
-        .on_hover_text("click to copy");
-    if response.clicked() {
-        ui.ctx().copy_text(value.to_owned());
-    }
-}
-
-/// A tiny clipboard button that copies `value`.
-pub(crate) fn copy_button(ui: &mut egui::Ui, value: &str) {
-    if ui
-        .small_button("copy")
-        .on_hover_text("copy to clipboard")
-        .clicked()
-    {
-        ui.ctx().copy_text(value.to_owned());
-    }
-}
-
-/// The current rate of a series as a string, or a dash when unsampled.
-pub(crate) fn series_rate(series: Option<&Series>, unit: Unit) -> String {
-    series.map_or_else(|| "—".to_string(), |s| rate(s.rate(unit), unit))
 }

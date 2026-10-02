@@ -77,10 +77,7 @@ fn summary(ui: &mut egui::Ui, network: &NetworkReport) {
         .spacing([12.0, 3.0])
         .show(ui, |ui| {
             ui.weak("id");
-            ui.horizontal(|ui| {
-                ui.monospace(&network.network_id);
-                format::copy_button(ui, &network.network_id);
-            });
+            format::copy_field(ui, &network.network_id, &network.network_id);
             ui.end_row();
 
             ui.weak("active");
@@ -92,12 +89,12 @@ fn summary(ui: &mut egui::Ui, network: &NetworkReport) {
 
             if let Some(range) = &network.range {
                 ui.weak("range");
-                format::copy_label(ui, range, range);
+                format::copy_field(ui, range, range);
                 ui.end_row();
             }
             if let Some(address) = network.overlay.as_ref().and_then(|o| o.address.as_ref()) {
                 ui.weak("this device");
-                format::copy_label(ui, address, address);
+                format::copy_field(ui, address, address);
                 ui.end_row();
             }
             ui.weak("candidates");
@@ -153,10 +150,10 @@ fn connected_table(
                 let name = hostnames
                     .get(peer.endpoint_id.as_str())
                     .map_or_else(|| format::short(&peer.public_key), |h| (*h).to_string());
-                format::copy_label(ui, &name, &name);
+                format::copy_field(ui, &name, &name);
                 ui.label(&peer.protocol);
                 match &peer.address {
-                    Some(address) => format::copy_label(ui, address, address),
+                    Some(address) => format::copy_field(ui, address, address),
                     None => {
                         ui.weak("—");
                     }
@@ -173,7 +170,11 @@ fn connected_table(
                 ));
                 let series = traffic.peer(network_id, &peer.public_key);
                 ui.horizontal(|ui| {
-                    ui.label(format::series_rate(series, unit));
+                    // A fixed-width rate so the inline plot does not shift as
+                    // the number's length changes (e.g. "0 B/s" vs "1.1 kB/s").
+                    ui.allocate_ui(egui::vec2(64.0, 18.0), |ui| {
+                        ui.add(egui::Label::new(format::series_rate(series, unit)).truncate());
+                    });
                     ui.allocate_ui(egui::vec2(90.0, 20.0), |ui| {
                         format::sparkline(ui, series, unit, 18.0);
                     });
@@ -203,13 +204,13 @@ fn offline_table(
                 let name = hostnames
                     .get(member.endpoint_id.as_str())
                     .map_or_else(|| format::short(&member.endpoint_id), |h| (*h).to_string());
-                format::copy_label(ui, &name, &member.endpoint_id);
-                ui.label(
-                    member
-                        .overlay_address_v4
-                        .clone()
-                        .unwrap_or_else(|| "—".into()),
-                );
+                format::copy_field(ui, &name, &member.endpoint_id);
+                match &member.overlay_address_v4 {
+                    Some(address) => format::copy_field(ui, address, address),
+                    None => {
+                        ui.weak("—");
+                    }
+                }
                 ui.label(member.failed_dials.to_string());
                 ui.end_row();
             }

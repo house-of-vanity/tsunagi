@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 
 use eframe::egui;
+use egui_phosphor::regular as icon;
 
 use tsunagi::ipc::{NetworkReport, StatusReport};
 
@@ -64,7 +65,11 @@ pub(crate) fn draw(
         ui.horizontal(|ui| {
             ui.heading("tsunagi");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("refresh").clicked() {
+                if ui
+                    .button(icon::ARROWS_CLOCKWISE)
+                    .on_hover_text("Refresh")
+                    .clicked()
+                {
                     agent.send(Command::Refresh);
                 }
                 if snapshot.busy {
@@ -139,8 +144,8 @@ fn draw_header(ui: &mut egui::Ui, agent: &AgentClient, state: &mut UiState, repo
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.weak("device");
-        ui.monospace(format::short(&report.endpoint_id));
-        format::copy_button(ui, &report.endpoint_id);
+        // Clicking the shortened id copies the full one.
+        format::copy_field(ui, &format::short(&report.endpoint_id), &report.endpoint_id);
     });
 
     ui.horizontal(|ui| {
@@ -148,7 +153,11 @@ fn draw_header(ui: &mut egui::Ui, agent: &AgentClient, state: &mut UiState, repo
         match &mut state.host_edit {
             None => {
                 ui.label(&report.hostname);
-                if ui.small_button("edit").clicked() {
+                if ui
+                    .small_button(icon::PENCIL_SIMPLE)
+                    .on_hover_text("rename")
+                    .clicked()
+                {
                     state.host_edit = Some(report.hostname.clone());
                 }
             }
@@ -156,11 +165,11 @@ fn draw_header(ui: &mut egui::Ui, agent: &AgentClient, state: &mut UiState, repo
                 let response = ui.add(egui::TextEdit::singleline(buffer).desired_width(150.0));
                 let submit = (response.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                    || ui.small_button("save").clicked();
+                    || ui.small_button(icon::CHECK).on_hover_text("save").clicked();
                 if submit {
                     agent.send(Command::SetHostname(buffer.trim().to_string()));
                     state.host_edit = None;
-                } else if ui.small_button("cancel").clicked() {
+                } else if ui.small_button(icon::X).on_hover_text("cancel").clicked() {
                     state.host_edit = None;
                 }
             }
@@ -186,8 +195,7 @@ fn draw_network(
     ui.add_space(6.0);
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.strong(network.name.as_str());
-            format::copy_button(ui, &network.name);
+            format::copy_field(ui, network.name.as_str(), &network.name);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let leave =
                     egui::Button::new(egui::RichText::new("Leave").color(egui::Color32::WHITE))
@@ -208,20 +216,17 @@ fn draw_network(
             .spacing([10.0, 3.0])
             .show(ui, |ui| {
                 ui.weak("id");
-                ui.horizontal(|ui| {
-                    ui.label(format::short(&network.network_id));
-                    format::copy_button(ui, &network.network_id);
-                });
+                format::copy_field(ui, &format::short(&network.network_id), &network.network_id);
                 ui.end_row();
 
                 if let Some(range) = &network.range {
                     ui.weak("range");
-                    format::copy_label(ui, range, range);
+                    format::copy_field(ui, range, range);
                     ui.end_row();
                 }
                 if let Some(address) = address {
                     ui.weak("addr");
-                    format::copy_label(ui, address, address);
+                    format::copy_field(ui, address, address);
                     ui.end_row();
                 }
                 ui.weak("peers");
@@ -255,7 +260,7 @@ fn draw_network(
                     state.open_devices.insert(network.network_id.clone());
                 }
                 if ui
-                    .button("Copy secret")
+                    .button(format!("{} Copy secret", icon::COPY))
                     .on_hover_text("copy this network's secret to the clipboard")
                     .clicked()
                 {
@@ -288,7 +293,7 @@ fn draw_join(ui: &mut egui::Ui, agent: &AgentClient, join: &mut JoinForm) {
                         .password(true),
                 );
                 if ui
-                    .button("random")
+                    .button(icon::SHUFFLE)
                     .on_hover_text("Generate a new random secret")
                     .clicked()
                 {

@@ -31,6 +31,12 @@ impl App {
         runtime: tokio::runtime::Handle,
     ) -> Result<Self, String> {
         let ctx = cc.egui_ctx.clone();
+        // Add the Phosphor icon glyphs to the font set so the icon buttons
+        // render instead of showing as tofu.
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        ctx.set_fonts(fonts);
+
         let agent = AgentClient::spawn(&runtime, ctx.clone(), resolve_socket());
         let tray = Tray::new(ctx)?;
         Ok(Self {
