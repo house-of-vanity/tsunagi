@@ -69,8 +69,7 @@ builddate = $(date +%s)
 packager = AB <ab@hexor.cy>
 size = ${size}
 arch = ${arch}
-${relations}license = MIT
-license = Apache
+${relations}license = WTFPL
 PKGINFO
 
 # Scriptlet: create the dedicated system user the service runs as, keep systemd

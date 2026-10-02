@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
+use crate::about;
 use crate::agent::{AgentClient, resolve_socket};
 use crate::devices;
 use crate::stats::Traffic;
@@ -59,6 +60,7 @@ impl eframe::App for App {
 
         ui::draw(ctx, &self.agent, &mut self.state, &snapshot, &self.traffic);
         self.show_devices_windows(ctx, &snapshot);
+        self.show_about_window(ctx, &snapshot);
 
         // A secret the worker fetched for the clipboard: copy it here, on the
         // UI thread that owns the clipboard, exactly once.
@@ -72,6 +74,29 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Renders the About window while it is open.
+    fn show_about_window(&mut self, ctx: &egui::Context, snapshot: &crate::agent::Snapshot) {
+        if !self.state.about_open {
+            return;
+        }
+        let builder = egui::ViewportBuilder::default()
+            .with_title("About tsunagi")
+            .with_inner_size([560.0, 520.0])
+            .with_min_inner_size([380.0, 280.0]);
+        let socket = self.agent.socket();
+        let keep = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("about"),
+            builder,
+            |vctx, _class| {
+                about::show(vctx, socket, snapshot);
+                !vctx.input(|i| i.viewport().close_requested())
+            },
+        );
+        if !keep {
+            self.state.about_open = false;
+        }
+    }
+
     /// Renders one separate window per open network-devices view.
     fn show_devices_windows(&mut self, ctx: &egui::Context, snapshot: &crate::agent::Snapshot) {
         let Some(Ok(report)) = &snapshot.status else {

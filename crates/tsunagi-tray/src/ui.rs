@@ -40,6 +40,8 @@ pub(crate) struct UiState {
     pub(crate) host_edit: Option<String>,
     /// Network ids whose devices window is open.
     pub(crate) open_devices: BTreeSet<String>,
+    /// Whether the About window is open.
+    pub(crate) about_open: bool,
 }
 
 impl Default for UiState {
@@ -49,6 +51,7 @@ impl Default for UiState {
             unit: Unit::Packets,
             host_edit: None,
             open_devices: BTreeSet::new(),
+            about_open: false,
         }
     }
 }
@@ -65,13 +68,14 @@ pub(crate) fn draw(
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.heading("tsunagi");
+            ui.label(
+                egui::RichText::new(env!("CARGO_PKG_VERSION"))
+                    .small()
+                    .weak(),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(icon::ARROWS_CLOCKWISE)
-                    .on_hover_text("Refresh")
-                    .clicked()
-                {
-                    agent.send(Command::Refresh);
+                if ui.button(icon::INFO).on_hover_text("About").clicked() {
+                    state.about_open = true;
                 }
                 if snapshot.busy {
                     ui.add(egui::Spinner::new());

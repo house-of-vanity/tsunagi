@@ -233,6 +233,54 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
     devices
 }
 
+/// The widest value each column is expected to hold, so the table starts out
+/// wide enough and does not reflow as numbers grow.
+const COLUMN_SAMPLES: [&str; 8] = [
+    "",
+    "tcp-tls",
+    "255.255.255.255",
+    "23h 59m",
+    "99999/99999",
+    "1023.9 MB / 1023.9 MB",
+    "1023.9 kB/s",
+    "",
+];
+
+/// Column widths that only ever grow, kept across frames.
+///
+/// A grid sizes each column to its widest cell *this frame*, so a value that
+/// gets shorter — `14.4 MB/s` giving way to `382 pkt/s` — would pull the
+/// column in and push every cell after it. Remembering the widest seen keeps
+/// the table where it is.
+fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 8] {
+    let stored: Option<[f32; 8]> = ui.memory(|m| m.data.get_temp(id));
+    stored.unwrap_or_else(|| {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let mut widths = [0.0; 8];
+        for (width, sample) in widths.iter_mut().zip(COLUMN_SAMPLES) {
+            if !sample.is_empty() {
+                *width = ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(sample.to_owned(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                });
+            }
+        }
+        widths
+    })
+}
+
+/// One cell, at least as wide as its column has ever been.
+fn cell(ui: &mut egui::Ui, column: usize, widths: &mut [f32; 8], add: impl FnOnce(&mut egui::Ui)) {
+    let floor = widths[column];
+    let response = ui.scope(|ui| {
+        ui.set_min_width(floor);
+        add(ui);
+    });
+    widths[column] = widths[column].max(response.response.rect.width());
+}
+
 /// One table of all devices: online rows carry live counters and a plot,
 /// offline rows show what is known (name and address) and dashes.
 fn device_table(
@@ -246,12 +294,14 @@ fn device_table(
         ui.weak("none");
         return;
     }
+    let widths_id = egui::Id::new(("devices column widths", network_id));
+    let mut widths = column_widths(ui, widths_id);
     egui::Grid::new("devices")
         .num_columns(8)
         .striped(true)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
-            for header in [
+            for (column, header) in [
                 "device",
                 "proto",
                 "address",
@@ -260,49 +310,112 @@ fn device_table(
                 "bytes",
                 "rate",
                 "plot",
-            ] {
-                ui.weak(header);
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                cell(ui, column, &mut widths, |ui| {
+                    ui.weak(header);
+                });
             }
             ui.end_row();
 
             for device in devices {
-                name_cell(ui, device);
-                ui.label(device.proto);
-                match &device.address {
+                cell(ui, 0, &mut widths, |ui| name_cell(ui, device));
+                cell(ui, 1, &mut widths, |ui| {
+                    ui.label(device.proto);
+                });
+                cell(ui, 2, &mut widths, |ui| match &device.address {
                     Some(address) => format::copy_field(ui, address, address),
                     None => {
                         ui.weak("—");
                     }
-                }
-                ui.label(
-                    device
-                        .handshake_secs
-                        .map_or_else(|| "offline".to_string(), format::age),
-                );
+                });
+                cell(ui, 3, &mut widths, |ui| {
+                    ui.label(
+                        device
+                            .handshake_secs
+                            .map_or_else(|| "offline".to_string(), format::age),
+                    );
+                });
 
                 match device.overlay.filter(|_| device.online) {
                     Some(peer) => {
-                        ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
-                        ui.label(format!(
-                            "{} / {}",
-                            format::bytes(peer.tx_bytes as f64),
-                            format::bytes(peer.rx_bytes as f64)
-                        ));
                         let series = traffic.peer(network_id, &peer.public_key);
-                        ui.add(egui::Label::new(format::series_rate(series, unit)).truncate());
+                        cell(ui, 4, &mut widths, |ui| {
+                            ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
+                        });
+                        cell(ui, 5, &mut widths, |ui| {
+                            ui.label(format!(
+                                "{} / {}",
+                                format::bytes(peer.tx_bytes as f64),
+                                format::bytes(peer.rx_bytes as f64)
+                            ));
+                        });
+                        cell(ui, 6, &mut widths, |ui| {
+                            ui.add(
+                                egui::Label::new(format::series_rate(series, unit))
+                                    .wrap_mode(egui::TextWrapMode::Extend),
+                            );
+                        });
                         ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
                             format::sparkline(ui, series, unit, 18.0);
                         });
                     }
                     None => {
-                        for _ in 0..4 {
-                            ui.weak("—");
+                        for column in 4..7 {
+                            cell(ui, column, &mut widths, |ui| {
+                                ui.weak("—");
+                            });
                         }
+                        ui.weak("—");
                     }
                 }
                 ui.end_row();
             }
+
+            // Everything this agent has moved through the overlay, including
+            // devices that have since gone away.
+            let (mut tx_packets, mut rx_packets, mut tx_bytes, mut rx_bytes) = (0u64, 0, 0, 0);
+            for peer in devices.iter().filter_map(|d| d.overlay) {
+                tx_packets += peer.tx_packets;
+                rx_packets += peer.rx_packets;
+                tx_bytes += peer.tx_bytes;
+                rx_bytes += peer.rx_bytes;
+            }
+            cell(ui, 0, &mut widths, |ui| {
+                ui.strong("total");
+            });
+            for column in 1..4 {
+                cell(ui, column, &mut widths, |ui| {
+                    ui.label("");
+                });
+            }
+            cell(ui, 4, &mut widths, |ui| {
+                ui.strong(format!("{tx_packets}/{rx_packets}"));
+            });
+            cell(ui, 5, &mut widths, |ui| {
+                ui.strong(format!(
+                    "{} / {}",
+                    format::bytes(tx_bytes as f64),
+                    format::bytes(rx_bytes as f64)
+                ));
+            });
+            cell(ui, 6, &mut widths, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format::series_rate(traffic.network(network_id), unit))
+                            .strong(),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            });
+            ui.end_row();
         });
+    ui.memory_mut(|m| {
+        m.data
+            .insert_temp(egui::Id::new("devices column widths"), widths)
+    });
 }
 
 fn yes_no(value: bool) -> &'static str {

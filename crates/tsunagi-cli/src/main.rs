@@ -4342,6 +4342,11 @@ async fn build_report(
         state_dir: paths.state_dir.display().to_string(),
         cache_dir: paths.cache_dir.display().to_string(),
         program: program_path(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        protocols: PROTOCOLS
+            .iter()
+            .map(|spec| format!("{} v{}", spec.name, spec.version))
+            .collect(),
         privilege: match tsunagi::overlay::probe_net_admin() {
             tsunagi::overlay::Privilege::Available => tsunagi::ipc::PrivilegeReport::Available,
             tsunagi::overlay::Privilege::Missing(reason) => {

@@ -763,4 +763,4 @@ any of this.
 
 ## Licence
 
-MIT OR Apache-2.0.
+[WTFPL](LICENSE): do what the fuck you want to.

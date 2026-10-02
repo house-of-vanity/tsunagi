@@ -21,8 +21,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A request from the UI to the agent.
 pub(crate) enum Command {
-    /// Re-read status now.
-    Refresh,
     /// Stop serving a network, or start serving it again.
     SetActive { network_id: String, active: bool },
     /// Turn local broadcast participation on or off for a network.
@@ -170,7 +168,6 @@ async fn run(
     ctx.request_repaint();
 
     let outcome: Result<String, String> = match command {
-        Command::Refresh => Ok(String::new()),
         Command::SetActive { network_id, active } => ipc::set_active(socket, &network_id, active)
             .await
             .map(|report| {

@@ -14,7 +14,7 @@ mainline = { path = "vendor/mainline" }
 [workspace.package]
 edition = "2024"
 rust-version = "1.91"
-license = "MIT OR Apache-2.0"
+license = "WTFPL"
 repository = "https://github.com/tsunagi-net/tsunagi"
 
 [workspace.lints.rust]

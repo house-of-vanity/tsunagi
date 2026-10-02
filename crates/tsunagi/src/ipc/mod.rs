@@ -366,6 +366,10 @@ pub struct StatusReport {
     /// It is the agent that creates the interface, so the client's own
     /// capabilities say nothing about it.
     pub privilege: PrivilegeReport,
+    /// The version of the agent's software.
+    pub version: String,
+    /// The data plane protocols it has, each as `name vN` (wire version).
+    pub protocols: Vec<String>,
 }
 
 /// What the agent found when it checked whether it may manage an interface.
