@@ -1448,6 +1448,17 @@ impl tsunagi::ipc::ReportSource for AgentControl {
         })
     }
 
+    fn network_secret(&self, network_id: String) -> tsunagi::BoxFuture<'_, Result<String, String>> {
+        Box::pin(async move {
+            let networks = stored_networks(&self.paths);
+            let network = networks
+                .iter()
+                .find(|network| network.network_id.to_string() == network_id)
+                .ok_or_else(|| format!("no configured network with id {network_id}"))?;
+            Ok(network.secret.encode().as_str().to_owned())
+        })
+    }
+
     fn join(
         &self,
         name: String,

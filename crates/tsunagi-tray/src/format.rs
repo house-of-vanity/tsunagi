@@ -130,7 +130,7 @@ pub(crate) fn copy_label(ui: &mut egui::Ui, display: &str, value: &str) {
 /// A tiny clipboard button that copies `value`.
 pub(crate) fn copy_button(ui: &mut egui::Ui, value: &str) {
     if ui
-        .small_button("⧉")
+        .small_button("copy")
         .on_hover_text("copy to clipboard")
         .clicked()
     {

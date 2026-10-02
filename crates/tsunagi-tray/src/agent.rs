@@ -33,6 +33,8 @@ pub(crate) enum Command {
     Leave { network_id: String },
     /// Change the hostname this device announces.
     SetHostname(String),
+    /// Fetch a network's shared secret and place it on the clipboard.
+    CopySecret { network_id: String },
 }
 
 /// The latest the worker knows, read by the UI each frame.
@@ -57,6 +59,10 @@ pub(crate) struct AgentClient {
     socket: PathBuf,
     tx: mpsc::UnboundedSender<Command>,
     shared: Arc<Mutex<Snapshot>>,
+    /// A secret fetched for the clipboard, taken by the UI thread which owns
+    /// the clipboard; kept out of [`Snapshot`] so it is copied once, not every
+    /// frame, and never travels in the cloned snapshot.
+    pending_copy: Arc<Mutex<Option<String>>>,
 }
 
 impl AgentClient {
@@ -68,8 +74,25 @@ impl AgentClient {
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Mutex::new(Snapshot::default()));
-        runtime.spawn(worker(socket.clone(), rx, Arc::clone(&shared), ctx));
-        Self { socket, tx, shared }
+        let pending_copy = Arc::new(Mutex::new(None));
+        runtime.spawn(worker(
+            socket.clone(),
+            rx,
+            Arc::clone(&shared),
+            Arc::clone(&pending_copy),
+            ctx,
+        ));
+        Self {
+            socket,
+            tx,
+            shared,
+            pending_copy,
+        }
+    }
+
+    /// Takes any secret the worker fetched for the clipboard.
+    pub(crate) fn take_pending_copy(&self) -> Option<String> {
+        lock(&self.pending_copy).take()
     }
 
     /// The control socket this client talks to.
@@ -100,6 +123,7 @@ async fn worker(
     socket: PathBuf,
     mut rx: mpsc::UnboundedReceiver<Command>,
     shared: Arc<Mutex<Snapshot>>,
+    pending_copy: Arc<Mutex<Option<String>>>,
     ctx: egui::Context,
 ) {
     refresh(&socket, &shared, &ctx).await;
@@ -113,7 +137,7 @@ async fn worker(
             }
             command = rx.recv() => {
                 let Some(command) = command else { return };
-                run(&socket, command, &shared, &ctx).await;
+                run(&socket, command, &shared, &pending_copy, &ctx).await;
                 refresh(&socket, &shared, &ctx).await;
             }
         }
@@ -139,6 +163,7 @@ async fn run(
     socket: &std::path::Path,
     command: Command,
     shared: &Arc<Mutex<Snapshot>>,
+    pending_copy: &Arc<Mutex<Option<String>>>,
     ctx: &egui::Context,
 ) {
     lock(shared).busy = true;
@@ -172,6 +197,17 @@ async fn run(
             .await
             .map(|accepted| format!("hostname: {accepted}"))
             .map_err(|err| err.to_string()),
+        Command::CopySecret { network_id } => {
+            match ipc::network_secret(socket, &network_id).await {
+                // The secret goes only to the clipboard slot, never into the
+                // banner text or any log line.
+                Ok(secret) => {
+                    *lock(pending_copy) = Some(secret);
+                    Ok("secret copied to clipboard".to_string())
+                }
+                Err(err) => Err(err.to_string()),
+            }
+        }
     };
 
     {

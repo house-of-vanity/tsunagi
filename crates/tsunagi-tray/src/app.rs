@@ -76,6 +76,12 @@ impl eframe::App for App {
         ui::draw(ctx, &self.agent, &mut self.state, &snapshot, &self.traffic);
         self.show_devices_windows(ctx, &snapshot);
 
+        // A secret the worker fetched for the clipboard: copy it here, on the
+        // UI thread that owns the clipboard, exactly once.
+        if let Some(secret) = self.agent.take_pending_copy() {
+            ctx.copy_text(secret);
+        }
+
         // Keep ticking so fresh status and tray actions are picked up.
         ctx.request_repaint_after(Duration::from_millis(500));
     }

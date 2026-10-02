@@ -73,6 +73,31 @@ use crate::error::{Error, Result};
 /// Largest accepted local control message.
 pub const MAX_MESSAGE_LEN: usize = 1024 * 1024;
 
+/// A string the control protocol must carry but that must never appear in a
+/// log: it serialises transparently (the text crosses the socket intact) but
+/// its `Debug` is redacted. Used for a network secret handed back to a local
+/// client that asked to copy it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactedText(String);
+
+impl RedactedText {
+    /// Wraps a string.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// Unwraps to the plain string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for RedactedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// Where the control socket for a state directory lives.
 ///
 /// A Unix socket path is limited to around 100 bytes, which a state directory
@@ -195,6 +220,13 @@ pub enum Request {
         #[serde(default)]
         broadcast: Option<bool>,
     },
+    /// Ask for a configured network's shared secret, in its `tsn1…` text form,
+    /// so a local GUI or script can copy it to re-share. The reply travels only
+    /// over the owner/group socket and the secret is never logged.
+    Secret {
+        /// Which network, by the id text `status` prints.
+        network_id: String,
+    },
 }
 
 impl std::fmt::Debug for Request {
@@ -215,6 +247,7 @@ impl std::fmt::Debug for Request {
                 write!(f, "Dns {{ enable: {enable}, port: {port:?} }}")
             }
             Request::Join { name, .. } => write!(f, "Join {{ name: {name}, secret: <redacted> }}"),
+            Request::Secret { network_id } => write!(f, "Secret {{ {network_id} }}"),
         }
     }
 }
@@ -239,6 +272,8 @@ pub enum Response {
     ///
     /// `None` means it is not serving at all.
     Dns(Option<DnsReport>),
+    /// A network's shared secret, redacted in `Debug`.
+    Secret(RedactedText),
     /// The request could not be served.
     Error(String),
 }
@@ -579,6 +614,17 @@ pub trait ReportSource: Send + Sync + 'static {
     ) -> BoxFuture<'_, std::result::Result<Option<DnsReport>, String>> {
         Box::pin(async move { Err("this agent cannot serve DNS".to_string()) })
     }
+
+    /// Returns a configured network's shared secret in its `tsn1…` text form.
+    ///
+    /// Defaulted to a refusal, like the others. An implementor reads it from
+    /// local state; it must never be logged.
+    fn network_secret(
+        &self,
+        _network_id: String,
+    ) -> BoxFuture<'_, std::result::Result<String, String>> {
+        Box::pin(async move { Err("this agent cannot read secrets".to_string()) })
+    }
 }
 
 impl<F> ReportSource for F
@@ -609,7 +655,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 16]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 17]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///
@@ -665,6 +711,10 @@ where
         }
         Request::Dns { enable, port } => match source.set_dns(enable, port).await {
             Ok(report) => Response::Dns(report),
+            Err(reason) => Response::Error(reason),
+        },
+        Request::Secret { network_id } => match source.network_secret(network_id).await {
+            Ok(secret) => Response::Secret(RedactedText::new(secret)),
             Err(reason) => Response::Error(reason),
         },
     };
@@ -816,6 +866,21 @@ pub async fn set_dns(
     let path = path.as_ref();
     match exchange(path, &Request::Dns { enable, port }, EXCHANGE_TIMEOUT).await? {
         Response::Dns(report) => Ok(report),
+        Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
+/// Asks a running agent for a configured network's shared secret, in its
+/// `tsn1…` text form, so a local client can copy it. The secret is never
+/// logged by this path.
+pub async fn network_secret(path: impl AsRef<Path>, network_id: &str) -> Result<String> {
+    let path = path.as_ref();
+    let request = Request::Secret {
+        network_id: network_id.to_string(),
+    };
+    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
+        Response::Secret(secret) => Ok(secret.into_string()),
         Response::Error(reason) => Err(Error::Storage(reason)),
         other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
     }

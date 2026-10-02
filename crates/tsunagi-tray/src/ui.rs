@@ -64,7 +64,7 @@ pub(crate) fn draw(
         ui.horizontal(|ui| {
             ui.heading("tsunagi");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⟳").on_hover_text("Refresh").clicked() {
+                if ui.button("refresh").clicked() {
                     agent.send(Command::Refresh);
                 }
                 if snapshot.busy {
@@ -148,7 +148,7 @@ fn draw_header(ui: &mut egui::Ui, agent: &AgentClient, state: &mut UiState, repo
         match &mut state.host_edit {
             None => {
                 ui.label(&report.hostname);
-                if ui.small_button("✎").on_hover_text("rename").clicked() {
+                if ui.small_button("edit").clicked() {
                     state.host_edit = Some(report.hostname.clone());
                 }
             }
@@ -156,11 +156,11 @@ fn draw_header(ui: &mut egui::Ui, agent: &AgentClient, state: &mut UiState, repo
                 let response = ui.add(egui::TextEdit::singleline(buffer).desired_width(150.0));
                 let submit = (response.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                    || ui.small_button("✔").clicked();
+                    || ui.small_button("save").clicked();
                 if submit {
                     agent.send(Command::SetHostname(buffer.trim().to_string()));
                     state.host_edit = None;
-                } else if ui.small_button("✕").clicked() {
+                } else if ui.small_button("cancel").clicked() {
                     state.host_edit = None;
                 }
             }
@@ -186,9 +186,8 @@ fn draw_network(
     ui.add_space(6.0);
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
-            // The name copies on click.
             ui.strong(network.name.as_str());
-            format::copy_label(ui, "⧉", &network.name);
+            format::copy_button(ui, &network.name);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let leave =
                     egui::Button::new(egui::RichText::new("Leave").color(egui::Color32::WHITE))
@@ -255,6 +254,15 @@ fn draw_network(
                 if ui.button("Show devices").clicked() {
                     state.open_devices.insert(network.network_id.clone());
                 }
+                if ui
+                    .button("Copy secret")
+                    .on_hover_text("copy this network's secret to the clipboard")
+                    .clicked()
+                {
+                    agent.send(Command::CopySecret {
+                        network_id: network.network_id.clone(),
+                    });
+                }
             });
         });
     });
@@ -280,7 +288,7 @@ fn draw_join(ui: &mut egui::Ui, agent: &AgentClient, join: &mut JoinForm) {
                         .password(true),
                 );
                 if ui
-                    .button("⟳")
+                    .button("random")
                     .on_hover_text("Generate a new random secret")
                     .clicked()
                 {
