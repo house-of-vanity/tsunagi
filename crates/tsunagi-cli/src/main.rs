@@ -838,6 +838,33 @@ enum Observed {
     },
 }
 
+/// The directories the running agent uses, unless the user named some.
+///
+/// The control socket of a packaged service is found without flags, but the
+/// state it keeps is not in this user's default directory — reading that
+/// would report a device that has joined nothing next to an agent that has
+/// joined a network. The agent knows where its state is, so it is asked.
+async fn agent_paths(
+    paths: StoragePaths,
+    socket: &std::path::Path,
+    is_custom_state: bool,
+) -> StoragePaths {
+    if is_custom_state || !tsunagi::ipc::is_serving(socket).await {
+        return paths;
+    }
+    match tsunagi::ipc::request_status(socket).await {
+        Ok(report) if !report.state_dir.is_empty() => {
+            let cache = if report.cache_dir.is_empty() {
+                paths.cache_dir
+            } else {
+                PathBuf::from(report.cache_dir)
+            };
+            StoragePaths::new(report.state_dir, cache)
+        }
+        _ => paths,
+    }
+}
+
 /// Asks the agent, and falls back to the state store.
 async fn observe(paths: &StoragePaths, socket: &std::path::Path) -> Observed {
     let socket_present = tsunagi::ipc::is_serving(socket).await;
@@ -1374,6 +1401,7 @@ impl tsunagi::ipc::ReportSource for AgentControl {
                 self.plugin.as_deref(),
                 self.tcp_tls.as_deref(),
                 dns,
+                &self.paths,
             )
             .await
         })
@@ -1667,6 +1695,7 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
     let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
+    let paths = agent_paths(paths, &socket, is_custom_state).await;
     match args.action {
         None => show_networks(&paths, &socket).await,
         Some(NetworkAction::Broadcast { network, choice }) => {
@@ -1702,6 +1731,7 @@ async fn join_command(args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> 
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
     let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
+    let paths = agent_paths(paths, &socket, is_custom_state).await;
     let name = NetworkName::new(args.network)?;
     // A name this device already has means that network; a name nobody
     // has means a new one, and no secret is needed to make a network with
@@ -1861,16 +1891,15 @@ async fn show_networks(
     use report::{Health, Report, Row, Section};
 
     let stored = stored_networks(paths);
-    if stored.is_empty() {
-        eprintln!("no network has been joined");
-        return Ok(());
-    }
-
     let observed = observe(paths, socket).await;
     let live = match &observed {
         Observed::Agent(report) => report.networks.clone(),
         Observed::Stored { .. } => Vec::new(),
     };
+    if stored.is_empty() && live.is_empty() {
+        eprintln!("no network has been joined");
+        return Ok(());
+    }
 
     let mut out = Report::new();
     let mut section = Section::new("networks");
@@ -1920,6 +1949,20 @@ async fn show_networks(
             )
             .with_note(note),
         );
+    }
+    // What the agent runs but this process could not read from the store,
+    // for instance when the state is not readable by this user.
+    for network in live.iter().filter(|live| {
+        !stored
+            .iter()
+            .any(|n| n.network_id.to_string() == live.network_id)
+    }) {
+        let state = if network.active { "running" } else { "stopped" };
+        section.push(Row::new(
+            Health::Info,
+            network.name.clone(),
+            format!("{}  ·  {state}", network.network_id),
+        ));
     }
     out.push(section);
     print_report("tsunagi networks", &out)
@@ -2163,6 +2206,7 @@ async fn dns_command(args: DnsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
     let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
+    let paths = agent_paths(paths, &socket, is_custom_state).await;
 
     let enable = match args.action {
         None => return show_dns(&paths, &socket).await,
@@ -2256,6 +2300,7 @@ async fn id(args: IdArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
     let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
+    let paths = agent_paths(paths, &socket, is_custom_state).await;
 
     match args.action {
         None => show_identity(&paths, &socket).await,
@@ -2448,6 +2493,7 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
     let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
+    let paths = agent_paths(paths, &socket, is_custom_state).await;
     let observed = observe(&paths, &socket).await;
 
     let mut out = Report::new();
@@ -2519,7 +2565,7 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    out.push(host_section());
+    out.push(host_section(&observed));
     out.push(addresses_section().await);
     print_report("tsunagi status", &out)
 }
@@ -3001,7 +3047,11 @@ fn short(text: &str, len: usize) -> String {
 }
 
 /// What this host can and cannot do for the data plane.
-fn host_section() -> report::Section {
+///
+/// The interface is created by the agent, so when one answered, its own
+/// report of whether it may do that is the answer; what this process holds
+/// says nothing about it.
+fn host_section(observed: &Observed) -> report::Section {
     use report::{Health, Row, Section};
 
     let mut host = Section::new("host");
@@ -3041,8 +3091,20 @@ fn host_section() -> report::Section {
             });
         }
 
+        use tsunagi::ipc::PrivilegeReport;
         use tsunagi::overlay::{Privilege, probe_net_admin};
-        match probe_net_admin() {
+        let (privilege, program) = match observed {
+            Observed::Agent(report) => match &report.privilege {
+                PrivilegeReport::Unknown => (probe_net_admin(), program_path()),
+                PrivilegeReport::Available => (Privilege::Available, report.program.clone()),
+                PrivilegeReport::Missing(reason) => {
+                    (Privilege::Missing(reason.clone()), report.program.clone())
+                }
+                PrivilegeReport::Unsupported => (Privilege::Unsupported, report.program.clone()),
+            },
+            Observed::Stored { .. } => (probe_net_admin(), program_path()),
+        };
+        match privilege {
             Privilege::Available => {
                 let held = if cfg!(target_os = "windows") {
                     "assumes an elevated process; creation reports if not"
@@ -3062,10 +3124,7 @@ fn host_section() -> report::Section {
                 // the eye is meant to scan.
                 host.push(
                     Row::new(Health::Degraded, "privileges", "CAP_NET_ADMIN not held").with_note(
-                        format!(
-                            "sudo setcap cap_net_admin,cap_net_bind_service+p {}",
-                            program_path()
-                        ),
+                        format!("sudo setcap cap_net_admin,cap_net_bind_service+p {program}"),
                     ),
                 );
                 host.push(Row::new(
@@ -3990,6 +4049,7 @@ async fn build_report(
     wireguard: Option<&WireguardPlugin>,
     tcp_tls: Option<&TcpTlsPlugin>,
     dns: Option<DnsState>,
+    paths: &StoragePaths,
 ) -> tsunagi::ipc::StatusReport {
     use tsunagi::ipc::{
         MemberReport, NetworkReport, OverlayPeerReport, OverlayReport, PeerReport, StatusReport,
@@ -4276,6 +4336,16 @@ async fn build_report(
         cache_healthy: status.cache_healthy,
         networks,
         dns,
+        state_dir: paths.state_dir.display().to_string(),
+        cache_dir: paths.cache_dir.display().to_string(),
+        program: program_path(),
+        privilege: match tsunagi::overlay::probe_net_admin() {
+            tsunagi::overlay::Privilege::Available => tsunagi::ipc::PrivilegeReport::Available,
+            tsunagi::overlay::Privilege::Missing(reason) => {
+                tsunagi::ipc::PrivilegeReport::Missing(reason)
+            }
+            tsunagi::overlay::Privilege::Unsupported => tsunagi::ipc::PrivilegeReport::Unsupported,
+        },
     }
 }
 

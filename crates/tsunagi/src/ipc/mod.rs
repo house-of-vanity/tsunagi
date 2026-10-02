@@ -352,6 +352,34 @@ pub struct StatusReport {
     pub networks: Vec<NetworkReport>,
     /// The local DNS service, when one was asked for.
     pub dns: Option<DnsReport>,
+    /// The state directory the agent is actually using.
+    ///
+    /// A client that was not told one would look in its own default, which is
+    /// not the agent's when the agent runs as a service under another user.
+    pub state_dir: String,
+    /// The cache directory the agent is actually using.
+    pub cache_dir: String,
+    /// The executable the agent runs, which is what needs the capability.
+    pub program: String,
+    /// Whether the agent itself can manage the overlay interface.
+    ///
+    /// It is the agent that creates the interface, so the client's own
+    /// capabilities say nothing about it.
+    pub privilege: PrivilegeReport,
+}
+
+/// What the agent found when it checked whether it may manage an interface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrivilegeReport {
+    /// Not checked.
+    #[default]
+    Unknown,
+    /// It can.
+    Available,
+    /// It cannot, with what was found.
+    Missing(String),
+    /// This platform has no provisioner yet.
+    Unsupported,
 }
 
 /// The local DNS service.

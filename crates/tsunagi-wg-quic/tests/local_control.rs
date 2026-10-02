@@ -83,6 +83,7 @@ fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::R
                 cache_healthy: status.cache_healthy,
                 networks,
                 dns: None,
+                ..Default::default()
             }
         })
     })
