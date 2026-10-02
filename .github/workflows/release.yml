@@ -6,9 +6,14 @@ name: Release
 # artifact backend and fills the release with `gh`.
 #
 # Gitea reads both .gitea/workflows and .github/workflows, so without a guard it
-# would also try to run this file and fail on @v4 and `gh`. Every job is gated
-# on running on github.com, so on Gitea they are simply skipped — the Gitea file
-# is the one that runs there.
+# would also try to run this file and fail on @v4 and `gh`. (Gitea reports
+# github.server_url as https://github.com, so that cannot tell the two apart.)
+# Instead every job is gated on a repository variable GITHUB_RELEASE=true, which
+# is set only in the GitHub repository's settings — so on Gitea, where it is
+# absent, these jobs are skipped and the .gitea file is the one that runs.
+#
+# To enable on GitHub: Settings → Secrets and variables → Actions → Variables →
+# New variable, name GITHUB_RELEASE, value true.
 on:
   push:
     tags: ["v*"]
@@ -23,7 +28,7 @@ env:
 jobs:
   build:
     name: ${{ matrix.asset }}
-    if: ${{ github.server_url == 'https://github.com' }}
+    if: ${{ vars.GITHUB_RELEASE == 'true' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -144,7 +149,7 @@ jobs:
   publish:
     name: Publish release
     needs: build
-    if: ${{ github.server_url == 'https://github.com' }}
+    if: ${{ vars.GITHUB_RELEASE == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
