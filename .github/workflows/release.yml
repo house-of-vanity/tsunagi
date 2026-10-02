@@ -34,11 +34,15 @@ jobs:
             asset: tsunagi-linux-x86_64
             archive: tar.gz
             zig: true
+            deb: true
+            deb_arch: amd64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             asset: tsunagi-linux-aarch64
             archive: tar.gz
             zig: true
+            deb: true
+            deb_arch: arm64
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: tsunagi-macos-aarch64
@@ -134,11 +138,28 @@ jobs:
             tar -C dist/pkg -czf "${archive}" "${{ matrix.asset }}"
           fi
 
-      - name: Upload the archive as a run artifact
+      # A dependency-free .deb for the x86_64 and aarch64 Linux builds: it drops
+      # the static binary, the systemd service and the polkit rule. Built with
+      # dpkg-deb (present on the runner); see dist/deb/build-deb.sh.
+      - name: Build the Debian package
+        if: matrix.deb
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          bash dist/deb/build-deb.sh \
+            "target/${{ matrix.target }}/release/tsunagi" \
+            "${{ matrix.deb_arch }}" \
+            "$version" \
+            "tsunagi_${version}_${{ matrix.deb_arch }}.deb"
+
+      - name: Upload the build outputs as run artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}-*.*
+          path: |
+            ${{ matrix.asset }}-*.*
+            *.deb
           if-no-files-found: error
 
   publish:
@@ -167,7 +188,7 @@ jobs:
 
           # download-artifact@v4 nests each artifact under its own directory, so
           # the archives are artifacts/<asset>/<file>.
-          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \))
+          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' \))
           printf 'asset: %s\n' "${files[@]}"
 
           prerelease=()

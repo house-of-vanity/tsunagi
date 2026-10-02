@@ -1,0 +1,25 @@
+// Installed by the tsunagi package.
+//
+// Lets a non-root agent configure systemd-resolved for its overlay zones — the
+// four resolve1 actions it calls, and nothing else — for any user in the
+// "tsunagi" group (created by the package). The packaged systemd service runs
+// as root and does not need this rule; it is for running the agent as your own
+// user instead:
+//
+//     sudo usermod -aG tsunagi "$USER"
+//     sudo setcap cap_net_admin,cap_net_bind_service+p /usr/bin/tsunagi
+//     tsunagi up
+//
+// polkit decides by user/group id, not by capability, which is why the resolver
+// needs this rule even once the binary has the capability.
+polkit.addRule(function(action, subject) {
+    var allowed = [
+        "org.freedesktop.resolve1.set-dns-servers",
+        "org.freedesktop.resolve1.set-domains",
+        "org.freedesktop.resolve1.set-default-route",
+        "org.freedesktop.resolve1.revert"
+    ];
+    if (allowed.indexOf(action.id) >= 0 && subject.isInGroup("tsunagi")) {
+        return polkit.Result.YES;
+    }
+});
