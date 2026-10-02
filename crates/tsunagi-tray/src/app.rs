@@ -5,6 +5,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::agent::{AgentClient, resolve_socket};
+use crate::stats::Traffic;
 use crate::tray::{Action, Tray};
 use crate::ui::{self, JoinForm};
 
@@ -13,6 +14,11 @@ pub(crate) struct App {
     agent: AgentClient,
     tray: Tray,
     join: JoinForm,
+    /// Traffic rates derived from successive snapshots.
+    traffic: Traffic,
+    /// The snapshot generation last folded into `traffic`, so each refresh is
+    /// sampled exactly once rather than on every repaint.
+    sampled: u64,
     /// Set when the user chose Quit, so the next close actually exits instead
     /// of hiding to the tray.
     quitting: bool,
@@ -31,6 +37,8 @@ impl App {
             agent,
             tray,
             join: JoinForm::default(),
+            traffic: Traffic::default(),
+            sampled: 0,
             quitting: false,
         })
     }
@@ -58,7 +66,14 @@ impl eframe::App for App {
         }
 
         let snapshot = self.agent.snapshot();
-        ui::draw(ctx, &self.agent, &mut self.join, &snapshot);
+        // Fold each fresh status into the traffic rates exactly once.
+        if snapshot.generation != self.sampled
+            && let (Some(Ok(report)), Some(at)) = (&snapshot.status, snapshot.at)
+        {
+            self.traffic.observe(report, at);
+            self.sampled = snapshot.generation;
+        }
+        ui::draw(ctx, &self.agent, &mut self.join, &snapshot, &self.traffic);
 
         // Keep ticking so fresh status and tray actions are picked up even when
         // nothing else requests a repaint.

@@ -25,5 +25,10 @@ tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time",
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# macOS only: set the app's activation policy to Accessory so it lives in the
+# menu bar with no Dock icon. Pinned to eframe's winit so the types unify.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"
+
 [lints]
 workspace = true

@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tokio::sync::mpsc;
@@ -43,6 +43,11 @@ pub(crate) struct Snapshot {
     pub last_action: Option<Result<String, String>>,
     /// Whether a command is currently being executed.
     pub busy: bool,
+    /// Bumped each time `status` is refreshed, so the UI can tell new data from
+    /// a repaint of the same data and sample traffic rates only on change.
+    pub generation: u64,
+    /// When this status was read, for computing rates between refreshes.
+    pub at: Option<Instant>,
 }
 
 /// Handle the UI holds: send commands, read the latest snapshot.
@@ -121,6 +126,8 @@ async fn refresh(socket: &std::path::Path, shared: &Arc<Mutex<Snapshot>>, ctx: &
     {
         let mut guard = lock(shared);
         guard.status = Some(status);
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.at = Some(Instant::now());
     }
     ctx.request_repaint();
 }

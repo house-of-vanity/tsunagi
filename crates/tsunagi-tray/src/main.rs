@@ -11,6 +11,7 @@
 
 mod agent;
 mod app;
+mod stats;
 mod tray;
 mod ui;
 
@@ -28,13 +29,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     let handle = runtime.handle().clone();
 
-    let options = eframe::NativeOptions {
+    #[cfg_attr(not(target_os = "macos"), expect(unused_mut))]
+    let mut options = eframe::NativeOptions {
+        // A fixed, small window; the whole layout targets this size.
         viewport: egui::ViewportBuilder::default()
             .with_title("tsunagi")
-            .with_inner_size([380.0, 540.0])
-            .with_min_inner_size([320.0, 360.0]),
+            .with_inner_size([360.0, 600.0])
+            .with_resizable(false)
+            // Start hidden: the app lives in the tray and the window opens from
+            // the menu.
+            .with_visible(false),
         ..Default::default()
     };
+
+    // macOS: live in the menu bar with no Dock icon (tray-only).
+    #[cfg(target_os = "macos")]
+    {
+        options.event_loop_builder = Some(Box::new(|builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        }));
+    }
 
     eframe::run_native(
         "tsunagi",
