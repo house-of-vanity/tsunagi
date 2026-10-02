@@ -112,7 +112,7 @@ impl App {
             let viewport_id = egui::ViewportId::from_hash_of(("devices", &id));
             let builder = egui::ViewportBuilder::default()
                 .with_title(devices::title(network))
-                .with_inner_size([720.0, 540.0])
+                .with_inner_size([900.0, 540.0])
                 .with_min_inner_size([480.0, 320.0]);
             let agent = &self.agent;
             let traffic = &self.traffic;

@@ -99,7 +99,7 @@ pub(crate) fn show(
             ))
             .strong(),
         );
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 device_table(ui, unit, &network.network_id, &devices, traffic);
