@@ -1,15 +1,20 @@
 name: Release
 
 # Build the agent for every supported target on a version tag and attach the
-# archives to a GitHub release. Linux is a fully static musl binary (built with
+# archives to a release. Linux is a fully static musl binary (built with
 # cargo-zigbuild) so one artifact runs on any distro — Arch, Alpine, NixOS, old
 # glibc systems alike — and can then be repackaged however a distro prefers.
+#
+# Targeted at Gitea Actions: the release assets are uploaded straight to the
+# Gitea release API with curl, rather than through actions/upload-artifact and
+# `gh`, because the v4 artifact backend and the GitHub REST API are not
+# available there. The only runner tools it needs are curl and coreutils.
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -66,11 +71,11 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           # Pin a real, archived Zig release. Left unpinned the action resolves
-          # to the newest version it knows of (a yet-unreleased 0.16.0-dev here),
-          # whose tarball 404s on ziglang.org while the community mirrors flake —
-          # exactly the failure this build hit. A concrete release always has a
-          # permanent official URL, so the download succeeds even if mirrors are
-          # down, and the version stays compatible with cargo-zigbuild.
+          # to the newest version it knows of (a yet-unreleased 0.16.0-dev),
+          # whose tarball 404s on ziglang.org while the community mirrors flake.
+          # A concrete release always has a permanent official URL, so the
+          # download succeeds even if mirrors are down, and the version stays
+          # compatible with cargo-zigbuild.
           version: 0.14.1
       - name: Install cargo-zigbuild
         if: matrix.zig
@@ -125,32 +130,46 @@ jobs:
             tar -C dist/pkg -czf "${archive}" "${{ matrix.asset }}"
           fi
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}-*.*
-          if-no-files-found: error
-
-  publish:
-    name: Publish release
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Create release and upload assets
+      - name: Upload the archive to the release
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          # Gitea injects this with write access to the current repository.
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          gh release create "$RELEASE_TAG" artifacts/*/* \
-            --title "tsunagi ${RELEASE_TAG}" \
-            --generate-notes \
-            --verify-tag
+          set -u
+
+          version="${GITHUB_REF_NAME#v}"
+          archive="${{ matrix.asset }}-${version}.${{ matrix.archive }}"
+          tag="${GITHUB_REF_NAME}"
+          api="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
+          auth="Authorization: token ${TOKEN}"
+
+          prerelease=false
+          case "$tag" in *-*) prerelease=true ;; esac
+
+          # The release id for this tag, or empty if there is no release yet.
+          # Parsed with grep so the job needs no jq on the runner image.
+          get_id() {
+            curl -fsSL -H "$auth" "$api/releases/tags/$tag" 2>/dev/null \
+              | grep -o '"id":[0-9]*' | head -n1 | cut -d: -f2
+          }
+
+          # Create the release if it is not there. Several matrix jobs can race
+          # here, so a create that loses the race is ignored and the id is then
+          # read back by tag.
+          id="$(get_id)"
+          if [ -z "$id" ]; then
+            curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"tag_name\":\"$tag\",\"name\":\"tsunagi $tag\",\"prerelease\":$prerelease}" \
+              "$api/releases" >/dev/null 2>&1 || true
+            id="$(get_id)"
+          fi
+          if [ -z "$id" ]; then
+            echo "could not create or find a release for $tag at $api" >&2
+            exit 1
+          fi
+
+          curl -fsS -X POST -H "$auth" \
+            -F "attachment=@${archive}" \
+            "$api/releases/$id/assets?name=${archive}" >/dev/null
+          echo "uploaded $archive to release $tag (id $id)"
