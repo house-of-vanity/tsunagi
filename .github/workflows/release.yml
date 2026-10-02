@@ -63,7 +63,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
       - name: Install zig
         if: matrix.zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
+        with:
+          # Pin a real, archived Zig release. Left unpinned the action resolves
+          # to the newest version it knows of (a yet-unreleased 0.16.0-dev here),
+          # whose tarball 404s on ziglang.org while the community mirrors flake —
+          # exactly the failure this build hit. A concrete release always has a
+          # permanent official URL, so the download succeeds even if mirrors are
+          # down, and the version stays compatible with cargo-zigbuild.
+          version: 0.14.1
       - name: Install cargo-zigbuild
         if: matrix.zig
         uses: taiki-e/install-action@v2
