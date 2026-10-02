@@ -4245,6 +4245,7 @@ dependencies = [
  "clap",
  "iroh",
  "netwatch",
+ "nix 0.31.3",
  "simple-dns",
  "tempfile",
  "tokio",

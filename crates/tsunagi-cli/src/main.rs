@@ -482,6 +482,17 @@ struct UpArgs {
     /// Control socket to serve. Derived from the state directory by default.
     #[arg(long, env = "TSUNAGI_CONTROL_SOCKET")]
     control_socket: Option<PathBuf>,
+
+    /// Group whose members may use the control socket (Unix, mode 0660), so a
+    /// GUI or CLI running as another user can reach the agent. Without it the
+    /// socket is owner-only (0600). The group must already exist.
+    #[arg(
+        long,
+        value_name = "GROUP",
+        env = "TSUNAGI_CONTROL_GROUP",
+        help_heading = "System"
+    )]
+    control_group: Option<String>,
 }
 
 /// Reads the shared secret from an argument or a file.
@@ -748,6 +759,31 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Resolves the control-socket access policy from an optional group name.
+///
+/// The group must already exist (packaging/post-install creates it); a name
+/// that cannot be resolved is an error the caller reports rather than a silent
+/// fallback that would leave a GUI unable to connect without explanation.
+#[cfg(unix)]
+fn control_socket_access(group: Option<&str>) -> Result<tsunagi::ipc::ControlSocketAccess, String> {
+    match group {
+        None => Ok(tsunagi::ipc::ControlSocketAccess::Private),
+        Some(name) => {
+            let group = nix::unistd::Group::from_name(name)
+                .map_err(|err| format!("cannot look up group `{name}`: {err}"))?
+                .ok_or_else(|| format!("group `{name}` does not exist; create it first"))?;
+            Ok(tsunagi::ipc::ControlSocketAccess::Group(group.gid.as_raw()))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn control_socket_access(
+    _group: Option<&str>,
+) -> Result<tsunagi::ipc::ControlSocketAccess, String> {
+    Ok(tsunagi::ipc::ControlSocketAccess::Private)
+}
+
 /// Path of the local control socket for a state directory.
 fn control_socket(
     paths: &StoragePaths,
@@ -757,7 +793,10 @@ fn control_socket(
     if let Some(path) = override_path {
         return path.clone();
     }
-    #[cfg(windows)]
+    // On Windows and macOS the agent runs as a system service and serves at a
+    // fixed system path (a runtime directory the GUI can reach), not inside the
+    // owner-only state directory.
+    #[cfg(any(windows, target_os = "macos"))]
     if !_is_custom_state_dir {
         return tsunagi::ipc::default_control_socket_path();
     }
@@ -3859,7 +3898,17 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         });
         let is_custom_state = args.paths.state_dir.is_some();
         let path = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
-        match tsunagi::ipc::ControlSocket::bind(path, source).await {
+        let access = match control_socket_access(args.control_group.as_deref()) {
+            Ok(access) => access,
+            Err(reason) => {
+                eprintln!(
+                    "warning: cannot grant the control socket to a group ({reason}); \
+                     it will be owner-only"
+                );
+                tsunagi::ipc::ControlSocketAccess::Private
+            }
+        };
+        match tsunagi::ipc::ControlSocket::bind(path, source, access).await {
             Ok(socket) => {
                 println!("  control      {}", socket.path().display());
                 Some(socket)

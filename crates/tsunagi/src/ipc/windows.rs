@@ -40,8 +40,8 @@ use tokio::task::JoinHandle;
 use crate::error::{Error, Result};
 
 pub use super::{
-    CONTROL_PROTOCOL, EXCHANGE_TIMEOUT, ReportSource, is_serving, join_network, leave_network,
-    request_status, set_active, set_dns, set_hostname,
+    CONTROL_PROTOCOL, ControlSocketAccess, EXCHANGE_TIMEOUT, ReportSource, is_serving,
+    join_network, leave_network, request_status, set_active, set_dns, set_hostname,
 };
 
 /// `ERROR_ACCESS_DENIED`: creating a first instance finds an existing pipe,
@@ -149,7 +149,16 @@ impl ControlSocket {
     /// Claiming the first instance of the name is what detects a second agent:
     /// if the name already exists, the create is refused and that is reported
     /// as the state being locked, so two live agents never share one pipe.
-    pub async fn bind(path: impl AsRef<Path>, source: Arc<dyn ReportSource>) -> Result<Self> {
+    ///
+    /// `_access` is accepted for parity with the Unix socket; granting a group
+    /// here means a pipe security descriptor and is a separate follow-up, so for
+    /// now the pipe keeps its default (creator plus the built-in access the
+    /// `PipeSecurityAttributes` set).
+    pub async fn bind(
+        path: impl AsRef<Path>,
+        source: Arc<dyn ReportSource>,
+        _access: ControlSocketAccess,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let name = pipe_name(&path);
 

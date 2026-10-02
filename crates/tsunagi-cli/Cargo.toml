@@ -33,6 +33,11 @@ anstyle = "1.0"
 # Local interface addresses, for the diagnostics in `status`.
 netwatch = "0.19.3"
 
+# Resolving a group name to its gid for `up --control-group`, through a safe
+# wrapper (no unsafe of our own). Unix only.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["user"] }
+
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
 tempfile.workspace = true

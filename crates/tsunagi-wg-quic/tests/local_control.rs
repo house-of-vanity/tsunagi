@@ -12,7 +12,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tsunagi::dataplane::IpPlugin;
 use tsunagi::discovery::SharedMemoryDiscovery;
-use tsunagi::ipc::{ControlSocket, request_status};
+use tsunagi::ipc::{ControlSocket, ControlSocketAccess, request_status};
 use tsunagi::ipc::{StatusReport, control_socket_path};
 use tsunagi::overlay::MemoryTunFactory;
 use tsunagi::testing::{config_with, network, wait_for_peers, wait_until};
@@ -130,9 +130,13 @@ async fn a_client_sees_the_agent_and_its_overlay() {
 
     // A short path: a Unix socket address is limited to about 100 bytes.
     let socket_path = dir_a.path().join("agent.sock");
-    let control = ControlSocket::bind(&socket_path, source(agent.clone(), plugin.clone()))
-        .await
-        .unwrap();
+    let control = ControlSocket::bind(
+        &socket_path,
+        source(agent.clone(), plugin.clone()),
+        ControlSocketAccess::Private,
+    )
+    .await
+    .unwrap();
 
     let report = wait_until("the overlay is reported as up", || {
         let socket_path = socket_path.clone();
@@ -193,13 +197,13 @@ async fn a_leftover_socket_file_is_replaced_but_a_live_one_is_not() {
 
     // A file with nobody listening is a leftover from a crash.
     std::fs::write(&path, b"stale").unwrap();
-    let first = ControlSocket::bind(&path, Arc::clone(&empty))
+    let first = ControlSocket::bind(&path, Arc::clone(&empty), ControlSocketAccess::Private)
         .await
         .unwrap();
     assert!(request_status(&path).await.is_ok());
 
     // A live socket is not stolen from the agent that owns it.
-    let second = ControlSocket::bind(&path, Arc::clone(&empty)).await;
+    let second = ControlSocket::bind(&path, Arc::clone(&empty), ControlSocketAccess::Private).await;
     assert!(
         matches!(second, Err(tsunagi::Error::StateLocked { .. })),
         "a second agent must not take over a live control socket"
@@ -321,9 +325,13 @@ async fn a_client_can_leave_a_network_through_the_running_agent() {
     wait_for_peers(&agent, network_id, 1).await;
 
     let socket_path = dir.path().join("control.sock");
-    let control = ControlSocket::bind(&socket_path, Arc::new(Control(agent.clone())))
-        .await
-        .unwrap();
+    let control = ControlSocket::bind(
+        &socket_path,
+        Arc::new(Control(agent.clone())),
+        ControlSocketAccess::Private,
+    )
+    .await
+    .unwrap();
 
     let report = tsunagi::ipc::leave_network(&socket_path, &network_id.to_string())
         .await
@@ -361,9 +369,13 @@ async fn a_client_can_add_a_network_to_a_running_agent() {
     agent.join_network(&first, &first_secret).await.unwrap();
 
     let socket_path = dir.path().join("control.sock");
-    let control = ControlSocket::bind(&socket_path, Arc::new(Control(agent.clone())))
-        .await
-        .unwrap();
+    let control = ControlSocket::bind(
+        &socket_path,
+        Arc::new(Control(agent.clone())),
+        ControlSocketAccess::Private,
+    )
+    .await
+    .unwrap();
 
     let report = tsunagi::ipc::join_network(
         &socket_path,

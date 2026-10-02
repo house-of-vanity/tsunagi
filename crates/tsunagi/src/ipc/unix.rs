@@ -22,8 +22,8 @@ use crate::error::{Error, Result};
 // The transport-agnostic surface, re-exported so this module is a complete
 // view of the local control interface on its own.
 pub use super::{
-    CONTROL_PROTOCOL, EXCHANGE_TIMEOUT, ReportSource, is_serving, join_network, leave_network,
-    request_status, set_active, set_dns, set_hostname,
+    CONTROL_PROTOCOL, ControlSocketAccess, EXCHANGE_TIMEOUT, ReportSource, is_serving,
+    join_network, leave_network, request_status, set_active, set_dns, set_hostname,
 };
 
 /// Serves the local control interface on a Unix socket.
@@ -39,11 +39,15 @@ impl ControlSocket {
     /// A socket file left behind by a crashed agent is replaced, but only
     /// after checking that nothing is listening on it, so two live agents
     /// never fight over one path.
-    pub async fn bind(path: impl AsRef<Path>, source: Arc<dyn ReportSource>) -> Result<Self> {
+    pub async fn bind(
+        path: impl AsRef<Path>,
+        source: Arc<dyn ReportSource>,
+        access: ControlSocketAccess,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
         if let Some(parent) = path.parent() {
-            crate::storage::create_dir(parent)?;
+            create_parent(parent, &access)?;
         }
 
         if path.exists() {
@@ -61,7 +65,7 @@ impl ControlSocket {
             path: path.clone(),
             source,
         })?;
-        restrict(&path)?;
+        apply_access(&path, &access)?;
 
         let task = tokio::spawn(serve(listener, source));
         Ok(Self {
@@ -94,9 +98,48 @@ impl Drop for ControlSocket {
     }
 }
 
-fn restrict(path: &Path) -> Result<()> {
+/// Creates the socket's parent directory.
+///
+/// A group-shared socket must sit in a directory the group can traverse, so it
+/// is `0755`; a private socket keeps the owner-only state-directory default.
+fn create_parent(parent: &Path, access: &ControlSocketAccess) -> Result<()> {
+    match access {
+        ControlSocketAccess::Private => crate::storage::create_dir(parent),
+        ControlSocketAccess::Group(_) => {
+            std::fs::create_dir_all(parent).map_err(|source| Error::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+            set_mode(parent, 0o755)
+        }
+    }
+}
+
+/// Applies the access policy to the bound socket.
+///
+/// Private is owner-only `0600`. Group sets the socket's group to the gid and
+/// the mode to `0660`; if the group cannot be set — the agent is not a member,
+/// say — it falls back to owner-only rather than leaving the group wrong, so
+/// the socket is never more open than intended.
+fn apply_access(path: &Path, access: &ControlSocketAccess) -> Result<()> {
+    match access {
+        ControlSocketAccess::Private => set_mode(path, 0o600),
+        ControlSocketAccess::Group(gid) => {
+            if let Err(source) = std::os::unix::fs::chown(path, None, Some(*gid)) {
+                tracing::warn!(
+                    path = %path.display(), gid, %source,
+                    "cannot set the control socket group; keeping it owner-only"
+                );
+                return set_mode(path, 0o600);
+            }
+            set_mode(path, 0o660)
+        }
+    }
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|source| {
         Error::Io {
             path: path.to_path_buf(),
             source,
@@ -170,7 +213,9 @@ mod tests {
         let source: Arc<dyn ReportSource> = Arc::new(|| -> BoxFuture<'static, StatusReport> {
             Box::pin(async { StatusReport::default() })
         });
-        let control = ControlSocket::bind(&path, source).await.unwrap();
+        let control = ControlSocket::bind(&path, source, ControlSocketAccess::Private)
+            .await
+            .unwrap();
 
         let answer = exchange(&path, &Request::Status, EXCHANGE_TIMEOUT)
             .await

@@ -44,6 +44,21 @@ use windows as transport;
 #[cfg(any(unix, windows))]
 pub use transport::ControlSocket;
 
+/// Who may open the local control socket.
+///
+/// The default is owner-only. A system service shares its socket with a GUI or
+/// CLI running as another user by granting a group; the agent sets that on the
+/// socket when it binds it, so the access is correct from creation rather than
+/// patched afterwards.
+#[derive(Debug, Clone)]
+pub enum ControlSocketAccess {
+    /// Owner only — mode `0600`. The per-user agent's default.
+    Private,
+    /// The owner and members of this group — the socket's group is set to this
+    /// gid and the mode to `0660`. The caller resolves a group name to its gid.
+    Group(u32),
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
