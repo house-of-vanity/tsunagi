@@ -56,6 +56,11 @@ mod windows;
 #[cfg(all(feature = "tun-device", target_os = "windows"))]
 pub use windows::WindowsHostRules;
 
+#[cfg(all(feature = "tun-device", target_os = "macos"))]
+mod macos;
+#[cfg(all(feature = "tun-device", target_os = "macos"))]
+pub use macos::MacosHostRules;
+
 /// What the host should be told for one interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BroadcastRulesPlan {

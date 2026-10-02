@@ -478,6 +478,7 @@ The original IP packet, including its DF bit, is preserved. See
 | `setcap cap_net_admin+p` | ordinary user, one capability | recommended: nothing to prepare, nothing left behind. Lost on every rebuild or copy of the binary. |
 | systemd service | `User=`, `AmbientCapabilities=CAP_NET_ADMIN` | the same, for an installed service |
 | `sudo tsunagi up` | root | everything works, nothing is isolated |
+| macOS root LaunchDaemon | root | the native macOS deployment; see below |
 | `--no-tun` | ordinary user, no capabilities | tunnels run and handshake, traffic never reaches the OS |
 
 On Windows, put `wintun.dll` beside the executable and start `tsunagi up`
@@ -489,9 +490,24 @@ of claiming the agent is absent or trying to edit its locked state.
 Creating a TUN without sufficient privileges also explains how to restart
 the agent with the required permissions.
 
-**Not implemented yet.** macOS has no provisioner; `--no-tun` is the way to
-run it. The control plane and tunnels are unaffected. The decision logic
-that says *what* to change is shared and tested on every platform.
+On macOS the agent creates a `utun` interface, configures it with `ifconfig`
+and `route`, and points the system resolver at the overlay by writing
+`/etc/resolver/<network>` files (which carry a port, so the DNS server needs no
+privileged socket). All of this needs **root**: macOS has no per-capability
+grant like Linux, and a `utun` plus `/etc/resolver` are root-only. The kernel
+assigns the interface its `utunN` name, so the name derived from the network id
+is only a request and the real one is adopted once the interface is up.
+
+Run it as root — `sudo tsunagi up` for a quick start, or install it as a root
+**LaunchDaemon** for the native always-on deployment. As a daemon the agent runs
+unprivileged commands (`join`, `status`, `dns`, `network`) over its control
+socket like any other platform; the socket lives at `/var/run/tsunagi/agent.sock`
+and the stores at `/var/db/tsunagi`, both fixed system paths so they do not
+depend on whose shell started `sudo`. A ready-to-edit plist and install notes
+are in [dist/macos/](dist/macos/). The broadcast route is installed; the
+inbound-UDP firewall allowance (a `pf` anchor) is not yet, so `status` reports
+that half as incomplete and names what to allow by hand. The decision logic that
+says *what* to change is shared and tested on every platform.
 
 ## Checks
 

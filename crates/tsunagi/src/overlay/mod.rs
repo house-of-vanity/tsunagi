@@ -64,10 +64,15 @@ pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest, ad
 
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 pub use hostrules::LinuxHostRules;
+#[cfg(all(feature = "tun-device", target_os = "macos"))]
+pub use hostrules::MacosHostRules;
 #[cfg(all(feature = "tun-device", target_os = "windows"))]
 pub use hostrules::WindowsHostRules;
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 pub use provision::NetlinkProvisioner;
+
+#[cfg(all(feature = "tun-device", target_os = "macos"))]
+pub use provision::UtunProvisioner;
 
 #[cfg(all(feature = "tun-device", target_os = "windows"))]
 pub use provision::WintunProvisioner;

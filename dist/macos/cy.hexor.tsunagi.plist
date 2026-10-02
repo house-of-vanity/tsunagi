@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon for the tsunagi agent.
+
+  A daemon, so it runs as root (creating a utun interface and writing
+  /etc/resolver both need it) and comes up at boot before anyone logs in.
+  Install it at /Library/LaunchDaemons/cy.hexor.tsunagi.plist, owned by
+  root:wheel with mode 0644 — launchd refuses a daemon plist that is
+  group- or world-writable. See README.md in this directory.
+
+  Edit the binary path if tsunagi is not at /usr/local/bin/tsunagi.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>cy.hexor.tsunagi</string>
+
+    <!-- `up` starts the agent and keeps it in the foreground, which is what a
+         launchd daemon expects: launchd owns the lifecycle, so the process
+         must not daemonise itself. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/tsunagi</string>
+        <string>up</string>
+    </array>
+
+    <!-- Start at boot and bring it back if it ever exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Back off rather than spin if it fails to start repeatedly. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logs. launchd creates these as root; rotate them with newsyslog if you
+         keep the daemon around. -->
+    <key>StandardOutPath</key>
+    <string>/var/log/tsunagi.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/tsunagi.log</string>
+
+    <!-- The agent uses the fixed macOS system paths by default:
+         state  /var/db/tsunagi
+         socket /var/run/tsunagi/agent.sock
+         so nothing here has to point at a user's home directory. -->
+</dict>
+</plist>

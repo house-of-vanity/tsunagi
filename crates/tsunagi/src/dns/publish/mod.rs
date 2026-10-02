@@ -28,6 +28,11 @@ mod windows;
 #[cfg(all(feature = "dns-publish", target_os = "windows"))]
 pub use windows::NrptPublisher;
 
+#[cfg(all(feature = "dns-publish", target_os = "macos"))]
+mod macos;
+#[cfg(all(feature = "dns-publish", target_os = "macos"))]
+pub use macos::ResolverDirPublisher;
+
 mod unsupported;
 pub use unsupported::UnsupportedPublisher;
 

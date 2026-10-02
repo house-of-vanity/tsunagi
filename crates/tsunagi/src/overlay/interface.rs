@@ -172,6 +172,13 @@ impl Interface {
         let name = name.into();
         let host_rules = factory.host_rules();
         let device = factory.create(TunRequest::bare(name.clone(), mtu)).await?;
+        // The name the operating system actually gave the interface. On Linux
+        // and Windows that is the one we asked for; on macOS the kernel assigns
+        // the utun unit, so the real name differs and everything that
+        // configures the host for this interface afterwards — the broadcast
+        // route and firewall, the reconfigure on an address change — has to use
+        // the real one, not the requested `tsun…`.
+        let name = device.name().to_string();
         let tally = Arc::new(Tally::default());
 
         let task = {

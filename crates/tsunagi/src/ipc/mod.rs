@@ -87,7 +87,10 @@ pub fn control_socket_path(state_dir: &Path) -> PathBuf {
 /// On Windows, the system-wide `%ProgramData%\tsunagi\agent.sock` is used so that
 /// any local user, tray application, or CLI tool can manage the running agent
 /// without needing to know which user account or service started it.
-/// On Unix, this derives from the default per-user state directory.
+/// On macOS the agent runs as a root LaunchDaemon, so a fixed system path under
+/// `/var/run` is used for the same reason, and it stays short enough for the
+/// Unix socket path limit. On other Unix it derives from the default per-user
+/// state directory.
 pub fn default_control_socket_path() -> PathBuf {
     #[cfg(windows)]
     {
@@ -99,7 +102,11 @@ pub fn default_control_socket_path() -> PathBuf {
         }
         PathBuf::from(r"C:\ProgramData\tsunagi\agent.sock")
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/var/run/tsunagi/agent.sock")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         if let Ok(paths) = crate::config::StoragePaths::user_default() {
             control_socket_path(&paths.state_dir)

@@ -20,11 +20,13 @@
 //! pure and tested on every platform, and only the execution is behind
 //! [`InterfaceProvisioner`].
 //!
-//! Four implementations:
+//! Five implementations:
 //!
 //! * `NetlinkProvisioner` on Linux, which needs `CAP_NET_ADMIN`.
 //! * `WintunProvisioner` on Windows, a Wintun adapter configured with `netsh`,
 //!   which needs an elevated process.
+//! * `UtunProvisioner` on macOS, a utun interface configured with `ifconfig`
+//!   and `route`, which needs root.
 //! * [`MockProvisioner`], an in-memory host used by the tests.
 //! * [`UnsupportedProvisioner`] elsewhere, which fails with an explanation
 //!   and a pointer at the manual route rather than pretending to work.
@@ -59,6 +61,11 @@ pub(crate) use linux::RouteHandle;
 mod windows;
 #[cfg(all(feature = "tun-device", target_os = "windows"))]
 pub use windows::WintunProvisioner;
+
+#[cfg(all(feature = "tun-device", target_os = "macos"))]
+mod macos;
+#[cfg(all(feature = "tun-device", target_os = "macos"))]
+pub use macos::UtunProvisioner;
 
 mod privilege;
 pub use privilege::{Privilege, probe_net_admin};

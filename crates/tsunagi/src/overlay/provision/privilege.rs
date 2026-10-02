@@ -63,15 +63,20 @@ pub use linux_impl::{NetAdmin, probe_net_admin};
 #[cfg(all(feature = "tun-device", target_os = "windows"))]
 pub use windows_impl::probe_net_admin;
 
+#[cfg(all(feature = "tun-device", target_os = "macos"))]
+pub use macos_impl::probe_net_admin;
+
 #[cfg(not(any(
     all(feature = "tun-device", target_os = "linux"),
-    all(feature = "tun-device", target_os = "windows")
+    all(feature = "tun-device", target_os = "windows"),
+    all(feature = "tun-device", target_os = "macos")
 )))]
 pub use other_impl::probe_net_admin;
 
 #[cfg(not(any(
     all(feature = "tun-device", target_os = "linux"),
-    all(feature = "tun-device", target_os = "windows")
+    all(feature = "tun-device", target_os = "windows"),
+    all(feature = "tun-device", target_os = "macos")
 )))]
 mod other_impl {
     use super::Privilege;
@@ -96,6 +101,25 @@ mod windows_impl {
     /// check is left to Wintun's adapter creation, which fails with a precise
     /// message when the process is not elevated. This matches how the Linux
     /// path treats the open itself as the honest answer.
+    pub fn probe_net_admin() -> Privilege {
+        Privilege::Available
+    }
+}
+
+#[cfg(all(feature = "tun-device", target_os = "macos"))]
+mod macos_impl {
+    use super::Privilege;
+
+    /// Whether this process can configure interfaces.
+    ///
+    /// macOS has no capability to hold and lower the way Linux does: creating
+    /// a utun interface simply needs the process to be root. Reading the
+    /// effective uid means a libc call this crate forbids, so the probe is
+    /// deliberately optimistic — it reports that the platform can manage
+    /// interfaces — and the real check is left to the utun open, which fails
+    /// with a precise "run with sudo" message when the process is not root.
+    /// This matches how the Linux path treats the open itself as the honest
+    /// answer.
     pub fn probe_net_admin() -> Privilege {
         Privilege::Available
     }

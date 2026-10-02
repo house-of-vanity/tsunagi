@@ -958,7 +958,11 @@ fn dns_publisher() -> Arc<dyn tsunagi::dns::DnsPublisher> {
     {
         Arc::new(tsunagi::dns::publish::NrptPublisher::new())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    {
+        Arc::new(tsunagi::dns::publish::ResolverDirPublisher::new())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         Arc::new(tsunagi::dns::publish::UnsupportedPublisher::new())
     }
@@ -4253,11 +4257,24 @@ fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error
     ))
 }
 
+/// The utun interface, created and configured by the agent and removed when it
+/// exits, the same as the Linux and Windows ones. The kernel assigns the utun
+/// unit, so the interface reports a `utunN` name the agent adopts.
+#[cfg(target_os = "macos")]
+fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+    use tsunagi::overlay::{MacosHostRules, ManagedTunFactory, UtunProvisioner};
+    let provisioner = UtunProvisioner::new()?;
+    Ok(Arc::new(
+        ManagedTunFactory::new(Arc::new(provisioner))
+            .with_host_rules(Arc::new(MacosHostRules::new())),
+    ))
+}
+
 /// There is no provisioner for this platform yet.
 ///
 /// Refused here rather than at the first packet, and with the one thing that
 /// does work on every platform named.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     Err(format!(
         "managing the overlay interface is not implemented on {} yet. \

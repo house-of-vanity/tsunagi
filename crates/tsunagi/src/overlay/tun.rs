@@ -417,7 +417,15 @@ mod system {
     /// across this call, and such a guard must not span an `await` because
     /// Linux capabilities are per thread.
     pub(crate) fn open_tun(request: &TunRequest) -> Result<Arc<dyn TunDevice>, OverlayError> {
+        // macOS mutates neither field below (it neither names the interface nor
+        // sets a platform config), so `mut` is unused only there.
+        #[cfg_attr(target_os = "macos", allow(unused_mut))]
         let mut config = tun::Configuration::default();
+        // macOS names its tunnels `utunN` and assigns the unit number itself.
+        // A name derived from the network id (`tsun…`) is not a legal utun
+        // name, so there the kernel is left to choose and the real name is read
+        // back below. Linux and Windows take the requested name verbatim.
+        #[cfg(not(target_os = "macos"))]
         config.tun_name(&request.name);
         #[cfg(target_os = "linux")]
         config.platform_config(|platform| {
@@ -435,9 +443,20 @@ mod system {
 
         let device = tun::create_as_async(&config).map_err(|err| open_error(&request.name, err))?;
 
+        // The interface name the operating system actually gave us: the
+        // requested one everywhere except macOS, where the kernel chose the
+        // utun unit and so the real name has to be read back off the device.
+        #[cfg(target_os = "macos")]
+        let name = {
+            use tun::AbstractDevice;
+            device.tun_name().unwrap_or_else(|_| request.name.clone())
+        };
+        #[cfg(not(target_os = "macos"))]
+        let name = request.name.clone();
+
         let (reader, writer) = tokio::io::split(device);
         Ok(Arc::new(SystemTun {
-            name: request.name.clone(),
+            name,
             mtu: request.mtu,
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
@@ -468,6 +487,9 @@ mod system {
             } else if cfg!(target_os = "linux") {
                 "Start `tsunagi up` as root or grant CAP_NET_ADMIN with \
                  `sudo setcap cap_net_admin,cap_net_bind_service+p /path/to/tsunagi`."
+            } else if cfg!(target_os = "macos") {
+                "Creating a utun interface needs root on macOS; start `tsunagi up` \
+                 with `sudo`, or install it as a root LaunchDaemon."
             } else {
                 "Start `tsunagi up` with the privileges required to create a TUN interface."
             };
@@ -496,7 +518,12 @@ mod system {
              run as Administrator with the DLL beside the executable, or run with `--no-tun` \
              to keep the tunnels off the operating system."
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(target_os = "macos")]
+        {
+            "Creating a utun interface needs root; start the agent with `sudo` or as a root \
+             LaunchDaemon, or run with `--no-tun` to keep the tunnels off the operating system."
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {
             "Run with `--no-tun` to keep the tunnels off the operating system."
         }

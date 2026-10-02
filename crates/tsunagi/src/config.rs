@@ -12,9 +12,13 @@ use std::time::Duration;
 
 use crate::dataplane::SharedPlugin;
 use crate::discovery::{MainlineDiscovery, NetworkDiscovery};
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 /// Qualifier/organisation/application triple used for platform directories.
+///
+/// Unused on macOS, where the default paths are fixed system locations rather
+/// than per-user directories derived from this.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const APP_NAME: &str = "tsunagi";
 
 /// Rendezvous slots per network; this bounds a discovery sample, not membership.
@@ -74,17 +78,34 @@ impl StoragePaths {
         }
     }
 
-    /// The per-user platform directories.
+    /// The default platform directories.
     ///
-    /// A future system service can supply its own paths instead.
+    /// Per user on Linux and Windows. On macOS the agent runs as a root
+    /// LaunchDaemon (creating a utun interface needs root, and `$HOME` under
+    /// `sudo` points at the wrong place), so the stores live in the system
+    /// locations instead — `/var/db/tsunagi` for the mandatory state and a
+    /// disposable cache beside it. A caller that wants somewhere else passes
+    /// explicit paths to [`StoragePaths::new`] or [`StoragePaths::under`].
     pub fn user_default() -> Result<Self> {
-        let dirs = directories::ProjectDirs::from("", "", APP_NAME).ok_or_else(|| {
-            Error::Storage("no valid home directory for platform config paths".into())
-        })?;
-        Ok(Self {
-            state_dir: dirs.data_dir().to_path_buf(),
-            cache_dir: dirs.cache_dir().to_path_buf(),
-        })
+        #[cfg(target_os = "macos")]
+        {
+            Ok(Self {
+                state_dir: PathBuf::from("/var/db/tsunagi"),
+                cache_dir: PathBuf::from("/var/db/tsunagi/cache"),
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let dirs = directories::ProjectDirs::from("", "", APP_NAME).ok_or_else(|| {
+                crate::error::Error::Storage(
+                    "no valid home directory for platform config paths".into(),
+                )
+            })?;
+            Ok(Self {
+                state_dir: dirs.data_dir().to_path_buf(),
+                cache_dir: dirs.cache_dir().to_path_buf(),
+            })
+        }
     }
 
     /// Path of the mandatory state database.
