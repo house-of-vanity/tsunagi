@@ -15,7 +15,7 @@ mainline = { path = "vendor/mainline" }
 edition = "2024"
 rust-version = "1.91"
 license = "WTFPL"
-repository = "https://github.com/tsunagi-net/tsunagi"
+repository = "https://github.com/house-of-vanity/tsunagi"
 
 [workspace.lints.rust]
 missing_docs = "warn"
