@@ -331,6 +331,9 @@ struct Runtime {
     pending_state: Vec<(EndpointId, Vec<SignedRecord>)>,
     /// The highest version this agent has ever published for this network.
     own_version: u64,
+    /// The last hostname each peer announced, kept across restarts so a
+    /// member that is away can still be called by name.
+    known_hostnames: HashMap<EndpointId, String>,
 }
 
 impl Runtime {
@@ -382,6 +385,7 @@ impl Runtime {
             state: StateSet::new(),
             pending_state: Vec::new(),
             own_version: 0,
+            known_hostnames: HashMap::new(),
         }
     }
 
@@ -844,6 +848,17 @@ impl Runtime {
             .own_record_version(self.network_id, self.local_id)
             .await
             .unwrap_or(0);
+        for (id, hostname) in self
+            .params
+            .storage
+            .peer_hostnames(self.network_id)
+            .await
+            .unwrap_or_default()
+        {
+            if let Ok(id) = EndpointId::from_bytes(&id) {
+                self.known_hostnames.insert(id, hostname);
+            }
+        }
 
         self.ensure_own_claim().await;
         self.publish_allocations().await;
@@ -1885,6 +1900,33 @@ impl Runtime {
         }
     }
 
+    /// Keeps the name a peer announced, on disk too when it changed.
+    ///
+    /// Written off the loop: a name that is not stored this time is stored
+    /// the next time the peer announces it.
+    fn remember_hostname(&mut self, peer: EndpointId, hostname: &str) {
+        if hostname.is_empty()
+            || self
+                .known_hostnames
+                .get(&peer)
+                .is_some_and(|h| h == hostname)
+        {
+            return;
+        }
+        self.known_hostnames.insert(peer, hostname.to_string());
+        let storage = self.params.storage.clone();
+        let network_id = self.network_id;
+        let hostname = hostname.to_string();
+        tokio::spawn(async move {
+            if let Err(err) = storage
+                .remember_peer_hostname(network_id, *peer.as_bytes(), hostname)
+                .await
+            {
+                tracing::debug!(%err, "could not remember a peer's hostname");
+            }
+        });
+    }
+
     fn dispatch_message(&mut self, peer: EndpointId, message: ControlMessage) {
         match &message {
             ControlMessage::Announce(announcement) => {
@@ -1894,6 +1936,7 @@ impl Runtime {
                     session.broadcast = announcement.broadcast;
                     session.capabilities = capabilities.clone();
                 }
+                self.remember_hostname(peer, &announcement.hostname);
                 self.update_broadcast();
                 self.dispatch_capabilities(peer, &capabilities);
                 self.ensure_links();
@@ -1994,7 +2037,10 @@ impl Runtime {
                     broadcast: session.broadcast,
                     endpoint_id: session.peer,
                     role: session.role,
-                    hostname: session.hostname.clone(),
+                    hostname: session
+                        .hostname
+                        .clone()
+                        .or_else(|| self.known_hostnames.get(&session.peer).cloned()),
                     protocols: session
                         .capabilities
                         .iter()
@@ -2052,6 +2098,7 @@ impl Runtime {
                     // both hold it would be untrue on one of them.
                     overlay_address_v4: self.state.address_of(&endpoint_id),
                     hostname: self.state.hostname_of(&endpoint_id).map(str::to_string),
+                    last_hostname: self.known_hostnames.get(&endpoint_id).cloned(),
                 })
             })
             .collect();

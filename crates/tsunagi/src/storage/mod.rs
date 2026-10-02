@@ -264,7 +264,8 @@ impl Storage {
     pub async fn remove_network(&self, network_id: NetworkId) -> Result<()> {
         self.with_state(move |state| {
             state.remove_network(network_id)?;
-            state.forget_signed_records(network_id)
+            state.forget_signed_records(network_id)?;
+            state.forget_peer_hostnames(network_id)
         })
         .await?;
         self.with_cache((), move |cache| cache.forget_network(network_id))
@@ -280,6 +281,26 @@ impl Storage {
     /// Writes the stored hostname.
     pub async fn set_hostname(&self, hostname: String) -> Result<()> {
         self.with_state(move |state| state.set_hostname(&hostname))
+            .await
+    }
+
+    /// Remembers the hostname a member announced, so it can still be named
+    /// once it is away.
+    pub async fn remember_peer_hostname(
+        &self,
+        network_id: NetworkId,
+        endpoint_id: [u8; 32],
+        hostname: String,
+    ) -> Result<()> {
+        self.with_state(move |state| {
+            state.remember_peer_hostname(network_id, &endpoint_id, &hostname)
+        })
+        .await
+    }
+
+    /// The hostnames members of a network last announced.
+    pub async fn peer_hostnames(&self, network_id: NetworkId) -> Result<Vec<([u8; 32], String)>> {
+        self.with_state(move |state| state.peer_hostnames(network_id))
             .await
     }
 

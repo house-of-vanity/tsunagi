@@ -80,6 +80,11 @@ pub struct MemberStatus {
     /// Signed, so it is still known while the member is away — which is what
     /// lets an absent member be named rather than shown as a bare id.
     pub hostname: Option<String>,
+    /// The last name this agent saw it announce, whether or not it is here.
+    ///
+    /// Not signed, so it is a convenience for naming a member that is away
+    /// and never a claim: the zone is served from `hostname`.
+    pub last_hostname: Option<String>,
 }
 
 /// Status of one authenticated session.

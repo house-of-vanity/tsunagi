@@ -21,7 +21,7 @@ use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
 use crate::state::{RecordBody, SignedRecord};
 
 /// Schema version written by this build.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Key of the stored hostname setting.
 const SETTING_HOSTNAME: &str = "hostname";
@@ -191,13 +191,34 @@ impl StateStore {
                 PRAGMA user_version = 4;
                 COMMIT;").map_err(|err| self.corrupt(format!("cannot migrate schema to 4: {err}")))?;
         }
+        if found < 5 {
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+                     CREATE TABLE IF NOT EXISTS peer_hostnames (
+                         network_id  BLOB NOT NULL,
+                         endpoint_id BLOB NOT NULL,
+                         hostname    TEXT NOT NULL,
+                         PRIMARY KEY (network_id, endpoint_id)
+                     );
+                     PRAGMA user_version = 5;
+                     COMMIT;",
+                )
+                .map_err(|err| self.corrupt(format!("cannot migrate schema to 5: {err}")))?;
+        }
         Ok(())
     }
 
     /// Confirms the expected tables exist, so that a truncated or foreign
     /// database is reported rather than used.
     fn verify_shape(&self) -> Result<()> {
-        for table in ["device_identity", "networks", "settings", "signed_records"] {
+        for table in [
+            "device_identity",
+            "networks",
+            "settings",
+            "signed_records",
+            "peer_hostnames",
+        ] {
             let present: Option<String> = self
                 .conn
                 .query_row(
@@ -635,6 +656,61 @@ impl StateStore {
         Ok(())
     }
 
+    /// Remembers the hostname a member last announced.
+    pub fn remember_peer_hostname(
+        &self,
+        network_id: NetworkId,
+        endpoint_id: &[u8; 32],
+        hostname: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO peer_hostnames (network_id, endpoint_id, hostname)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(network_id, endpoint_id) DO UPDATE SET hostname = excluded.hostname",
+                params![
+                    network_id.as_bytes().as_slice(),
+                    endpoint_id.as_slice(),
+                    hostname
+                ],
+            )
+            .map_err(|err| Error::Storage(format!("cannot remember a hostname: {err}")))?;
+        Ok(())
+    }
+
+    /// The last hostname every member of a network announced.
+    pub fn peer_hostnames(&self, network_id: NetworkId) -> Result<Vec<([u8; 32], String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT endpoint_id, hostname FROM peer_hostnames WHERE network_id = ?1")
+            .map_err(|err| Error::Storage(format!("cannot read hostnames: {err}")))?;
+        let rows = stmt
+            .query_map(params![network_id.as_bytes().as_slice()], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| Error::Storage(format!("cannot read hostnames: {err}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, hostname) =
+                row.map_err(|err| Error::Storage(format!("cannot read hostnames: {err}")))?;
+            if let Ok(id) = <[u8; 32]>::try_from(id.as_slice()) {
+                out.push((id, hostname));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forgets every remembered hostname of a network.
+    pub fn forget_peer_hostnames(&self, network_id: NetworkId) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM peer_hostnames WHERE network_id = ?1",
+                params![network_id.as_bytes().as_slice()],
+            )
+            .map_err(|err| Error::Storage(format!("cannot forget hostnames: {err}")))?;
+        Ok(())
+    }
+
     /// Reads an arbitrary setting.
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.conn
@@ -697,6 +773,29 @@ mod broadcast_storage_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use crate::identity::NetworkKeys;
+
+    #[test]
+    fn a_remembered_hostname_survives_a_restart_and_follows_the_latest_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let name = NetworkName::new("hostnames").unwrap();
+        let secret = NetworkSecret::from_bytes([9; 32]).unwrap();
+        let id = NetworkKeys::derive(&name, &secret).network_id();
+        let peer = [3u8; 32];
+
+        let store = StateStore::open(&path).unwrap();
+        store.remember_peer_hostname(id, &peer, "laptop").unwrap();
+        store.remember_peer_hostname(id, &peer, "laptop-2").unwrap();
+        drop(store);
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store.peer_hostnames(id).unwrap(),
+            vec![(peer, "laptop-2".to_string())]
+        );
+        store.forget_peer_hostnames(id).unwrap();
+        assert!(store.peer_hostnames(id).unwrap().is_empty());
+    }
 
     #[test]
     fn v3_migration_preserves_identity_and_networks_and_defaults_broadcast_on() {

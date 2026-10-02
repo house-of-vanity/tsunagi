@@ -464,6 +464,8 @@ pub struct MemberReport {
     pub overlay_address_v4: Option<String>,
     /// Consecutive failed dial attempts, when this agent is trying to reach it.
     pub failed_dials: u32,
+    /// The last hostname this agent saw it announce, kept while it is away.
+    pub hostname: Option<String>,
 }
 
 /// One control plane peer.

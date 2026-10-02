@@ -2677,10 +2677,8 @@ impl MemberRow<'_> {
         self.transport.is_some()
     }
 
-    /// What to call it: the name it announced, or a short form of its id.
-    ///
-    /// A member that is away has no hostname, because nothing durable records
-    /// one — only the signed claim survives, and that carries an address.
+    /// What to call it: the name it announced — the last one, when it is
+    /// away — or a short form of its id.
     fn label(&self) -> String {
         match self.hostname {
             Some(hostname) => hostname.to_string(),
@@ -2713,10 +2711,11 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
         let row = entry(&mut rows, &member.endpoint_id);
         row.overlay_address_v4 = member.overlay_address_v4.as_deref();
         row.failed_dials = member.failed_dials;
+        row.hostname = member.hostname.as_deref();
     }
     for peer in &network.peers {
         let row = entry(&mut rows, &peer.endpoint_id);
-        row.hostname = peer.hostname.as_deref();
+        row.hostname = peer.hostname.as_deref().or(row.hostname);
         row.transport = Some(&peer.transport);
         row.rtt_ms = peer.rtt_ms;
     }
@@ -4310,6 +4309,10 @@ async fn build_report(
                             .iter()
                             .find(|candidate| candidate.endpoint_id == member.endpoint_id)
                             .map_or(0, |candidate| candidate.consecutive_failures),
+                        hostname: member
+                            .last_hostname
+                            .clone()
+                            .or_else(|| member.hostname.clone()),
                     })
                     .collect(),
                 range: network.range.map(|range| range.to_string()),
@@ -4647,11 +4650,13 @@ mod status_tests {
                     endpoint_id: OWN.into(),
                     overlay_address_v4: Some("10.13.37.69".into()),
                     failed_dials: 0,
+                    hostname: None,
                 },
                 MemberReport {
                     endpoint_id: ONLINE.into(),
                     overlay_address_v4: Some("10.13.37.237".into()),
                     failed_dials: 0,
+                    hostname: None,
                 },
             ],
             range: Some("10.13.37.0/24".into()),
@@ -4892,6 +4897,7 @@ mod status_tests {
             endpoint_id: AWAY.into(),
             overlay_address_v4: Some("10.13.37.99".into()),
             failed_dials: 9,
+            hostname: None,
         });
 
         let rows = member_rows(&network, OWN);
@@ -4899,6 +4905,22 @@ mod status_tests {
         assert!(rows[0].online(), "the connected member comes first");
         assert!(!rows[1].online());
         assert_eq!(rows[1].endpoint_id, AWAY);
+    }
+
+    #[test]
+    fn an_offline_member_keeps_the_last_name_it_announced() {
+        let mut network = network_after_a_peer_returned();
+        network.members.push(MemberReport {
+            endpoint_id: AWAY.into(),
+            overlay_address_v4: Some("10.13.37.99".into()),
+            failed_dials: 0,
+            hostname: Some("laptop".into()),
+        });
+
+        let rows = member_rows(&network, OWN);
+        let away = rows.iter().find(|row| row.endpoint_id == AWAY).unwrap();
+        assert!(!away.online());
+        assert_eq!(away.label(), "laptop");
     }
 
     #[test]
@@ -4912,6 +4934,7 @@ mod status_tests {
             endpoint_id: AWAY.into(),
             overlay_address_v4: Some("10.13.37.99".into()),
             failed_dials: 9,
+            hostname: None,
         });
 
         let mut out = report::Report::new();
