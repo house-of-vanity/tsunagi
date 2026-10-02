@@ -2,13 +2,14 @@ name: Release
 
 # GitHub version of the release pipeline. The build half mirrors the Gitea one
 # in .gitea/workflows/release.yml (static musl Linux via cargo-zigbuild, native
-# macOS and Windows); only the publish half differs: GitHub needs the v4
-# artifact backend and fills the release with `gh`.
+# macOS and Windows); only the publish half differs: it uses the current
+# artifact actions (Node 24) and fills the release with `gh`.
 #
 # Every job is gated on `github.server_url == 'https://github.com'`, so this file
-# runs only on GitHub. Gitea runs its own copy in .gitea/workflows; should a
-# Gitea instance also read .github/workflows, the guard skips these jobs there
-# so they never fail on the @v4 artifact backend or `gh`.
+# runs only on GitHub. Gitea runs its own copy in .gitea/workflows (which pins
+# the older @v3 artifact actions it supports); should a Gitea instance also read
+# .github/workflows, the guard skips these jobs there so they never fail on the
+# artifact backend or `gh`.
 on:
   push:
     tags: ["v*"]
@@ -57,7 +58,7 @@ jobs:
             zig: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -173,7 +174,7 @@ jobs:
             "tsunagi-${pkgver}-1-${{ matrix.pkg_arch }}.pkg.tar.zst"
 
       - name: Upload the build outputs as run artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: |
@@ -191,7 +192,7 @@ jobs:
       contents: write
     steps:
       - name: Download every build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -206,7 +207,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # download-artifact@v4 nests each artifact under its own directory, so
+          # download-artifact nests each artifact under its own directory, so
           # the archives are artifacts/<asset>/<file>.
           mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.pkg.tar.zst' \))
           printf 'asset: %s\n' "${files[@]}"
