@@ -37,10 +37,15 @@ creates and owns its directories:
 | cache | `/var/cache/tsunagi` |
 | control socket | `/run/tsunagi/agent.sock` |
 
-The polkit rule lets anyone in the `tsunagi` group configure systemd-resolved
-for the overlay zones (the service user is in that group). To run the agent as
-your own user as well, add yourself to the group: `sudo usermod -aG tsunagi
-"$USER"`.
+Installing the package enables and starts the service, and adds the user who ran
+pacman to the `tsunagi` group (log out and in again for it to apply). The
+control socket is open to that group, so members can run `tsunagi status`, the
+CLI and the tray GUI without sudo; anyone else adds themselves with `sudo
+usermod -aG tsunagi "$USER"`. The group also lets its members configure
+systemd-resolved for the overlay zones through the polkit rule.
+
+The GUI package depends on `gtk3`, `libayatana-appindicator` (the tray icon),
+`xdotool` (its `libxdo`), and the usual windowing libraries.
 
 ## Removal
 

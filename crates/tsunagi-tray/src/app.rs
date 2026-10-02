@@ -10,7 +10,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::about;
-use crate::agent::{AgentClient, resolve_socket};
+use crate::agent::AgentClient;
 use crate::devices;
 use crate::stats::Traffic;
 use crate::ui::{self, UiState};
@@ -38,7 +38,7 @@ impl App {
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         ctx.set_fonts(fonts);
 
-        let agent = AgentClient::spawn(&runtime, ctx, resolve_socket());
+        let agent = AgentClient::spawn(&runtime, ctx);
         Ok(Self {
             agent,
             state: UiState::default(),
@@ -88,7 +88,7 @@ impl App {
             egui::ViewportId::from_hash_of("about"),
             builder,
             |vctx, _class| {
-                about::show(vctx, socket, snapshot);
+                about::show(vctx, &socket, snapshot);
                 !vctx.input(|i| i.viewport().close_requested())
             },
         );

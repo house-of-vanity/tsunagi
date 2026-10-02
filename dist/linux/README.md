@@ -22,7 +22,9 @@ and `CAP_NET_BIND_SERVICE` (granted by systemd), not root. systemd creates its
 state (`/var/lib/tsunagi`), cache (`/var/cache/tsunagi`) and runtime
 (`/run/tsunagi`) directories, and the polkit rule lets it configure the
 resolver. Control it with `sudo` — the CLI finds the running service's socket at
-`/run/tsunagi/agent.sock` with no flags:
+`/run/tsunagi/agent.sock` with no flags. The socket is open to the `tsunagi`
+group, so after `sudo usermod -aG tsunagi "$USER"` (and logging in again) no
+`sudo` is needed:
 
 ```sh
 sudo tsunagi status

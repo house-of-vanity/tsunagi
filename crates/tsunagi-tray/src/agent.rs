@@ -50,11 +50,12 @@ pub(crate) struct Snapshot {
     pub generation: u64,
     /// When this status was read, for computing rates between refreshes.
     pub at: Option<Instant>,
+    /// The socket the last request went to.
+    pub socket: PathBuf,
 }
 
 /// Handle the UI holds: send commands, read the latest snapshot.
 pub(crate) struct AgentClient {
-    socket: PathBuf,
     tx: mpsc::UnboundedSender<Command>,
     shared: Arc<Mutex<Snapshot>>,
     /// A secret fetched for the clipboard, taken by the UI thread which owns
@@ -65,23 +66,20 @@ pub(crate) struct AgentClient {
 
 impl AgentClient {
     /// Starts the worker on `runtime`, reporting to `ctx` (for repaints).
-    pub(crate) fn spawn(
-        runtime: &tokio::runtime::Handle,
-        ctx: egui::Context,
-        socket: PathBuf,
-    ) -> Self {
+    pub(crate) fn spawn(runtime: &tokio::runtime::Handle, ctx: egui::Context) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let shared = Arc::new(Mutex::new(Snapshot::default()));
+        let shared = Arc::new(Mutex::new(Snapshot {
+            socket: resolve_socket(),
+            ..Snapshot::default()
+        }));
         let pending_copy = Arc::new(Mutex::new(None));
         runtime.spawn(worker(
-            socket.clone(),
             rx,
             Arc::clone(&shared),
             Arc::clone(&pending_copy),
             ctx,
         ));
         Self {
-            socket,
             tx,
             shared,
             pending_copy,
@@ -93,9 +91,9 @@ impl AgentClient {
         lock(&self.pending_copy).take()
     }
 
-    /// The control socket this client talks to.
-    pub(crate) fn socket(&self) -> &std::path::Path {
-        &self.socket
+    /// The control socket this client talks to, as last resolved.
+    pub(crate) fn socket(&self) -> PathBuf {
+        lock(&self.shared).socket.clone()
     }
 
     /// Sends a command; a dropped worker simply means nothing happens.
@@ -118,33 +116,37 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The worker loop: refresh on an interval and whenever a command runs.
 async fn worker(
-    socket: PathBuf,
     mut rx: mpsc::UnboundedReceiver<Command>,
     shared: Arc<Mutex<Snapshot>>,
     pending_copy: Arc<Mutex<Option<String>>>,
     ctx: egui::Context,
 ) {
-    refresh(&socket, &shared, &ctx).await;
+    refresh(&shared, &ctx).await;
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                refresh(&socket, &shared, &ctx).await;
+                refresh(&shared, &ctx).await;
             }
             command = rx.recv() => {
                 let Some(command) = command else { return };
-                run(&socket, command, &shared, &pending_copy, &ctx).await;
-                refresh(&socket, &shared, &ctx).await;
+                run(&resolve_socket(), command, &shared, &pending_copy, &ctx).await;
+                refresh(&shared, &ctx).await;
             }
         }
     }
 }
 
 /// Reads status and stores it, mapping any failure to a human string.
-async fn refresh(socket: &std::path::Path, shared: &Arc<Mutex<Snapshot>>, ctx: &egui::Context) {
-    let status = ipc::request_status(socket)
+///
+/// The socket is looked for again each time: a window opened before the agent
+/// was started would otherwise keep asking the per-user path for ever, while
+/// the service came up at the system one.
+async fn refresh(shared: &Arc<Mutex<Snapshot>>, ctx: &egui::Context) {
+    let socket = resolve_socket();
+    let status = ipc::request_status(&socket)
         .await
         .map_err(|err| err.to_string());
     {
@@ -152,6 +154,7 @@ async fn refresh(socket: &std::path::Path, shared: &Arc<Mutex<Snapshot>>, ctx: &
         guard.status = Some(status);
         guard.generation = guard.generation.wrapping_add(1);
         guard.at = Some(Instant::now());
+        guard.socket = socket;
     }
     ctx.request_repaint();
 }

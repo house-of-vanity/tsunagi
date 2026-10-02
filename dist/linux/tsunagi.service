@@ -1,6 +1,6 @@
 [Unit]
 Description=tsunagi mesh agent
-Documentation=https://github.com/Ultradesu/tsunagi
+Documentation=https://github.com/house-of-vanity/tsunagi
 After=network-online.target
 Wants=network-online.target
 
@@ -16,7 +16,8 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 
 # systemd creates and owns these for the service user, and the agent is pointed
 # at them: state in /var/lib/tsunagi, cache in /var/cache/tsunagi, and the
-# control socket in /run/tsunagi, which stays private to the service user.
+# control socket in /run/tsunagi. The socket is opened to the `tsunagi` group,
+# so a user who joins it can run the CLI and the tray without sudo.
 StateDirectory=tsunagi
 StateDirectoryMode=0700
 CacheDirectory=tsunagi
@@ -25,6 +26,7 @@ RuntimeDirectoryMode=0755
 Environment=TSUNAGI_STATE_DIR=%S/tsunagi
 Environment=TSUNAGI_CACHE_DIR=%C/tsunagi
 Environment=TSUNAGI_CONTROL_SOCKET=%t/tsunagi/agent.sock
+Environment=TSUNAGI_CONTROL_GROUP=tsunagi
 
 # The tarball installer puts the binary here; the deb and the Arch package
 # rewrite this to /usr/bin where they install it.

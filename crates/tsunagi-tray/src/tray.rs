@@ -81,6 +81,26 @@ fn build() -> Result<Built, String> {
     })
 }
 
+/// [`build`], with a missing indicator library reported instead of panicking.
+///
+/// The library is loaded on first use, and its binding panics when it is not
+/// installed, which reads as a bug in this program rather than a package that
+/// is not there.
+#[cfg(target_os = "linux")]
+fn build_checked() -> Result<Built, String> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+    std::panic::set_hook(hook);
+    built.unwrap_or_else(|_| {
+        Err(
+            "the tray needs libayatana-appindicator (Arch: libayatana-appindicator, \
+             Debian/Ubuntu: libayatana-appindicator3-1), which is not installed"
+                .to_string(),
+        )
+    })
+}
+
 /// Acts on menu choices as the platform's loop delivers them.
 fn handle_menu(built: &Built, window: Arc<Window>) {
     let (open, quit) = (built.open.clone(), built.quit.clone());
@@ -101,7 +121,7 @@ fn handle_menu(built: &Built, window: Arc<Window>) {
 #[cfg(target_os = "linux")]
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     gtk::init().map_err(|err| format!("cannot initialise GTK: {err}"))?;
-    let built = build()?;
+    let built = build_checked()?;
     handle_menu(
         &built,
         Arc::new(Window {
