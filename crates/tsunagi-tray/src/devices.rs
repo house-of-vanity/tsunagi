@@ -24,12 +24,21 @@ pub(crate) fn title(network: &NetworkReport) -> String {
 pub(crate) fn show(
     ctx: &egui::Context,
     _agent: &AgentClient,
-    unit: Unit,
+    unit: &mut Unit,
     network: &NetworkReport,
     traffic: &Traffic,
 ) {
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading(&network.name);
+        ui.horizontal(|ui| {
+            ui.heading(&network.name);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.selectable_value(unit, Unit::Bytes, "bytes");
+                ui.selectable_value(unit, Unit::Packets, "pkts");
+                ui.label("show:");
+            });
+        });
+        // A copy of the chosen unit for the read-only rendering below.
+        let unit = *unit;
         summary(ui, network);
         ui.add_space(6.0);
 
@@ -129,7 +138,7 @@ fn connected_table(
         return;
     }
     egui::Grid::new("connected")
-        .num_columns(7)
+        .num_columns(8)
         .striped(true)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
@@ -140,7 +149,8 @@ fn connected_table(
                 "handshake",
                 "pkts",
                 "bytes",
-                "rate / plot",
+                "rate",
+                "plot",
             ] {
                 ui.weak(header);
             }
@@ -169,15 +179,12 @@ fn connected_table(
                     format::bytes(peer.rx_bytes as f64)
                 ));
                 let series = traffic.peer(network_id, &peer.public_key);
-                ui.horizontal(|ui| {
-                    // A fixed-width rate so the inline plot does not shift as
-                    // the number's length changes (e.g. "0 B/s" vs "1.1 kB/s").
-                    ui.allocate_ui(egui::vec2(64.0, 18.0), |ui| {
-                        ui.add(egui::Label::new(format::series_rate(series, unit)).truncate());
-                    });
-                    ui.allocate_ui(egui::vec2(90.0, 20.0), |ui| {
-                        format::sparkline(ui, series, unit, 18.0);
-                    });
+                // Rate and plot are separate grid columns, so the plot column
+                // starts at the same x on every row regardless of the rate's
+                // text width.
+                ui.add(egui::Label::new(format::series_rate(series, unit)).truncate());
+                ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
+                    format::sparkline(ui, series, unit, 18.0);
                 });
                 ui.end_row();
             }

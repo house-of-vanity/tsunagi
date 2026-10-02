@@ -99,7 +99,6 @@ impl App {
         let Some(Ok(report)) = &snapshot.status else {
             return;
         };
-        let unit = self.state.unit;
         let open: Vec<String> = self.state.open_devices.iter().cloned().collect();
         for id in open {
             let Some(network) = report.networks.iter().find(|n| n.network_id == id) else {
@@ -114,6 +113,9 @@ impl App {
                 .with_min_inner_size([480.0, 320.0]);
             let agent = &self.agent;
             let traffic = &self.traffic;
+            // The window shares the single unit setting, so its toggle and the
+            // main window's stay in step.
+            let unit = &mut self.state.unit;
             let keep = ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
                 devices::show(vctx, agent, unit, network, traffic);
                 !vctx.input(|i| i.viewport().close_requested())
