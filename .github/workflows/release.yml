@@ -1,14 +1,14 @@
 name: Release
 
-# Build the agent for every supported target on a version tag and attach the
-# archives to a release. Linux is a fully static musl binary (built with
-# cargo-zigbuild) so one artifact runs on any distro — Arch, Alpine, NixOS, old
-# glibc systems alike — and can then be repackaged however a distro prefers.
+# Build the agent for every supported target on a version tag, leave each build
+# as a run artifact, and then — only after every target has built — attach the
+# archives to the release. Linux is a fully static musl binary (built with
+# cargo-zigbuild) so one artifact runs on any distro and can be repackaged
+# however a distro prefers.
 #
-# Targeted at Gitea Actions: the release assets are uploaded straight to the
-# Gitea release API with curl, rather than through actions/upload-artifact and
-# `gh`, because the v4 artifact backend and the GitHub REST API are not
-# available there. The only runner tools it needs are curl and coreutils.
+# Targeted at Gitea Actions: artifacts use @v3 (the v4 backend is not available
+# on Gitea/GHES), and the release is filled through Gitea's own API with curl
+# rather than `gh`, which speaks only to github.com.
 on:
   push:
     tags: ["v*"]
@@ -73,9 +73,6 @@ jobs:
           # Pin a real, archived Zig release. Left unpinned the action resolves
           # to the newest version it knows of (a yet-unreleased 0.16.0-dev),
           # whose tarball 404s on ziglang.org while the community mirrors flake.
-          # A concrete release always has a permanent official URL, so the
-          # download succeeds even if mirrors are down, and the version stays
-          # compatible with cargo-zigbuild.
           version: 0.14.1
       - name: Install cargo-zigbuild
         if: matrix.zig
@@ -136,46 +133,83 @@ jobs:
             tar -C dist/pkg -czf "${archive}" "${{ matrix.asset }}"
           fi
 
-      - name: Upload the archive to the release
+      # @v3 on purpose: Gitea does not support the v4 artifact backend. This is
+      # what makes the archive show up under the run and hands it to `publish`.
+      - name: Upload the archive as a run artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}-*.*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download every build artifact
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+
+      - name: Show what was collected
+        run: find artifacts -type f
+
+      - name: Create the release and upload the archives
         shell: bash
         env:
-          # Gitea injects this with write access to the current repository.
+          # Gitea injects this with access to the current repository. If the
+          # release calls below return 403, the repo/runner is configured to
+          # hand Actions a read-only token — grant it write access to releases.
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
 
-          version="${GITHUB_REF_NAME#v}"
-          archive="${{ matrix.asset }}-${version}.${{ matrix.archive }}"
           tag="${GITHUB_REF_NAME}"
-          api="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
+          # Gitea sets GITHUB_API_URL to its own API root (…/api/v1); fall back
+          # to building it from the server URL if it is absent.
+          base="${GITHUB_API_URL:-${GITHUB_SERVER_URL}/api/v1}"
+          api="${base}/repos/${GITHUB_REPOSITORY}"
           auth="Authorization: token ${TOKEN}"
+          echo "release API: $api"
 
           prerelease=false
           case "$tag" in *-*) prerelease=true ;; esac
 
-          # The release id for this tag, or empty if there is no release yet.
-          # Parsed with grep so the job needs no jq on the runner image.
-          get_id() {
-            curl -fsSL -H "$auth" "$api/releases/tags/$tag" 2>/dev/null \
-              | grep -o '"id":[0-9]*' | head -n1 | cut -d: -f2
-          }
+          # The release id for this tag, if it already exists.
+          code=$(curl -sS -o resp.json -w '%{http_code}' -H "$auth" "$api/releases/tags/$tag" || true)
+          echo "get release by tag: HTTP $code"
+          id=$(grep -o '"id":[0-9]*' resp.json 2>/dev/null | head -n1 | cut -d: -f2 || true)
 
-          # Create the release if it is not there. Several matrix jobs can race
-          # here, so a create that loses the race is ignored and the id is then
-          # read back by tag.
-          id="$(get_id)"
           if [ -z "$id" ]; then
-            curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
+            code=$(curl -sS -o resp.json -w '%{http_code}' -X POST -H "$auth" \
+              -H 'Content-Type: application/json' \
               -d "{\"tag_name\":\"$tag\",\"name\":\"tsunagi $tag\",\"prerelease\":$prerelease}" \
-              "$api/releases" >/dev/null 2>&1 || true
-            id="$(get_id)"
+              "$api/releases" || true)
+            echo "create release: HTTP $code"
+            id=$(grep -o '"id":[0-9]*' resp.json 2>/dev/null | head -n1 | cut -d: -f2 || true)
+            if [ -z "$id" ]; then
+              echo "could not create the release; response was:" >&2
+              cat resp.json >&2 || true
+              exit 1
+            fi
           fi
-          if [ -z "$id" ]; then
-            echo "could not create or find a release for $tag at $api" >&2
-            exit 1
-          fi
+          echo "release id: $id"
 
-          curl -fsS -X POST -H "$auth" \
-            -F "attachment=@${archive}" \
-            "$api/releases/$id/assets?name=${archive}" >/dev/null
-          echo "uploaded $archive to release $tag (id $id)"
+          # download-artifact@v3 nests each artifact in a directory named after
+          # its upload, with the single archive inside. The read loop runs in
+          # this shell (process substitution, not a pipe) so a failed upload
+          # actually fails the job.
+          rc=0
+          while IFS= read -r -d '' f; do
+            name=$(basename "$f")
+            code=$(curl -sS -o up.json -w '%{http_code}' -X POST -H "$auth" \
+              -F "attachment=@${f}" \
+              "$api/releases/$id/assets?name=${name}" || true)
+            echo "upload $name: HTTP $code"
+            if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+              cat up.json >&2 || true
+              rc=1
+            fi
+          done < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0)
+          exit "$rc"
