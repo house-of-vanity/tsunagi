@@ -3061,18 +3061,19 @@ async fn addresses_section() -> report::Section {
         iface_map.insert(item.addr, item.iface.clone());
     }
 
+    // One line per address: the announce status is the label, and the address
+    // and its interface share the detail, so a host with many addresses stays
+    // compact instead of spending two lines on each.
+    let detail = |addr: std::net::IpAddr| match iface_map.get(&addr) {
+        Some(iface) => format!("{addr} · {iface}"),
+        None => addr.to_string(),
+    };
+
     // 1. Announced peer candidate addresses (in candidate priority order)
     let mut seen = std::collections::HashSet::new();
-    for (idx, &cand) in candidates.iter().enumerate() {
+    for &cand in &candidates {
         if seen.insert(cand) {
-            let note = iface_map
-                .get(&cand)
-                .map(|iface| format!("{iface} · candidate #{}", idx + 1));
-            let row = Row::new(Health::Info, "announced", cand.to_string());
-            addresses.push(match note {
-                Some(n) => row.with_note(n),
-                None => row,
-            });
+            addresses.push(Row::new(Health::Info, "announced", detail(cand)));
         }
     }
 
@@ -3093,16 +3094,13 @@ async fn addresses_section() -> report::Section {
 
     unannounced.sort_by_key(|item| item.addr);
     for item in unannounced {
-        let note = format!("{} · not announced to peers", item.iface);
-        addresses
-            .push(Row::new(Health::Info, "not announced", item.addr.to_string()).with_note(note));
+        addresses.push(Row::new(Health::Info, "not announced", detail(item.addr)));
     }
 
     // 3. Loopback addresses
     loopbacks.sort_by_key(|item| item.addr);
     for item in loopbacks {
-        addresses
-            .push(Row::new(Health::Info, "loopback", item.addr.to_string()).with_note(&item.iface));
+        addresses.push(Row::new(Health::Info, "loopback", detail(item.addr)));
     }
 
     addresses
