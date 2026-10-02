@@ -1,0 +1,23 @@
+// Installed by the tsunagi packages.
+//
+// polkit decides who may configure systemd-resolved by user/group id, not by
+// capability, so the agent needs this even though it holds CAP_NET_ADMIN. It
+// grants exactly the four resolve1 actions the agent calls, and nothing else,
+// to anyone in the "tsunagi" group.
+//
+// The packaged service runs as the "tsunagi" user (which is in that group), so
+// its resolver configuration is allowed. To also run the agent as your own
+// user, add yourself to the group:
+//
+//     sudo usermod -aG tsunagi "$USER"
+polkit.addRule(function(action, subject) {
+    var allowed = [
+        "org.freedesktop.resolve1.set-dns-servers",
+        "org.freedesktop.resolve1.set-domains",
+        "org.freedesktop.resolve1.set-default-route",
+        "org.freedesktop.resolve1.revert"
+    ];
+    if (allowed.indexOf(action.id) >= 0 && subject.isInGroup("tsunagi")) {
+        return polkit.Result.YES;
+    }
+});

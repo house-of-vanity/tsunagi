@@ -2,40 +2,45 @@
 
 This archive holds a **static** `tsunagi` binary (musl), so it runs on any
 distribution — Arch, Alpine, NixOS, old glibc systems — with no shared-library
-dependencies. Alongside it are a systemd unit and an installer.
+dependencies. Alongside it are a systemd unit, a polkit rule, and an installer.
 
 Creating the TUN interface needs `CAP_NET_ADMIN`, and configuring
-systemd-resolved is decided by polkit (by user id, not capability). There are
-three ways to satisfy that; pick one.
+systemd-resolved is decided by polkit. There are three ways to run it; pick one.
 
-## Quick install — systemd service as root
+> On Debian/Ubuntu and Arch, prefer the native package (`.deb` / `.pkg.tar.zst`)
+> from the release — it does all of the below for you.
+
+## Quick install — systemd service as a dedicated user
 
 ```sh
 sudo ./install.sh
 sudo systemctl enable --now tsunagi
 ```
 
-The service runs the agent as root, so the interface, low ports and the
-resolver all just work (root is not subject to polkit). Control it **as root**,
-so the client resolves the same state directory the daemon uses:
+The service runs as an unprivileged `tsunagi` user with just `CAP_NET_ADMIN`
+and `CAP_NET_BIND_SERVICE` (granted by systemd), not root. systemd creates its
+state (`/var/lib/tsunagi`), cache (`/var/cache/tsunagi`) and runtime
+(`/run/tsunagi`) directories, and the polkit rule lets it configure the
+resolver. Control it with `sudo` — the CLI finds the running service's socket at
+`/run/tsunagi/agent.sock` with no flags:
 
 ```sh
 sudo tsunagi status
 sudo tsunagi join <network-name> <tsn1…secret>
 ```
 
-## As your own user — one capability, no root at runtime
+## As your own user — one capability, no service
 
 ```sh
 sudo install -m 0755 tsunagi /usr/local/bin/tsunagi
 sudo setcap cap_net_admin,cap_net_bind_service+p /usr/local/bin/tsunagi
+sudo usermod -aG tsunagi "$USER"   # so the resolver works; log in again after
 tsunagi up
 ```
 
-Nothing is left behind and nothing runs as root. The capability is lost on every
-rebuild or copy of the binary, so re-run `setcap` after replacing it. For the
-local DNS resolver, run `tsunagi dns` once: it prints the exact polkit rule that
-lets your user configure systemd-resolved, ready to paste.
+Nothing runs as root. The capability is lost on every rebuild or copy of the
+binary, so re-run `setcap` after replacing it. The agent uses your per-user
+state directory and socket, so plain `tsunagi status` (no sudo) reaches it.
 
 ## Without touching the OS
 

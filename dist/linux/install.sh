@@ -1,10 +1,11 @@
 #!/usr/bin/env sh
-# Installs the tsunagi binary and, where systemd is present, a root service.
-# Run it as root (it writes under /usr/local and /etc):
+# Installs the static tsunagi binary and, where systemd is present, a service
+# that runs the agent as a dedicated unprivileged "tsunagi" user. Run as root:
 #
 #   sudo ./install.sh
 #
-# PREFIX overrides the install prefix (default /usr/local).
+# PREFIX overrides the install prefix (default /usr/local); if you change it,
+# edit ExecStart in tsunagi.service to match.
 set -eu
 
 PREFIX="${PREFIX:-/usr/local}"
@@ -19,8 +20,23 @@ echo "Installing tsunagi to ${PREFIX}/bin"
 install -d "${PREFIX}/bin"
 install -m 0755 "${here}/tsunagi" "${PREFIX}/bin/tsunagi"
 
+# The dedicated system user the service runs as (works with either shadow's
+# useradd or Debian's adduser).
+if ! getent group tsunagi >/dev/null 2>&1; then
+    groupadd -r tsunagi 2>/dev/null || addgroup --system tsunagi 2>/dev/null || true
+fi
+if ! getent passwd tsunagi >/dev/null 2>&1; then
+    useradd -r -g tsunagi -d /var/lib/tsunagi -s /usr/sbin/nologin -c "tsunagi agent" tsunagi 2>/dev/null \
+        || adduser --system --ingroup tsunagi --home /var/lib/tsunagi --no-create-home \
+            --gecos "tsunagi agent" --disabled-login tsunagi 2>/dev/null || true
+fi
+
+# polkit rule so the agent (as the tsunagi user) may configure systemd-resolved.
+install -d /etc/polkit-1/rules.d
+install -m 0644 "${here}/50-tsunagi-resolved.rules" /etc/polkit-1/rules.d/50-tsunagi-resolved.rules
+
 if command -v systemctl >/dev/null 2>&1; then
-    echo "Installing the systemd service (runs the agent as root)"
+    echo "Installing the systemd service (runs as the tsunagi user)"
     install -m 0644 "${here}/tsunagi.service" /etc/systemd/system/tsunagi.service
     systemctl daemon-reload
     cat <<EOF
@@ -29,7 +45,7 @@ Done. Start the agent with:
 
     sudo systemctl enable --now tsunagi
 
-Control it as root, so the client shares the agent's state directory:
+Control it with sudo (the CLI finds the service's socket automatically):
 
     sudo tsunagi status
     sudo tsunagi join <network-name> <tsn1…secret>
@@ -39,19 +55,11 @@ else
 
 Installed the binary; no systemd found, so no service was set up. Either:
 
-  * run it directly as root:
-
-        sudo tsunagi up
-
-  * or grant the capability and run it as your own user (no root at runtime):
-
-        sudo setcap cap_net_admin,cap_net_bind_service+p ${PREFIX}/bin/tsunagi
-        tsunagi up
-
-    For the local DNS resolver as a non-root user, run \`tsunagi dns\` once; it
-    prints the polkit rule that lets your user configure systemd-resolved.
-
-  * or skip the interface entirely with \`tsunagi up --no-tun\`: tunnels still
-    form, they just do not reach the operating system.
+  * run it as root:            sudo ${PREFIX}/bin/tsunagi up
+  * or as your own user:       sudo setcap cap_net_admin,cap_net_bind_service+p ${PREFIX}/bin/tsunagi
+                               tsunagi up
+    (add yourself to the tsunagi group so the resolver works:
+     sudo usermod -aG tsunagi "\$USER")
+  * or without touching the OS: tsunagi up --no-tun
 EOF
 fi

@@ -6,21 +6,31 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Runs as a dedicated unprivileged user, not root. The two capabilities are all
+# it needs: CAP_NET_ADMIN to create and configure the TUN interface, and
+# CAP_NET_BIND_SERVICE for low ports. The packages create the `tsunagi` user.
+User=tsunagi
+Group=tsunagi
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+# systemd creates and owns these for the service user, and the agent is pointed
+# at them: state in /var/lib/tsunagi, cache in /var/cache/tsunagi, and the
+# control socket in /run/tsunagi, which stays private to the service user.
+StateDirectory=tsunagi
+StateDirectoryMode=0700
+CacheDirectory=tsunagi
+RuntimeDirectory=tsunagi
+RuntimeDirectoryMode=0755
+Environment=TSUNAGI_STATE_DIR=%S/tsunagi
+Environment=TSUNAGI_CACHE_DIR=%C/tsunagi
+Environment=TSUNAGI_CONTROL_SOCKET=%t/tsunagi/agent.sock
+
+# The tarball installer puts the binary here; the deb and the Arch package
+# rewrite this to /usr/bin where they install it.
 ExecStart=/usr/local/bin/tsunagi up
 Restart=on-failure
 RestartSec=5
-
-# This unit runs the agent as root, which covers everything it needs: creating
-# the TUN interface (CAP_NET_ADMIN), binding low ports, and configuring
-# systemd-resolved — root is not subject to polkit, so no polkit rule is needed.
-#
-# To run as a non-root user instead, uncomment the three lines below, set a
-# User=, and install the polkit rule that `tsunagi dns` prints (resolved decides
-# by user id, not capability, so the rule is what lets a non-root agent set the
-# resolver):
-#User=tsunagi
-#AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-#CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

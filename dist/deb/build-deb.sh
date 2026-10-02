@@ -29,7 +29,7 @@ sed 's#/usr/local/bin/tsunagi#/usr/bin/tsunagi#' \
     "$here/../linux/tsunagi.service" > "$root/lib/systemd/system/tsunagi.service"
 chmod 0644 "$root/lib/systemd/system/tsunagi.service"
 
-install -D -m 0644 "$here/50-tsunagi-resolved.rules" \
+install -D -m 0644 "$here/../linux/50-tsunagi-resolved.rules" \
     "$root/usr/share/polkit-1/rules.d/50-tsunagi-resolved.rules"
 install -D -m 0644 "$here/../../README.md" "$root/usr/share/doc/tsunagi/README.md"
 install -D -m 0644 "$here/../linux/README.md" "$root/usr/share/doc/tsunagi/INSTALL.md"
@@ -47,17 +47,23 @@ Homepage: https://github.com/Ultradesu/tsunagi
 Description: Serverless private mesh networking agent
  tsunagi forms small private mesh IP networks between peers, with NAT
  traversal and no central server. This package installs a static,
- dependency-free binary, a systemd service that runs the agent as root, and a
- polkit rule that lets a non-root agent configure systemd-resolved.
+ dependency-free binary, a systemd service that runs the agent as a dedicated
+ unprivileged "tsunagi" user with only CAP_NET_ADMIN and CAP_NET_BIND_SERVICE,
+ and a polkit rule for the local DNS resolver.
 CTRL
 
-# A system group for the optional non-root run (the polkit rule grants it the
-# resolve1 actions). The packaged service runs as root and does not need it.
+# The dedicated system user the service runs as. It is in the "tsunagi" group,
+# which the polkit rule grants the resolve1 actions. systemd creates the state,
+# cache and runtime directories for it on first start.
 cat > "$root/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e
 if ! getent group tsunagi >/dev/null 2>&1; then
     addgroup --system tsunagi >/dev/null 2>&1 || true
+fi
+if ! getent passwd tsunagi >/dev/null 2>&1; then
+    adduser --system --ingroup tsunagi --home /var/lib/tsunagi --no-create-home \
+        --gecos "tsunagi agent" --disabled-login tsunagi >/dev/null 2>&1 || true
 fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || true

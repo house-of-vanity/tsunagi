@@ -761,6 +761,17 @@ fn control_socket(
     if !_is_custom_state_dir {
         return tsunagi::ipc::default_control_socket_path();
     }
+    // When the user did not choose a state directory, prefer a running system
+    // service's socket, so `sudo tsunagi status` reaches the packaged daemon —
+    // which binds there via TSUNAGI_CONTROL_SOCKET — with no flags. Only when it
+    // is actually present, so a per-user agent still uses its own socket.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if !_is_custom_state_dir {
+        let system = std::path::Path::new("/run/tsunagi/agent.sock");
+        if system.exists() {
+            return system.to_path_buf();
+        }
+    }
     tsunagi::ipc::control_socket_path(&paths.state_dir)
 }
 

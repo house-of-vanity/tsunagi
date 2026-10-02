@@ -36,6 +36,7 @@ jobs:
             zig: true
             deb: true
             deb_arch: amd64
+            pkg_arch: x86_64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             asset: tsunagi-linux-aarch64
@@ -43,6 +44,7 @@ jobs:
             zig: true
             deb: true
             deb_arch: arm64
+            pkg_arch: aarch64
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: tsunagi-macos-aarch64
@@ -68,9 +70,9 @@ jobs:
       # aws-lc-sys (iroh's rustls backend) and the bundled sqlite are C, and the
       # musl targets have no prebuilt bindings, so bindgen needs libclang and the
       # C build needs cmake. zig is the cross C compiler cargo-zigbuild drives.
-      - name: Install musl build tooling
+      - name: Install musl build and packaging tooling
         if: matrix.zig
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev libarchive-tools zstd
       - name: Install zig
         if: matrix.zig
         uses: mlugg/setup-zig@v2
@@ -119,7 +121,8 @@ jobs:
           cp README.md "$stage/"
           case "${{ runner.os }}" in
             Linux)
-              cp dist/linux/tsunagi.service dist/linux/install.sh "$stage/"
+              cp dist/linux/tsunagi.service dist/linux/install.sh \
+                 dist/linux/50-tsunagi-resolved.rules "$stage/"
               cp dist/linux/README.md "$stage/INSTALL.md"
               ;;
             macOS)
@@ -153,6 +156,22 @@ jobs:
             "$version" \
             "tsunagi_${version}_${{ matrix.deb_arch }}.deb"
 
+      # A dependency-free Arch package (.pkg.tar.zst), assembled with bsdtar and
+      # zstd (no makepkg); same binary, service and polkit rule. See
+      # dist/arch/build-pkg.sh.
+      - name: Build the Arch package
+        if: matrix.pkg_arch
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          pkgver="${version//-/_}"
+          bash dist/arch/build-pkg.sh \
+            "target/${{ matrix.target }}/release/tsunagi" \
+            "${{ matrix.pkg_arch }}" \
+            "$version" \
+            "tsunagi-${pkgver}-1-${{ matrix.pkg_arch }}.pkg.tar.zst"
+
       - name: Upload the build outputs as run artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -160,6 +179,7 @@ jobs:
           path: |
             ${{ matrix.asset }}-*.*
             *.deb
+            *.pkg.tar.zst
           if-no-files-found: error
 
   publish:
@@ -188,7 +208,7 @@ jobs:
 
           # download-artifact@v4 nests each artifact under its own directory, so
           # the archives are artifacts/<asset>/<file>.
-          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' \))
+          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.pkg.tar.zst' \))
           printf 'asset: %s\n' "${files[@]}"
 
           prerelease=()
