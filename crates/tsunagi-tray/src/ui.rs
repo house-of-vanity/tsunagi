@@ -1,40 +1,61 @@
-//! The window contents, drawn from the latest agent snapshot.
+//! The main window: a compact overview. Per-network detail (the full peer
+//! table with inline plots) lives in a separate devices window (see
+//! [`crate::devices`]), opened from each tile.
 //!
-//! Pure rendering: state comes from the snapshot and the traffic sampler, and a
-//! change to a switch or a button sends a [`Command`] to the worker. The layout
-//! targets one fixed, small window, so everything is laid out on a grid and the
-//! peer list hides behind a collapsing header.
+//! Pure rendering: state comes from the snapshot and the traffic sampler, a
+//! change to a switch or button sends a [`Command`] to the worker, and local UI
+//! state (the join form, the unit toggle, which devices windows are open, an
+//! in-progress hostname edit) lives in [`UiState`].
 
-use std::collections::VecDeque;
+use std::collections::BTreeSet;
 
 use eframe::egui;
 
-use tsunagi::identity::NetworkSecret;
-use tsunagi::ipc::{NetworkReport, OverlayPeerReport, StatusReport};
+use tsunagi::ipc::{NetworkReport, StatusReport};
 
 use crate::agent::{AgentClient, Command, Snapshot};
-use crate::stats::Traffic;
+use crate::format;
+use crate::stats::{Traffic, Unit};
 
-/// Width of the value column's input fields, so name and secret line up.
-const INPUT_WIDTH: f32 = 208.0;
-/// Accent used for the traffic sparkline.
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x80, 0xd8);
 const OK: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xb0, 0x4a);
-const WARN: egui::Color32 = egui::Color32::from_rgb(0xd9, 0x9a, 0x00);
 const BAD: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x4a, 0x3c);
+/// A neutral, not-garish red for the Leave button.
+const LEAVE_RED: egui::Color32 = egui::Color32::from_rgb(0xa8, 0x3a, 0x3a);
 
-/// Join form state, kept across frames.
+/// Join form fields.
 #[derive(Default)]
 pub(crate) struct JoinForm {
     pub(crate) name: String,
     pub(crate) secret: String,
 }
 
-/// Draws the whole window.
+/// Local UI state kept across frames.
+pub(crate) struct UiState {
+    pub(crate) join: JoinForm,
+    /// Whether rates and sparklines are shown in packets or bytes.
+    pub(crate) unit: Unit,
+    /// An in-progress hostname edit (`None` when not editing).
+    pub(crate) host_edit: Option<String>,
+    /// Network ids whose devices window is open.
+    pub(crate) open_devices: BTreeSet<String>,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            join: JoinForm::default(),
+            unit: Unit::Packets,
+            host_edit: None,
+            open_devices: BTreeSet::new(),
+        }
+    }
+}
+
+/// Draws the main window.
 pub(crate) fn draw(
     ctx: &egui::Context,
     agent: &AgentClient,
-    join: &mut JoinForm,
+    state: &mut UiState,
     snapshot: &Snapshot,
     traffic: &Traffic,
 ) {
@@ -49,6 +70,10 @@ pub(crate) fn draw(
                 if snapshot.busy {
                     ui.add(egui::Spinner::new());
                 }
+                ui.separator();
+                ui.selectable_value(&mut state.unit, Unit::Bytes, "bytes");
+                ui.selectable_value(&mut state.unit, Unit::Packets, "pkts");
+                ui.label("show:");
             });
         });
         ui.add_space(4.0);
@@ -63,7 +88,7 @@ pub(crate) fn draw(
             };
         }
         ui.add_space(4.0);
-        draw_join(ui, agent, join);
+        draw_join(ui, agent, &mut state.join);
         ui.add_space(4.0);
     });
 
@@ -74,7 +99,7 @@ pub(crate) fn draw(
         }
         Some(Err(error)) => draw_unreachable(ui, agent, error),
         Some(Ok(report)) => {
-            draw_header(ui, report);
+            draw_header(ui, agent, state, report);
             ui.separator();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -84,19 +109,22 @@ pub(crate) fn draw(
                         ui.weak("No networks yet — join one below.");
                     }
                     for network in &report.networks {
-                        draw_network(ui, agent, traffic, network);
+                        draw_network(ui, agent, state, traffic, network);
                     }
                 });
         }
     });
 }
 
-/// The "agent cannot be reached" state, naming the socket it tried.
+/// The "agent cannot be reached" state.
 fn draw_unreachable(ui: &mut egui::Ui, agent: &AgentClient, error: &str) {
     ui.add_space(8.0);
     ui.colored_label(BAD, "The agent is not reachable.");
     ui.add_space(6.0);
-    kv(ui, "socket", &agent.socket().display().to_string());
+    ui.horizontal(|ui| {
+        ui.weak("socket");
+        ui.monospace(agent.socket().display().to_string());
+    });
     ui.add_space(4.0);
     ui.weak(error);
     ui.add_space(6.0);
@@ -106,34 +134,66 @@ fn draw_unreachable(ui: &mut egui::Ui, agent: &AgentClient, error: &str) {
     );
 }
 
-/// The device line.
-fn draw_header(ui: &mut egui::Ui, report: &StatusReport) {
+/// The device header: id (with a copy button) and an editable hostname.
+fn draw_header(ui: &mut egui::Ui, agent: &AgentClient, state: &mut UiState, report: &StatusReport) {
     ui.add_space(4.0);
-    egui::Grid::new("device")
-        .num_columns(2)
-        .spacing([10.0, 3.0])
-        .show(ui, |ui| {
-            kv_row(ui, "device", &short(&report.endpoint_id));
-            kv_row(ui, "host", &report.hostname);
-        });
+    ui.horizontal(|ui| {
+        ui.weak("device");
+        ui.monospace(format::short(&report.endpoint_id));
+        format::copy_button(ui, &report.endpoint_id);
+    });
+
+    ui.horizontal(|ui| {
+        ui.weak("host");
+        match &mut state.host_edit {
+            None => {
+                ui.label(&report.hostname);
+                if ui.small_button("✎").on_hover_text("rename").clicked() {
+                    state.host_edit = Some(report.hostname.clone());
+                }
+            }
+            Some(buffer) => {
+                let response = ui.add(egui::TextEdit::singleline(buffer).desired_width(150.0));
+                let submit = (response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || ui.small_button("✔").clicked();
+                if submit {
+                    agent.send(Command::SetHostname(buffer.trim().to_string()));
+                    state.host_edit = None;
+                } else if ui.small_button("✕").clicked() {
+                    state.host_edit = None;
+                }
+            }
+        }
+    });
+
     if !report.cache_healthy {
-        ui.colored_label(WARN, "cache unavailable");
+        ui.colored_label(
+            egui::Color32::from_rgb(0xd9, 0x9a, 0x00),
+            "cache unavailable",
+        );
     }
 }
 
-/// One network tile.
+/// One compact network tile.
 fn draw_network(
     ui: &mut egui::Ui,
     agent: &AgentClient,
+    state: &mut UiState,
     traffic: &Traffic,
     network: &NetworkReport,
 ) {
     ui.add_space(6.0);
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
+            // The name copies on click.
             ui.strong(network.name.as_str());
+            format::copy_label(ui, "⧉", &network.name);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Leave").clicked() {
+                let leave =
+                    egui::Button::new(egui::RichText::new("Leave").color(egui::Color32::WHITE))
+                        .fill(LEAVE_RED);
+                if ui.add(leave).clicked() {
                     agent.send(Command::Leave {
                         network_id: network.network_id.clone(),
                     });
@@ -141,40 +201,40 @@ fn draw_network(
             });
         });
 
-        let overlay = network.overlay.as_ref();
-        let address = overlay.and_then(|o| o.address.as_ref());
+        let address = network.overlay.as_ref().and_then(|o| o.address.as_ref());
         let series = traffic.network(&network.network_id);
 
         egui::Grid::new(("net", &network.network_id))
             .num_columns(2)
             .spacing([10.0, 3.0])
             .show(ui, |ui| {
-                kv_row(ui, "id", &short(&network.network_id));
+                ui.weak("id");
+                ui.horizontal(|ui| {
+                    ui.label(format::short(&network.network_id));
+                    format::copy_button(ui, &network.network_id);
+                });
+                ui.end_row();
+
                 if let Some(range) = &network.range {
-                    kv_row(ui, "range", range);
+                    ui.weak("range");
+                    format::copy_label(ui, range, range);
+                    ui.end_row();
                 }
                 if let Some(address) = address {
-                    kv_row(ui, "addr", address);
+                    ui.weak("addr");
+                    format::copy_label(ui, address, address);
+                    ui.end_row();
                 }
-                kv_row(
-                    ui,
-                    "peers",
-                    &format!(
-                        "{} connected · {} known",
-                        network.peers.len(),
-                        network.members.len()
-                    ),
-                );
-                if let Some(series) = series {
-                    kv_row(ui, "traffic", &rate(series.rate));
-                }
+                ui.weak("peers");
+                ui.label(format!(
+                    "{} connected · {} known",
+                    network.peers.len(),
+                    network.members.len()
+                ));
+                ui.end_row();
             });
 
-        if let Some(series) = series
-            && series.history.len() >= 2
-        {
-            sparkline(ui, &series.history);
-        }
+        format::sparkline(ui, series, state.unit, 34.0);
 
         ui.horizontal(|ui| {
             let mut active = network.active;
@@ -191,51 +251,18 @@ fn draw_network(
                     enabled: broadcast,
                 });
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Show devices").clicked() {
+                    state.open_devices.insert(network.network_id.clone());
+                }
+            });
         });
-
-        if let Some(overlay) = overlay
-            && !overlay.peers.is_empty()
-        {
-            egui::CollapsingHeader::new(format!("peers ({})", overlay.peers.len()))
-                .id_salt(("peers", &network.network_id))
-                .show(ui, |ui| {
-                    draw_peers(ui, traffic, &network.network_id, &overlay.peers);
-                });
-        }
     });
-}
-
-/// The per-peer table inside a network's collapsing header.
-fn draw_peers(ui: &mut egui::Ui, traffic: &Traffic, network_id: &str, peers: &[OverlayPeerReport]) {
-    egui::Grid::new(("peertable", network_id))
-        .num_columns(5)
-        .striped(true)
-        .spacing([10.0, 3.0])
-        .show(ui, |ui| {
-            for header in ["peer", "address", "age", "tx/rx", "rate"] {
-                ui.weak(header);
-            }
-            ui.end_row();
-
-            for peer in peers {
-                ui.monospace(short(&peer.public_key));
-                ui.label(peer.address.clone().unwrap_or_else(|| "—".into()));
-                ui.label(match peer.handshake_secs_ago {
-                    Some(secs) => format!("{secs}s"),
-                    None => "—".into(),
-                });
-                ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
-                let pps = traffic
-                    .peer(network_id, &peer.public_key)
-                    .map_or(0.0, |series| series.rate);
-                ui.label(rate(pps));
-                ui.end_row();
-            }
-        });
 }
 
 /// The join form: aligned name and secret, a generate button, and Join.
 fn draw_join(ui: &mut egui::Ui, agent: &AgentClient, join: &mut JoinForm) {
+    const INPUT_WIDTH: f32 = 208.0;
     ui.label("Join or create a network");
     egui::Grid::new("join")
         .num_columns(2)
@@ -257,7 +284,10 @@ fn draw_join(ui: &mut egui::Ui, agent: &AgentClient, join: &mut JoinForm) {
                     .on_hover_text("Generate a new random secret")
                     .clicked()
                 {
-                    join.secret = NetworkSecret::generate().encode().as_str().to_owned();
+                    join.secret = tsunagi::identity::NetworkSecret::generate()
+                        .encode()
+                        .as_str()
+                        .to_owned();
                 }
             });
             ui.end_row();
@@ -273,64 +303,5 @@ fn draw_join(ui: &mut egui::Ui, agent: &AgentClient, join: &mut JoinForm) {
             secret: join.secret.trim().to_string(),
         });
         join.secret.clear();
-    }
-}
-
-/// A small filled-ish line chart of recent rates, drawn with the painter.
-fn sparkline(ui: &mut egui::Ui, history: &VecDeque<f32>) {
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    let peak = history.iter().copied().fold(1.0_f32, f32::max);
-    let count = history.len();
-    if count < 2 {
-        return;
-    }
-    let points: Vec<egui::Pos2> = history
-        .iter()
-        .enumerate()
-        .map(|(i, value)| {
-            let x = rect.left() + rect.width() * (i as f32 / (count - 1) as f32);
-            let y = rect.bottom() - (rect.height() - 2.0) * (value / peak);
-            egui::pos2(x, y)
-        })
-        .collect();
-    painter.add(egui::Shape::line(
-        points,
-        egui::Stroke::new(1.5_f32, ACCENT),
-    ));
-}
-
-/// A key/value label pair outside a grid.
-fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.weak(key);
-        ui.monospace(value);
-    });
-}
-
-/// A key/value row inside a two-column grid.
-fn kv_row(ui: &mut egui::Ui, key: &str, value: &str) {
-    ui.weak(key);
-    ui.label(value);
-    ui.end_row();
-}
-
-/// Formats a packets-per-second rate.
-fn rate(pps: f32) -> String {
-    if pps >= 1000.0 {
-        format!("{:.1}k pkt/s", pps / 1000.0)
-    } else {
-        format!("{pps:.0} pkt/s")
-    }
-}
-
-/// A short, readable prefix of a long identifier (char-safe, no panic).
-fn short(id: &str) -> String {
-    const KEEP: usize = 12;
-    if id.chars().count() <= KEEP {
-        id.to_string()
-    } else {
-        format!("{}…", id.chars().take(KEEP).collect::<String>())
     }
 }

@@ -31,6 +31,8 @@ pub(crate) enum Command {
     Join { name: String, secret: String },
     /// Leave a network entirely.
     Leave { network_id: String },
+    /// Change the hostname this device announces.
+    SetHostname(String),
 }
 
 /// The latest the worker knows, read by the UI each frame.
@@ -165,6 +167,10 @@ async fn run(
         Command::Leave { network_id } => ipc::leave_network(socket, &network_id)
             .await
             .map(|report| format!("left {}", report.name))
+            .map_err(|err| err.to_string()),
+        Command::SetHostname(name) => ipc::set_hostname(socket, &name)
+            .await
+            .map(|accepted| format!("hostname: {accepted}"))
             .map_err(|err| err.to_string()),
     };
 

@@ -11,6 +11,8 @@
 
 mod agent;
 mod app;
+mod devices;
+mod format;
 mod stats;
 mod tray;
 mod ui;
