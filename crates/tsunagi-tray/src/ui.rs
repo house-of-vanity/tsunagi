@@ -128,6 +128,8 @@ pub(crate) fn draw(
                 });
         }
     });
+
+    devices::confirm_exit(ctx, agent, &mut state.exit_confirm, None);
 }
 
 /// The "agent cannot be reached" state.
@@ -281,21 +283,32 @@ fn draw_network(
             }
         });
         ui.horizontal(|ui| {
-            if let Some(via) = &network.exit.via {
-                ui.weak("exit");
-                ui.label(exit::name_of(network, via));
-                if ui
-                    .small_button("off")
-                    .on_hover_text("send internet traffic the ordinary way again")
-                    .clicked()
-                {
-                    agent.send(Command::SetExitNode {
-                        network_id: network.network_id.clone(),
-                        peer: None,
-                    });
-                }
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // In the corner while this device sends its traffic through
+                // somebody: green while that works, red while it does not.
+                if let Some(via) = &network.exit.via {
+                    let color = if network.exit.via_online {
+                        exit::GOOD
+                    } else {
+                        exit::LOUD
+                    };
+                    let response = ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(icon::SIGN_OUT).size(18.0).color(color),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(format!(
+                            "exit node: {} — click to stop",
+                            exit::name_of(network, via)
+                        ));
+                    if response.clicked() {
+                        state.exit_confirm =
+                            Some(devices::ExitConfirm::stop_from_tile(network, via));
+                    }
+                }
                 if ui.button("Show devices").clicked() {
                     state.open_devices.insert(network.network_id.clone());
                 }

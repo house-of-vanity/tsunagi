@@ -52,6 +52,12 @@ be an exit node in one network and not in another.
 - Packets for addresses outside every overlay range are sent to the exit node
   by the router; the exit node's replies are accepted from any source. A member
   that is not your exit node cannot do that.
+- **IPv6 is blocked while you use one.** There is no IPv6 through an exit node,
+  and letting it go the ordinary way would leak it. The same three rules exist
+  for IPv6 with an `unreachable default` in the table, so applications get an
+  immediate "network unreachable" and fall back to IPv4. LAN, ULA and other
+  specific IPv6 routes keep working, and so does the agent's own IPv6. A host
+  with no IPv6 has nothing to block and is left alone.
 
 ## What it does not do
 
@@ -62,7 +68,8 @@ be an exit node in one network and not in another.
   it returns or you run `tsunagi exit-node off`. This is deliberate: falling
   back to the direct path would leak traffic nobody agreed to send in the
   clear. The agent logs it once, `status` and the tray say so loudly.
-- IPv6 and DNS are untouched. IPv6 traffic still leaves the ordinary way.
+- **IPv6-only destinations are unreachable** meanwhile; carrying IPv6 through
+  the exit node is not implemented. DNS is untouched.
 - Kernel forwarding is only read, never changed.
 
 ## Trust

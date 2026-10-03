@@ -3385,7 +3385,8 @@ fn exit_rows(network: &tsunagi::ipc::NetworkReport) -> Vec<report::Row> {
                     Health::Good,
                     "using exit",
                     format!("{name}  ·  all internet traffic leaves through it"),
-                ),
+                )
+                .with_note("IPv6 is blocked meanwhile, so it cannot leave the ordinary way"),
                 Some(rules) => Row::new(
                     Health::Degraded,
                     "using exit",

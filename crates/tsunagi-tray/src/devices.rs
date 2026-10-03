@@ -48,6 +48,21 @@ pub(crate) struct ExitConfirm {
     name: String,
     /// Stop using it, rather than start.
     stop: bool,
+    /// Asked in the main window, not in the devices window of the network.
+    main: bool,
+}
+
+impl ExitConfirm {
+    /// A question about stopping the exit node a network's tile shows.
+    pub(crate) fn stop_from_tile(network: &NetworkReport, peer_id: &str) -> Self {
+        Self {
+            network_id: network.network_id.clone(),
+            peer_id: peer_id.to_string(),
+            name: exit::name_of(network, peer_id),
+            stop: true,
+            main: true,
+        }
+    }
 }
 
 impl Device<'_> {
@@ -126,18 +141,24 @@ pub(crate) fn show(
                 device_table(ui, unit, network, &devices, traffic, confirm);
             });
     });
-    confirm_exit(ctx, agent, confirm, &network.network_id);
+    confirm_exit(ctx, agent, confirm, Some(&network.network_id));
 }
 
 /// The confirmation for an exit-node choice, drawn in the window it was
 /// made in. Everything behind it is blocked until it is answered.
-fn confirm_exit(
+///
+/// `network_id` is the devices window the question is drawn in, or `None` for
+/// the main window; a question appears in the window it was asked in only.
+pub(crate) fn confirm_exit(
     ctx: &egui::Context,
     agent: &AgentClient,
     confirm: &mut Option<ExitConfirm>,
-    network_id: &str,
+    network_id: Option<&str>,
 ) {
-    let Some(pending) = confirm.as_ref().filter(|c| c.network_id == network_id) else {
+    let Some(pending) = confirm.as_ref().filter(|c| match network_id {
+        Some(id) => !c.main && c.network_id == id,
+        None => c.main,
+    }) else {
         return;
     };
     egui::Area::new(egui::Id::new("exit confirm backdrop"))
@@ -151,48 +172,31 @@ fn confirm_exit(
         });
 
     let (mut accepted, mut cancelled) = (false, false);
-    egui::Window::new(if pending.stop {
-        "Stop using exit node"
-    } else {
-        "Use as exit node"
-    })
-    .order(egui::Order::Foreground)
-    .collapsible(false)
-    .resizable(false)
-    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-    .show(ctx, |ui| {
-        ui.set_max_width(380.0);
-        if pending.stop {
-            ui.label(format!("Stop using {} as exit node?", pending.name));
-            ui.label("Your internet traffic will leave this device the ordinary way again.");
-        } else {
-            ui.label(
-                egui::RichText::new(format!(
-                    "Send ALL your internet traffic through {}?",
-                    pending.name
-                ))
-                .strong(),
-            );
-            ui.label(
-                "Everything not on this network will leave through that device, which can \
-                 see it.",
-            );
-        }
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let label = if pending.stop {
-                "Stop"
+    egui::Window::new("Exit node")
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_max_width(380.0);
+            ui.label(if pending.stop {
+                format!("Stop using {}?", pending.name)
             } else {
-                "Use as exit node"
-            };
-            if ui.button(label).clicked() {
-                accepted = true;
-            }
-            if ui.button("Cancel").clicked() {
-                cancelled = true;
-            }
+                format!("Use {} as exit node?", pending.name)
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(if pending.stop { "Stop" } else { "Use" })
+                    .clicked()
+                {
+                    accepted = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+            });
         });
-    });
     if accepted {
         agent.send(Command::SetExitNode {
             network_id: pending.network_id.clone(),
@@ -431,6 +435,7 @@ fn exit_cell(
             peer_id: device.id.to_string(),
             name: device.name(),
             stop: device.in_use,
+            main: false,
         });
     }
 }

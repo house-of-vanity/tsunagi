@@ -702,14 +702,37 @@ fn exit_default_route(index: Option<u32>) -> rtnetlink::packet_route::route::Rou
     builder.build()
 }
 
-/// Removes the exit node's routing rules and its table. Nothing there is
+/// The exit table's IPv6 default: nothing is reachable through it.
+///
+/// There is no IPv6 through an exit node, and what the ordinary route would do
+/// is send it out in the clear. This turns it into an immediate refusal, which
+/// is what makes applications fall back to IPv4.
+fn exit_blocking_route_v6() -> rtnetlink::packet_route::route::RouteMessage {
+    RouteMessageBuilder::<std::net::Ipv6Addr>::new()
+        .destination_prefix(std::net::Ipv6Addr::UNSPECIFIED, 0)
+        .table_id(EXIT_TABLE)
+        .kind(rtnetlink::packet_route::route::RouteType::Unreachable)
+        .build()
+}
+
+/// A host with no IPv6 at all has nothing to block, and says so this way.
+fn family_unsupported(err: &impl std::fmt::Display) -> bool {
+    let text = err.to_string();
+    text.contains("not supported") || text.contains("Address family")
+}
+
+/// Removes the exit node's routing rules and its tables. Nothing there is
 /// success: it also runs once at startup, for what a crashed run left.
 async fn clear_exit_client() -> Result<(), OverlayError> {
     with_netlink(|handle| async move { remove_exit_client(&handle).await }).await
 }
 
-async fn remove_exit_client(handle: &rtnetlink::Handle) -> Result<(), OverlayError> {
-    let mut rules = handle.rule().get(IpVersion::V4).execute();
+/// Deletes this agent's exit rules of one address family.
+async fn remove_exit_rules(
+    handle: &rtnetlink::Handle,
+    version: IpVersion,
+) -> Result<(), OverlayError> {
+    let mut rules = handle.rule().get(version).execute();
     let mut ours = Vec::new();
     while let Some(rule) = rules
         .try_next()
@@ -732,12 +755,32 @@ async fn remove_exit_client(handle: &rtnetlink::Handle) -> Result<(), OverlayErr
             }
         }
     }
+    Ok(())
+}
+
+async fn remove_exit_client(handle: &rtnetlink::Handle) -> Result<(), OverlayError> {
+    remove_exit_rules(handle, IpVersion::V4).await?;
     match handle.route().del(exit_default_route(None)).execute().await {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         // "No such process": no such route, which is the goal.
-        Err(err) if err.to_string().contains("No such") => Ok(()),
+        Err(err) if err.to_string().contains("No such") => {}
+        Err(err) => {
+            return Err(OverlayError::Unavailable(format!(
+                "cannot remove the exit node default route: {err}"
+            )));
+        }
+    }
+
+    match remove_exit_rules(handle, IpVersion::V6).await {
+        Ok(()) => {}
+        Err(OverlayError::Unavailable(reason)) if family_unsupported(&reason) => return Ok(()),
+        Err(err) => return Err(err),
+    }
+    match handle.route().del(exit_blocking_route_v6()).execute().await {
+        Ok(()) => Ok(()),
+        Err(err) if err.to_string().contains("No such") || family_unsupported(&err) => Ok(()),
         Err(err) => Err(OverlayError::Unavailable(format!(
-            "cannot remove the exit node default route: {err}"
+            "cannot remove the exit node IPv6 block: {err}"
         ))),
     }
 }
@@ -750,6 +793,9 @@ async fn remove_exit_client(handle: &rtnetlink::Handle) -> Result<(), OverlayErr
 /// ip rule add priority 5290 lookup main suppress_prefixlength 0
 /// ip rule add priority 5300 lookup 0x7473
 /// ```
+///
+/// and the same for IPv6 with `ip -6 route replace unreachable default table
+/// 0x7473`, so that IPv6 is refused instead of leaving the ordinary way.
 ///
 /// What an earlier call left is removed first, so repeating it is safe, and
 /// the rules go in last, so a failure part way never leaves a rule that
@@ -817,9 +863,79 @@ async fn set_exit_client(name: &str, uid: u32) -> Result<(), OverlayError> {
             .priority(EXIT_DEFAULT_PRIORITY)
             .execute()
             .await
-            .map_err(|err| fail("rule for the default route", err))
+            .map_err(|err| fail("rule for the default route", err))?;
+
+        set_exit_block_v6(&handle, uid).await
     })
     .await
+}
+
+/// The IPv6 half: an unreachable default for everything but the agent's own
+/// connections and the specific routes, which keep working.
+async fn set_exit_block_v6(handle: &rtnetlink::Handle, uid: u32) -> Result<(), OverlayError> {
+    let fail = |what: &str, err: rtnetlink::Error| {
+        OverlayError::Unavailable(format!("cannot add the exit node IPv6 {what}: {err}"))
+    };
+    if let Err(err) = handle
+        .route()
+        .add(exit_blocking_route_v6())
+        .replace()
+        .execute()
+        .await
+    {
+        // Without IPv6 there is nothing to leak.
+        return if family_unsupported(&err) {
+            Ok(())
+        } else {
+            Err(fail("block", err))
+        };
+    }
+
+    let mut bypass = handle
+        .rule()
+        .add()
+        .v6()
+        .table_id(MAIN_TABLE)
+        .action(RuleAction::ToTable)
+        .priority(EXIT_BYPASS_PRIORITY);
+    bypass
+        .message_mut()
+        .attributes
+        .push(RuleAttribute::UidRange(RuleUidRange {
+            start: uid,
+            end: uid,
+        }));
+    bypass
+        .execute()
+        .await
+        .map_err(|err| fail("rule for the agent's own traffic", err))?;
+
+    let mut specific = handle
+        .rule()
+        .add()
+        .v6()
+        .table_id(MAIN_TABLE)
+        .action(RuleAction::ToTable)
+        .priority(EXIT_SPECIFIC_PRIORITY);
+    specific
+        .message_mut()
+        .attributes
+        .push(RuleAttribute::SuppressPrefixLen(0));
+    specific
+        .execute()
+        .await
+        .map_err(|err| fail("rule for the specific routes", err))?;
+
+    handle
+        .rule()
+        .add()
+        .v6()
+        .table_id(EXIT_TABLE)
+        .action(RuleAction::ToTable)
+        .priority(EXIT_DEFAULT_PRIORITY)
+        .execute()
+        .await
+        .map_err(|err| fail("rule for the default route", err))
 }
 
 async fn configure_link(configure: &Configure) -> Result<(), OverlayError> {
@@ -992,6 +1108,25 @@ mod tests {
         assert!(!is_exit_rule(&rule(5300, 52, vec![])));
         assert!(!is_exit_rule(&rule(5270, 52, vec![])));
         assert!(!is_exit_rule(&rule(5280, 100, vec![uid])));
+    }
+
+    #[test]
+    fn the_ipv6_default_of_the_exit_table_refuses_instead_of_routing() {
+        let route = exit_blocking_route_v6();
+        assert_eq!(route.header.destination_prefix_length, 0);
+        let debug = format!("{route:?}");
+        assert!(debug.contains("Unreachable"), "{debug}");
+        assert!(debug.contains(&format!("Table({EXIT_TABLE})")), "{debug}");
+        assert!(!debug.contains("Oif"), "{debug}");
+    }
+
+    #[test]
+    fn a_host_without_ipv6_is_not_a_failure() {
+        assert!(family_unsupported(
+            &"Address family not supported by protocol"
+        ));
+        assert!(family_unsupported(&"Operation not supported"));
+        assert!(!family_unsupported(&"Operation not permitted"));
     }
 
     #[test]
