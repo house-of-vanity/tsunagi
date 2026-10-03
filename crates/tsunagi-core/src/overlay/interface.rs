@@ -164,6 +164,17 @@ pub struct Interface {
     rules_report: std::sync::Mutex<Option<BroadcastRulesReport>>,
     /// What the exit-node rules were last asked for, and what came of it.
     exit_state: std::sync::Mutex<ExitState>,
+    /// Where each network's runtime reaches its peers and relays outside the
+    /// overlay; read only by hosts that cannot exempt the agent from the
+    /// exit node's default route.
+    underlay: std::sync::Mutex<std::collections::HashMap<NetworkId, Underlay>>,
+}
+
+/// Underlay destinations one network's runtime currently depends on.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Underlay {
+    addresses: std::collections::BTreeSet<std::net::Ipv4Addr>,
+    hosts: std::collections::BTreeSet<String>,
 }
 
 /// The exit-node host rules as this interface last left them.
@@ -275,6 +286,7 @@ impl Interface {
             host_rules,
             rules_report: std::sync::Mutex::new(None),
             exit_state: std::sync::Mutex::new(ExitState::default()),
+            underlay: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -350,11 +362,20 @@ impl Interface {
             .collect();
         ranges.sort_by_key(|range| (range.base, range.prefix_len));
         ranges.dedup();
+        let client = self.routes.exit_via().is_some();
+        let overlay = self.routes.overlay_ranges();
+        let (bypass, bypass_hosts) = if client && exit.needs_bypass() {
+            self.underlay_targets(&overlay)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let wanted = ExitHostPlan {
             interface: self.name.clone(),
             offer: ranges,
-            client: self.routes.exit_via().is_some(),
-            overlay: self.routes.overlay_ranges(),
+            client,
+            overlay,
+            bypass,
+            bypass_hosts,
         };
 
         let first = !std::mem::replace(&mut self.exit_state().cleaned, true);
@@ -424,6 +445,68 @@ impl Interface {
         let mut state = self.exit_state();
         state.plan = Some(wanted);
         state.report = Some(report);
+    }
+
+    /// Tells the interface where a network's runtime reaches peers and
+    /// relays outside the overlay. When the host needs those kept out of the
+    /// exit node's default route and the set changed, the rules follow.
+    pub async fn set_underlay(
+        &self,
+        network: NetworkId,
+        addresses: impl IntoIterator<Item = std::net::Ipv4Addr>,
+        hosts: impl IntoIterator<Item = String>,
+    ) {
+        let new = Underlay {
+            addresses: addresses.into_iter().collect(),
+            hosts: hosts.into_iter().collect(),
+        };
+        let changed = {
+            let mut map = match self.underlay.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if new == Underlay::default() {
+                map.remove(&network).is_some()
+            } else {
+                map.insert(network, new.clone()) != Some(new)
+            }
+        };
+        let needed = changed
+            && self.routes.exit_via().is_some()
+            && self
+                .host_rules
+                .as_ref()
+                .and_then(|rules| rules.exit_rules())
+                .is_some_and(|exit| exit.needs_bypass());
+        if needed {
+            self.sync_exit_rules().await;
+        }
+    }
+
+    /// Every underlay destination worth keeping direct, minus anything that
+    /// is the overlay itself, loopback or link-local.
+    fn underlay_targets(
+        &self,
+        overlay: &[crate::state::Ipv4Range],
+    ) -> (Vec<std::net::Ipv4Addr>, Vec<String>) {
+        let map = match self.underlay.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut addresses = std::collections::BTreeSet::new();
+        let mut hosts = std::collections::BTreeSet::new();
+        for underlay in map.values() {
+            addresses.extend(underlay.addresses.iter().copied().filter(|address| {
+                !address.is_loopback()
+                    && !address.is_link_local()
+                    && !address.is_multicast()
+                    && !address.is_unspecified()
+                    && !address.is_broadcast()
+                    && !overlay.iter().any(|range| range.contains(*address))
+            }));
+            hosts.extend(underlay.hosts.iter().cloned());
+        }
+        (addresses.into_iter().collect(), hosts.into_iter().collect())
     }
 
     fn exit_state(&self) -> std::sync::MutexGuard<'_, ExitState> {
@@ -1341,6 +1424,65 @@ mod tests {
             );
         }
         assert_eq!(interface.counters().received, 1);
+    }
+
+    #[tokio::test]
+    async fn the_underlay_reaches_the_rules_only_for_hosts_that_need_it_and_only_while_using_one() {
+        let rules = MockHostRules::new();
+        let (interface, routes, id) = managed_interface(&rules, false).await;
+        let relay = || vec!["relay.example".to_string()];
+        let direct = || {
+            vec![
+                Ipv4Addr::new(138, 201, 61, 182),
+                Ipv4Addr::new(10, 13, 37, 9), // the overlay itself
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::new(169, 254, 1, 1),
+            ]
+        };
+
+        // A host that does not ask never gets them, so Linux and macOS do not
+        // re-apply their rules whenever a path moves.
+        routes.set_exit(id, using(peer(2)));
+        interface.set_underlay(id, direct(), relay()).await;
+        interface.sync_exit_rules().await;
+        let plan = rules.exit().installed().unwrap();
+        assert!(plan.client);
+        assert!(plan.bypass.is_empty() && plan.bypass_hosts.is_empty());
+
+        // A host that does gets the usable ones, and follows changes.
+        rules.exit().set_needs_bypass(true);
+        interface.set_underlay(id, direct(), relay()).await;
+        interface.sync_exit_rules().await;
+        let plan = rules.exit().installed().unwrap();
+        assert_eq!(plan.bypass, vec![Ipv4Addr::new(138, 201, 61, 182)]);
+        assert_eq!(plan.bypass_hosts, relay());
+        let applies = || {
+            rules
+                .exit()
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("apply"))
+                .count()
+        };
+        let before = applies();
+        interface.set_underlay(id, direct(), relay()).await;
+        assert_eq!(applies(), before, "an unchanged set is not applied again");
+        interface
+            .set_underlay(id, vec![Ipv4Addr::new(5, 6, 7, 8)], relay())
+            .await;
+        assert_eq!(applies(), before + 1);
+        assert_eq!(
+            rules.exit().installed().unwrap().bypass,
+            vec![Ipv4Addr::new(5, 6, 7, 8)]
+        );
+
+        // Not using an exit node: nothing to keep direct.
+        routes.set_exit(id, Default::default());
+        interface.sync_exit_rules().await;
+        interface
+            .set_underlay(id, vec![Ipv4Addr::new(1, 1, 1, 1)], relay())
+            .await;
+        assert!(rules.exit().installed().is_none());
     }
 
     #[tokio::test]

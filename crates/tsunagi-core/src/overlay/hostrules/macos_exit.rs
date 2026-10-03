@@ -623,6 +623,7 @@ destination: default\n\
             offer: if offer { vec![range()] } else { Vec::new() },
             client,
             overlay: vec![range()],
+            ..Default::default()
         }
     }
 

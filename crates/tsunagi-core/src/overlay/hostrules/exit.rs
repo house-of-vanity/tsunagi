@@ -39,6 +39,13 @@ pub struct ExitHostPlan {
     /// reads it, to keep this agent's own traffic *to* the overlay inside it
     /// where the host has no per-user routing (macOS).
     pub overlay: Vec<Ipv4Range>,
+    /// Underlay addresses this agent talks to directly and must keep reaching
+    /// outside the overlay's default route. Only filled while `client` is set
+    /// and only for hosts that report [`ExitHostRules::needs_bypass`].
+    pub bypass: Vec<std::net::Ipv4Addr>,
+    /// Host names (relay servers) that must stay reachable the same way; the
+    /// host rules resolve them.
+    pub bypass_hosts: Vec<String>,
 }
 
 impl ExitHostPlan {
@@ -76,6 +83,13 @@ pub trait ExitHostRules: Send + Sync + std::fmt::Debug + 'static {
     /// when nothing is there: it runs on the shutdown path, and once at
     /// startup to take away what a crashed run left.
     fn clear<'a>(&'a self, interface: &'a str) -> BoxFuture<'a, ()>;
+
+    /// Whether using an exit node on this host needs the underlay addresses
+    /// the agent talks to, because the host cannot exempt the agent's own
+    /// traffic from the default route by user id (Windows). The default is no.
+    fn needs_bypass(&self) -> bool {
+        false
+    }
 }
 
 /// The tag every firewall object of one offered range carries.
@@ -103,6 +117,7 @@ pub struct MockExitRules {
     calls: Arc<Mutex<Vec<String>>>,
     forwarding: Arc<Mutex<Option<bool>>>,
     failure: Arc<Mutex<Option<String>>>,
+    needs_bypass: Arc<Mutex<bool>>,
 }
 
 impl MockExitRules {
@@ -116,6 +131,11 @@ impl MockExitRules {
     /// What the host reports for kernel forwarding from now on.
     pub fn set_forwarding(&self, forwarding: Option<bool>) {
         *lock(&self.forwarding) = forwarding;
+    }
+
+    /// Whether this host asks for the underlay addresses, like Windows.
+    pub fn set_needs_bypass(&self, needs: bool) {
+        *lock(&self.needs_bypass) = needs;
     }
 
     /// Makes every step fail with this reason from now on.
@@ -142,6 +162,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl ExitHostRules for MockExitRules {
+    fn needs_bypass(&self) -> bool {
+        *lock(&self.needs_bypass)
+    }
+
     fn apply<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, ExitHostReport> {
         Box::pin(async move {
             lock(&self.calls).push(format!("apply:{}", plan.interface));
@@ -209,6 +233,7 @@ mod tests {
             offer: vec![range()],
             client: true,
             overlay: vec![range()],
+            ..Default::default()
         };
         let report = rules.apply(&plan).await;
         assert_eq!(report.offer[0].1, RuleOutcome::Applied);
@@ -224,6 +249,7 @@ mod tests {
                 offer: vec![range()],
                 client: false,
                 overlay: Vec::new(),
+                ..Default::default()
             })
             .await;
         assert_eq!(report.forwarding, Some(false));

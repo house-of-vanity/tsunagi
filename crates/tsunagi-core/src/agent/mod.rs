@@ -800,6 +800,11 @@ impl Agent {
         // itself stays, because the agent owns it and other networks may
         // still be using it.
         self.inner.routes.remove_network(network_id);
+        if let Some(interface) = self.inner.interface.get() {
+            interface
+                .set_underlay(network_id, Vec::new(), Vec::new())
+                .await;
+        }
         if let Some(interface) = self.inner.interface.get()
             && let Err(err) = interface.sync_addresses().await
         {

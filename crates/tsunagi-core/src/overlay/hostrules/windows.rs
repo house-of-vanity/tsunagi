@@ -162,12 +162,36 @@ impl WindowsHostRules {
     }
 }
 
+/// The IPv4 addresses a host name resolves to; empty when it does not.
+fn resolve_host(host: &str) -> Vec<std::net::Ipv4Addr> {
+    use std::net::{IpAddr, ToSocketAddrs};
+    (host, 443)
+        .to_socket_addrs()
+        .map(|addrs| {
+            addrs
+                .filter_map(|addr| match addr.ip() {
+                    IpAddr::V4(ip) => Some(ip),
+                    IpAddr::V6(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl ExitHostRules for WindowsHostRules {
+    fn needs_bypass(&self) -> bool {
+        true
+    }
+
     fn apply<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, ExitHostReport> {
         Box::pin(async move {
             let job = plan.clone();
             tokio::task::spawn_blocking(move || {
-                windows_exit::apply_plan(&|script| run_powershell_output(script), &job)
+                windows_exit::apply_plan(
+                    &|script| run_powershell_output(script),
+                    &resolve_host,
+                    &job,
+                )
             })
             .await
             .unwrap_or_else(|err| {

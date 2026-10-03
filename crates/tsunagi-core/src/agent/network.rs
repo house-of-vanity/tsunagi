@@ -712,6 +712,34 @@ impl Runtime {
         self.start_dials();
         // Last, so it carries what this round learned.
         self.introduce_peers();
+        self.refresh_underlay().await;
+    }
+
+    /// Hands the interface the underlay destinations this network depends
+    /// on: the verified direct IPv4 paths of every control connection, and
+    /// the relays in use. Only hosts that cannot exempt the agent from an
+    /// exit node's default route read it.
+    async fn refresh_underlay(&self) {
+        let Some(interface) = self.params.interface.clone() else {
+            return;
+        };
+        let mut addresses = Vec::new();
+        let mut hosts = Vec::new();
+        for session in self.sessions.values() {
+            for path in snapshot_connection(&session.conn).paths {
+                match path.remote {
+                    PathAddr::Ip(std::net::SocketAddr::V4(socket)) => addresses.push(*socket.ip()),
+                    PathAddr::Relay(url) => hosts.extend(relay_host(&url)),
+                    _ => {}
+                }
+            }
+        }
+        for url in self.params.adapter.snapshot().relay_urls {
+            hosts.extend(relay_host(&url));
+        }
+        interface
+            .set_underlay(self.network_id, addresses, hosts)
+            .await;
     }
 
     fn add_candidate(&mut self, candidate: Candidate) {
@@ -2446,5 +2474,50 @@ mod tests {
                     None => true,
                 });
         assert_eq!(chosen_restored.copied(), Some("wg"));
+    }
+}
+
+/// The host name of a relay URL such as `https://relay.example:443/`.
+fn relay_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if host.starts_with('[') {
+        host.split_once(']')?.0.trim_start_matches('[')
+    } else {
+        host.split(':').next()?
+    };
+    (!host.is_empty()
+        && host.len() <= 253
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':'))
+    .then(|| host.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod relay_host_tests {
+    use super::relay_host;
+
+    #[test]
+    fn the_host_is_taken_out_of_a_relay_url() {
+        assert_eq!(
+            relay_host("https://relay.example.com./").as_deref(),
+            Some("relay.example.com.")
+        );
+        assert_eq!(
+            relay_host("https://Euw1-1.relay.iroh.network:443/x").as_deref(),
+            Some("euw1-1.relay.iroh.network")
+        );
+        assert_eq!(
+            relay_host("http://192.0.2.7:3340").as_deref(),
+            Some("192.0.2.7")
+        );
+        assert_eq!(
+            relay_host("https://[2001:db8::1]:443/").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(relay_host("https:///").as_deref(), None);
+        assert_eq!(relay_host("https://bad host/").as_deref(), None);
     }
 }

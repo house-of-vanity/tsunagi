@@ -82,18 +82,25 @@ is built from `pf` and `route`. The agent runs as root there.
 
 ## Windows
 
-Offering only. Each offered range gets a WinNAT object
-`tsunagi-exit:<interface>:<range>` (`New-NetNat`), removed with the offer, the
-network and the agent. Forwarding is read for the overlay interface and never
-changed; Windows forwards per interface, so enable it on the ones involved
-(`Get-NetIPInterface | Set-NetIPInterface -Forwarding Enabled`, administrator
-PowerShell). Some Windows versions allow one NAT per host; a second range then
-reports its own failure.
-
-Using one is **not available**: Windows has no per-user routing, so the agent's
-own traffic cannot be kept out of a default route through the overlay and would
-loop. `tsng exit-node <name>` reports that and installs nothing. This was
-written without a Windows host to run it on.
+- **Offering:** each offered range gets a WinNAT object
+  `tsunagi-exit:<interface>:<range>` (`New-NetNat`), removed with the offer, the
+  network and the agent. Forwarding is read for the overlay interface and never
+  changed; Windows forwards per interface, so enable it on the ones involved
+  (`Get-NetIPInterface | Set-NetIPInterface -Forwarding Enabled`, administrator
+  PowerShell). Some Windows versions allow one NAT per host; a second range then
+  reports its own failure.
+- **Using:** Windows has no per-user routing, so the agent's own traffic is kept
+  off the tunnel *by destination*. `0.0.0.0/1` and `128.0.0.0/1` go through the
+  overlay interface; a `/32` route with metric 7373 (the marker for "ours")
+  through the physical default gateway is added for every address the agent
+  talks to directly: verified direct paths of its connections, plus the relays
+  it uses, resolved when the rules are applied. The set follows path changes. A
+  path that appears after the last apply goes through the tunnel until the next
+  one. IPv6 is blackholed with `::/1` and `8000::/1` on the overlay interface,
+  so applications fall back to IPv4 after a delay rather than at once.
+  Everything is in the active store: a reboot clears it.
+- Not verified on a live host when this was written. To inspect:
+  `Get-NetRoute -PolicyStore ActiveStore | ? { $_.RouteMetric -eq 7373 -or $_.InterfaceAlias -like 'tsun*' }`.
 
 ## What it does not do
 
