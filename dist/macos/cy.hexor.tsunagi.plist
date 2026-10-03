@@ -36,6 +36,15 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
+    <!-- The control socket belongs to the admin group, so the CLI and the tray
+         work without sudo for any administrator. A plain account is not in it
+         and cannot manage the agent. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TSUNAGI_CONTROL_GROUP</key>
+        <string>admin</string>
+    </dict>
+
     <!-- Logs. launchd creates these as root; rotate them with newsyslog if you
          keep the daemon around. -->
     <key>StandardOutPath</key>

@@ -9,3 +9,4 @@ Terminal=false
 Categories=Network;Utility;
 Keywords=mesh;vpn;overlay;network;
 StartupNotify=false
+StartupWMClass=tsunagi-tray

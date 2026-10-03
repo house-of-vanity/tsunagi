@@ -27,6 +27,20 @@ shell started `sudo`:
 | disposable cache | `/var/db/tsunagi/cache` |
 | control socket | `/var/run/tsunagi/agent.sock` |
 
+## Homebrew
+
+```sh
+brew tap house-of-vanity/tap
+brew install --cask tsunagi-gui    # the tray app, and the agent it needs
+# or just the command line agent:
+brew install tsunagi
+sudo brew services start tsunagi   # the agent, as a root daemon at boot
+```
+
+The cask starts the service for you. The agent runs as root, and its control
+socket is open to the `admin` group, so the CLI and the tray work without
+`sudo` for an administrator.
+
 ## Native deployment — root LaunchDaemon
 
 For an always-on agent that starts at boot, install the bundled

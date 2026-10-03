@@ -283,32 +283,31 @@ fn draw_network(
             }
         });
         ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // In the corner while this device sends its traffic through
-                // somebody: green while that works, red while it does not.
-                if let Some(via) = &network.exit.via {
-                    let color = if network.exit.via_online {
-                        exit::GOOD
-                    } else {
-                        exit::LOUD
-                    };
-                    let response = ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(icon::SIGN_OUT).size(18.0).color(color),
-                            )
-                            .sense(egui::Sense::click()),
+            // In the bottom left corner while this device sends its traffic through
+            // somebody: green while that works, red while it does not.
+            if let Some(via) = &network.exit.via {
+                let color = if network.exit.via_online {
+                    exit::GOOD
+                } else {
+                    exit::LOUD
+                };
+                let response = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(icon::SIGN_OUT).size(18.0).color(color),
                         )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(format!(
-                            "exit node: {} — click to stop",
-                            exit::name_of(network, via)
-                        ));
-                    if response.clicked() {
-                        state.exit_confirm =
-                            Some(devices::ExitConfirm::stop_from_tile(network, via));
-                    }
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(format!(
+                        "exit node: {} — click to stop",
+                        exit::name_of(network, via)
+                    ));
+                if response.clicked() {
+                    state.exit_confirm = Some(devices::ExitConfirm::stop_from_tile(network, via));
                 }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Show devices").clicked() {
                     state.open_devices.insert(network.network_id.clone());
                 }

@@ -15,9 +15,11 @@ mod app;
 mod devices;
 mod exit;
 mod format;
+mod icon;
 mod stats;
 mod tray;
 mod ui;
+mod watch;
 
 use eframe::egui;
 
@@ -53,7 +55,8 @@ fn window() -> Result<(), Box<dyn std::error::Error>> {
         // A fixed, small window; the whole layout targets this size.
         viewport: egui::ViewportBuilder::default()
             .with_title("tsunagi")
-            .with_app_id("tsunagi")
+            .with_app_id(icon::APP_ID)
+            .with_icon(icon::window())
             .with_inner_size([360.0, 600.0])
             .with_resizable(false),
         ..Default::default()

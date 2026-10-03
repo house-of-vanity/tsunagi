@@ -173,6 +173,10 @@ jobs:
             macOS)
               cp dist/macos/cy.hexor.tsunagi.plist "$stage/"
               cp dist/macos/README.md "$stage/INSTALL.md"
+              # The tray as an application bundle, for the Homebrew cask.
+              bash dist/macos/build-app.sh \
+                "target/${{ matrix.target }}/release/tsunagi-tray" \
+                "$version" "$stage/Tsunagi.app"
               ;;
             Windows)
               cp dist/windows/README.md "$stage/INSTALL.md"

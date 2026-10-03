@@ -81,6 +81,8 @@ impl App {
         }
         let builder = egui::ViewportBuilder::default()
             .with_title("About tsunagi")
+            .with_app_id(crate::icon::APP_ID)
+            .with_icon(crate::icon::window())
             .with_inner_size([560.0, 520.0])
             .with_min_inner_size([380.0, 280.0]);
         let socket = self.agent.socket();
@@ -112,6 +114,8 @@ impl App {
             let viewport_id = egui::ViewportId::from_hash_of(("devices", &id));
             let builder = egui::ViewportBuilder::default()
                 .with_title(devices::title(network))
+                .with_app_id(crate::icon::APP_ID)
+                .with_icon(crate::icon::window())
                 .with_inner_size([940.0, 540.0])
                 .with_min_inner_size([480.0, 320.0]);
             let agent = &self.agent;

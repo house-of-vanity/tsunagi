@@ -47,7 +47,10 @@ use crate::state::Ipv4Range;
 
 use super::RuleOutcome;
 use super::exit::{ExitHostPlan, ExitHostReport, ExitHostRules, exit_tag, exit_tag_prefix};
-use super::linux::{LinuxHostRules, Ran, Run, failure, locked, run_iptables, split_rule_line};
+use super::linux::{
+    LinuxHostRules, Ran, Run, comment_supported, failure, locked, run_iptables, same_rule,
+    split_rule_line,
+};
 
 /// The chains the offering rules live in: `(table, chain)`.
 const CHAINS: [(&str, &str); 2] = [("nat", "POSTROUTING"), ("filter", "FORWARD")];
@@ -65,14 +68,23 @@ fn owned(words: &[&str]) -> Vec<String> {
 }
 
 /// The three rules of one offered range.
-fn offer_rules(interface: &str, range: &Ipv4Range) -> Vec<Rule> {
+///
+/// Each carries a comment naming its interface and range, which is how it is
+/// found again. A kernel without the `comment` match (small router builds
+/// leave it out) cannot take that, so `comment` false leaves it off and the
+/// rules are recognised by their shape instead; see [`tagged_rules`].
+fn offer_rules(interface: &str, range: &Ipv4Range, comment: bool) -> Vec<Rule> {
     let range_text = range.to_string();
     let tag = exit_tag(interface, range);
-    let comment = ["-m", "comment", "--comment", tag.as_str()];
+    let comment: Vec<String> = if comment {
+        owned(&["-m", "comment", "--comment", tag.as_str()])
+    } else {
+        Vec::new()
+    };
     let spec = |head: &[&str], tail: &[&str]| -> Vec<String> {
         owned(head)
             .into_iter()
-            .chain(owned(&comment))
+            .chain(comment.iter().cloned())
             .chain(owned(tail))
             .collect()
     };
@@ -142,9 +154,16 @@ struct Found {
     rest: Vec<String>,
 }
 
-/// Every rule in an `iptables -S <chain>` listing carrying a tag that starts
-/// with `prefix`. Anything else in the chain is left alone.
+/// Every rule in an `iptables -S <chain>` listing that is ours: carrying a
+/// tag that starts with `prefix`, or, on a kernel with no `comment` match,
+/// being exactly one of the three rules this module writes for some range.
+/// Anything else in the chain is left alone.
 fn tagged_rules(listing: &str, chain: &str, prefix: &str) -> Vec<Found> {
+    // `tsunagi-exit:<interface>:`
+    let interface = prefix
+        .strip_prefix("tsunagi-exit:")
+        .and_then(|rest| rest.strip_suffix(':'))
+        .unwrap_or_default();
     listing
         .lines()
         .filter_map(|line| {
@@ -158,13 +177,30 @@ fn tagged_rules(listing: &str, chain: &str, prefix: &str) -> Vec<Found> {
             let tag = rest
                 .windows(2)
                 .find(|pair| pair[0] == "--comment" && pair[1].starts_with(prefix))
-                .map(|pair| pair[1].clone())?;
+                .map(|pair| pair[1].clone())
+                .or_else(|| uncommented_tag(interface, chain, rest))?;
             Some(Found {
                 tag,
                 rest: rest.to_vec(),
             })
         })
         .collect()
+}
+
+/// The tag a rule would have carried, when it is one of ours written without
+/// a comment: its words are those of the rule for the range it names.
+fn uncommented_tag(interface: &str, chain: &str, rest: &[String]) -> Option<String> {
+    if interface.is_empty() {
+        return None;
+    }
+    let range: Ipv4Range = rest
+        .windows(2)
+        .find(|pair| pair[0] == "-s" || pair[0] == "-d")
+        .and_then(|pair| pair[1].parse().ok())?;
+    offer_rules(interface, &range, false)
+        .iter()
+        .any(|rule| rule.chain == chain && same_rule(&rule.spec, rest))
+        .then(|| exit_tag(interface, &range))
 }
 
 fn delete_args(table: &str, chain: &str, found: &Found) -> Vec<String> {
@@ -236,6 +272,7 @@ fn apply_offer(
     };
     let prefix = exit_tag_prefix(interface);
     let wanted: Vec<String> = ranges.iter().map(|r| exit_tag(interface, r)).collect();
+    let comment = comment_supported(run);
 
     // What is there now, per chain.
     let mut present: Vec<(&str, &str, Vec<Found>)> = Vec::new();
@@ -263,7 +300,7 @@ fn apply_offer(
     ranges
         .iter()
         .map(|range| {
-            let rules = offer_rules(interface, range);
+            let rules = offer_rules(interface, range, comment);
             let tag = exit_tag(interface, range);
             let in_place = rules
                 .iter()
@@ -468,7 +505,7 @@ mod tests {
 
     #[test]
     fn the_rules_masquerade_the_range_out_of_every_other_interface_and_forward_it() {
-        let rules = offer_rules("tsun0", &range());
+        let rules = offer_rules("tsun0", &range(), true);
         assert_eq!(rules.len(), 3);
         assert_eq!(
             words(&rules[0].spec),
@@ -521,6 +558,8 @@ mod tests {
         listing: RefCell<Vec<(String, String)>>,
         missing: bool,
         check_ok: bool,
+        /// A kernel with no `comment` match, as small router builds have.
+        no_comment: bool,
     }
 
     impl Fake {
@@ -530,6 +569,7 @@ mod tests {
                 listing: RefCell::new(Vec::new()),
                 missing: false,
                 check_ok,
+                no_comment: false,
             }
         }
 
@@ -556,6 +596,13 @@ mod tests {
                 stdout,
                 stderr: String::new(),
             };
+            if self.no_comment && line.contains("-m comment") {
+                return Ran::Exited {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "iptables: No chain/target/match by that name.".to_string(),
+                };
+            }
             if line.contains(" -S ") {
                 let listing: Vec<String> = self
                     .listing
@@ -584,6 +631,44 @@ mod tests {
                 .cloned()
                 .collect()
         }
+    }
+
+    #[test]
+    fn a_kernel_without_the_comment_match_gets_the_rules_without_comments() {
+        let mut fake = Fake::new(false);
+        fake.no_comment = true;
+        let outcome = apply_offer(&|args| fake.run(args), "tsun0", &[range()]);
+        assert_eq!(outcome, vec![(range(), RuleOutcome::Applied)]);
+        let inserted = fake.verbs("-I");
+        assert_eq!(inserted.len(), 3, "{inserted:?}");
+        assert!(
+            inserted.iter().all(|call| !call.contains("comment")),
+            "{inserted:?}"
+        );
+    }
+
+    #[test]
+    fn rules_written_without_a_comment_are_ours_and_are_removed_with_them() {
+        // The way iptables prints them: its own option order.
+        let listing = "\
+-P FORWARD ACCEPT
+-A FORWARD -s 10.13.37.0/24 -i tsun0 ! -o tsun0 -j ACCEPT
+-A FORWARD -d 10.13.37.0/24 -o tsun0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -i tsun0 -j ACCEPT
+-A FORWARD -s 10.13.37.0/24 -i tsun1 ! -o tsun1 -j ACCEPT
+";
+        let found = tagged_rules(listing, "FORWARD", &exit_tag_prefix("tsun0"));
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|rule| rule.tag == exit_tag("tsun0", &range()))
+        );
+        let nat = "-A POSTROUTING -s 10.13.37.0/24 ! -o tsun0 -j MASQUERADE\n";
+        assert_eq!(
+            tagged_rules(nat, "POSTROUTING", &exit_tag_prefix("tsun0")).len(),
+            1
+        );
     }
 
     #[test]

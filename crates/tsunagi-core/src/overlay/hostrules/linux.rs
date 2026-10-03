@@ -66,24 +66,68 @@ pub(super) enum Ran {
 pub(super) type Run<'a> = &'a dyn Fn(&[String]) -> Ran;
 
 /// The match and target of the rule, without the chain or position.
-fn rule_spec(plan: &BroadcastRulesPlan) -> Vec<String> {
-    [
-        "-i",
-        plan.interface.as_str(),
-        "-p",
-        "udp",
-        "-s",
-        &plan.range.to_string(),
-        "-m",
-        "comment",
-        "--comment",
-        &plan.tag(),
-        "-j",
-        "ACCEPT",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+///
+/// `comment` false leaves the tag off, for a kernel that has no `comment`
+/// match; the rule is then recognised by its shape, see [`tagged_deletions`].
+fn rule_spec(plan: &BroadcastRulesPlan, comment: bool) -> Vec<String> {
+    let range = plan.range.to_string();
+    let tag = plan.tag();
+    let mut words = vec!["-i", plan.interface.as_str(), "-p", "udp", "-s", &range];
+    if comment {
+        words.extend(["-m", "comment", "--comment", &tag]);
+    }
+    words.extend(["-j", "ACCEPT"]);
+    words.into_iter().map(str::to_string).collect()
+}
+
+/// Whether the kernel has the `comment` match, which a rule needs to carry
+/// its tag. Asked of iptables itself: checking a rule that does not exist
+/// fails either way, but only a missing match says so.
+pub(super) fn comment_supported(run: Run<'_>) -> bool {
+    let probe = locked(
+        [
+            "-t",
+            "filter",
+            "-C",
+            "FORWARD",
+            "-m",
+            "comment",
+            "--comment",
+            "tsunagi-probe",
+            "-j",
+            "ACCEPT",
+        ]
+        .map(str::to_string),
+    );
+    match run(&probe) {
+        Ran::Exited {
+            success: false,
+            stderr,
+            ..
+        } => !stderr.contains("No chain/target/match by that name"),
+        _ => true,
+    }
+}
+
+/// `iptables -S` words as option clauses: an option with its value, a negated
+/// one with its `!`. It prints the options in its own order, not the one a
+/// rule was written in, so rules are compared by their clauses, sorted.
+fn clauses(words: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < words.len() {
+        let take = if words[at] == "!" { 3 } else { 2 };
+        let end = (at + take).min(words.len());
+        out.push(words[at..end].join(" "));
+        at = end;
+    }
+    out.sort();
+    out
+}
+
+/// Whether two rules say the same thing, whatever order they list it in.
+pub(super) fn same_rule(a: &[String], b: &[String]) -> bool {
+    clauses(a) == clauses(b)
 }
 
 /// Waits briefly for the xtables lock instead of failing when another tool
@@ -96,19 +140,19 @@ pub(super) fn locked(args: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
-fn check_args(plan: &BroadcastRulesPlan) -> Vec<String> {
+fn check_args(plan: &BroadcastRulesPlan, comment: bool) -> Vec<String> {
     locked(
         ["-C".to_string(), CHAIN.to_string()]
             .into_iter()
-            .chain(rule_spec(plan)),
+            .chain(rule_spec(plan, comment)),
     )
 }
 
-fn insert_args(plan: &BroadcastRulesPlan) -> Vec<String> {
+fn insert_args(plan: &BroadcastRulesPlan, comment: bool) -> Vec<String> {
     locked(
         ["-I".to_string(), CHAIN.to_string(), "1".to_string()]
             .into_iter()
-            .chain(rule_spec(plan)),
+            .chain(rule_spec(plan, comment)),
     )
 }
 
@@ -147,8 +191,28 @@ pub(super) fn split_rule_line(line: &str) -> Vec<String> {
     words
 }
 
+/// Whether a rule is the one this module writes for some range of the
+/// interface the tag belongs to, with no comment on it.
+fn is_uncommented_rule(tag: &str, rest: &[String]) -> bool {
+    let Some(interface) = tag.strip_prefix("tsunagi:") else {
+        return false;
+    };
+    let Some(range) = rest
+        .windows(2)
+        .find(|pair| pair[0] == "-s")
+        .map(|pair| pair[1].as_str())
+    else {
+        return false;
+    };
+    let ours: Vec<String> = ["-i", interface, "-p", "udp", "-s", range, "-j", "ACCEPT"]
+        .map(str::to_string)
+        .to_vec();
+    same_rule(&ours, rest)
+}
+
 /// The delete commands for every rule in an `iptables -S INPUT` listing that
-/// carries exactly this tag. Anything else in the chain is left alone.
+/// carries exactly this tag, or, with no `comment` match in the kernel, is
+/// exactly the rule written for some range. Anything else is left alone.
 fn tagged_deletions(listing: &str, tag: &str) -> Vec<Vec<String>> {
     listing
         .lines()
@@ -162,7 +226,8 @@ fn tagged_deletions(listing: &str, tag: &str) -> Vec<Vec<String>> {
             }
             let tagged = rest
                 .windows(2)
-                .any(|pair| pair[0] == "--comment" && pair[1] == tag);
+                .any(|pair| pair[0] == "--comment" && pair[1] == tag)
+                || is_uncommented_rule(tag, rest);
             tagged.then(|| {
                 locked(
                     ["-D".to_string(), CHAIN.to_string()]
@@ -197,7 +262,8 @@ fn missing(plan: &BroadcastRulesPlan) -> String {
 
 /// Makes the firewall hold exactly one rule for this interface, the planned one.
 fn apply_firewall(run: Run<'_>, plan: &BroadcastRulesPlan) -> RuleOutcome {
-    let present = match run(&check_args(plan)) {
+    let comment = comment_supported(run);
+    let present = match run(&check_args(plan, comment)) {
         Ran::Missing => return RuleOutcome::Failed(missing(plan)),
         Ran::Exited { success, .. } => success,
     };
@@ -227,7 +293,7 @@ fn apply_firewall(run: Run<'_>, plan: &BroadcastRulesPlan) -> RuleOutcome {
             return RuleOutcome::Failed(failure(&stderr));
         }
     }
-    match run(&insert_args(plan)) {
+    match run(&insert_args(plan, comment)) {
         Ran::Missing => RuleOutcome::Failed(missing(plan)),
         Ran::Exited { success: true, .. } => RuleOutcome::Applied,
         Ran::Exited { stderr, .. } => RuleOutcome::Failed(failure(&stderr)),
@@ -365,7 +431,7 @@ mod tests {
 
     #[test]
     fn the_rule_is_udp_only_from_the_overlay_range_on_this_interface() {
-        let spec = words(&rule_spec(&plan()));
+        let spec = words(&rule_spec(&plan(), true));
         assert_eq!(
             spec,
             "-i tsun0 -p udp -s 10.13.37.0/24 -m comment --comment tsunagi:tsun0 -j ACCEPT"
@@ -373,8 +439,8 @@ mod tests {
         // Nothing here may widen to other protocols or every source.
         assert!(spec.contains("-p udp"));
         assert!(!spec.contains("0.0.0.0/0"));
-        assert!(words(&insert_args(&plan())).starts_with("-w 5 -I INPUT 1 -i tsun0"));
-        assert!(words(&check_args(&plan())).starts_with("-w 5 -C INPUT -i tsun0"));
+        assert!(words(&insert_args(&plan(), true)).starts_with("-w 5 -I INPUT 1 -i tsun0"));
+        assert!(words(&check_args(&plan(), true)).starts_with("-w 5 -C INPUT -i tsun0"));
     }
 
     #[test]
@@ -408,6 +474,49 @@ mod tests {
         assert!(tagged_deletions("", "tsunagi:tsun0").is_empty());
     }
 
+    #[test]
+    fn a_kernel_without_the_comment_match_says_so_in_its_error() {
+        let answer = |stderr: &'static str| {
+            move |_: &[String]| Ran::Exited {
+                success: false,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            }
+        };
+        assert!(!comment_supported(&answer(
+            "iptables: No chain/target/match by that name."
+        )));
+        assert!(comment_supported(&answer(
+            "iptables: Bad rule (does a matching rule exist in that chain?)."
+        )));
+        assert!(comment_supported(&|_: &[String]| Ran::Missing));
+    }
+
+    #[test]
+    fn a_rule_written_without_a_comment_is_found_by_its_shape() {
+        // Listed the way iptables prints it: its own option order.
+        let listing = "\
+-P INPUT ACCEPT
+-A INPUT -s 10.13.37.0/24 -i tsun0 -p udp -j ACCEPT
+-A INPUT -s 10.99.0.0/16 -i tsun0 -p udp -j ACCEPT
+-A INPUT -s 10.13.37.0/24 -i tsun1 -p udp -j ACCEPT
+-A INPUT -s 10.13.37.0/24 -i tsun0 -p udp -j DROP
+-A INPUT -s 10.13.37.0/24 -i tsun0 -p tcp -j ACCEPT
+";
+        let deletions = tagged_deletions(listing, "tsunagi:tsun0");
+        assert_eq!(deletions.len(), 2, "{deletions:?}");
+        assert!(words(&deletions[0]).ends_with("-s 10.13.37.0/24 -i tsun0 -p udp -j ACCEPT"));
+        assert!(words(&deletions[1]).contains("10.99.0.0/16"));
+    }
+
+    #[test]
+    fn without_a_comment_the_rule_has_none() {
+        let with = words(&rule_spec(&plan(), true));
+        let without = words(&rule_spec(&plan(), false));
+        assert!(with.contains("-m comment --comment tsunagi:tsun0"));
+        assert_eq!(without, "-i tsun0 -p udp -s 10.13.37.0/24 -j ACCEPT");
+    }
+
     /// A scripted `iptables`: answers by the leading verb, records every call.
     struct Fake {
         calls: RefCell<Vec<String>>,
@@ -428,6 +537,14 @@ mod tests {
             }
         }
         fn run(&self, args: &[String]) -> Ran {
+            // The probe for the `comment` match: not part of what is tested.
+            if args.iter().any(|word| word == "tsunagi-probe") {
+                return Ran::Exited {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "Bad rule".into(),
+                };
+            }
             self.calls.borrow_mut().push(words(args));
             if self.missing {
                 return Ran::Missing;

@@ -8,7 +8,10 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{TrayIcon, TrayIconBuilder};
+
+use crate::icon;
+use crate::watch::{self, Health};
 
 /// The window process, when there is one.
 struct Window {
@@ -69,9 +72,9 @@ fn build() -> Result<Built, String> {
     menu.append(&quit).map_err(|err| err.to_string())?;
 
     let icon = TrayIconBuilder::new()
-        .with_tooltip("tsunagi")
+        .with_tooltip(Health::Disconnected.label())
         .with_menu(Box::new(menu))
-        .with_icon(make_icon()?)
+        .with_icon(icon::tray(Health::Disconnected).ok_or("cannot draw the tray icon")?)
         .build()
         .map_err(|err| err.to_string())?;
     Ok(Built {
@@ -101,6 +104,16 @@ fn build_checked() -> Result<Built, String> {
     })
 }
 
+/// Shows a state on the icon, if it is a different one than is showing.
+fn show(icon: &TrayIcon, shown: &mut Option<Health>, health: Health) {
+    if *shown == Some(health) {
+        return;
+    }
+    *shown = Some(health);
+    let _ = icon.set_icon(icon::tray(health));
+    let _ = icon.set_tooltip(Some(health.label()));
+}
+
 /// Acts on menu choices as the platform's loop delivers them.
 fn handle_menu(built: &Built, window: Arc<Window>) {
     let (open, quit) = (built.open.clone(), built.quit.clone());
@@ -128,8 +141,22 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
             child: Mutex::new(None),
         }),
     );
+
+    // The icon belongs to this thread, so the answers come to it: the poller
+    // queues them and the loop here takes them off once a second.
+    let (tx, rx) = std::sync::mpsc::channel();
+    watch::spawn(move |health| {
+        let _ = tx.send(health);
+    });
+    let icon = built.icon;
+    let mut shown = None;
+    gtk::glib::timeout_add_seconds_local(1, move || {
+        while let Ok(health) = rx.try_recv() {
+            show(&icon, &mut shown, health);
+        }
+        gtk::glib::ControlFlow::Continue
+    });
     gtk::main();
-    drop(built.icon);
     Ok(())
 }
 
@@ -148,9 +175,16 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     struct Pump {
         window: Arc<Window>,
         icon: Option<TrayIcon>,
+        shown: Option<Health>,
     }
 
-    impl ApplicationHandler for Pump {
+    impl ApplicationHandler<Health> for Pump {
+        fn user_event(&mut self, _event_loop: &ActiveEventLoop, health: Health) {
+            if let Some(icon) = &self.icon {
+                show(icon, &mut self.shown, health);
+            }
+        }
+
         fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
             if self.icon.is_some() {
                 return;
@@ -170,7 +204,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
     }
 
-    let mut builder = EventLoop::builder();
+    let mut builder = EventLoop::<Health>::with_user_event();
     // macOS: live in the menu bar with no Dock icon.
     #[cfg(target_os = "macos")]
     {
@@ -178,33 +212,17 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         builder.with_activation_policy(ActivationPolicy::Accessory);
     }
     let event_loop = builder.build()?;
+    let proxy = event_loop.create_proxy();
+    watch::spawn(move |health| {
+        let _ = proxy.send_event(health);
+    });
     let mut pump = Pump {
         window: Arc::new(Window {
             child: Mutex::new(None),
         }),
         icon: None,
+        shown: None,
     };
     event_loop.run_app(&mut pump)?;
     Ok(())
-}
-
-/// A small round icon, drawn in code so there is no asset to ship yet.
-fn make_icon() -> Result<Icon, String> {
-    const SIZE: u32 = 32;
-    let centre = (SIZE as f32 - 1.0) / 2.0;
-    let radius = SIZE as f32 * 0.46;
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let (dx, dy) = (x as f32 - centre, y as f32 - centre);
-            if dx * dx + dy * dy <= radius * radius {
-                let i = ((y * SIZE + x) * 4) as usize;
-                rgba[i] = 0x2f;
-                rgba[i + 1] = 0x80;
-                rgba[i + 2] = 0xd8;
-                rgba[i + 3] = 0xff;
-            }
-        }
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE).map_err(|err| err.to_string())
 }
