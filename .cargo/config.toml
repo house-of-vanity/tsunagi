@@ -1,0 +1,5 @@
+# Windows: link the C runtime statically, so the agent and the tray start on a
+# machine that has no Visual C++ redistributable installed. The installer ships
+# nothing but our own files and Wintun.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

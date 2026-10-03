@@ -1,5 +1,34 @@
 # Running tsunagi on Windows
 
+## The installer (recommended)
+
+`tsunagi-setup-<version>-x86_64.exe` does everything in one go. Run it as an
+administrator (it asks):
+
+- installs `tsng.exe`, the tray app and **Wintun** to `C:\Program Files\Tsunagi`;
+- registers and starts the **Tsunagi** Windows service (it starts at boot and
+  restarts after a crash), running as the system account;
+- adds `tsng` to the PATH and an inbound Windows Firewall rule for the agent
+  (both are tasks you can untick);
+- starts the tray icon at sign-in.
+
+Where things live: the device's identity and networks in
+`%ProgramData%\Tsunagi\data` (readable only by administrators and the system),
+the log in `%ProgramData%\Tsunagi\logs\tsng.log`. The service keeps its own
+state: networks joined by an agent you started by hand (`tsng up`, which keeps
+its data in your user profile) are not carried over; join them again with
+`tsng join`. The installer stops such an agent, because it cannot run beside the
+service.
+
+`tsng status`, `tsng join` and the tray work from an ordinary, non-elevated
+terminal. Manage the service with the Services app or `sc stop Tsunagi` /
+`sc start Tsunagi`. Silent install: `/VERYSILENT /SUPPRESSMSGBOXES`; choose
+tasks with `/TASKS="!autostart,addtopath,firewall"`. Uninstalling removes the
+service, the firewall rule and the PATH entry, and asks before deleting the
+data.
+
+## By hand (the zip)
+
 This archive holds `tsng.exe`. The overlay interface is a Wintun adapter, so
 the agent needs two things to carry real traffic:
 

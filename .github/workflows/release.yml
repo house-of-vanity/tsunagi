@@ -192,6 +192,29 @@ jobs:
             tar -C dist/pkg -czf "${archive}" "${{ matrix.asset }}"
           fi
 
+      # The Windows installer: the agent as a service, Wintun, the tray and the
+      # PATH entry in one setup program. Wintun is the signed library from
+      # wintun.net, pinned by hash so a changed download fails the build.
+      - name: Build the Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          $hash = (Get-FileHash wintun.zip -Algorithm SHA256).Hash
+          if ($hash -ne '07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51') {
+            throw "wintun.zip has an unexpected hash: $hash"
+          }
+          Expand-Archive wintun.zip -DestinationPath wintun-dl
+          choco install innosetup -y --no-progress
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          $stage = Join-Path $PWD 'dist/pkg/${{ matrix.asset }}'
+          & $iscc "/DAppVersion=$version" "/DSourceDir=$stage" `
+            "/DWintunDir=$(Join-Path $PWD 'wintun-dl/wintun/bin/amd64')" `
+            "/O$PWD" dist/windows/tsunagi.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
       # A dependency-free .deb for the x86_64 and aarch64 Linux builds: it drops
       # the static binary, the systemd service and the polkit rule. Built with
       # dpkg-deb (present on the runner); see dist/deb/build-deb.sh.
@@ -250,6 +273,7 @@ jobs:
             ${{ matrix.asset }}-*.*
             *.deb
             *.pkg.tar.zst
+            tsunagi-setup-*.exe
           if-no-files-found: error
 
   publish:
@@ -278,7 +302,7 @@ jobs:
 
           # download-artifact nests each artifact under its own directory, so
           # the archives are artifacts/<asset>/<file>.
-          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.pkg.tar.zst' \))
+          mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.pkg.tar.zst' -o -name 'tsunagi-setup-*.exe' \))
           printf 'asset: %s\n' "${files[@]}"
 
           prerelease=()

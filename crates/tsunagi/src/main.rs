@@ -11,6 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(windows)]
+mod winservice;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tsunagi::agent::Event;
 use tsunagi::config::{AgentConfig, StoragePaths, TransportPolicy};
@@ -84,6 +87,10 @@ enum Command {
     ExitNode(ExitNodeArgs),
     /// Removes everything this device has stored and starts over.
     Wipe(WipeArgs),
+    /// Runs the agent under the Windows service manager. Registered by the
+    /// installer, not typed.
+    #[command(hide = true)]
+    Service(Box<UpArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -757,12 +764,26 @@ fn main() -> std::process::ExitCode {
 
     let is_debug = log_filter.contains("debug") || log_filter.contains("trace");
 
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&log_filter))
         .with_target(is_debug)
-        .compact()
-        .with_writer(std::io::stderr)
-        .init();
+        .compact();
+    // A service has no console: it writes to a file.
+    match matches!(cli.command, Command::Service(_))
+        .then(open_service_log)
+        .flatten()
+    {
+        Some(file) => builder
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => builder.with_writer(std::io::stderr).init(),
+    }
+
+    #[cfg(windows)]
+    if let Command::Service(args) = cli.command {
+        return run_service(*args);
+    }
 
     // The library never starts a runtime; this binary owns it.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -785,6 +806,89 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// The log file of the Windows service, `%ProgramData%\Tsunagi\logs\tsng.log`.
+///
+/// The previous one is kept as `tsng.log.old` once it passes a few megabytes,
+/// so a service that logs for months does not fill the disk. `None` anywhere
+/// else, and when the file cannot be opened.
+fn open_service_log() -> Option<std::fs::File> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let root = std::env::var_os("ProgramData")?;
+    open_log_in(&PathBuf::from(root).join("Tsunagi").join("logs"))
+}
+
+/// Opens `tsng.log` in a directory for appending, moving a large one aside.
+fn open_log_in(dir: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(dir).ok()?;
+    let log = dir.join("tsng.log");
+    if std::fs::metadata(&log).is_ok_and(|meta| meta.len() > SERVICE_LOG_LIMIT) {
+        let _ = std::fs::rename(&log, dir.join("tsng.log.old"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok()
+}
+
+/// Past this size the service log is moved aside, keeping one older file.
+const SERVICE_LOG_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// The directories and control socket of the Windows service, unless the
+/// service command line names its own.
+///
+/// A service runs as the system account, whose profile is the wrong home for
+/// a device's identity, so the state is kept under `%ProgramData%\Tsunagi`,
+/// where the installer locks it to administrators and the system. The control
+/// socket stays at the system-wide default every client already looks at,
+/// which is what lets a tray and an unelevated `tsng status` find the service.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn service_defaults(mut args: UpArgs, program_data: &std::path::Path) -> UpArgs {
+    let root = program_data.join("Tsunagi");
+    args.paths
+        .state_dir
+        .get_or_insert_with(|| root.join("data"));
+    args.paths
+        .cache_dir
+        .get_or_insert_with(|| root.join("cache"));
+    args.control_socket
+        .get_or_insert_with(tsunagi::ipc::default_control_socket_path);
+    args
+}
+
+/// Hands the process to the Windows service manager, with `up` as the body.
+#[cfg(windows)]
+fn run_service(args: UpArgs) -> std::process::ExitCode {
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    let args = service_defaults(args, &program_data);
+    let args = std::sync::Mutex::new(Some(args));
+    let body = move || -> Result<(), String> {
+        let Some(args) = args.lock().ok().and_then(|mut slot| slot.take()) else {
+            return Err("the service was started twice".to_string());
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| format!("cannot start the async runtime: {err}"))?;
+        runtime.block_on(up(args)).map_err(|err| err.to_string())
+    };
+    match winservice::run(Box::new(body)) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!(
+                "error: cannot run as a service ({err}); `tsng service` is started by the \
+                 Windows service manager, use `tsng up` to run the agent yourself"
+            );
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Id(args) => id(args).await,
@@ -796,6 +900,11 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Dns(args) => dns_command(args).await,
         Command::ExitNode(args) => exit_node_command(args).await,
         Command::Wipe(args) => wipe(args).await,
+        // Taken in `main`, before there is a runtime: the service manager
+        // wants the process's thread, not an async task.
+        Command::Service(_) => Err("`tsng service` is started by the Windows service \
+                                    manager; use `tsng up` to run the agent yourself"
+            .into()),
     }
 }
 
@@ -4900,7 +5009,14 @@ async fn stop_signal() -> &'static str {
             _ = terminate.recv() => "terminated",
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "interrupted",
+            _ = winservice::stop_requested() => "stopped by the service manager",
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
         "interrupted"
@@ -5941,5 +6057,95 @@ mod network_context_tests {
         let (standing, _) =
             network_context(std::slice::from_ref(&stopped), &name, stopped.network_id);
         assert_eq!(standing, NetworkStanding::Stopped);
+    }
+}
+
+#[cfg(test)]
+mod service_log_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use std::io::Write;
+
+    use super::*;
+
+    #[test]
+    fn the_log_appends_and_a_large_one_is_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let mut file = open_log_in(&logs).unwrap();
+        writeln!(file, "one").unwrap();
+        drop(file);
+        let mut file = open_log_in(&logs).unwrap();
+        writeln!(file, "two").unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::read_to_string(logs.join("tsng.log")).unwrap(),
+            "one\ntwo\n"
+        );
+
+        let big = std::fs::File::options()
+            .append(true)
+            .open(logs.join("tsng.log"))
+            .unwrap();
+        big.set_len(SERVICE_LOG_LIMIT + 1).unwrap();
+        drop(big);
+        let file = open_log_in(&logs).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert!(logs.join("tsng.log.old").exists());
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_opened_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        // A directory cannot be made under a regular file.
+        assert!(open_log_in(&file.join("logs")).is_none());
+    }
+
+    #[test]
+    fn the_service_keeps_its_state_under_program_data_unless_told_otherwise() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut words = vec!["tsng", "service"];
+            words.extend_from_slice(extra);
+            match Cli::try_parse_from(words).unwrap().command {
+                Command::Service(args) => *args,
+                other => panic!("{other:?}"),
+            }
+        };
+        let root = std::path::Path::new("/pd");
+        let args = service_defaults(parse(&[]), root);
+        assert_eq!(
+            args.paths.state_dir,
+            Some(root.join("Tsunagi").join("data"))
+        );
+        assert_eq!(
+            args.paths.cache_dir,
+            Some(root.join("Tsunagi").join("cache"))
+        );
+        assert_eq!(
+            args.control_socket,
+            Some(tsunagi::ipc::default_control_socket_path())
+        );
+
+        let args = service_defaults(
+            parse(&["--state-dir", "/mine", "--control-socket", "/mine/sock"]),
+            root,
+        );
+        assert_eq!(args.paths.state_dir, Some(PathBuf::from("/mine")));
+        assert_eq!(args.control_socket, Some(PathBuf::from("/mine/sock")));
+    }
+
+    #[test]
+    fn the_service_command_is_refused_off_the_service_manager() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["tsng", "service"]).unwrap();
+        assert!(matches!(cli.command, Command::Service(_)));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let err = runtime.block_on(run(cli.command)).unwrap_err();
+        assert!(err.to_string().contains("service manager"), "{err}");
     }
 }
