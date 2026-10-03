@@ -22,7 +22,7 @@ service's socket at `/run/tsunagi/agent.sock`):
 
 ```sh
 sudo tsng status
-sudo tsng join <network-name> <tsn1…secret>
+sudo tsng join -n <network-name> -s <tsn1…secret>
 ```
 
 ## How it runs

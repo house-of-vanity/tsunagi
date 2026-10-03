@@ -15,7 +15,7 @@ socket and do **not** need `sudo`:
 
 ```sh
 tsng status
-tsng join <network-name> <tsn1…secret>
+tsng join -n <network-name> -s <tsn1…secret>
 ```
 
 The agent uses fixed system paths, so the commands find it regardless of whose

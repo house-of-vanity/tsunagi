@@ -8,7 +8,7 @@ before touching the code. Do not restate the full design here; follow the links.
 A proof-of-concept agent library for small private mesh networks. A user
 supplies a network name and one shared secret; agents derive the same network
 space independently, find each other, prove membership and exchange control
-messages. Scope and non-scope are in [README.md](README.md).
+messages. What it does and does not do is in [docs/architecture.md](docs/architecture.md) and [docs/threat-model.md](docs/threat-model.md).
 
 There is no central server, no owner, no registration and no majority vote.
 Design accordingly: a majority is not a root of trust.

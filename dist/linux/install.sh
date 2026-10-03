@@ -48,7 +48,7 @@ Done. Start the agent with:
 Control it with sudo (the CLI finds the service's socket automatically):
 
     sudo tsng status
-    sudo tsng join <network-name> <tsn1…secret>
+    sudo tsng join -n <network-name> -s <tsn1…secret>
 EOF
 else
     cat <<EOF

@@ -26,8 +26,8 @@ system can hand us IP packets, and even that is behind a trait
 | `ManagedTunFactory` | `CAP_NET_ADMIN` | traffic actually reaches the OS |
 
 `ManagedTunFactory` creates the interface and configures it; see
-*Provisioning the interface* below and *Privileges* in
-[../README.md](../README.md#privileges). With no capability the agent runs
+*Provisioning the interface* below and Privileges in
+[../dist/linux/README.md](../dist/linux/README.md). With no capability the agent runs
 with `--no-tun`: everything but the last hop into the kernel still works.
 
 [boringtun]: https://docs.rs/boringtun
