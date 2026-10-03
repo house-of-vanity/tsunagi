@@ -30,7 +30,7 @@ Environment=TSUNAGI_CONTROL_GROUP=tsunagi
 
 # The tarball installer puts the binary here; the deb and the Arch package
 # rewrite this to /usr/bin where they install it.
-ExecStart=/usr/local/bin/tsunagi up
+ExecStart=/usr/local/bin/tsng up
 Restart=on-failure
 RestartSec=5
 

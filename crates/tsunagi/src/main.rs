@@ -1,4 +1,4 @@
-//! The `tsunagi` command line agent.
+//! The `tsng` command line agent.
 //!
 //! This binary owns everything the library deliberately refuses to do: it
 //! starts the tokio runtime, installs a logging subscriber and handles
@@ -34,7 +34,7 @@ use tsunagi_wireguard::{
 
 /// A small agent for private mesh networks.
 #[derive(Debug, Parser)]
-#[command(name = "tsunagi", version, about, long_about = None)]
+#[command(name = "tsng", version, about, long_about = None)]
 struct Cli {
     /// Log filter, for example `info` or `tsunagi=debug`.
     ///
@@ -69,7 +69,7 @@ enum Command {
     Protocols,
     /// Makes a network, or joins one — the command that does the work.
     ///
-    /// The same as `tsunagi network join`, at the top level because it is
+    /// The same as `tsng network join`, at the top level because it is
     /// what gets typed: `up` runs the agent, this decides what it is in.
     Join(JoinArgs),
     /// Shows the networks this device belongs to, and leaves them.
@@ -79,7 +79,7 @@ enum Command {
     /// Lists devices offering to be an exit node, and sends all this
     /// device's internet traffic through one.
     ///
-    /// The other half of `tsunagi network exit-node`, which is what makes a
+    /// The other half of `tsng network exit-node`, which is what makes a
     /// device offer itself. A device uses one exit node at a time.
     ExitNode(ExitNodeArgs),
     /// Removes everything this device has stored and starts over.
@@ -205,8 +205,8 @@ enum NetworkAction {
     ///
     /// The state directory belongs to one live agent, so this is how a
     /// network is added to it, and it takes effect at once. With no agent
-    /// running it is configured and starts with the next `tsunagi up`.
-    /// `tsunagi join` is the same command, spelled shorter.
+    /// running it is configured and starts with the next `tsng up`.
+    /// `tsng join` is the same command, spelled shorter.
     Join(JoinArgs),
     /// Stops serving a network, keeping everything so it can be resumed.
     ///
@@ -214,7 +214,7 @@ enum NetworkAction {
     /// signed state all stay. Sessions close and the address comes off the
     /// interface, and nothing is announced — to the others this device is
     /// simply away, as if it had been switched off. It stays stopped
-    /// across restarts until `tsunagi network start`.
+    /// across restarts until `tsng network start`.
     Stop {
         /// Exact network name, full id or unique id prefix.
         network: String,
@@ -471,7 +471,7 @@ struct UpArgs {
 
     /// A protocol setting, as `key=value` or `protocol:key=value`.
     ///
-    /// Repeat for several. `tsunagi protocols` lists what each one takes.
+    /// Repeat for several. `tsng protocols` lists what each one takes.
     #[arg(
         short = 'o',
         long = "protocol-option",
@@ -498,13 +498,13 @@ struct UpArgs {
     /// addresses; questions are taken on loopback of both families, over
     /// UDP and TCP.
     ///
-    /// Overrides a remembered opt-out. Use --no-dns or `tsunagi dns off` to disable.
+    /// Overrides a remembered opt-out. Use --no-dns or `tsng dns off` to disable.
     #[arg(long, conflicts_with = "no_dns", help_heading = "System")]
     dns: bool,
 
     /// Disable local DNS and remember this choice for future starts.
     ///
-    /// Use --dns or `tsunagi dns on` to enable it again.
+    /// Use --dns or `tsng dns on` to enable it again.
     #[arg(long, conflicts_with = "dns", help_heading = "System")]
     no_dns: bool,
 
@@ -715,7 +715,7 @@ fn resolve_secret(
         [one] => Ok((one.secret.clone(), SecretOrigin::Stored)),
         several => Err(format!(
             "this device is in {} networks called `{name}`, so the name alone does not say \
-             which. Give --secret, or `tsunagi network` lists them with their ids.",
+             which. Give --secret, or `tsng network` lists them with their ids.",
             several.len()
         )
         .into()),
@@ -841,7 +841,7 @@ fn control_socket(
         return tsunagi::ipc::default_control_socket_path();
     }
     // When the user did not choose a state directory, prefer a running system
-    // service's socket, so `sudo tsunagi status` reaches the packaged daemon —
+    // service's socket, so `sudo tsng status` reaches the packaged daemon —
     // which binds there via TSUNAGI_CONTROL_SOCKET — with no flags. Only when it
     // is actually present, so a per-user agent still uses its own socket.
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -979,7 +979,7 @@ fn device_section(paths: &StoragePaths, observed: &Observed) -> report::Section 
 /// The networks this device belongs to, named but not described.
 ///
 /// No secrets: this is part of `status`, and a status report is somewhere a
-/// secret must never appear. `tsunagi network secret` is the place that shows one,
+/// secret must never appear. `tsng network secret` is the place that shows one,
 /// because asking for it there is deliberate.
 fn configured_networks_section(paths: &StoragePaths) -> report::Section {
     use report::{Health, Row, Section};
@@ -1299,7 +1299,7 @@ fn update(state: &Arc<std::sync::Mutex<DnsState>>, edit: impl FnOnce(&mut DnsSta
 /// What a protocol is called, what it speaks, and what it takes.
 ///
 /// A registry rather than a lookup on the plugins themselves, because
-/// `tsunagi protocols` has to answer before anything is constructed, and
+/// `tsng protocols` has to answer before anything is constructed, and
 /// because this is the list `--protocol` resolves against.
 struct ProtocolSpec {
     /// The name on the wire, which is what peers compare.
@@ -1411,7 +1411,7 @@ fn show_protocols() -> Result<(), Box<dyn std::error::Error>> {
         }
         out.push(section);
     }
-    print_report("tsunagi protocols", &out)
+    print_report("tsng protocols", &out)
 }
 
 /// Serves the local control socket from the running agent.
@@ -1734,7 +1734,7 @@ fn resolve_network<'a>(
 ) -> Result<&'a tsunagi::storage::StoredNetwork, String> {
     let wanted = wanted.trim_matches(|c: char| c.is_ascii_whitespace());
     if wanted.is_empty() {
-        return Err("select a network by name or id; `tsunagi network` lists them".to_string());
+        return Err("select a network by name or id; `tsng network` lists them".to_string());
     }
     if let Some(network) = networks
         .iter()
@@ -1755,7 +1755,7 @@ fn resolve_network<'a>(
         [one] => Ok(one),
         [] => Err(format!(
             "no configured network matches name or id `{wanted}`; \
-             `tsunagi network` lists them"
+             `tsng network` lists them"
         )),
         several => {
             let candidates = several
@@ -1771,7 +1771,7 @@ fn resolve_network<'a>(
     }
 }
 
-/// `tsunagi network`: what this device belongs to, and leaving it.
+/// `tsng network`: what this device belongs to, and leaving it.
 async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
@@ -1810,7 +1810,7 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
     }
 }
 
-/// `tsunagi join`: make a network or join one.
+/// `tsng join`: make a network or join one.
 async fn join_command(args: JoinArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
@@ -1883,7 +1883,7 @@ async fn join_network(
             eprintln!(
                 "\nwarning: `{}` is also configured with a different secret, as {}.\n\
                  A network is its name *and* its secret, so these two share nothing.\n\
-                 If that was a mistyped secret, `tsunagi network leave` removes one.",
+                 If that was a mistyped secret, `tsng network leave` removes one.",
                 report.name,
                 short(other, 10)
             );
@@ -1935,7 +1935,7 @@ async fn join_network(
     if origin == SecretOrigin::Generated {
         println!("  secret  {}", secret.encode().as_str());
     }
-    eprintln!("\nNo agent is running here, so it starts with the next `tsunagi up`.");
+    eprintln!("\nNo agent is running here, so it starts with the next `tsng up`.");
     Ok(())
 }
 
@@ -1955,15 +1955,15 @@ async fn invite(socket: &std::path::Path, name: &NetworkName, secret: &NetworkSe
     println!("  secret  {}", secret.encode().as_str());
     println!(
         "\nRun this on the other machine:\n\n  \
-         tsunagi join --network {name} --secret {}",
+         tsng join --network {name} --secret {}",
         secret.encode().as_str()
     );
     match endpoint {
         Some(endpoint) => println!(
-            "\nStart its agent with `tsunagi up`; DHT discovery is enabled by default.\n\n  \
-             Optional manual bootstrap: tsunagi up --peer {endpoint}"
+            "\nStart its agent with `tsng up`; DHT discovery is enabled by default.\n\n  \
+             Optional manual bootstrap: tsng up --peer {endpoint}"
         ),
-        None => println!("\nIts agent has to be running: `tsunagi up`."),
+        None => println!("\nIts agent has to be running: `tsng up`."),
     }
 }
 
@@ -1999,28 +1999,28 @@ async fn show_networks(
                     None => "running  ·  no address agreed yet".to_string(),
                 },
                 format!(
-                    "`tsunagi network stop {}` pauses it, `leave` gives it up",
+                    "`tsng network stop {}` pauses it, `leave` gives it up",
                     short(&id, 10)
                 ),
             ),
             Some(_) => (
                 "stopped".to_string(),
                 format!(
-                    "kept as it was; `tsunagi network start {}` resumes it",
+                    "kept as it was; `tsng network start {}` resumes it",
                     short(&id, 10)
                 ),
             ),
             None if network.auto_start => (
                 "configured  ·  starts with the agent".to_string(),
                 format!(
-                    "`tsunagi network stop {}` keeps it from starting",
+                    "`tsng network stop {}` keeps it from starting",
                     short(&id, 10)
                 ),
             ),
             None => (
                 "stopped".to_string(),
                 format!(
-                    "kept as it was; `tsunagi network start {}` resumes it",
+                    "kept as it was; `tsng network start {}` resumes it",
                     short(&id, 10)
                 ),
             ),
@@ -2049,7 +2049,7 @@ async fn show_networks(
         ));
     }
     out.push(section);
-    print_report("tsunagi networks", &out)
+    print_report("tsng networks", &out)
 }
 
 /// Stops serving a network, or starts serving it again.
@@ -2114,7 +2114,7 @@ async fn exit_offer_command(
         storage.set_exit_node(network.network_id, enabled).await?;
         storage.release_ownership_lock();
         println!(
-            "exit node {} for `{}` ({}) with the next `tsunagi up`",
+            "exit node {} for `{}` ({}) with the next `tsng up`",
             if enabled {
                 "will be offered"
             } else {
@@ -2153,7 +2153,7 @@ async fn exit_offer_command(
     }
     println!(
         "\nMembers can now send all their internet traffic through this device, and it \
-         can see it. `tsunagi network exit-node {wanted} off` stops."
+         can see it. `tsng network exit-node {wanted} off` stops."
     );
     Ok(())
 }
@@ -2235,12 +2235,12 @@ fn resolve_exit_node<'a>(
         [] => match named.first() {
             Some((network, peer)) => Err(format!(
                 "`{}` is connected but does not offer to be an exit node. On that device: \
-                 tsunagi network exit-node {} on",
+                 tsng network exit-node {} on",
                 peer_label(peer),
                 network.name
             )),
             None => Err(format!(
-                "no connected device matches `{wanted}`. `tsunagi exit-node` lists the \
+                "no connected device matches `{wanted}`. `tsng exit-node` lists the \
                  ones that offer to be an exit node"
             )),
         },
@@ -2262,7 +2262,7 @@ fn resolve_exit_node<'a>(
     }
 }
 
-/// `tsunagi exit-node`: list, use or stop using an exit node.
+/// `tsng exit-node`: list, use or stop using an exit node.
 async fn exit_node_command(args: ExitNodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     use report::{Health, Report, Row, Section};
 
@@ -2272,7 +2272,7 @@ async fn exit_node_command(args: ExitNodeArgs) -> Result<(), Box<dyn std::error:
     if !tsunagi::ipc::is_serving(&socket).await {
         return Err(
             "no agent is running: an exit node is used through the running agent, which \
-             changes the routes of this device. Start it with `tsunagi up`."
+             changes the routes of this device. Start it with `tsng up`."
                 .into(),
         );
     }
@@ -2308,16 +2308,14 @@ async fn exit_node_command(args: ExitNodeArgs) -> Result<(), Box<dyn std::error:
                         "none",
                         "no connected device offers to be an exit node",
                     )
-                    .with_note("on that device: tsunagi network exit-node <network> on"),
+                    .with_note("on that device: tsng network exit-node <network> on"),
                 );
             }
             let mut out = Report::new();
             out.push(section);
-            print_report("tsunagi exit-node", &out)?;
+            print_report("tsng exit-node", &out)?;
             if any {
-                println!(
-                    "\n`tsunagi exit-node <name|id>` uses one; `tsunagi exit-node off` stops."
-                );
+                println!("\n`tsng exit-node <name|id>` uses one; `tsng exit-node off` stops.");
             }
             Ok(())
         }
@@ -2364,7 +2362,7 @@ async fn exit_node_command(args: ExitNodeArgs) -> Result<(), Box<dyn std::error:
             }
             eprintln!(
                 "\nThat device can see everything that is not encrypted. If it goes away the \
-                 traffic is dropped, not sent the old way; `tsunagi exit-node off` stops."
+                 traffic is dropped, not sent the old way; `tsng exit-node off` stops."
             );
             Ok(())
         }
@@ -2399,8 +2397,8 @@ async fn set_active(
         if !report.active {
             eprintln!(
                 "\nNothing was announced: to the others this device is away, and the address \
-                 and name it holds stay reserved for it. `tsunagi network start {}` resumes \
-                 it; `tsunagi network leave` is the one that gives them up.",
+                 and name it holds stay reserved for it. `tsng network start {}` resumes \
+                 it; `tsng network leave` is the one that gives them up.",
                 short(&id, 10)
             );
         }
@@ -2412,7 +2410,7 @@ async fn set_active(
     storage.set_auto_start(network.network_id, active).await?;
     storage.release_ownership_lock();
     println!(
-        "`{name}` ({}) will {} with the next `tsunagi up`",
+        "`{name}` ({}) will {} with the next `tsng up`",
         short(&id, 10),
         if active { "start" } else { "stay stopped" }
     );
@@ -2511,7 +2509,7 @@ fn forget_protocol_state(paths: &StoragePaths, network: tsunagi::NetworkId) {
     }
 }
 
-/// `tsunagi wipe`: back to a device that has never joined anything.
+/// `tsng wipe`: back to a device that has never joined anything.
 async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
@@ -2532,7 +2530,7 @@ async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let networks = stored_networks(&paths);
     if !args.yes {
-        println!("`tsunagi wipe --yes` would remove:\n");
+        println!("`tsng wipe --yes` would remove:\n");
         for entry in plan.entries() {
             println!("  {}", entry.display());
         }
@@ -2543,7 +2541,7 @@ async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             println!(
                 "\nNobody is told. Leave each network first — start the agent and run\n\
-                 `tsunagi network leave <id>` — to free the address and name it holds\n\
+                 `tsng network leave <id>` — to free the address and name it holds\n\
                  for the others. Afterwards this device is a stranger: a new identity,\n\
                  no networks, and no way to sign anything for the old ones."
             );
@@ -2572,7 +2570,7 @@ async fn wipe(args: WipeArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `tsunagi dns`: the local resolver, and turning it on or off.
+/// `tsng dns`: the local resolver, and turning it on or off.
 async fn dns_command(args: DnsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
@@ -2628,7 +2626,7 @@ async fn dns_command(args: DnsArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     println!("{} for future starts", if enable { "on" } else { "off" });
-    eprintln!("\nNo agent is running here, so it takes effect with the next `tsunagi up`.");
+    eprintln!("\nNo agent is running here, so it takes effect with the next `tsng up`.");
     Ok(())
 }
 
@@ -2663,10 +2661,10 @@ async fn show_dns(
             out.push(section);
         }
     }
-    print_report("tsunagi dns", &out)
+    print_report("tsng dns", &out)
 }
 
-/// `tsunagi id`: what this device is, and what changes it.
+/// `tsng id`: what this device is, and what changes it.
 async fn id(args: IdArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
     let is_custom_state = args.paths.state_dir.is_some();
@@ -2703,13 +2701,13 @@ async fn show_identity(
     out.push(device);
 
     // What this device *is*, not what it belongs to. The networks are
-    // `tsunagi network`, and their secrets are asked for by name there:
+    // `tsng network`, and their secrets are asked for by name there:
     // printing them in an overview put them in every pasted report.
     let networks = stored_networks(paths);
     let mut section = Section::new("networks");
     section.push(match networks.len() {
         0 => Row::new(Health::Info, "none", "no network has been joined")
-            .with_note("`tsunagi join --network <name>` makes or joins one"),
+            .with_note("`tsng join --network <name>` makes or joins one"),
         count => Row::new(
             Health::Info,
             "joined",
@@ -2722,11 +2720,11 @@ async fn show_identity(
                     .join(", ")
             ),
         )
-        .with_note("`tsunagi network` lists them with their ids and addresses"),
+        .with_note("`tsng network` lists them with their ids and addresses"),
     });
     out.push(section);
 
-    print_report("tsunagi id", &out)
+    print_report("tsng id", &out)
 }
 
 /// The name this device answers to.
@@ -2938,7 +2936,7 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     out.push(host_section(&observed));
     out.push(addresses_section().await);
-    print_report("tsunagi status", &out)
+    print_report("tsng status", &out)
 }
 
 /// The local resolver: whether it answers, and whether the system asks it.
@@ -3017,7 +3015,7 @@ fn dns_absent_section() -> report::Section {
             "no local resolver for any network",
         )
         .with_note(
-            "members resolve by address only. `tsunagi up --dns` serves \
+            "members resolve by address only. `tsng up --dns` serves \
              `<hostname>.<network>` from signed state, so a member that is switched \
              off still resolves.",
         ),
@@ -3160,7 +3158,7 @@ fn network_section(
             )
             .with_note(
                 "a network is its name *and* its secret, so these two share nothing. \
-                 Usually a mistyped secret; `tsunagi network secret` shows which is which.",
+                 Usually a mistyped secret; `tsng network secret` shows which is which.",
             ),
         );
     }
@@ -3377,7 +3375,7 @@ fn exit_rows(network: &tsunagi::ipc::NetworkReport) -> Vec<report::Row> {
         let row = if !exit.via_online {
             Row::new(Health::Broken, "using exit", format!("{name}  ·  OFFLINE")).with_note(
                 "internet traffic is dropped until it returns or you run \
-                 `tsunagi exit-node off`",
+                 `tsng exit-node off`",
             )
         } else {
             match &exit.client_rules {
@@ -3535,7 +3533,7 @@ fn host_section(observed: &Observed) -> report::Section {
         .collect();
     host.push(
         Row::new(Health::Info, "protocols", protocols.join(", "))
-            .with_note("run `tsunagi protocols` to see what each one takes"),
+            .with_note("run `tsng protocols` to see what each one takes"),
     );
     host.push(Row::new(
         Health::Info,
@@ -3727,7 +3725,7 @@ fn print_report(title: &str, out: &report::Report) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// The shape of what `tsunagi status` reports.
+/// The shape of what `tsng status` reports.
 ///
 /// Findings are built first and rendered second, so what is reported is
 /// decided separately from how it looks and can be tested without a
@@ -3869,7 +3867,7 @@ mod report {
 
         /// Whether anything in the report was graded at all.
         ///
-        /// A report of plain facts — `tsunagi id` — has nothing to summarise,
+        /// A report of plain facts — `tsng id` — has nothing to summarise,
         /// and "everything checked out" under a list of identifiers would be
         /// claiming something that was never checked.
         fn has_checks(&self) -> bool {
@@ -4075,7 +4073,7 @@ mod report {
 
         #[test]
         fn a_report_of_plain_facts_claims_nothing_at_the_end() {
-            // `tsunagi id` reports identifiers, not checks. Summarising them
+            // `tsng id` reports identifiers, not checks. Summarising them
             // as fine would assert something that was never tested.
             let mut report = Report::new();
             let mut section = Section::new("device");
@@ -4213,7 +4211,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let known: Vec<&str> = PROTOCOLS.iter().map(|spec| spec.name).collect();
                 return Err(format!(
                     "this build has no protocol called `{name}`; it has {}. \
-                     Run `tsunagi protocols` to see what each one takes.",
+                     Run `tsng protocols` to see what each one takes.",
                     known.join(", ")
                 )
                 .into());
@@ -4232,7 +4230,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             .any(|spec| !settings_for(spec, std::slice::from_ref(setting)).is_empty())
         {
             return Err(format!(
-                "no selected protocol takes `{}`; run `tsunagi protocols` to see what they do",
+                "no selected protocol takes `{}`; run `tsng protocols` to see what they do",
                 setting.key
             )
             .into());
@@ -4343,13 +4341,13 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                     "an agent is already running for {}, and one state directory is one \
                      agent — it is the device, not a network.\n\n\
                      To add a network to it:\n\n  \
-                     tsunagi join --network <name>\n\n\
+                     tsng join --network <name>\n\n\
                      To run a second, separate agent instead, give it everything of its \
                      own:\n\n  \
-                     tsunagi up --state-dir <dir> --cache-dir <dir> --interface tsun1 \
+                     tsng up --state-dir <dir> --cache-dir <dir> --interface tsun1 \
                      --ipv4-range <cidr>\n\n\
                      That is a different identity with its own interface, not this one \
-                     with another network. `tsunagi network` lists what this one has.",
+                     with another network. `tsng network` lists what this one has.",
                     path.display()
                 )
                 .into());
@@ -4403,14 +4401,14 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         protocol_names.join(", ")
     );
     // What this device belongs to is a separate question from whether its
-    // agent is running, and `tsunagi join` answers it at any time.
+    // agent is running, and `tsng join` answers it at any time.
     let configured = agent.list_networks().await.unwrap_or_default();
     let running = configured.iter().filter(|network| network.active).count();
     println!(
         "  networks     {}",
         match configured.len() {
-            0 => "none yet  ·  `tsunagi join --network <name>` makes or joins one".to_string(),
-            total => format!("{running} of {total} running  ·  `tsunagi network` lists them"),
+            0 => "none yet  ·  `tsng join --network <name>` makes or joins one".to_string(),
+            total => format!("{running} of {total} running  ·  `tsng network` lists them"),
         }
     );
     println!("  state        {}", paths.state_dir.display());
@@ -4424,7 +4422,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     }));
 
-    // Serve `tsunagi status` for as long as this agent runs. Failing to bind
+    // Serve `tsng status` for as long as this agent runs. Failing to bind
     // is not fatal: the agent itself works fine without it.
     let control = {
         let agent = agent.clone();
@@ -4458,7 +4456,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
                 Some(socket)
             }
             Err(err) => {
-                eprintln!("warning: `tsunagi status` will not work: {err}");
+                eprintln!("warning: `tsng status` will not work: {err}");
                 None
             }
         }
@@ -5476,7 +5474,7 @@ mod status_tests {
         assert_eq!(out.worst(), Health::Broken, "{text}");
         assert!(text.contains("OFFLINE"), "{text}");
         assert!(text.contains("dropped until it returns"), "{text}");
-        assert!(text.contains("tsunagi exit-node off"), "{text}");
+        assert!(text.contains("tsng exit-node off"), "{text}");
     }
 
     #[test]
@@ -5630,14 +5628,13 @@ mod network_tests {
             (vec!["--reach", "local", "--dht"], false),
             (vec!["--reach", "direct"], true),
         ] {
-            let cli =
-                super::Cli::try_parse_from(["tsunagi", "up"].into_iter().chain(flags)).unwrap();
+            let cli = super::Cli::try_parse_from(["tsng", "up"].into_iter().chain(flags)).unwrap();
             let super::Command::Up(args) = cli.command else {
                 panic!("expected up");
             };
             assert_eq!(super::dht_enabled(&args), expected);
         }
-        assert!(super::Cli::try_parse_from(["tsunagi", "up", "--dht", "--no-dht"]).is_err());
+        assert!(super::Cli::try_parse_from(["tsng", "up", "--dht", "--no-dht"]).is_err());
     }
 
     use super::*;
@@ -5814,7 +5811,7 @@ mod secret_tests {
 
     #[test]
     fn a_name_this_device_already_has_resumes_it() {
-        // Otherwise `tsunagi join --network lab` would invent a stranger with
+        // Otherwise `tsng join --network lab` would invent a stranger with
         // the same name every time, which is the confusion this whole
         // report format exists to prevent.
         let dir = tempfile::tempdir().unwrap();

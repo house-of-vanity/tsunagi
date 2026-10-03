@@ -31,10 +31,10 @@ pkgrel=1
 
 # Payload. Arch keeps units under /usr/lib/systemd/system and installs to
 # /usr/bin, so the service's ExecStart is rewritten to match.
-install -D -m 0755 "$binary" "$root/usr/bin/tsunagi"
+install -D -m 0755 "$binary" "$root/usr/bin/tsng"
 
 mkdir -p "$root/usr/lib/systemd/system"
-sed 's#/usr/local/bin/tsunagi#/usr/bin/tsunagi#' \
+sed 's#/usr/local/bin/tsng#/usr/bin/tsng#' \
     "$here/../linux/tsunagi.service" > "$root/usr/lib/systemd/system/tsunagi.service"
 chmod 0644 "$root/usr/lib/systemd/system/tsunagi.service"
 

@@ -75,7 +75,7 @@ neither administrative rights nor public relays/DHT.
 Run the forwarding microbenchmark explicitly:
 
 ```sh
-cargo test --release -p tsunagi --lib forwarding_benchmark -- --ignored --nocapture
+cargo test --release -p tsunagi-core --lib forwarding_benchmark -- --ignored --nocapture
 ```
 
 It processes one million 64-byte frames and one million 1280-byte frames with

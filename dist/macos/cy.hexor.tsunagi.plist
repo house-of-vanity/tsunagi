@@ -10,7 +10,7 @@
   root:wheel with mode 0644 — launchd refuses a daemon plist that is
   group- or world-writable. See README.md in this directory.
 
-  Edit the binary path if tsunagi is not at /usr/local/bin/tsunagi.
+  Edit the binary path if tsng is not at /usr/local/bin/tsng.
 -->
 <plist version="1.0">
 <dict>
@@ -22,7 +22,7 @@
          must not daemonise itself. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/tsunagi</string>
+        <string>/usr/local/bin/tsng</string>
         <string>up</string>
     </array>
 

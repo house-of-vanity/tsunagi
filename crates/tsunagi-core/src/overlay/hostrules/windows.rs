@@ -90,7 +90,7 @@ fn classify(what: &str, text: &str) -> String {
         || lower.contains("run as administrator")
         || lower.contains("permissiondenied")
     {
-        format!("{what}: Windows refused; run tsunagi from an elevated (administrator) process")
+        format!("{what}: Windows refused; run tsng from an elevated (administrator) process")
     } else if lower.contains("is not recognized") || lower.contains("commandnotfound") {
         format!("{what}: the NetTCPIP/NetSecurity PowerShell modules are not available: {text}")
     } else if text.is_empty() {

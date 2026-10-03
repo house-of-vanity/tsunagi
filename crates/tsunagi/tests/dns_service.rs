@@ -103,7 +103,7 @@ impl Running {
 
     /// Runs another `tsunagi` command against this agent's directory.
     fn run(&self, args: &[&str]) -> std::process::Output {
-        std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_tsng"))
             .args(args)
             .arg("--state-dir")
             .arg(self.dir.path().join("state"))
@@ -174,7 +174,7 @@ fn spawn_child(
     dns_port: Option<u16>,
     dns_flag: Option<&str>,
 ) -> std::process::Child {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"));
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tsng"));
     command
         .arg("up")
         .arg("--state-dir")
@@ -338,7 +338,7 @@ fn explicit_dns_choices_override_the_saved_setting_and_survive_restart() {
 
 #[test]
 fn opposing_dns_flags_are_rejected() {
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_tsng"))
         .args(["up", "--dns", "--no-dns"])
         .output()
         .unwrap();

@@ -483,15 +483,15 @@ mod system {
         if denied {
             let hint = if cfg!(target_os = "windows") {
                 "Open PowerShell or Command Prompt with 'Run as administrator' and \
-                 start `tsunagi up` there."
+                 start `tsng up` there."
             } else if cfg!(target_os = "linux") {
-                "Start `tsunagi up` as root or grant CAP_NET_ADMIN with \
+                "Start `tsng up` as root or grant CAP_NET_ADMIN with \
                  `sudo setcap cap_net_admin,cap_net_bind_service+p /path/to/tsunagi`."
             } else if cfg!(target_os = "macos") {
-                "Creating a utun interface needs root on macOS; start `tsunagi up` \
+                "Creating a utun interface needs root on macOS; start `tsng up` \
                  with `sudo`, or install it as a root LaunchDaemon."
             } else {
-                "Start `tsunagi up` with the privileges required to create a TUN interface."
+                "Start `tsng up` with the privileges required to create a TUN interface."
             };
             return OverlayError::Unavailable(format!(
                 "permission denied while creating the TUN interface `{name}`. \
@@ -539,7 +539,7 @@ mod system {
             let message = open_error("tsun0", error).to_string();
             assert!(message.contains("permission denied"), "{message}");
             assert!(message.contains("tsun0"), "{message}");
-            assert!(message.contains("tsunagi up"), "{message}");
+            assert!(message.contains("tsng up"), "{message}");
             #[cfg(target_os = "windows")]
             assert!(message.contains("Run as administrator"), "{message}");
             #[cfg(target_os = "linux")]

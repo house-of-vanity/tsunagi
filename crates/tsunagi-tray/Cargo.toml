@@ -15,7 +15,7 @@ path = "src/main.rs"
 # The agent control client and the report types: the GUI is a thin client over
 # the same local control interface the CLI uses, so it reuses these directly
 # and never re-implements the protocol.
-tsunagi = { path = "../tsunagi", version = "0.1.0" }
+tsunagi-core = { path = "../tsunagi-core", version = "0.1.0" }
 # Native, lightweight GUI — no web engine. eframe re-exports egui.
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 # Cross-platform tray icon + menu (Windows tray, macOS menu bar, Linux SNI).

@@ -9,7 +9,7 @@ or Tailscale's exit nodes work. Linux only for now.
 The offering side, per network, off by default:
 
 ```sh
-tsunagi network exit-node <network> on      # or off
+tsng network exit-node <network> on      # or off
 ```
 
 Rules are installed even when the kernel does not forward yet, and `status`
@@ -22,9 +22,9 @@ sudo sysctl -w net.ipv4.ip_forward=1
 The using side:
 
 ```sh
-tsunagi exit-node                  # who offers one
-tsunagi exit-node <name|id>        # send everything through it
-tsunagi exit-node off
+tsng exit-node                  # who offers one
+tsng exit-node <name|id>        # send everything through it
+tsng exit-node off
 ```
 
 The tray does the same: a checkbox on the network tile to offer, and an icon on
@@ -65,7 +65,7 @@ be an exit node in one network and not in another.
   would otherwise cover everything you run. A per-user agent refuses to use an
   exit node and says why.
 - **If the exit node disappears the rules stay** and traffic is dropped until
-  it returns or you run `tsunagi exit-node off`. This is deliberate: falling
+  it returns or you run `tsng exit-node off`. This is deliberate: falling
   back to the direct path would leak traffic nobody agreed to send in the
   clear. The agent logs it once, `status` and the tray say so loudly.
 - **IPv6-only destinations are unreachable** meanwhile; carrying IPv6 through

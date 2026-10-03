@@ -69,7 +69,9 @@ And in crates of their own:
 | crate | responsibility |
 |---|---|
 | `tsunagi-wg-quic` | the `wg-quic` protocol: its keys, its announcement, its tunnels |
-| `tsunagi-cli` | the command line agent: the only place that owns a runtime, a logger and signals |
+| `tsunagi` | the command line agent, built as the `tsng` executable: the only place that owns a runtime, a logger and signals |
+
+The core library is the package `tsunagi-core`; its library target is still called `tsunagi`, so code says `use tsunagi::…`.
 
 A protocol is a separate crate so the boundary is the compiler's to enforce,
 and so it can carry its own version. That version is not what peers compare:

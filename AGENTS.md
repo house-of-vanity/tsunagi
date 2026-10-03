@@ -30,7 +30,7 @@ scripts when improving the interactive workflow.
 Keep these separate. Crossing them is the main thing to review for.
 
 - **Control plane vs data plane.** The separation is **logical, not physical**.
-  The control protocol in `crates/tsunagi/src/proto/` knows nothing about
+  The control protocol in `crates/tsunagi-core/src/proto/` knows nothing about
   packets, and a protocol crate knows nothing about the control protocol;
   either can be replaced on its own. Both may ride on iroh — refusing to
   would throw away iroh's NAT traversal and force the data plane to
@@ -70,9 +70,9 @@ Keep these separate. Crossing them is the main thing to review for.
   ownership checks or add broadcast flooding to encrypted transit.
 - **Plugins never learn reachability.** An `IpPlugin` is handed a `PacketLink`
   per peer and moves datagrams over it. Addresses, hole punching and relays
-  belong to `crates/tsunagi/src/dataplane/transport/`. A plugin announcement says *who*, never
+  belong to `crates/tsunagi-core/src/dataplane/transport/`. A plugin announcement says *who*, never
   *where*.
-- **The core never parses a plugin payload.** See `crates/tsunagi/src/dataplane/mod.rs`. Only
+- **The core never parses a plugin payload.** See `crates/tsunagi-core/src/dataplane/mod.rs`. Only
   `crates/tsunagi-wg-quic/src/announcement.rs` interprets `wg-quic` payloads, and
   only after bounding every field. A data plane failure must never stop the
   control plane.
@@ -81,7 +81,7 @@ Keep these separate. Crossing them is the main thing to review for.
   inbound packets are dropped unless their source is the address derived for
   the peer that sent them. Never trust an address a peer announces.
 - **Signed state is the only durable agreement.** A fact that must survive a
-  participant being away goes in `crates/tsunagi/src/state/` as a record signed by its
+  participant being away goes in `crates/tsunagi-core/src/state/` as a record signed by its
   author, never in a session. Merging is deterministic, an older version never
   rolls back a newer one, and absence from a snapshot is not deletion. Never
   add a vote or a quorum: a majority is not a trust root here, and it would
@@ -115,7 +115,7 @@ Keep these separate. Crossing them is the main thing to review for.
    normal path *and* the important failures. See [docs/testing.md](docs/testing.md).
    Do not add tests for getters or to move a coverage number.
 2. **Never change `IDENTITY_SCHEME`, the derivation labels, or the transcript
-   encoding** in `crates/tsunagi/src/identity/network.rs` and `crates/tsunagi/src/proto/handshake.rs` without
+   encoding** in `crates/tsunagi-core/src/identity/network.rs` and `crates/tsunagi-core/src/proto/handshake.rs` without
    treating it as an incompatible protocol change. Bumping the crate version or
    the control protocol version must not change an existing `NetworkId`.
 3. **Secrets never leak.** Not into logs, not into `Debug`, not into status
@@ -126,7 +126,7 @@ Keep these separate. Crossing them is the main thing to review for.
    the library; tests opt out explicitly at the top of each file.
 5. **Bounds before allocation.** Frame lengths are checked against
    `Limits::max_frame_len` before a buffer is allocated. Every string, list and
-   queue has a limit in `crates/tsunagi/src/config.rs`.
+   queue has a limit in `crates/tsunagi-core/src/config.rs`.
 6. **Failure is contained.** A bad signature, wrong secret, malformed packet or
    unknown version rejects one message or one session. It never stops another
    network and never stops the agent. There is no irreversible global error
@@ -150,18 +150,18 @@ Keep these separate. Crossing them is the main thing to review for.
 
 | path                | responsibility |
 |---------------------|----------------|
-| `crates/tsunagi/src/identity/`     | device identity; deterministic network space identity and derived keys |
-| `crates/tsunagi/src/storage/`      | `state.sqlite`, `cache.sqlite`, directory ownership lock |
-| `crates/tsunagi/src/discovery.rs`  | candidate sources; test and static backends |
-| `crates/tsunagi/src/proto/`        | framing, message formats, membership handshake |
-| `crates/tsunagi/src/net.rs`        | iroh endpoint adapter and observability snapshots |
-| `crates/tsunagi/src/agent/`        | agent lifecycle, per-network runtimes, sessions, events, status |
-| `crates/tsunagi/src/state/`        | signed records that outlive a session, their merge rules and address allocation |
-| `crates/tsunagi/src/overlay/`   | the one interface an agent owns: provisioning, the TUN, routing, source checks, broadcast host rules |
-| `crates/tsunagi/src/dataplane/` | the protocol contract and the authenticated packet transport |
-| `crates/tsunagi/src/dns/`       | the DNS view of a network: zone, server, resolver publication |
+| `crates/tsunagi-core/src/identity/`     | device identity; deterministic network space identity and derived keys |
+| `crates/tsunagi-core/src/storage/`      | `state.sqlite`, `cache.sqlite`, directory ownership lock |
+| `crates/tsunagi-core/src/discovery.rs`  | candidate sources; test and static backends |
+| `crates/tsunagi-core/src/proto/`        | framing, message formats, membership handshake |
+| `crates/tsunagi-core/src/net.rs`        | iroh endpoint adapter and observability snapshots |
+| `crates/tsunagi-core/src/agent/`        | agent lifecycle, per-network runtimes, sessions, events, status |
+| `crates/tsunagi-core/src/state/`        | signed records that outlive a session, their merge rules and address allocation |
+| `crates/tsunagi-core/src/overlay/`   | the one interface an agent owns: provisioning, the TUN, routing, source checks, broadcast host rules |
+| `crates/tsunagi-core/src/dataplane/` | the protocol contract and the authenticated packet transport |
+| `crates/tsunagi-core/src/dns/`       | the DNS view of a network: zone, server, resolver publication |
 | `crates/tsunagi-wg-quic/`       | the `wg-quic` protocol: its keys, its announcement, its tunnels |
-| `crates/tsunagi-cli/` | the command line agent; the only place that owns a runtime, a logger and signals |
+| `crates/tsunagi/` | the command line agent, built as `tsng`; the only place that owns a runtime, a logger and signals |
 | `tests/`            | integration tests; `tests/common/` is the shared harness |
 
 Add abstractions only at real substitution or testing boundaries. Do not add a

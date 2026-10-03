@@ -89,7 +89,7 @@ The ignored `forwarding_benchmark` measures the synchronous transit routine in
 release mode, excluding crypto and socket I/O. Run it explicitly as described
 in [routing.md](routing.md); it has no timing threshold in the default suite.
 
-Unit tests in `crates/tsunagi/src/state/` cover the signed record model directly: tampering
+Unit tests in `crates/tsunagi-core/src/state/` cover the signed record model directly: tampering
 with any field breaks verification, a newer version wins while an older one
 never rolls back, two authors claiming one address resolve the same way no
 matter the merge order, one key used in two places is reported rather than
@@ -103,7 +103,7 @@ asking a running agent for status over a real Unix socket, joining and
 leaving a network through it, a leftover socket file being replaced while a
 live one is not, and the derived socket path staying short enough to bind.
 
-`crates/tsunagi-cli/tests/network_cli.rs` runs the real binary too: joining
+`crates/tsunagi/tests/network_cli.rs` runs the real binary too: joining
 with no secret invents one, prints it in full and prints a line the other
 side can paste unchanged; a bare name this device already knows resumes
 that network instead of inventing another of the same name; and a network
@@ -114,7 +114,7 @@ duplicate and unknown names change nothing and full ids resolve ambiguity.
 Selector unit tests cover case-sensitive names, Unicode/ellipsis names, copied
 id prefixes and collisions between names and ids without revealing secrets.
 
-`crates/tsunagi-cli/tests/dns_service.rs` runs the real binary: the resolver
+`crates/tsunagi/tests/dns_service.rs` runs the real binary: the resolver
 comes up with no interface to attach it to, the listener is not rebuilt on
 the way past, a name outside every zone is refused, each network gets a zone
 of its own as it is joined, and the resolver can be switched on and off
@@ -128,7 +128,7 @@ about arrive as candidates that still pass the handshake like any other.
 candidate is enough to join, several backends compose, entries are withdrawn
 when a network stops, and a forgotten network stays forgotten across a restart.
 
-Unit tests in `crates/tsunagi/src/proto/handshake.rs` cover the transcript construction
+Unit tests in `crates/tsunagi-core/src/proto/handshake.rs` cover the transcript construction
 itself: role separation, channel binding, identity and network binding,
 unambiguous encoding, and rejection under the wrong key.
 

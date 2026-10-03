@@ -1,7 +1,7 @@
 //! The local control interface: a client asking a running agent for status.
 //!
 //! Uses a real Unix socket on a temporary path, the real agent and the real
-//! WireGuard data plane, so what a `tsunagi status` client would see is what
+//! WireGuard data plane, so what a `tsng status` client would see is what
 //! is checked here.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

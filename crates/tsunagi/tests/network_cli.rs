@@ -30,7 +30,7 @@ impl Running {
 }
 
 fn run_in(dir: &TempDir, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+    std::process::Command::new(env!("CARGO_BIN_EXE_tsng"))
         .args(args)
         .arg("--state-dir")
         .arg(dir.path().join("state"))
@@ -51,7 +51,7 @@ fn read_networks(dir: &TempDir) -> Vec<tsunagi::storage::StoredNetwork> {
 /// anything has been decided.
 fn start_bare(port: u16) -> Running {
     let dir = TempDir::new().unwrap();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsng"))
         .arg("up")
         .arg("--state-dir")
         .arg(dir.path().join("state"))
@@ -111,7 +111,7 @@ fn joining_with_no_secret_makes_one_and_prints_what_to_send() {
     assert!(secret.starts_with("tsn1"), "{out}");
     let command = out
         .lines()
-        .find(|line| line.contains("tsunagi join --network spontaneous"))
+        .find(|line| line.contains("tsng join --network spontaneous"))
         .expect("a command to send");
     assert!(command.contains(secret), "with the secret in it: {out}");
     // And where to find this device, for an agent that is not up yet.
@@ -244,7 +244,7 @@ fn up_is_the_agent_and_takes_no_network_at_all() {
     // second way to do the same thing, and the one that cannot be undone
     // without a restart.
     for argument in ["--network", "--secret"] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_tsunagi"))
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_tsng"))
             .args(["up", argument, "whatever"])
             .arg("--state-dir")
             .arg(TempDir::new().unwrap().path().join("state"))

@@ -25,10 +25,10 @@ trap 'rm -rf "$root"' EXIT
 # Payload. Debian installs to /usr/bin (not /usr/local), so the service's
 # ExecStart is rewritten to match; the source unit targets /usr/local/bin for
 # the tarball installer.
-install -D -m 0755 "$binary" "$root/usr/bin/tsunagi"
+install -D -m 0755 "$binary" "$root/usr/bin/tsng"
 
 mkdir -p "$root/lib/systemd/system"
-sed 's#/usr/local/bin/tsunagi#/usr/bin/tsunagi#' \
+sed 's#/usr/local/bin/tsng#/usr/bin/tsng#' \
     "$here/../linux/tsunagi.service" > "$root/lib/systemd/system/tsunagi.service"
 chmod 0644 "$root/lib/systemd/system/tsunagi.service"
 
@@ -43,7 +43,7 @@ desc_gui=""
 if [ -n "$tray" ]; then
     pkgname=tsunagi-gui
     # The GUI package is a superset of the headless one and must not coexist
-    # with it (both ship /usr/bin/tsunagi).
+    # with it (both ship /usr/bin/tsng).
     extra_control=$'Conflicts: tsunagi\nReplaces: tsunagi\nProvides: tsunagi\n'
     # What the tray and its window load at run time.
     extra_control+=$'Depends: libgtk-3-0 | libgtk-3-0t64, libayatana-appindicator3-1 | libappindicator3-1, libxdo3, libxkbcommon0, libwayland-client0, libx11-6, libgl1\n'

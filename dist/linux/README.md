@@ -27,27 +27,27 @@ group, so after `sudo usermod -aG tsunagi "$USER"` (and logging in again) no
 `sudo` is needed:
 
 ```sh
-sudo tsunagi status
-sudo tsunagi join <network-name> <tsn1…secret>
+sudo tsng status
+sudo tsng join <network-name> <tsn1…secret>
 ```
 
 ## As your own user — one capability, no service
 
 ```sh
-sudo install -m 0755 tsunagi /usr/local/bin/tsunagi
-sudo setcap cap_net_admin,cap_net_bind_service+p /usr/local/bin/tsunagi
+sudo install -m 0755 tsunagi /usr/local/bin/tsng
+sudo setcap cap_net_admin,cap_net_bind_service+p /usr/local/bin/tsng
 sudo usermod -aG tsunagi "$USER"   # so the resolver works; log in again after
-tsunagi up
+tsng up
 ```
 
 Nothing runs as root. The capability is lost on every rebuild or copy of the
 binary, so re-run `setcap` after replacing it. The agent uses your per-user
-state directory and socket, so plain `tsunagi status` (no sudo) reaches it.
+state directory and socket, so plain `tsng status` (no sudo) reaches it.
 
 ## Without touching the OS
 
 ```sh
-tsunagi up --no-tun
+tsng up --no-tun
 ```
 
 Tunnels form and handshake between agents, but no interface, address or route is

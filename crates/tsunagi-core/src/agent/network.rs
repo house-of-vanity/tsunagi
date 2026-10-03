@@ -1218,7 +1218,7 @@ impl Runtime {
                 network = %self.network_id,
                 exit_node = %via.fmt_short(),
                 "the exit node is gone or no longer offers to be one; internet traffic stays \
-                 routed through it and is dropped until it returns or `tsunagi exit-node off`"
+                 routed through it and is dropped until it returns or `tsng exit-node off`"
             );
         }
     }

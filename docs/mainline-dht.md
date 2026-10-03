@@ -1,6 +1,6 @@
 # Mainline rendezvous
 
-`tsunagi up` enables public Mainline DHT discovery. `--no-dht` disables it;
+`tsng up` enables public Mainline DHT discovery. `--no-dht` disables it;
 `--dht` explicitly selects the default. `--reach local` always disables it.
 Manual `--peer` entries work alongside DHT or on their own. Library callers
 opt in with `AgentConfig::with_dht(MainlineDiscovery::default())`; merely
@@ -86,5 +86,5 @@ Public DHT and relay checks are opt-in and are not part of the offline suite.
 Run the optional public check with:
 
 ```sh
-cargo test --locked -p tsunagi --test mainline public_dht_finds_and_authenticates_two_agents -- --ignored --exact
+cargo test --locked -p tsunagi-core --test mainline public_dht_finds_and_authenticates_two_agents -- --ignored --exact
 ```

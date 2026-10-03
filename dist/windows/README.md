@@ -1,18 +1,18 @@
 # Running tsunagi on Windows
 
-This archive holds `tsunagi.exe`. The overlay interface is a Wintun adapter, so
+This archive holds `tsng.exe`. The overlay interface is a Wintun adapter, so
 the agent needs two things to carry real traffic:
 
 1. **`wintun.dll` beside the executable.** Download it from
    <https://www.wintun.net>, take the DLL for your architecture (`amd64`), and
-   put it in the same folder as `tsunagi.exe`.
+   put it in the same folder as `tsng.exe`.
 2. **An elevated process.** Creating the adapter requires Administrator rights.
 
 Open PowerShell or Command Prompt with **Run as administrator** and start the
 agent there:
 
 ```powershell
-.\tsunagi.exe up
+.\tsng.exe up
 ```
 
 Run the commands that control it (`join`, `status`, `dns`, `network`) as the
@@ -23,7 +23,7 @@ regardless of which account started the agent.
 ## Without touching the OS
 
 ```powershell
-.\tsunagi.exe up --no-tun
+.\tsng.exe up --no-tun
 ```
 
 Tunnels form and handshake between agents, but no adapter, address or route is

@@ -214,7 +214,7 @@ pub enum Request {
     ///
     /// Asked of the running agent because that is the only way to add a
     /// network to an agent that is already up: the state directory belongs
-    /// to one live agent, so a second `tsunagi up` cannot.
+    /// to one live agent, so a second `tsng up` cannot.
     Join {
         /// The network name.
         name: String,
@@ -764,7 +764,7 @@ where
 ///
 /// A local answer comes from memory, so anything this slow means the agent is
 /// wedged rather than busy. Saying so beats waiting: unbounded, one wedged
-/// runtime leaves `tsunagi status` hanging with nothing on screen and no way
+/// runtime leaves `tsng status` hanging with nothing on screen and no way
 /// out but Ctrl-C.
 pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 

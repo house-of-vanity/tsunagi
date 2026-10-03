@@ -18,7 +18,7 @@ fi
 
 echo "Installing tsunagi to ${PREFIX}/bin"
 install -d "${PREFIX}/bin"
-install -m 0755 "${here}/tsunagi" "${PREFIX}/bin/tsunagi"
+install -m 0755 "${here}/tsng" "${PREFIX}/bin/tsng"
 
 # The dedicated system user the service runs as (works with either shadow's
 # useradd or Debian's adduser).
@@ -47,19 +47,19 @@ Done. Start the agent with:
 
 Control it with sudo (the CLI finds the service's socket automatically):
 
-    sudo tsunagi status
-    sudo tsunagi join <network-name> <tsn1…secret>
+    sudo tsng status
+    sudo tsng join <network-name> <tsn1…secret>
 EOF
 else
     cat <<EOF
 
 Installed the binary; no systemd found, so no service was set up. Either:
 
-  * run it as root:            sudo ${PREFIX}/bin/tsunagi up
-  * or as your own user:       sudo setcap cap_net_admin,cap_net_bind_service+p ${PREFIX}/bin/tsunagi
-                               tsunagi up
+  * run it as root:            sudo ${PREFIX}/bin/tsng up
+  * or as your own user:       sudo setcap cap_net_admin,cap_net_bind_service+p ${PREFIX}/bin/tsng
+                               tsng up
     (add yourself to the tsunagi group so the resolver works:
      sudo usermod -aG tsunagi "\$USER")
-  * or without touching the OS: tsunagi up --no-tun
+  * or without touching the OS: tsng up --no-tun
 EOF
 fi

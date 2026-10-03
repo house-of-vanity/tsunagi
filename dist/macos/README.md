@@ -7,15 +7,15 @@ Linux. There are two ways to run it.
 ## Quick start — `sudo`
 
 ```sh
-sudo tsunagi up
+sudo tsng up
 ```
 
 In another terminal, the control commands talk to it over the system control
 socket and do **not** need `sudo`:
 
 ```sh
-tsunagi status
-tsunagi join <network-name> <tsn1…secret>
+tsng status
+tsng join <network-name> <tsn1…secret>
 ```
 
 The agent uses fixed system paths, so the commands find it regardless of whose
@@ -34,7 +34,7 @@ For an always-on agent that starts at boot, install the bundled
 
 ```sh
 # Put the binary where the plist expects it (edit the plist for another path).
-sudo install -m 0755 target/release/tsunagi /usr/local/bin/tsunagi
+sudo install -m 0755 target/release/tsng /usr/local/bin/tsng
 
 # Install the daemon. launchd refuses a daemon plist that is not owned by
 # root:wheel or that is group/world-writable.
@@ -56,7 +56,7 @@ tail -f /var/log/tsunagi.log                          # logs
 ```
 
 The control commands (`status`, `join`, `network`, `dns`) work the same against
-the daemon as against a `sudo tsunagi up`, over the same socket.
+the daemon as against a `sudo tsng up`, over the same socket.
 
 ## What the agent does to the system
 
@@ -74,7 +74,7 @@ off, or the agent stops:
   it wrote, never one you created by hand.
 - while broadcast is on, a `255.255.255.255` **route** through the overlay
   interface. The matching inbound-UDP firewall allowance is **not** implemented
-  yet (it needs a `pf` anchor); `tsunagi status` reports that half as incomplete
+  yet (it needs a `pf` anchor); `tsng status` reports that half as incomplete
   and names what to allow by hand if your host firewall drops discovery replies.
 
 Nothing taken from a remote peer ever becomes a path, a command argument or an

@@ -6,11 +6,11 @@ each member advertises whether it accepts broadcasts over its authenticated
 control session. It is not a network-wide vote or signed shared configuration.
 
 ```sh
-tsunagi join -n games --no-broadcast
-tsunagi join -n games --broadcast
-tsunagi network broadcast games off
-tsunagi network broadcast games on
-tsunagi network broadcast games
+tsng join -n games --no-broadcast
+tsng join -n games --broadcast
+tsng network broadcast games off
+tsng network broadcast games on
+tsng network broadcast games
 ```
 
 Joining without either flag preserves the saved choice. The `network broadcast`
@@ -83,7 +83,7 @@ announcement. A rule left by a crashed run is replaced on the next apply. If
 `iptables` is missing (for example a host with only `nft`) or the process is not
 privileged, the route is still installed and `status` prints a
 `broadcast rules` line saying which half is missing and why. To undo it all,
-turn broadcast off for the network: `tsunagi network broadcast <network> off`.
+turn broadcast off for the network: `tsng network broadcast <network> off`.
 
 **One interface, several networks.** The host has one `255.255.255.255` route
 per interface, so only one overlay address can be its source. The lowest network

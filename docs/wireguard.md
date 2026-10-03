@@ -58,7 +58,7 @@ and no second set of NAT problems to solve for WireGuard.
 
 ## Checking it from outside
 
-`tsunagi status` asks a running agent over its local control socket and prints
+`tsng status` asks a running agent over its local control socket and prints
 what it sees, including whether each tunnel has actually handshaken. See
 [../README.md](../README.md#checking-that-it-works).
 
@@ -209,8 +209,8 @@ edit. Reconciliation is purely "do the running tunnels match what is known".
 
 ```bash
 # On both machines: the agent, then the network
-tsunagi up
-tsunagi join --network lab --secret "$SECRET"
+tsng up
+tsng join --network lab --secret "$SECRET"
 ```
 
 See the two-machine walkthrough in [../README.md](../README.md#trying-it-on-two-machines).

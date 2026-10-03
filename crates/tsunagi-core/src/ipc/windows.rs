@@ -210,7 +210,7 @@ impl Drop for ControlSocket {
 /// Accepts one client at a time, keeping a fresh instance ready for the next.
 ///
 /// A named pipe server instance serves a single client, so a new instance is
-/// created as soon as one is taken — otherwise a second `tsunagi status` while
+/// created as soon as one is taken — otherwise a second `tsng status` while
 /// the first is mid-flight would find nothing listening.
 async fn serve(
     name: String,
@@ -294,7 +294,7 @@ pub(crate) async fn connect(path: &Path) -> Result<NamedPipeClient> {
                         format!(
                             "the agent's control pipe exists, but Windows denied access. \
                              Run this command as the same Windows user and with the same \
-                             elevation as `tsunagi up` (use an administrator terminal if \
+                             elevation as `tsng up` (use an administrator terminal if \
                              the agent is elevated). Windows error: {err}"
                         ),
                     ),

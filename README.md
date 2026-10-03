@@ -36,7 +36,7 @@ A working library with **real iroh connections** and integration tests:
   overlay with deterministically derived addresses and optional IPv4, real
   tunnels carried over iroh, and address ownership enforced rather than
   believed;
-- a **command line agent**, `tsunagi`, with a local control socket.
+- a **command line agent**, `tsng`, with a local control socket.
 
 ### What it deliberately does **not** do
 
@@ -71,8 +71,8 @@ On the first machine:
 
 ```bash
 cargo build --release
-./target/release/tsunagi status          # this device, the agent, and this host
-./target/release/tsunagi network         # the networks this device belongs to
+./target/release/tsng status          # this device, the agent, and this host
+./target/release/tsng network         # the networks this device belongs to
 ```
 
 Two commands do the work, and they are separate on purpose: `up` runs the
@@ -81,19 +81,19 @@ what it belongs to, at any time, while it runs.
 
 ```bash
 # Terminal one: the agent. It prints its endpoint id and then serves.
-./target/release/tsunagi up
+./target/release/tsng up
 
 # Terminal two: make a network. With no --secret it invents one and prints
 # it, along with the line to send the other machine.
-./target/release/tsunagi join --network lab
+./target/release/tsng join --network lab
 ```
 
 On the second machine, start its agent and join the same network with the
 secret that was printed:
 
 ```bash
-./target/release/tsunagi up
-./target/release/tsunagi join --network lab --secret tsn1...
+./target/release/tsng up
+./target/release/tsng join --network lab --secret tsn1...
 ```
 
 **Name and secret are enough for the first meeting.** Mainline DHT discovery
@@ -141,7 +141,7 @@ wg-quic: tsun0 on 10.13.37.69/24 mtu 1280, 1/1 tunnel(s) established
 From another shell on either machine:
 
 ```bash
-tsunagi status
+tsng status
 ```
 
 ```text
@@ -170,8 +170,8 @@ ping  100.65.243.53
 what they find, so `--ipv4-range` only matters for whoever starts the network:
 
 ```bash
-tsunagi up --ipv4-range 10.44.0.0/16
-tsunagi up --ipv4-range none   # no data plane at all
+tsng up --ipv4-range 10.44.0.0/16
+tsng up --ipv4-range none   # no data plane at all
 ```
 
 One agent has one interface, so two of its networks cannot both use that
@@ -193,7 +193,7 @@ assigns it to the interface itself.
 
 ## Levels
 
-The command line is split the way the design is. A bare `tsunagi up` needs
+The command line is split the way the design is. A bare `tsng up` needs
 only a network name and a secret; everything else sits under the level it
 belongs to, which `--help` shows as two sections:
 
@@ -204,7 +204,7 @@ belongs to, which `--help` shows as two sections:
   their own settings (`-o key=value`, or `-o protocol:key=value`).
 
 ```bash
-tsunagi protocols          # what this build can carry packets with
+tsng protocols          # what this build can carry packets with
 ```
 
 ```text
@@ -223,7 +223,7 @@ A pair of peers uses a protocol they both have **at the same wire version**.
 That is not the software version: two peers on different builds carry traffic
 for each other for as long as the bytes between them have not changed. A peer
 with nothing in common keeps its control plane — messages and signed state
-still flow — and simply has no data plane, which `tsunagi status` shows as a
+still flow — and simply has no data plane, which `tsng status` shows as a
 session with no agreed protocol.
 
 ## Names
@@ -233,12 +233,12 @@ each named after the network, so members can be reached by name instead of
 by address:
 
 ```bash
-tsunagi up               # DNS is already enabled
+tsng up               # DNS is already enabled
 dig @127.0.0.1 -p 5354 music.lab
 ```
 
-An explicit choice is remembered across restarts. `--no-dns` or `tsunagi dns off`
-disables it; `--dns` or `tsunagi dns on` enables it again. Existing saved opt-outs
+An explicit choice is remembered across restarts. `--no-dns` or `tsng dns off`
+disables it; `--dns` or `tsng dns on` enables it again. Existing saved opt-outs
 remain respected. The `dns on` and `dns off` commands also take effect immediately
 on a running agent. `--dns` and `--no-dns` cannot be combined.
 
@@ -299,7 +299,7 @@ polkit.addRule(function(action, subject) {
 RULE
 ```
 
-**Without it the server still runs** — `tsunagi status` prints where it is
+**Without it the server still runs** — `tsng status` prints where it is
 listening and the exact `dig` line — so the automatic part is missing, not
 the feature. The refusal is said once rather than on every pass, and retried
 slowly, because nothing but a person will change it.
@@ -318,7 +318,7 @@ remote peer could influence.
 That needs `CAP_NET_ADMIN`, granted once:
 
 ```bash
-sudo setcap cap_net_admin+p /usr/local/bin/tsunagi
+sudo setcap cap_net_admin+p /usr/local/bin/tsng
 ```
 
 `+p` rather than `+ep`: the capability is then *permitted* but not
@@ -328,7 +328,7 @@ allocation changes. Everything else, including every byte from the network,
 is handled with it lowered. `+ep` works too; the agent lowers it on the way
 in.
 
-`tsunagi status` says which of these applies on the host it runs on, along
+`tsng status` says which of these applies on the host it runs on, along
 with what the agent is doing. It grades each finding: **ok** for what works,
 **warn** for what the agent runs without and you can fix from the line it
 prints, **FAIL** for what it cannot work around. The words carry the grade as
@@ -353,28 +353,28 @@ Every item takes the same shape, so there is nothing to remember: name it to
 see it, name it with a value to change it.
 
 ```
-tsunagi id                      everything about this device
-tsunagi id hostname             the name it answers to
-tsunagi id hostname mango       change it
-tsunagi id key                  the key it signs with
-tsunagi id key rotate           replace that key
+tsng id                      everything about this device
+tsng id hostname             the name it answers to
+tsng id hostname mango       change it
+tsng id key                  the key it signs with
+tsng id key rotate           replace that key
 
-tsunagi network                 the networks this device belongs to
-tsunagi network join -n lab -s tsn1…   join one; adds it to a running agent
-tsunagi network join -n lab     resume one this device has, or make it on the spot
-tsunagi network stop lab        stop serving it, keeping everything
-tsunagi network start lab       serve it again, from where it left off
-tsunagi network leave lab       give up the address and name, then forget it
-tsunagi network secret          the secret of each joined network
-tsunagi network secret lab      just that one, for copying
-tsunagi network secret generate a fresh secret for a network that does not exist yet
+tsng network                 the networks this device belongs to
+tsng network join -n lab -s tsn1…   join one; adds it to a running agent
+tsng network join -n lab     resume one this device has, or make it on the spot
+tsng network stop lab        stop serving it, keeping everything
+tsng network start lab       serve it again, from where it left off
+tsng network leave lab       give up the address and name, then forget it
+tsng network secret          the secret of each joined network
+tsng network secret lab      just that one, for copying
+tsng network secret generate a fresh secret for a network that does not exist yet
 
-tsunagi dns                     whether the local resolver is serving, and what
-tsunagi dns on                  start it, now and after every restart
-tsunagi dns off                 stop it, now and after every restart
+tsng dns                     whether the local resolver is serving, and what
+tsng dns on                  start it, now and after every restart
+tsng dns off                 stop it, now and after every restart
 ```
 
-**A network without a secret makes one.** `tsunagi join --network lab`
+**A network without a secret makes one.** `tsng join --network lab`
 resolves a bare name in the obvious way: if this device is already in
 exactly one network called `lab`, that one — so the name alone resumes what
 you have; if it is in none, a fresh random secret, printed in full with the
@@ -386,11 +386,11 @@ joined `lab` (k2on43wadbi5x267vp6z3ogkm7nbjedfdoxyauxhtxhwqrprylba)
 
 Run this on the other machine:
 
-  tsunagi join --network lab --secret tsn1u7c…
+  tsng join --network lab --secret tsn1u7c…
 
 Its agent has to be running. If it is not:
 
-  tsunagi up --peer 91e83a6e2b7a…
+  tsng up --peer 91e83a6e2b7a…
 ```
 
 Two networks of one name is a thing that happens — a mistyped secret makes
@@ -410,11 +410,11 @@ Asking for it is deliberate, because these reports get pasted into chats.
 
 **`up` takes no network at all** if you would rather decide later: it
 brings up the agent and whatever it is already configured for, and waits.
-That is the shape of a daemon in one terminal and `tsunagi network join`
+That is the shape of a daemon in one terminal and `tsng network join`
 in another.
 
 `network join` is also the answer to a question `up` cannot: a state
-directory belongs to one live agent, so a second `tsunagi up` cannot add a
+directory belongs to one live agent, so a second `tsng up` cannot add a
 network to the one already running. This adds it over the control socket and
 it starts at once. With no agent running it is written to the configuration
 and starts with the next `up`.
@@ -477,11 +477,11 @@ The original IP packet, including its DF bit, is preserved. See
 |---|---|---|
 | `setcap cap_net_admin+p` | ordinary user, one capability | recommended: nothing to prepare, nothing left behind. Lost on every rebuild or copy of the binary. |
 | systemd service | `User=`, `AmbientCapabilities=CAP_NET_ADMIN` | the same, for an installed service |
-| `sudo tsunagi up` | root | everything works, nothing is isolated |
+| `sudo tsng up` | root | everything works, nothing is isolated |
 | macOS root LaunchDaemon | root | the native macOS deployment; see below |
 | `--no-tun` | ordinary user, no capabilities | tunnels run and handshake, traffic never reaches the OS |
 
-On Windows, put `wintun.dll` beside the executable and start `tsunagi up`
+On Windows, put `wintun.dll` beside the executable and start `tsng up`
 from PowerShell or Command Prompt opened with **Run as administrator**.
 Run commands controlling that agent (`join`, `status`, `dns`, `network`)
 as the same Windows user with the same elevation. If Windows denies access
@@ -498,7 +498,7 @@ grant like Linux, and a `utun` plus `/etc/resolver` are root-only. The kernel
 assigns the interface its `utunN` name, so the name derived from the network id
 is only a request and the real one is adopted once the interface is up.
 
-Run it as root — `sudo tsunagi up` for a quick start, or install it as a root
+Run it as root — `sudo tsng up` for a quick start, or install it as a root
 **LaunchDaemon** for the native always-on deployment. As a daemon the agent runs
 unprivileged commands (`join`, `status`, `dns`, `network`) over its control
 socket like any other platform; the socket lives at `/var/run/tsunagi/agent.sock`
@@ -613,10 +613,10 @@ paths. It supports `255.255.255.255` and the overlay subnet's broadcast address;
 received broadcasts never trigger another fanout.
 
 ```sh
-tsunagi join -n games --no-broadcast
-tsunagi join -n games --broadcast
-tsunagi network broadcast games off
-tsunagi network broadcast games on
+tsng join -n games --no-broadcast
+tsng join -n games --broadcast
+tsng network broadcast games off
+tsng network broadcast games on
 ```
 
 The choice persists across restarts and a plain `join`. It can be changed while
@@ -681,8 +681,8 @@ directories by default; `--state-dir` and `--cache-dir` override them.
 One state directory belongs to one live agent, enforced with a real OS file
 lock rather than an existence check. That directory *is* the identity: one
 agent, one device key, one interface, and as many networks as you like on it
-— `tsunagi network join` adds them to the agent that is already running,
-which is why a second `tsunagi up` on the same directory is refused rather
+— `tsng network join` adds them to the agent that is already running,
+which is why a second `tsng up` on the same directory is refused rather
 than made to work. A second agent on the same host is a second identity, and
 needs everything of its own: its own state and cache directories, its own
 interface name and its own overlay range. The library owns no globals, so
@@ -693,9 +693,9 @@ several of them run side by side in one process as readily as in one host.
 Membership outlives a session, so it also has to be possible to end it.
 
 ```bash
-tsunagi network                     # what this device belongs to
-tsunagi network leave lab           # give up the address and the name, then forget it
-tsunagi wipe --yes                  # remove everything and be a stranger again
+tsng network                     # what this device belongs to
+tsng network leave lab           # give up the address and the name, then forget it
+tsng wipe --yes                  # remove everything and be a stranger again
 ```
 
 **Stopping is not leaving.** `stop` closes this network's sessions, takes

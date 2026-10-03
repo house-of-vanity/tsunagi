@@ -100,9 +100,9 @@ jobs:
             # one lint to keep the musl build log clean. A real link error still
             # fails the build.
             export RUSTFLAGS="${RUSTFLAGS:-} -A linker_messages"
-            cargo zigbuild --release --locked --target "${{ matrix.target }}" --bin tsunagi
+            cargo zigbuild --release --locked --target "${{ matrix.target }}" --bin tsng
           else
-            cargo build --release --locked --target "${{ matrix.target }}" --bin tsunagi
+            cargo build --release --locked --target "${{ matrix.target }}" --bin tsng
           fi
 
       # The tray GUI. On Linux it is built against glibc (an old baseline for
@@ -138,8 +138,8 @@ jobs:
           stage="dist/pkg/${{ matrix.asset }}"
           mkdir -p "$stage"
 
-          bin="tsunagi"
-          [[ "${{ runner.os }}" == "Windows" ]] && bin="tsunagi.exe"
+          bin="tsng"
+          [[ "${{ runner.os }}" == "Windows" ]] && bin="tsng.exe"
           cp "target/${{ matrix.target }}/release/${bin}" "$stage/"
 
           # The tray GUI alongside it, where it was built (Linux: x86_64 only).
@@ -188,7 +188,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           bash dist/deb/build-deb.sh \
-            "target/${{ matrix.target }}/release/tsunagi" \
+            "target/${{ matrix.target }}/release/tsng" \
             "${{ matrix.deb_arch }}" \
             "$version" \
             "tsunagi_${version}_${{ matrix.deb_arch }}.deb"
@@ -204,7 +204,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           pkgver="${version//-/_}"
           bash dist/arch/build-pkg.sh \
-            "target/${{ matrix.target }}/release/tsunagi" \
+            "target/${{ matrix.target }}/release/tsng" \
             "${{ matrix.pkg_arch }}" \
             "$version" \
             "tsunagi-${pkgver}-1-${{ matrix.pkg_arch }}.pkg.tar.zst"
@@ -220,11 +220,11 @@ jobs:
           pkgver="${version//-/_}"
           tray="target/${{ matrix.gnu_target }}/release/tsunagi-tray"
           bash dist/deb/build-deb.sh \
-            "target/${{ matrix.target }}/release/tsunagi" \
+            "target/${{ matrix.target }}/release/tsng" \
             "${{ matrix.deb_arch }}" "$version" \
             "tsunagi-gui_${version}_${{ matrix.deb_arch }}.deb" "$tray"
           bash dist/arch/build-pkg.sh \
-            "target/${{ matrix.target }}/release/tsunagi" \
+            "target/${{ matrix.target }}/release/tsng" \
             "${{ matrix.pkg_arch }}" "$version" \
             "tsunagi-gui-${pkgver}-1-${{ matrix.pkg_arch }}.pkg.tar.zst" "$tray"
 

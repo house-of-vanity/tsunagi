@@ -1,110 +1,43 @@
 [package]
 name = "tsunagi"
 version = "0.1.0"
-description = "Small private mesh networks: persistent agent identity, deterministic network spaces, an iroh control plane, signed state and a local DNS view."
-readme = "../../README.md"
-keywords = ["mesh", "p2p", "iroh", "networking"]
-categories = ["network-programming"]
+description = "The tsunagi command line agent."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-default = []
-# A real TUN device, so a plugin can carry actual IP traffic. On Linux it
-# needs CAP_NET_ADMIN; on Windows the process must run elevated and
-# `wintun.dll` must be reachable. Without either the in-memory device serves
-# tests. The platform-specific dependencies are declared per target, so
-# enabling this only pulls what the target it is built for actually uses.
-tun-device = [
-    "dep:tun",
-    "dep:rtnetlink",
-    "dep:caps",
-    "dep:futures-util",
-]
-# Telling the operating system where to send its DNS questions. systemd-resolved
-# on Linux, the Name Resolution Policy Table on Windows; the zone and the
-# server work without it either way.
-dns-publish = ["dep:zbus"]
-# The test harness in `testing`, for this crate's own tests and for a
-# protocol crate's. Not on by default: it is only of use to a test.
-testing = ["dep:tempfile", "dep:tracing-subscriber"]
+[[bin]]
+name = "tsng"
+path = "src/main.rs"
 
 [dependencies]
-arc-swap = "1.9"
+tsunagi-core = { path = "../tsunagi-core", version = "0.1.0", features = ["tun-device", "dns-publish"] }
+tsunagi-wireguard = { path = "../tsunagi-wireguard", version = "0.1.0" }
+tsunagi-wg-quic = { path = "../tsunagi-wg-quic", version = "0.1.0" }
+tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls", version = "0.1.0" }
 iroh.workspace = true
-# `net` for the local control interface: a Unix socket on Unix, a named pipe
-# on Windows. Both live behind the same `net` feature.
-tokio = { workspace = true, features = ["net"] }
-tokio-stream = "0.1"
-serde.workspace = true
-postcard.workspace = true
-bytes.workspace = true
-thiserror.workspace = true
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal"] }
 tracing.workspace = true
-hex.workspace = true
-data-encoding.workspace = true
-rusqlite = { version = "0.40", features = ["bundled"] }
-hkdf = "0.13"
-hmac = "0.13"
-sha2 = "0.11"
-subtle = "2.6"
-zeroize = { version = "1.9", features = ["derive"] }
-rand = "0.10"
-# Already in the tree through iroh. A packet codec, not a DNS server: the
-# zone logic is ours and a full server framework would be a large dependency
-# for answering A records from memory.
-simple-dns = "0.12"
-# The IANA top-level domain list, compiled in: one function, no
-# dependencies, no network. Used only to warn that a zone name shadows a
-# real public domain, never to refuse one.
-tld = "2.40"
-fs4 = { version = "1.1", features = ["sync"] }
-directories = "6.0"
-# The real system hostname, without a libc call of our own: this crate is
-# forbidden `unsafe` and will not make one.
-gethostname = "1.1"
+tracing-subscriber.workspace = true
+clap = { version = "4.5", features = ["derive", "env"] }
+# Already in the tree through clap. `anstream` strips the escapes when stdout
+# is not a terminal and turns on virtual terminal processing on Windows, so
+# colour is never written where it would show up as rubbish.
+anstream = "1.0"
+anstyle = "1.0"
+# Local interface addresses, for the diagnostics in `status`.
 netwatch = "0.19.3"
-netdev = "0.46"
-mainline = "8.0"
-futures-lite = "2.6"
-tun = { version = "0.8", features = ["async"], optional = true }
-# Only for the `testing` harness, which a protocol crate's tests use too.
-tempfile = { version = "3.24", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
-# Linux-only interface provisioning. `rtnetlink` configures the interface in
-# process, so no `ip` invocation is ever needed; `caps` keeps CAP_NET_ADMIN
-# out of the effective set except during the moments it is used.
-[target.'cfg(target_os = "linux")'.dependencies]
-rtnetlink = { version = "0.23", optional = true }
-# Pure Rust D-Bus, no libdbus to link against. `tokio` rather than the
-# default reactor, because the agent brings its own.
-zbus = { version = "5.19", default-features = false, features = ["tokio"], optional = true }
-caps = { version = "0.5", optional = true }
-futures-util = { version = "0.3", default-features = false, optional = true }
-
-# Windows-only interface provisioning. The Wintun adapter itself is created
-# and driven through the `tun` dependency, whose safe wrapper is the only way
-# in — loading `wintun.dll` is an `unsafe` call this crate forbids. `netdev`
-# (already in the tree through `netwatch`) reads the interface table through a
-# safe wrapper, which is how the provisioner observes an adapter by name
-# before deciding what to change. Creating an adapter needs the process to be
-# elevated and `wintun.dll` to be reachable at run time.
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_Foundation",
-] }
+# Resolving a group name to its gid for `up --control-group`, through a safe
+# wrapper (no unsafe of our own). Unix only.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["user"] }
 
 [dev-dependencies]
-# Its own tests use the harness it publishes.
-tsunagi = { path = ".", features = ["testing"] }
-tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process", "test-util"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
 tempfile.workspace = true
-tracing-subscriber.workspace = true
+simple-dns = "0.12"
 
 [lints]
 workspace = true

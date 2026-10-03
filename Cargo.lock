@@ -6235,6 +6235,27 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tsunagi"
 version = "0.1.0"
 dependencies = [
+ "anstream",
+ "anstyle",
+ "clap",
+ "iroh",
+ "netwatch",
+ "nix 0.31.3",
+ "simple-dns",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tsunagi-core",
+ "tsunagi-tcp-tls",
+ "tsunagi-wg-quic",
+ "tsunagi-wireguard",
+]
+
+[[package]]
+name = "tsunagi-core"
+version = "0.1.0"
+dependencies = [
  "arc-swap",
  "bytes",
  "caps",
@@ -6266,32 +6287,11 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
- "tsunagi",
+ "tsunagi-core",
  "tun",
  "windows-sys 0.61.2",
  "zbus",
  "zeroize",
-]
-
-[[package]]
-name = "tsunagi-cli"
-version = "0.1.0"
-dependencies = [
- "anstream",
- "anstyle",
- "clap",
- "iroh",
- "netwatch",
- "nix 0.31.3",
- "simple-dns",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tsunagi",
- "tsunagi-tcp-tls",
- "tsunagi-wg-quic",
- "tsunagi-wireguard",
 ]
 
 [[package]]
@@ -6318,7 +6318,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
- "tsunagi",
+ "tsunagi-core",
  "x25519-dalek",
  "zeroize",
 ]
@@ -6334,7 +6334,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
- "tsunagi",
+ "tsunagi-core",
  "winit",
 ]
 
@@ -6359,7 +6359,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tsunagi",
+ "tsunagi-core",
  "zeroize",
 ]
 
@@ -6383,7 +6383,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tsunagi",
+ "tsunagi-core",
  "zeroize",
 ]
 

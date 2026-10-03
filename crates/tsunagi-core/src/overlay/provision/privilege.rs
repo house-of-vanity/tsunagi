@@ -15,7 +15,7 @@
 //! Grant it with:
 //!
 //! ```text
-//! sudo setcap cap_net_admin,cap_net_bind_service+p /usr/local/bin/tsunagi
+//! sudo setcap cap_net_admin,cap_net_bind_service+p /usr/local/bin/tsng
 //! ```
 //!
 //! `+p` rather than `+ep`: with `+p` the capability is permitted but not
@@ -171,7 +171,7 @@ mod linux_impl {
             caps::raise(None, CapSet::Effective, Capability::CAP_NET_ADMIN).map_err(|err| {
                 OverlayError::Unavailable(format!(
                     "cannot raise CAP_NET_ADMIN: {err}. {}",
-                    Privilege::how_to_grant("tsunagi")
+                    Privilege::how_to_grant("tsng")
                 ))
             })?;
             Ok(Self { raised: true })
@@ -204,10 +204,8 @@ mod tests {
 
     #[test]
     fn the_grant_instructions_name_the_program() {
-        let text = Privilege::how_to_grant("/usr/local/bin/tsunagi");
-        assert!(
-            text.contains("setcap cap_net_admin,cap_net_bind_service+p /usr/local/bin/tsunagi")
-        );
+        let text = Privilege::how_to_grant("/usr/local/bin/tsng");
+        assert!(text.contains("setcap cap_net_admin,cap_net_bind_service+p /usr/local/bin/tsng"));
         assert!(text.contains("--no-tun"), "the fallback is offered too");
     }
 

@@ -11,7 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tsunagi = { path = "../tsunagi", version = "0.1.0" }
+tsunagi-core = { path = "../tsunagi-core", version = "0.1.0" }
 iroh.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -30,7 +30,7 @@ rand = "0.10"
 boringtun = { version = "0.7.1", default-features = false }
 
 [dev-dependencies]
-tsunagi = { path = "../tsunagi", features = ["testing"] }
+tsunagi-core = { path = "../tsunagi-core", features = ["testing"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true

@@ -582,7 +582,7 @@ impl Agent {
                         "`{name}` is already configured with a different secret, as {}. \
                          Joining with this one adds a second network under the same name; \
                          they share nothing. Check the secret, or use \
-                         `tsunagi network secret` \
+                         `tsng network secret` \
                          to see which is which.",
                         other.network_id
                     );
