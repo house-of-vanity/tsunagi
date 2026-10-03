@@ -4,7 +4,7 @@
 #
 # Usage: build-deb.sh <binary> <deb_arch> <version> <output.deb> [tray_binary]
 #   <binary>      path to the built tsunagi (agent/CLI) executable
-#   <deb_arch>    Debian architecture: amd64 or arm64
+#   <deb_arch>    Debian architecture: amd64, arm64 or armhf
 #   <version>     package version (the tag without its leading v)
 #   <output>      path to write the .deb to
 #   [tray_binary] optional path to the tsunagi-tray GUI executable; when given,

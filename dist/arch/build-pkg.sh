@@ -4,7 +4,7 @@
 #
 # Usage: build-pkg.sh <binary> <arch> <version> <output.pkg.tar.zst> [tray_binary]
 #   <binary>      path to the built tsunagi (agent/CLI) executable
-#   <arch>        pacman architecture: x86_64 or aarch64
+#   <arch>        pacman architecture: x86_64, aarch64 or armv7h
 #   <version>     package version (the tag without its leading v)
 #   <output>      path to write the package to
 #   [tray_binary] optional tsunagi-tray GUI executable; when given, the package

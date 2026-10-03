@@ -45,6 +45,16 @@ jobs:
             deb: true
             deb_arch: arm64
             pkg_arch: aarch64
+          # 32-bit ARM with hardware float (ARMv7, `v7l`): single-board and edge
+          # devices. Statically linked like the others.
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            asset: tsunagi-linux-armv7
+            archive: tar.gz
+            zig: true
+            deb: true
+            deb_arch: armhf
+            pkg_arch: armv7h
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: tsunagi-macos-aarch64
