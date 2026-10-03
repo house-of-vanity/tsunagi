@@ -55,8 +55,9 @@ Source: "{#SourceDir}\tsng.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\tsunagi-tray.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Wintun is the unmodified, signed library from wintun.net; its licence allows
 ; shipping it with an application and asks for the licence text beside it.
+; In the archive the text sits at its root, two levels above bin\amd64.
 Source: "{#WintunDir}\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#WintunDir}\LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "wintun-LICENSE.txt"; Flags: ignoreversion
+Source: "{#WintunDir}\..\..\LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "wintun-LICENSE.txt"; Flags: ignoreversion
 
 [Dirs]
 ; Identity and network secrets live here; locked down below.
