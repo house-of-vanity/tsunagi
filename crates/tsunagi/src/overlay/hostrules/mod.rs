@@ -45,8 +45,16 @@ use std::sync::{Arc, Mutex};
 use crate::BoxFuture;
 use crate::state::Ipv4Range;
 
+mod exit;
+pub use exit::{
+    ExitHostPlan, ExitHostReport, ExitHostRules, MockExitRules, exit_tag, exit_tag_prefix,
+    offer_detail,
+};
+
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 mod linux;
+#[cfg(all(feature = "tun-device", target_os = "linux"))]
+mod linux_exit;
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 pub use linux::LinuxHostRules;
 
@@ -159,6 +167,15 @@ pub trait BroadcastHostRules: Send + Sync + std::fmt::Debug + 'static {
     /// Removes what this agent put there for the interface. Succeeds when
     /// nothing is there: it runs on the shutdown path.
     fn clear<'a>(&'a self, interface: &'a str) -> BoxFuture<'a, ()>;
+
+    /// The exit-node rules that go with these, when the platform has them.
+    ///
+    /// One object per host, because both halves need the same privileged
+    /// helpers; the default is that this platform has none, which is said
+    /// where it matters rather than pretended.
+    fn exit_rules(&self) -> Option<&dyn ExitHostRules> {
+        None
+    }
 }
 
 /// The platform has no implementation, which is said rather than pretended.
@@ -195,6 +212,7 @@ pub type MockRulesState = std::collections::BTreeMap<String, BroadcastRulesPlan>
 /// An in-memory host, for tests: nothing is touched.
 #[derive(Debug, Clone, Default)]
 pub struct MockHostRules {
+    exit: MockExitRules,
     state: Arc<Mutex<MockRulesState>>,
     calls: Arc<Mutex<Vec<String>>>,
     firewall_failure: Arc<Mutex<Option<String>>>,
@@ -203,7 +221,15 @@ pub struct MockHostRules {
 impl MockHostRules {
     /// An empty host.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            exit: MockExitRules::new(),
+            ..Self::default()
+        }
+    }
+
+    /// The exit-node half of this host, for inspecting and steering tests.
+    pub fn exit(&self) -> &MockExitRules {
+        &self.exit
     }
 
     /// Makes the firewall step fail with this reason from now on.
@@ -232,6 +258,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl BroadcastHostRules for MockHostRules {
     fn name(&self) -> &str {
         "mock"
+    }
+
+    fn exit_rules(&self) -> Option<&dyn ExitHostRules> {
+        Some(&self.exit)
     }
 
     fn apply<'a>(&'a self, plan: &'a BroadcastRulesPlan) -> BoxFuture<'a, BroadcastRulesReport> {

@@ -25,6 +25,14 @@ pub(crate) enum Command {
     SetActive { network_id: String, active: bool },
     /// Turn local broadcast participation on or off for a network.
     SetBroadcast { network_id: String, enabled: bool },
+    /// Offer this device as an exit node in a network, or stop.
+    SetExitOffer { network_id: String, enabled: bool },
+    /// Send all this device's internet traffic through a member of a
+    /// network, or (`None`) back the ordinary way.
+    SetExitNode {
+        network_id: String,
+        peer: Option<String>,
+    },
     /// Join a network, or start one already configured.
     Join { name: String, secret: String },
     /// Leave a network entirely.
@@ -185,6 +193,22 @@ async fn run(
             .await
             .map(|on| format!("broadcast {}", if on { "on" } else { "off" }))
             .map_err(|err| err.to_string()),
+        Command::SetExitOffer {
+            network_id,
+            enabled,
+        } => ipc::set_exit_offer(socket, &network_id, enabled)
+            .await
+            .map(|on| format!("exit node {}", if on { "on" } else { "off" }))
+            .map_err(|err| err.to_string()),
+        Command::SetExitNode { network_id, peer } => {
+            ipc::set_exit_node(socket, &network_id, peer.as_deref())
+                .await
+                .map(|peer| match peer {
+                    Some(_) => "now using the exit node".to_string(),
+                    None => "stopped using an exit node".to_string(),
+                })
+                .map_err(|err| err.to_string())
+        }
         Command::Join { name, secret } => ipc::join_network(socket, &name, &secret)
             .await
             .map(|report| format!("joined {}", report.name))

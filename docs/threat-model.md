@@ -69,6 +69,10 @@ Read this before relying on anything here. The protocol is in
   punch, the data connection goes through a relay, which then sees the volume
   and timing of tunnelled traffic — though not its contents, which WireGuard
   encrypted, nor the iroh layer's contents.
+- **Exit nodes.** A member that offers one carries other members' internet
+  traffic and sees where it goes; a member that uses one trusts it completely.
+  Anyone holding the network secret can use an offered exit node. See
+  [exit-node.md](exit-node.md).
 - **Overlay address squatting.** A member can mint many WireGuard keys and
   therefore occupy many overlay addresses. It cannot pick which ones, but it
   can consume them and appear as many participants.

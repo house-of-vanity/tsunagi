@@ -74,6 +74,8 @@ pub(crate) struct Session {
     pub(crate) hostname: Option<String>,
     pub(crate) capabilities: Vec<PluginCapability>,
     pub(crate) broadcast: bool,
+    /// The peer offers itself as an exit node in this network.
+    pub(crate) exit_node: bool,
     pub(crate) messages_sent: u64,
     pub(crate) messages_received: u64,
     pub(crate) bytes_sent: u64,
@@ -228,6 +230,7 @@ pub(crate) fn spawn(
         hostname: None,
         capabilities: Vec::new(),
         broadcast: false,
+        exit_node: false,
         messages_sent: 0,
         messages_received: 0,
         bytes_sent: 0,

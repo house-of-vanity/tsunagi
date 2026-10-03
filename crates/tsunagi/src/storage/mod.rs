@@ -254,6 +254,18 @@ impl Storage {
             .await
     }
 
+    /// Persists whether this agent offers itself as an exit node in a network.
+    pub async fn set_exit_node(&self, network_id: NetworkId, enabled: bool) -> Result<()> {
+        self.with_state(move |state| state.set_exit_node(network_id, enabled))
+            .await
+    }
+
+    /// Persists the member this device sends its internet traffic through.
+    pub async fn set_exit_via(&self, network_id: NetworkId, via: Option<[u8; 32]>) -> Result<()> {
+        self.with_state(move |state| state.set_exit_via(network_id, via.as_ref()))
+            .await
+    }
+
     /// Updates the auto-start flag of a network.
     pub async fn set_auto_start(&self, network_id: NetworkId, auto_start: bool) -> Result<()> {
         self.with_state(move |state| state.set_auto_start(network_id, auto_start))

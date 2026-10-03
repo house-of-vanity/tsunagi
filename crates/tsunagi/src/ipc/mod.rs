@@ -234,6 +234,22 @@ pub enum Request {
         /// Which network, by the id text `status` prints.
         network_id: String,
     },
+    /// Offer this agent as an exit node in one network, or stop. Off unless
+    /// asked.
+    SetExitOffer {
+        /// Public network identifier.
+        network_id: String,
+        /// Whether members may send their internet traffic through this agent.
+        enabled: bool,
+    },
+    /// Send all this device's internet traffic through a member of one
+    /// network, or back the ordinary way.
+    SetExitNode {
+        /// Public network identifier.
+        network_id: String,
+        /// The member's endpoint id, or `None` to stop using an exit node.
+        peer: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for Request {
@@ -255,6 +271,13 @@ impl std::fmt::Debug for Request {
             }
             Request::Join { name, .. } => write!(f, "Join {{ name: {name}, secret: <redacted> }}"),
             Request::Secret { network_id } => write!(f, "Secret {{ {network_id} }}"),
+            Request::SetExitOffer {
+                network_id,
+                enabled,
+            } => write!(f, "SetExitOffer {{ {network_id}, enabled: {enabled} }}"),
+            Request::SetExitNode { network_id, peer } => {
+                write!(f, "SetExitNode {{ {network_id}, peer: {peer:?} }}")
+            }
         }
     }
 }
@@ -281,6 +304,10 @@ pub enum Response {
     Dns(Option<DnsReport>),
     /// A network's shared secret, redacted in `Debug`.
     Secret(RedactedText),
+    /// Whether this agent now offers itself as an exit node.
+    ExitOffer(bool),
+    /// The member this device now sends its internet traffic through.
+    ExitNode(Option<String>),
     /// The request could not be served.
     Error(String),
 }
@@ -457,6 +484,9 @@ pub struct NetworkReport {
     pub range_conflict: Option<String>,
     /// The overlay, when a protocol is running one.
     pub overlay: Option<OverlayReport>,
+    /// Exit-node settings: whether this agent offers one, and whether it
+    /// uses one.
+    pub exit: ExitReport,
 }
 
 /// One member of the network, from signed state.
@@ -484,6 +514,8 @@ pub struct PeerReport {
     pub transport: String,
     /// Round-trip time in milliseconds, when a path is selected.
     pub rtt_ms: Option<u64>,
+    /// The peer offers itself as an exit node in this network.
+    pub exit_node: bool,
 }
 
 /// The WireGuard overlay of one network.
@@ -514,6 +546,35 @@ pub struct OverlayReport {
     /// The broadcast route and firewall allowance on this host, when the
     /// agent installed them. `None` means none are installed.
     pub broadcast_rules: Option<HostRulesReport>,
+}
+
+/// How one set of exit-node host rules went.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleSetReport {
+    /// Whether every step took.
+    pub ok: bool,
+    /// One line: what is in place, or what is missing and why.
+    pub detail: String,
+}
+
+/// One network's exit-node settings and what they are doing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitReport {
+    /// This agent offers itself as an exit node in this network.
+    pub offering: bool,
+    /// Masquerading and forwarding rules for members' traffic, when offering.
+    pub offer_rules: Option<RuleSetReport>,
+    /// Whether the kernel forwards packets for the overlay interface.
+    /// `Some(false)` means the rules are in place and nothing passes until it
+    /// is turned on. `None` when unknown.
+    pub forwarding: Option<bool>,
+    /// The member this device sends its internet traffic through, as an
+    /// endpoint id.
+    pub via: Option<String>,
+    /// Whether that member is connected and still offering to be one.
+    pub via_online: bool,
+    /// The routes that send this device's traffic through it.
+    pub client_rules: Option<RuleSetReport>,
 }
 
 /// What the agent installed on the host so LAN broadcast reaches the overlay.
@@ -666,6 +727,28 @@ pub trait ReportSource: Send + Sync + 'static {
     ) -> BoxFuture<'_, std::result::Result<String, String>> {
         Box::pin(async move { Err("this agent cannot read secrets".to_string()) })
     }
+
+    /// Offers this agent as an exit node in a network, or stops.
+    ///
+    /// Defaulted to a refusal, like the others.
+    fn set_exit_offer(
+        &self,
+        _network_id: String,
+        _enabled: bool,
+    ) -> BoxFuture<'_, std::result::Result<bool, String>> {
+        Box::pin(async move { Err("this agent cannot be an exit node".to_string()) })
+    }
+
+    /// Sends this device's internet traffic through a member, or stops.
+    ///
+    /// Defaulted to a refusal, like the others.
+    fn set_exit_node(
+        &self,
+        _network_id: String,
+        _peer: Option<String>,
+    ) -> BoxFuture<'_, std::result::Result<Option<String>, String>> {
+        Box::pin(async move { Err("this agent cannot use an exit node".to_string()) })
+    }
 }
 
 impl<F> ReportSource for F
@@ -758,6 +841,19 @@ where
             Ok(secret) => Response::Secret(RedactedText::new(secret)),
             Err(reason) => Response::Error(reason),
         },
+        Request::SetExitOffer {
+            network_id,
+            enabled,
+        } => match source.set_exit_offer(network_id, enabled).await {
+            Ok(enabled) => Response::ExitOffer(enabled),
+            Err(reason) => Response::Error(reason),
+        },
+        Request::SetExitNode { network_id, peer } => {
+            match source.set_exit_node(network_id, peer).await {
+                Ok(peer) => Response::ExitNode(peer),
+                Err(reason) => Response::Error(reason),
+            }
+        }
     };
     write_message(&mut stream, &response).await
 }
@@ -908,6 +1004,41 @@ pub async fn set_dns(
     match exchange(path, &Request::Dns { enable, port }, EXCHANGE_TIMEOUT).await? {
         Response::Dns(report) => Ok(report),
         Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
+/// Offers the running agent as an exit node in one network, or stops.
+pub async fn set_exit_offer(
+    path: impl AsRef<Path>,
+    network_id: &str,
+    enabled: bool,
+) -> Result<bool> {
+    let request = Request::SetExitOffer {
+        network_id: network_id.to_owned(),
+        enabled,
+    };
+    match exchange(path.as_ref(), &request, EXCHANGE_TIMEOUT).await? {
+        Response::ExitOffer(enabled) => Ok(enabled),
+        Response::Error(message) => Err(Error::Storage(message)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
+/// Sends the running agent's internet traffic through a member of one
+/// network, or back the ordinary way with `None`.
+pub async fn set_exit_node(
+    path: impl AsRef<Path>,
+    network_id: &str,
+    peer: Option<&str>,
+) -> Result<Option<String>> {
+    let request = Request::SetExitNode {
+        network_id: network_id.to_owned(),
+        peer: peer.map(str::to_owned),
+    };
+    match exchange(path.as_ref(), &request, EXCHANGE_TIMEOUT).await? {
+        Response::ExitNode(peer) => Ok(peer),
+        Response::Error(message) => Err(Error::Storage(message)),
         other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
     }
 }

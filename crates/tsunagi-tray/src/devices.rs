@@ -11,7 +11,8 @@ use eframe::egui;
 
 use tsunagi::ipc::{NetworkReport, OverlayPeerReport};
 
-use crate::agent::AgentClient;
+use crate::agent::{AgentClient, Command};
+use crate::exit;
 use crate::format;
 use crate::stats::{Traffic, Unit};
 
@@ -33,9 +34,28 @@ struct Device<'a> {
     address: Option<String>,
     handshake_secs: Option<u64>,
     overlay: Option<&'a OverlayPeerReport>,
+    /// It is connected and offers to be an exit node.
+    exit_node: bool,
+    /// It is the exit node this device sends its internet traffic through.
+    in_use: bool,
+}
+
+/// An exit-node choice the user has to confirm: all their traffic goes through
+/// somebody else's device, or stops doing so.
+pub(crate) struct ExitConfirm {
+    network_id: String,
+    peer_id: String,
+    name: String,
+    /// Stop using it, rather than start.
+    stop: bool,
 }
 
 impl Device<'_> {
+    fn name(&self) -> String {
+        self.hostname
+            .map_or_else(|| format::short(self.id), str::to_string)
+    }
+
     fn sort_key(&self) -> String {
         self.hostname.unwrap_or(self.id).to_lowercase()
     }
@@ -64,8 +84,9 @@ fn name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
 /// Draws the window body into its viewport.
 pub(crate) fn show(
     ctx: &egui::Context,
-    _agent: &AgentClient,
+    agent: &AgentClient,
     unit: &mut Unit,
+    confirm: &mut Option<ExitConfirm>,
     network: &NetworkReport,
     own_id: &str,
     traffic: &Traffic,
@@ -102,9 +123,85 @@ pub(crate) fn show(
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                device_table(ui, unit, &network.network_id, &devices, traffic);
+                device_table(ui, unit, network, &devices, traffic, confirm);
             });
     });
+    confirm_exit(ctx, agent, confirm, &network.network_id);
+}
+
+/// The confirmation for an exit-node choice, drawn in the window it was
+/// made in. Everything behind it is blocked until it is answered.
+fn confirm_exit(
+    ctx: &egui::Context,
+    agent: &AgentClient,
+    confirm: &mut Option<ExitConfirm>,
+    network_id: &str,
+) {
+    let Some(pending) = confirm.as_ref().filter(|c| c.network_id == network_id) else {
+        return;
+    };
+    egui::Area::new(egui::Id::new("exit confirm backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.screen_rect();
+            ui.allocate_response(screen.size(), egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
+        });
+
+    let (mut accepted, mut cancelled) = (false, false);
+    egui::Window::new(if pending.stop {
+        "Stop using exit node"
+    } else {
+        "Use as exit node"
+    })
+    .order(egui::Order::Foreground)
+    .collapsible(false)
+    .resizable(false)
+    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+    .show(ctx, |ui| {
+        ui.set_max_width(380.0);
+        if pending.stop {
+            ui.label(format!("Stop using {} as exit node?", pending.name));
+            ui.label("Your internet traffic will leave this device the ordinary way again.");
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Send ALL your internet traffic through {}?",
+                    pending.name
+                ))
+                .strong(),
+            );
+            ui.label(
+                "Everything not on this network will leave through that device, which can \
+                 see it.",
+            );
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let label = if pending.stop {
+                "Stop"
+            } else {
+                "Use as exit node"
+            };
+            if ui.button(label).clicked() {
+                accepted = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancelled = true;
+            }
+        });
+    });
+    if accepted {
+        agent.send(Command::SetExitNode {
+            network_id: pending.network_id.clone(),
+            peer: (!pending.stop).then(|| pending.peer_id.clone()),
+        });
+    }
+    if accepted || cancelled || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        *confirm = None;
+    }
 }
 
 /// The network's own settings and counters.
@@ -165,7 +262,8 @@ fn known_ids<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<&'a str> {
         .iter()
         .map(|p| p.endpoint_id.as_str())
         .chain(network.peers.iter().map(|p| p.endpoint_id.as_str()))
-        .chain(network.members.iter().map(|m| m.endpoint_id.as_str()));
+        .chain(network.members.iter().map(|m| m.endpoint_id.as_str()))
+        .chain(network.exit.via.as_deref());
     for id in candidates {
         if id != own_id && !ids.contains(&id) {
             ids.push(id);
@@ -221,6 +319,12 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
                     .or_else(|| member.and_then(|m| m.overlay_address_v4.clone())),
                 handshake_secs: overlay.and_then(|p| p.handshake_secs_ago),
                 overlay,
+                exit_node: online
+                    && network
+                        .peers
+                        .iter()
+                        .any(|p| p.endpoint_id == id && p.exit_node),
+                in_use: network.exit.via.as_deref() == Some(id),
             }
         })
         .collect();
@@ -235,8 +339,9 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
 
 /// The widest value each column is expected to hold, so the table starts out
 /// wide enough and does not reflow as numbers grow.
-const COLUMN_SAMPLES: [&str; 8] = [
+const COLUMN_SAMPLES: [&str; 9] = [
     "",
+    "exit",
     "tcp-tls",
     "255.255.255.255",
     "23h 59m",
@@ -252,11 +357,11 @@ const COLUMN_SAMPLES: [&str; 8] = [
 /// gets shorter — `14.4 MB/s` giving way to `382 pkt/s` — would pull the
 /// column in and push every cell after it. Remembering the widest seen keeps
 /// the table where it is.
-fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 8] {
-    let stored: Option<[f32; 8]> = ui.memory(|m| m.data.get_temp(id));
+fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 9] {
+    let stored: Option<[f32; 9]> = ui.memory(|m| m.data.get_temp(id));
     stored.unwrap_or_else(|| {
         let font = egui::TextStyle::Body.resolve(ui.style());
-        let mut widths = [0.0; 8];
+        let mut widths = [0.0; 9];
         for (width, sample) in widths.iter_mut().zip(COLUMN_SAMPLES) {
             if !sample.is_empty() {
                 *width = ui.fonts(|fonts| {
@@ -272,7 +377,7 @@ fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 8] {
 }
 
 /// One cell, at least as wide as its column has ever been.
-fn cell(ui: &mut egui::Ui, column: usize, widths: &mut [f32; 8], add: impl FnOnce(&mut egui::Ui)) {
+fn cell(ui: &mut egui::Ui, column: usize, widths: &mut [f32; 9], add: impl FnOnce(&mut egui::Ui)) {
     let floor = widths[column];
     let response = ui.scope(|ui| {
         ui.set_min_width(floor);
@@ -281,15 +386,66 @@ fn cell(ui: &mut egui::Ui, column: usize, widths: &mut [f32; 8], add: impl FnOnc
     widths[column] = widths[column].max(response.response.rect.width());
 }
 
+/// The exit-node mark of a device: shown when it offers to be one, bright
+/// for the one in use, and clickable (to confirm) only while that can be done.
+///
+/// The one in use stays clickable even when it has gone away, since stopping
+/// is the only way out of the traffic being blocked.
+fn exit_cell(
+    ui: &mut egui::Ui,
+    device: &Device<'_>,
+    network_id: &str,
+    confirm: &mut Option<ExitConfirm>,
+) {
+    if !device.exit_node && !device.in_use {
+        ui.label("");
+        return;
+    }
+    let (color, hint) = if device.in_use {
+        let color = if device.online {
+            exit::GOOD
+        } else {
+            exit::LOUD
+        };
+        (color, "in use as your exit node — click to stop")
+    } else {
+        (
+            ui.visuals().text_color(),
+            "offers to be an exit node — click to send all your internet traffic through it",
+        )
+    };
+    let response = ui
+        .add(
+            egui::Label::new(
+                egui::RichText::new(egui_phosphor::regular::SIGN_OUT)
+                    .size(16.0)
+                    .color(color),
+            )
+            .sense(egui::Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hint);
+    if response.clicked() {
+        *confirm = Some(ExitConfirm {
+            network_id: network_id.to_string(),
+            peer_id: device.id.to_string(),
+            name: device.name(),
+            stop: device.in_use,
+        });
+    }
+}
+
 /// One table of all devices: online rows carry live counters and a plot,
 /// offline rows show what is known (name and address) and dashes.
 fn device_table(
     ui: &mut egui::Ui,
     unit: Unit,
-    network_id: &str,
+    network: &NetworkReport,
     devices: &[Device<'_>],
     traffic: &Traffic,
+    confirm: &mut Option<ExitConfirm>,
 ) {
+    let network_id = network.network_id.as_str();
     if devices.is_empty() {
         ui.weak("none");
         return;
@@ -297,12 +453,13 @@ fn device_table(
     let widths_id = egui::Id::new(("devices column widths", network_id));
     let mut widths = column_widths(ui, widths_id);
     egui::Grid::new("devices")
-        .num_columns(8)
+        .num_columns(9)
         .striped(true)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
             for (column, header) in [
                 "device",
+                "exit",
                 "proto",
                 "address",
                 "handshake",
@@ -323,15 +480,18 @@ fn device_table(
             for device in devices {
                 cell(ui, 0, &mut widths, |ui| name_cell(ui, device));
                 cell(ui, 1, &mut widths, |ui| {
+                    exit_cell(ui, device, network_id, confirm);
+                });
+                cell(ui, 2, &mut widths, |ui| {
                     ui.label(device.proto);
                 });
-                cell(ui, 2, &mut widths, |ui| match &device.address {
+                cell(ui, 3, &mut widths, |ui| match &device.address {
                     Some(address) => format::copy_field(ui, address, address),
                     None => {
                         ui.weak("—");
                     }
                 });
-                cell(ui, 3, &mut widths, |ui| {
+                cell(ui, 4, &mut widths, |ui| {
                     ui.label(
                         device
                             .handshake_secs
@@ -342,17 +502,17 @@ fn device_table(
                 match device.overlay.filter(|_| device.online) {
                     Some(peer) => {
                         let series = traffic.peer(network_id, &peer.public_key);
-                        cell(ui, 4, &mut widths, |ui| {
+                        cell(ui, 5, &mut widths, |ui| {
                             ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
                         });
-                        cell(ui, 5, &mut widths, |ui| {
+                        cell(ui, 6, &mut widths, |ui| {
                             ui.label(format!(
                                 "{} / {}",
                                 format::bytes(peer.tx_bytes as f64),
                                 format::bytes(peer.rx_bytes as f64)
                             ));
                         });
-                        cell(ui, 6, &mut widths, |ui| {
+                        cell(ui, 7, &mut widths, |ui| {
                             ui.add(
                                 egui::Label::new(format::series_rate(series, unit))
                                     .wrap_mode(egui::TextWrapMode::Extend),
@@ -363,7 +523,7 @@ fn device_table(
                         });
                     }
                     None => {
-                        for column in 4..7 {
+                        for column in 5..8 {
                             cell(ui, column, &mut widths, |ui| {
                                 ui.weak("—");
                             });
@@ -386,22 +546,22 @@ fn device_table(
             cell(ui, 0, &mut widths, |ui| {
                 ui.strong("total");
             });
-            for column in 1..4 {
+            for column in 1..5 {
                 cell(ui, column, &mut widths, |ui| {
                     ui.label("");
                 });
             }
-            cell(ui, 4, &mut widths, |ui| {
+            cell(ui, 5, &mut widths, |ui| {
                 ui.strong(format!("{tx_packets}/{rx_packets}"));
             });
-            cell(ui, 5, &mut widths, |ui| {
+            cell(ui, 6, &mut widths, |ui| {
                 ui.strong(format!(
                     "{} / {}",
                     format::bytes(tx_bytes as f64),
                     format::bytes(rx_bytes as f64)
                 ));
             });
-            cell(ui, 6, &mut widths, |ui| {
+            cell(ui, 7, &mut widths, |ui| {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(format::series_rate(traffic.network(network_id), unit))
@@ -412,10 +572,7 @@ fn device_table(
             });
             ui.end_row();
         });
-    ui.memory_mut(|m| {
-        m.data
-            .insert_temp(egui::Id::new("devices column widths"), widths)
-    });
+    ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
 }
 
 fn yes_no(value: bool) -> &'static str {

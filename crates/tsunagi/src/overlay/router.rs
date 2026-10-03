@@ -40,9 +40,21 @@ pub struct Route {
     pub peer: EndpointId,
 }
 
+/// A network's exit-node settings, as far as packets are concerned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExitPolicy {
+    /// This agent offers itself as an exit node here: packets from members
+    /// for addresses outside every overlay range are handed to the host.
+    pub offer: bool,
+    /// The member all other traffic is sent to, if this device uses one.
+    pub via: Option<EndpointId>,
+}
+
 /// What one network contributes to the table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkRoutes {
+    /// Exit-node settings of this network.
+    pub exit: ExitPolicy,
     /// Local broadcast policy and authenticated willing recipients.
     pub broadcast: BroadcastPolicy,
     /// The range this network allocates from, once it has agreed one.
@@ -153,6 +165,16 @@ impl RoutingTable {
         }
     }
 
+    /// Replaces only a network's exit-node settings, without changing addresses.
+    ///
+    /// A network that has no entry yet (its range is not agreed) takes them
+    /// from [`NetworkRoutes::exit`] when it is added.
+    pub fn set_exit(&self, network: NetworkId, policy: ExitPolicy) {
+        if let Some(routes) = self.write().get_mut(&network) {
+            routes.exit = policy;
+        }
+    }
+
     /// Recognizes limited and configured subnet broadcasts before unicast lookup.
     pub fn is_broadcast(&self, destination: Ipv4Addr) -> bool {
         self.broadcast.load().is_destination(destination)
@@ -181,6 +203,10 @@ impl RoutingTable {
     ///
     /// This agent's own address returns `None`: a packet for ourselves does
     /// not go over a tunnel, and answering with a peer would send it to one.
+    ///
+    /// An address nobody holds, outside every overlay range and an ordinary
+    /// unicast destination, goes to this device's exit node when it has one:
+    /// that is what sending *all* traffic through a member means.
     pub fn route(&self, destination: Ipv4Addr) -> Option<Route> {
         let networks = self.read();
         for (network, routes) in networks.iter() {
@@ -198,17 +224,80 @@ impl RoutingTable {
                 });
             }
         }
-        None
+        // Inside an overlay range, an unowned address is nobody's, not the
+        // internet's.
+        if !is_internet_destination(destination) || in_any_range(&networks, destination) {
+            return None;
+        }
+        exit_via(&networks).map(|(network, peer)| Route { network, peer })
     }
 
     /// Whether a peer may send from a source address.
+    ///
+    /// A peer speaks only for the address the network agreed it holds. The
+    /// one exception is this device's exit node: what comes back from the
+    /// internet carries the internet's addresses, so from *that* peer any
+    /// source outside the overlay ranges is accepted.
     pub fn may_send_from(&self, network: NetworkId, peer: EndpointId, source: Ipv4Addr) -> bool {
-        self.read().get(&network).is_some_and(|routes| {
-            routes
-                .peers
-                .iter()
-                .any(|(address, holder)| *address == source && *holder == peer)
-        })
+        let networks = self.read();
+        let Some(routes) = networks.get(&network) else {
+            return false;
+        };
+        if routes
+            .peers
+            .iter()
+            .any(|(address, holder)| *address == source && *holder == peer)
+        {
+            return true;
+        }
+        routes.exit.via == Some(peer)
+            && is_internet_destination(source)
+            && !in_any_range(&networks, source)
+    }
+
+    /// Whether this agent, as an exit node of `network`, takes a member's
+    /// packet for `destination` to the host.
+    ///
+    /// Only an ordinary unicast address outside every overlay range, so a
+    /// packet for another member, for this agent or for the local network
+    /// segment never leaves by this door. The sender's own source address is
+    /// checked separately, by [`Self::may_send_from`].
+    pub fn accepts_exit_traffic(&self, network: NetworkId, destination: Ipv4Addr) -> bool {
+        let networks = self.read();
+        networks
+            .get(&network)
+            .is_some_and(|routes| routes.exit.offer)
+            && is_internet_destination(destination)
+            && !in_any_range(&networks, destination)
+    }
+
+    /// The network and member this device sends its internet traffic through.
+    ///
+    /// One default route, so one answer; if several networks claim one (they
+    /// should not) the lowest network id decides, so two runs agree.
+    pub fn exit_via(&self) -> Option<(NetworkId, EndpointId)> {
+        exit_via(&self.read())
+    }
+
+    /// Networks that offer this agent as an exit node, with the range each
+    /// agreed. A network that has not agreed one yet has nothing to
+    /// masquerade and is left out.
+    pub fn exit_offers(&self) -> Vec<(NetworkId, Ipv4Range)> {
+        let mut offers: Vec<(NetworkId, Ipv4Range)> = self
+            .read()
+            .iter()
+            .filter(|(_, routes)| routes.exit.offer)
+            .filter_map(|(network, routes)| Some((*network, routes.range?)))
+            .collect();
+        offers.sort_by_key(|(network, _)| *network);
+        offers
+    }
+
+    /// One network's exit-node settings and its range, if it is in the table.
+    pub fn exit_settings(&self, network: NetworkId) -> Option<(ExitPolicy, Option<Ipv4Range>)> {
+        self.read()
+            .get(&network)
+            .map(|routes| (routes.exit, routes.range))
     }
 
     /// Whether an ordinary packet terminates on this host in this network.
@@ -275,6 +364,31 @@ impl RoutingTable {
     }
 }
 
+/// Whether an address is an ordinary unicast one: not this host, not a
+/// multicast or broadcast group, not link-local, not unspecified.
+fn is_internet_destination(address: Ipv4Addr) -> bool {
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || address.is_broadcast()
+        || address.is_link_local())
+}
+
+/// Whether an address lies in any network's range.
+fn in_any_range(networks: &HashMap<NetworkId, NetworkRoutes>, address: Ipv4Addr) -> bool {
+    networks
+        .values()
+        .any(|routes| routes.range.is_some_and(|range| range.contains(address)))
+}
+
+/// The exit node in use, if any, from the lowest network that names one.
+fn exit_via(networks: &HashMap<NetworkId, NetworkRoutes>) -> Option<(NetworkId, EndpointId)> {
+    networks
+        .iter()
+        .filter_map(|(network, routes)| Some((*network, routes.exit.via?)))
+        .min_by_key(|(network, _)| *network)
+}
+
 /// Whether two ranges share any address.
 fn ranges_overlap(one: Ipv4Range, other: Ipv4Range) -> bool {
     // A range contains the other's base, or the other way round. With
@@ -308,6 +422,7 @@ mod tests {
 
     fn routes() -> NetworkRoutes {
         NetworkRoutes {
+            exit: Default::default(),
             broadcast: Default::default(),
             range: Some("10.13.37.0/24".parse().unwrap()),
             local: Some(addr(1)),
@@ -391,6 +506,7 @@ mod tests {
             .set_network(
                 second,
                 NetworkRoutes {
+                    exit: Default::default(),
                     broadcast: Default::default(),
                     range: Some("10.99.0.0/16".parse().unwrap()),
                     local: Some(Ipv4Addr::new(10, 99, 0, 1)),
@@ -420,6 +536,7 @@ mod tests {
             if a < b { (a, b) } else { (b, a) }
         };
         let mk = |enabled: bool, base: [u8; 4], local: Option<Ipv4Addr>| NetworkRoutes {
+            exit: Default::default(),
             broadcast: BroadcastPolicy {
                 enabled,
                 ..Default::default()
@@ -495,6 +612,7 @@ mod tests {
             .set_network(
                 network("wide"),
                 NetworkRoutes {
+                    exit: Default::default(),
                     broadcast: Default::default(),
                     range: Some("10.0.0.0/8".parse().unwrap()),
                     ..Default::default()
@@ -507,6 +625,7 @@ mod tests {
                 .set_network(
                     network("narrow"),
                     NetworkRoutes {
+                        exit: Default::default(),
                         broadcast: Default::default(),
                         range: Some("10.13.37.0/24".parse().unwrap()),
                         ..Default::default()
@@ -549,6 +668,7 @@ mod tests {
             .set_network(
                 network("two"),
                 NetworkRoutes {
+                    exit: Default::default(),
                     broadcast: Default::default(),
                     range: Some("10.99.0.0/16".parse().unwrap()),
                     local: Some(Ipv4Addr::new(10, 99, 0, 1)),
@@ -572,5 +692,234 @@ mod tests {
         assert!(table.local_addresses().is_empty());
         assert_eq!(table.route(addr(2)), None);
         assert_eq!(table.len(), 1, "the network is known, it just has nothing");
+    }
+
+    fn with_exit(offer: bool, via: Option<EndpointId>) -> NetworkRoutes {
+        NetworkRoutes {
+            exit: ExitPolicy { offer, via },
+            ..routes()
+        }
+    }
+
+    const INTERNET: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
+
+    #[test]
+    fn without_an_exit_node_the_internet_has_nowhere_to_go() {
+        let table = RoutingTable::new();
+        table.set_network(network("plain"), routes()).unwrap();
+        assert_eq!(table.route(INTERNET), None);
+        assert_eq!(table.exit_via(), None);
+    }
+
+    #[test]
+    fn with_an_exit_node_every_ordinary_destination_goes_to_it() {
+        let table = RoutingTable::new();
+        let id = network("client");
+        table
+            .set_network(id, with_exit(false, Some(peer(2))))
+            .unwrap();
+        let exit = Route {
+            network: id,
+            peer: peer(2),
+        };
+        assert_eq!(table.route(INTERNET), Some(exit));
+        assert_eq!(table.route(Ipv4Addr::new(192, 168, 1, 10)), Some(exit));
+        assert_eq!(table.exit_via(), Some((id, peer(2))));
+        // A member's own address still goes to that member.
+        assert_eq!(
+            table.route(addr(3)),
+            Some(Route {
+                network: id,
+                peer: peer(3)
+            })
+        );
+    }
+
+    #[test]
+    fn the_exit_node_is_never_the_answer_for_what_is_not_the_internet() {
+        let table = RoutingTable::new();
+        table
+            .set_network(network("client"), with_exit(false, Some(peer(2))))
+            .unwrap();
+        // Ourselves, a free address inside the overlay range, and everything
+        // that is not an ordinary unicast destination.
+        for destination in [
+            addr(1),
+            addr(200),
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(224, 0, 0, 251),
+            Ipv4Addr::new(239, 255, 255, 250),
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(169, 254, 1, 1),
+        ] {
+            assert_eq!(table.route(destination), None, "{destination}");
+        }
+    }
+
+    #[test]
+    fn another_networks_range_is_not_the_internet_either() {
+        let table = RoutingTable::new();
+        table
+            .set_network(network("client"), with_exit(false, Some(peer(2))))
+            .unwrap();
+        table
+            .set_network(
+                network("other"),
+                NetworkRoutes {
+                    range: Some("10.99.0.0/16".parse().unwrap()),
+                    local: Some(Ipv4Addr::new(10, 99, 0, 1)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(table.route(Ipv4Addr::new(10, 99, 7, 7)), None);
+    }
+
+    #[test]
+    fn two_exit_choices_resolve_to_the_lowest_network_id() {
+        let table = RoutingTable::new();
+        let (a, b) = (network("one"), network("two"));
+        table
+            .set_network(a, with_exit(false, Some(peer(2))))
+            .unwrap();
+        table
+            .set_network(
+                b,
+                NetworkRoutes {
+                    exit: ExitPolicy {
+                        offer: false,
+                        via: Some(peer(9)),
+                    },
+                    range: Some("10.99.0.0/16".parse().unwrap()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (chosen, _) = table.exit_via().unwrap();
+        assert_eq!(chosen, a.min(b));
+        assert_eq!(table.route(INTERNET).unwrap().network, a.min(b));
+    }
+
+    #[test]
+    fn the_exit_peer_may_send_from_any_internet_address_but_nobody_else_may() {
+        let table = RoutingTable::new();
+        let id = network("client");
+        table
+            .set_network(id, with_exit(false, Some(peer(2))))
+            .unwrap();
+
+        // What comes back from the internet carries the internet's addresses.
+        assert!(table.may_send_from(id, peer(2), INTERNET));
+        // Another member still speaks only for its own address.
+        assert!(!table.may_send_from(id, peer(3), INTERNET));
+        assert!(table.may_send_from(id, peer(3), addr(3)));
+        // The exit peer cannot pass itself off as somebody else in the
+        // overlay, nor as this agent, nor as something that is not a source.
+        assert!(!table.may_send_from(id, peer(2), addr(3)));
+        assert!(!table.may_send_from(id, peer(2), addr(1)));
+        assert!(!table.may_send_from(id, peer(2), addr(200)));
+        for source in [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::BROADCAST,
+        ] {
+            assert!(!table.may_send_from(id, peer(2), source), "{source}");
+        }
+        // Without choosing an exit node nobody gets the exception.
+        let plain = RoutingTable::new();
+        plain.set_network(id, routes()).unwrap();
+        assert!(!plain.may_send_from(id, peer(2), INTERNET));
+    }
+
+    #[test]
+    fn an_exit_node_takes_a_members_internet_packets_only_while_it_offers() {
+        let table = RoutingTable::new();
+        let id = network("server");
+        table.set_network(id, with_exit(false, None)).unwrap();
+        assert!(!table.accepts_exit_traffic(id, INTERNET));
+
+        table.set_exit(
+            id,
+            ExitPolicy {
+                offer: true,
+                via: None,
+            },
+        );
+        assert!(table.accepts_exit_traffic(id, INTERNET));
+        assert!(table.accepts_exit_traffic(id, Ipv4Addr::new(192, 168, 1, 10)));
+        // Never for another member, for this agent, a free overlay address,
+        // or anything that is not an ordinary unicast destination.
+        for destination in [
+            addr(1),
+            addr(2),
+            addr(200),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(224, 0, 0, 251),
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::UNSPECIFIED,
+        ] {
+            assert!(
+                !table.accepts_exit_traffic(id, destination),
+                "{destination}"
+            );
+        }
+        // An unknown network offers nothing.
+        assert!(!table.accepts_exit_traffic(network("elsewhere"), INTERNET));
+
+        table.set_exit(id, ExitPolicy::default());
+        assert!(!table.accepts_exit_traffic(id, INTERNET));
+    }
+
+    #[test]
+    fn offers_are_listed_by_network_with_the_range_each_agreed() {
+        let table = RoutingTable::new();
+        let (a, b) = (network("a"), network("b"));
+        table.set_network(a, with_exit(true, None)).unwrap();
+        table
+            .set_network(
+                b,
+                NetworkRoutes {
+                    exit: ExitPolicy {
+                        offer: true,
+                        via: None,
+                    },
+                    // No range agreed yet: nothing to masquerade.
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            table.exit_offers(),
+            vec![(a, "10.13.37.0/24".parse().unwrap())]
+        );
+        assert_eq!(
+            table.exit_settings(a),
+            Some((
+                ExitPolicy {
+                    offer: true,
+                    via: None
+                },
+                Some("10.13.37.0/24".parse().unwrap())
+            ))
+        );
+        assert_eq!(table.exit_settings(network("none")), None);
+    }
+
+    #[test]
+    fn setting_exit_for_a_network_with_no_entry_is_remembered_by_the_caller() {
+        // The runtime keeps the policy and passes it with the network when
+        // its range is agreed; a setter for a network the table does not know
+        // yet changes nothing.
+        let table = RoutingTable::new();
+        table.set_exit(
+            network("later"),
+            ExitPolicy {
+                offer: true,
+                via: None,
+            },
+        );
+        assert!(table.is_empty());
     }
 }

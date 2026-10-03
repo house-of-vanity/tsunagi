@@ -112,15 +112,24 @@ impl App {
             let viewport_id = egui::ViewportId::from_hash_of(("devices", &id));
             let builder = egui::ViewportBuilder::default()
                 .with_title(devices::title(network))
-                .with_inner_size([900.0, 540.0])
+                .with_inner_size([940.0, 540.0])
                 .with_min_inner_size([480.0, 320.0]);
             let agent = &self.agent;
             let traffic = &self.traffic;
             // The window shares the single unit setting, so its toggle and the
             // main window's stay in step.
             let unit = &mut self.state.unit;
+            let confirm = &mut self.state.exit_confirm;
             let keep = ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
-                devices::show(vctx, agent, unit, network, &report.endpoint_id, traffic);
+                devices::show(
+                    vctx,
+                    agent,
+                    unit,
+                    confirm,
+                    network,
+                    &report.endpoint_id,
+                    traffic,
+                );
                 !vctx.input(|i| i.viewport().close_requested())
             });
             if !keep {

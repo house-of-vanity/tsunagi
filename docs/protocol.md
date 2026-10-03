@@ -9,7 +9,7 @@ Two versions exist and are independent:
 
 - **Identity scheme**, `tsunagi-network-id-v1`. Frozen. Changing it creates a
   different network space for the same name and secret.
-- **Control protocol**, ALPN `tsunagi/ctrl/3`, `PROTOCOL_VERSION = 3`.
+- **Control protocol**, ALPN `tsunagi/ctrl/4`, `PROTOCOL_VERSION = 4`.
 
 Upgrading the crate or bumping the control protocol must never change an
 existing `NetworkId`.

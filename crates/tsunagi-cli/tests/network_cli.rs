@@ -418,3 +418,46 @@ fn ambiguous_and_unknown_names_leave_every_network_untouched() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].network_id, before[1].network_id);
 }
+
+#[test]
+fn an_exit_node_is_offered_per_network_only_when_asked_and_nobody_offers_by_default() {
+    let agent = start_bare(0);
+    assert!(agent.run(&["join", "-n", "exit-offer"]).status.success());
+    let offered = || {
+        read_networks(&agent.dir)
+            .iter()
+            .find(|n| n.name.as_str() == "exit-offer")
+            .unwrap()
+            .exit_node
+    };
+    assert!(!offered(), "off unless somebody turns it on");
+
+    let on = agent.run(&["network", "exit-node", "exit-offer", "on"]);
+    assert!(
+        on.status.success(),
+        "{}",
+        String::from_utf8_lossy(&on.stderr)
+    );
+    assert!(String::from_utf8_lossy(&on.stdout).contains("exit node on"));
+    assert!(offered());
+
+    let off = agent.run(&["network", "exit-node", "exit-offer", "off"]);
+    assert!(off.status.success());
+    assert!(!offered());
+
+    let listed = agent.run(&["exit-node"]);
+    assert!(listed.status.success());
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("no connected device offers"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    let unknown = agent.run(&["exit-node", "nobody"]);
+    assert!(!unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("no connected device matches"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+}

@@ -40,6 +40,7 @@ pub enum OverlayError {
 
 pub mod broadcast;
 pub mod config;
+pub mod exit;
 pub mod hostrules;
 pub mod interface;
 pub mod packet;
@@ -48,9 +49,10 @@ pub mod router;
 pub mod tun;
 
 pub use config::{Cidr, DEFAULT_INTERFACE_PREFIX, MAX_INTERFACE_NAME_LEN, interface_name};
+pub use exit::{ExitRulesReport, RuleSetReport};
 pub use hostrules::{
-    BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport, MockHostRules, RuleOutcome,
-    UnsupportedHostRules,
+    BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport, ExitHostPlan, ExitHostReport,
+    ExitHostRules, MockExitRules, MockHostRules, RuleOutcome, UnsupportedHostRules,
 };
 pub use interface::{Counters, Interface, PacketCarrier, Rejected};
 pub use packet::IpHeader;
@@ -59,7 +61,7 @@ pub use provision::{
     MockHost, MockProvisioner, Privilege, Provisioned, UnsupportedProvisioner, plan_changes,
     probe_net_admin,
 };
-pub use router::{NetworkRoutes, Route, RouteError, RoutingTable};
+pub use router::{ExitPolicy, NetworkRoutes, Route, RouteError, RoutingTable};
 pub use tun::{MemoryTun, MemoryTunFactory, TunDevice, TunFactory, TunRequest, address_is_local};
 
 #[cfg(all(feature = "tun-device", target_os = "linux"))]

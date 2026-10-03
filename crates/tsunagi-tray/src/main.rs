@@ -13,6 +13,7 @@ mod about;
 mod agent;
 mod app;
 mod devices;
+mod exit;
 mod format;
 mod stats;
 mod tray;

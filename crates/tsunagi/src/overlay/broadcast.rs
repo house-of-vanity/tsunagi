@@ -140,6 +140,7 @@ mod tests {
     fn limited_and_directed_broadcasts_never_cross_domains_or_target_disabled_peers() {
         let peer = iroh::SecretKey::from_bytes(&[8; 32]).public();
         let a = NetworkRoutes {
+            exit: Default::default(),
             range: Some("10.0.0.0/24".parse().unwrap()),
             local: Some("10.0.0.1".parse().unwrap()),
             peers: vec![("10.0.0.2".parse().unwrap(), peer)],
@@ -149,6 +150,7 @@ mod tests {
             },
         };
         let b = NetworkRoutes {
+            exit: Default::default(),
             range: Some("10.1.0.0/24".parse().unwrap()),
             local: Some("10.1.0.1".parse().unwrap()),
             peers: vec![("10.1.0.2".parse().unwrap(), peer)],
@@ -185,6 +187,7 @@ mod tests {
         assert!(!table.accepts(id("b"), peer, Ipv4Addr::BROADCAST));
         assert!(table.accepts(id("a"), peer, Ipv4Addr::BROADCAST));
         let disabled = NetworkRoutes {
+            exit: Default::default(),
             broadcast: BroadcastPolicy {
                 enabled: false,
                 ..a.broadcast.clone()

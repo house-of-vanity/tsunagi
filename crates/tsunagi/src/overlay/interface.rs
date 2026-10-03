@@ -29,7 +29,11 @@ use tokio::task::JoinHandle;
 
 use crate::identity::NetworkId;
 
-use super::hostrules::{BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport};
+use super::exit::{ExitRulesReport, RuleSetReport};
+use super::hostrules::{
+    BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport, ExitHostPlan, ExitHostReport,
+    RuleOutcome, offer_detail,
+};
 use super::packet::IpHeader;
 use super::router::{Route, RoutingTable};
 use super::tun::{TunDevice, TunFactory, TunRequest};
@@ -158,6 +162,31 @@ pub struct Interface {
     host_rules: Option<Arc<dyn BroadcastHostRules>>,
     /// What those rules last reported, `None` while none are installed.
     rules_report: std::sync::Mutex<Option<BroadcastRulesReport>>,
+    /// What the exit-node rules were last asked for, and what came of it.
+    exit_state: std::sync::Mutex<ExitState>,
+}
+
+/// The exit-node host rules as this interface last left them.
+#[derive(Debug, Default)]
+struct ExitState {
+    /// Whether what an earlier run left behind has been taken away. Done once,
+    /// at the first sync, whether or not anything is wanted now: a firewall
+    /// rule that forwards a range must not outlive the switch that offered it.
+    cleaned: bool,
+    /// What was last applied, `None` while nothing is.
+    plan: Option<ExitHostPlan>,
+    /// What came of it.
+    report: Option<ExitHostReport>,
+}
+
+impl ExitState {
+    /// Whether every step of the last apply took.
+    fn is_ok(&self) -> bool {
+        self.report.as_ref().is_some_and(|report| {
+            report.offer.iter().all(|(_, outcome)| outcome.is_applied())
+                && report.client.as_ref().is_none_or(RuleOutcome::is_applied)
+        })
+    }
 }
 
 impl Interface {
@@ -245,6 +274,7 @@ impl Interface {
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             host_rules,
             rules_report: std::sync::Mutex::new(None),
+            exit_state: std::sync::Mutex::new(ExitState::default()),
         })
     }
 
@@ -296,6 +326,193 @@ impl Interface {
                 self.store_rules_report(Some(report));
             }
         }
+    }
+
+    /// Brings the host's exit-node rules in line with the routing table.
+    ///
+    /// Idempotent, and cheap when nothing changed. It never fails: the
+    /// outcome is kept for [`Self::exit_rules`]. The first call also takes
+    /// away whatever an earlier run left, even when nothing is wanted now.
+    pub async fn sync_exit_rules(&self) {
+        let Some(exit) = self
+            .host_rules
+            .as_ref()
+            .and_then(|rules| rules.exit_rules())
+        else {
+            return;
+        };
+        let _guard = self.sync_lock.lock().await;
+        let mut ranges: Vec<_> = self
+            .routes
+            .exit_offers()
+            .into_iter()
+            .map(|(_, range)| range)
+            .collect();
+        ranges.sort_by_key(|range| (range.base, range.prefix_len));
+        ranges.dedup();
+        let wanted = ExitHostPlan {
+            interface: self.name.clone(),
+            offer: ranges,
+            client: self.routes.exit_via().is_some(),
+        };
+
+        let first = !std::mem::replace(&mut self.exit_state().cleaned, true);
+        if first {
+            exit.clear(&self.name).await;
+        }
+        let (planned, ok) = {
+            let state = self.exit_state();
+            (state.plan.clone(), state.is_ok())
+        };
+        if wanted.is_empty() {
+            if planned.is_some() {
+                exit.clear(&self.name).await;
+                let mut state = self.exit_state();
+                state.plan = None;
+                state.report = None;
+                tracing::info!(interface = %self.name, "exit node host rules removed");
+            }
+            return;
+        }
+        if planned.as_ref() == Some(&wanted) && ok {
+            return;
+        }
+        let report = exit.apply(&wanted).await;
+        for (range, outcome) in &report.offer {
+            match outcome {
+                RuleOutcome::Applied => tracing::info!(
+                    interface = %self.name,
+                    %range,
+                    "exit node firewall rules applied"
+                ),
+                RuleOutcome::Failed(reason) => tracing::warn!(
+                    interface = %self.name,
+                    %range,
+                    "exit node firewall rules are incomplete: {reason}"
+                ),
+            }
+        }
+        if report.offer.iter().any(|(_, outcome)| outcome.is_applied())
+            && report.forwarding == Some(false)
+        {
+            tracing::warn!(
+                interface = %self.name,
+                "kernel forwarding is off for this interface, so nothing is forwarded for the \
+                 exit node yet: `sysctl -w net.ipv4.conf.{0}.forwarding=1` (or \
+                 `net.ipv4.ip_forward=1`), and set it in sysctl.d to keep it",
+                self.name
+            );
+        }
+        match &report.client {
+            Some(RuleOutcome::Applied) => tracing::info!(
+                interface = %self.name,
+                "this device's traffic is routed through its exit node"
+            ),
+            Some(RuleOutcome::Failed(reason)) => tracing::warn!(
+                interface = %self.name,
+                "cannot route this device's traffic through the exit node: {reason}"
+            ),
+            None => {}
+        }
+        let mut state = self.exit_state();
+        state.plan = Some(wanted);
+        state.report = Some(report);
+    }
+
+    fn exit_state(&self) -> std::sync::MutexGuard<'_, ExitState> {
+        match self.exit_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// What the exit-node rules of a network are doing now.
+    ///
+    /// `offer` is `Some` while the network offers this agent as an exit node,
+    /// `client` while this device sends its traffic through a member of it.
+    pub fn exit_rules(&self, network: NetworkId) -> ExitRulesReport {
+        let Some((policy, range)) = self.routes.exit_settings(network) else {
+            return ExitRulesReport::default();
+        };
+        let unavailable = match self
+            .host_rules
+            .as_ref()
+            .map(|rules| rules.exit_rules().is_some())
+        {
+            None => Some(
+                "this overlay interface is not on the host (no TUN device), so there is \
+                 nothing to forward to",
+            ),
+            Some(false) => Some("exit nodes are only supported on Linux yet"),
+            Some(true) => None,
+        };
+        let failed = |detail: &str| RuleSetReport {
+            ok: false,
+            detail: detail.to_string(),
+        };
+        let state = self.exit_state();
+        let mut out = ExitRulesReport::default();
+        if policy.offer {
+            out.offer = Some(match (unavailable, range) {
+                (Some(why), _) => failed(why),
+                (None, None) => failed("waiting for the network to agree an address range"),
+                (None, Some(range)) => {
+                    match state
+                        .report
+                        .as_ref()
+                        .and_then(|report| report.offer.iter().find(|(r, _)| *r == range))
+                    {
+                        Some((_, outcome)) => RuleSetReport {
+                            ok: outcome.is_applied(),
+                            detail: offer_detail(outcome, &range),
+                        },
+                        None => failed("not applied yet"),
+                    }
+                }
+            });
+            if unavailable.is_none() {
+                out.forwarding = state.report.as_ref().and_then(|report| report.forwarding);
+            }
+        }
+        if policy.via.is_some()
+            && self
+                .routes
+                .exit_via()
+                .is_some_and(|(selected, _)| selected == network)
+        {
+            out.client = Some(match unavailable {
+                Some(why) => failed(why),
+                None => match state
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.client.as_ref())
+                {
+                    Some(RuleOutcome::Applied) => RuleSetReport {
+                        ok: true,
+                        detail: "this device's traffic is routed through the exit node".to_string(),
+                    },
+                    Some(RuleOutcome::Failed(reason)) => failed(reason),
+                    None => failed("not applied yet"),
+                },
+            });
+        }
+        out
+    }
+
+    /// Whether this agent can really act as an exit node in a network: the
+    /// rules members' traffic needs are in place. Kernel forwarding is not
+    /// part of it, because the agent never turns that on itself.
+    pub fn exit_offer_ready(&self, network: NetworkId) -> bool {
+        let Some((policy, Some(range))) = self.routes.exit_settings(network) else {
+            return false;
+        };
+        policy.offer
+            && self.exit_state().report.as_ref().is_some_and(|report| {
+                report
+                    .offer
+                    .iter()
+                    .any(|(r, outcome)| *r == range && outcome.is_applied())
+            })
     }
 
     /// What the broadcast host rules achieved, `None` when none are installed
@@ -379,6 +596,16 @@ impl Interface {
         if let Some(rules) = &self.host_rules {
             rules.clear(&self.name).await;
             self.store_rules_report(None);
+            let touched = {
+                let state = self.exit_state();
+                state.cleaned || state.plan.is_some()
+            };
+            if let (true, Some(exit)) = (touched, rules.exit_rules()) {
+                exit.clear(&self.name).await;
+                let mut state = self.exit_state();
+                state.plan = None;
+                state.report = None;
+            }
         }
         // The packet loop holds the device open, and it ends only when the
         // device reports end of stream — which a real interface never does
@@ -433,6 +660,11 @@ impl Interface {
                 true
             }
             IpAddr::V4(destination) if self.routes.is_local_destination(network, destination) => {
+                false
+            }
+            // This agent is an exit node of this network: a member's packet
+            // for the internet goes to the host, which masquerades it.
+            IpAddr::V4(destination) if self.routes.accepts_exit_traffic(network, destination) => {
                 false
             }
             _ => {
@@ -525,7 +757,7 @@ mod tests {
     use crate::overlay::broadcast::BroadcastPolicy;
     use crate::overlay::hostrules::{MockHostRules, RuleOutcome};
     use crate::overlay::provision::{ManagedTunFactory, MockProvisioner};
-    use crate::overlay::router::NetworkRoutes;
+    use crate::overlay::router::{ExitPolicy, NetworkRoutes};
     use crate::overlay::tun::{MemoryTun, MemoryTunFactory};
 
     fn network(name: &str) -> NetworkId {
@@ -667,6 +899,7 @@ mod tests {
             .set_network(
                 id,
                 NetworkRoutes {
+                    exit: Default::default(),
                     broadcast: Default::default(),
                     range: Some("10.13.37.0/24".parse().unwrap()),
                     local: Some(addr(1)),
@@ -833,6 +1066,7 @@ mod tests {
             .set_network(
                 id,
                 NetworkRoutes {
+                    exit: Default::default(),
                     broadcast: Default::default(),
                     range: Some("10.13.37.0/24".parse().unwrap()),
                     local: Some(addr(9)),
@@ -856,6 +1090,7 @@ mod tests {
             .set_network(
                 id,
                 NetworkRoutes {
+                    exit: Default::default(),
                     broadcast: BroadcastPolicy {
                         enabled: broadcast_enabled,
                         ..Default::default()
@@ -910,6 +1145,7 @@ mod tests {
             .set_network(
                 id,
                 NetworkRoutes {
+                    exit: Default::default(),
                     broadcast: BroadcastPolicy::default(),
                     range: Some("10.13.37.0/24".parse().unwrap()),
                     local: Some(addr(9)),
@@ -976,6 +1212,263 @@ mod tests {
         let (interface, _device, _routes, _carrier, _id) = interface(false).await;
         interface.sync_broadcast_rules().await;
         assert!(interface.broadcast_rules().is_none());
+        interface.remove().await;
+    }
+
+    const INTERNET: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
+
+    fn offering() -> ExitPolicy {
+        ExitPolicy {
+            offer: true,
+            via: None,
+        }
+    }
+
+    fn using(exit: EndpointId) -> ExitPolicy {
+        ExitPolicy {
+            offer: false,
+            via: Some(exit),
+        }
+    }
+
+    #[tokio::test]
+    async fn internet_traffic_goes_to_the_exit_node_and_only_once_one_is_chosen() {
+        let (interface, device, routes, carrier, id) = interface(false).await;
+        device.push_from_os(ipv4(addr(1), INTERNET, b"before"));
+        wait_for(&interface, |counters| counters.unroutable).await;
+        assert!(carrier.carried().is_empty(), "no exit node, no route");
+
+        routes.set_exit(id, using(peer(2)));
+        device.push_from_os(ipv4(addr(1), INTERNET, b"after"));
+        wait_for(&interface, |counters| counters.sent).await;
+        let carried = carrier.carried();
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].0.peer, peer(2));
+        assert_eq!(&carried[0].1[20..], b"after");
+    }
+
+    #[tokio::test]
+    async fn the_exit_node_may_answer_with_any_source_and_nobody_else_may() {
+        let (interface, device, routes, _carrier, id) = interface(false).await;
+        routes.set_exit(id, using(peer(2)));
+
+        interface
+            .deliver(id, peer(2), ipv4(INTERNET, addr(1), b"reply"))
+            .await
+            .unwrap();
+        let written = tokio::time::timeout(std::time::Duration::from_secs(5), device.pop_to_os())
+            .await
+            .expect("the reply reaches the interface")
+            .unwrap();
+        assert_eq!(&written[20..], b"reply");
+
+        // Another member cannot use the internet's addresses.
+        assert_eq!(
+            interface
+                .deliver(id, peer(3), ipv4(INTERNET, addr(1), b"spoof"))
+                .await,
+            Err(Rejected::WrongSource)
+        );
+        // Nor can the exit node speak for a member.
+        assert_eq!(
+            interface
+                .deliver(id, peer(2), ipv4(addr(3), addr(1), b"spoof"))
+                .await,
+            Err(Rejected::WrongSource)
+        );
+        // And what it sends still has to be for this agent.
+        assert_eq!(
+            interface
+                .deliver(id, peer(2), ipv4(INTERNET, addr(200), b"elsewhere"))
+                .await,
+            Err(Rejected::WrongDestination)
+        );
+        assert_eq!(interface.counters().received, 1);
+    }
+
+    #[tokio::test]
+    async fn an_exit_node_hands_a_members_internet_packet_to_the_host_only_while_offering() {
+        let (interface, device, routes, _carrier, id) = interface(false).await;
+
+        // Not offering: dropped exactly as before.
+        assert_eq!(
+            interface
+                .deliver(id, peer(2), ipv4(addr(2), INTERNET, b"request"))
+                .await,
+            Err(Rejected::WrongDestination)
+        );
+        assert_eq!(interface.counters().received, 0);
+
+        routes.set_exit(id, offering());
+        interface
+            .deliver(id, peer(2), ipv4(addr(2), INTERNET, b"request"))
+            .await
+            .unwrap();
+        let written = tokio::time::timeout(std::time::Duration::from_secs(5), device.pop_to_os())
+            .await
+            .expect("the request reaches the interface")
+            .unwrap();
+        assert_eq!(&written[20..], b"request");
+
+        // The source must still be the sender's own address.
+        assert_eq!(
+            interface
+                .deliver(id, peer(2), ipv4(addr(3), INTERNET, b"spoof"))
+                .await,
+            Err(Rejected::WrongSource)
+        );
+        assert_eq!(
+            interface
+                .deliver(id, peer(2), ipv4(INTERNET, INTERNET, b"spoof"))
+                .await,
+            Err(Rejected::WrongSource)
+        );
+        // Offering does not make this a door to the overlay or to this host.
+        for destination in [addr(3), addr(200), Ipv4Addr::LOCALHOST] {
+            assert_eq!(
+                interface
+                    .deliver(id, peer(2), ipv4(addr(2), destination, b"no"))
+                    .await,
+                Err(Rejected::WrongDestination),
+                "{destination}"
+            );
+        }
+        assert_eq!(interface.counters().received, 1);
+    }
+
+    #[tokio::test]
+    async fn the_exit_rules_follow_the_routing_table_and_leave_with_the_interface() {
+        let rules = MockHostRules::new();
+        let (interface, routes, id) = managed_interface(&rules, false).await;
+        let range: crate::state::Ipv4Range = "10.13.37.0/24".parse().unwrap();
+
+        // Nothing wanted: nothing installed, but what a crashed run left is
+        // taken away once.
+        interface.sync_exit_rules().await;
+        interface.sync_exit_rules().await;
+        assert_eq!(rules.exit().calls(), ["clear:tsunrules"]);
+        assert!(rules.exit().installed().is_none());
+        assert!(!interface.exit_offer_ready(id));
+        assert_eq!(interface.exit_rules(id), ExitRulesReport::default());
+
+        // Offering: the range is masqueraded, and the agent can say so.
+        routes.set_exit(id, offering());
+        assert!(!interface.exit_offer_ready(id), "not applied yet");
+        let waiting = interface.exit_rules(id).offer.unwrap();
+        assert!(!waiting.ok);
+        assert!(waiting.detail.contains("not applied yet"), "{waiting:?}");
+        interface.sync_exit_rules().await;
+        assert_eq!(rules.exit().installed().unwrap().offer, vec![range]);
+        assert!(interface.exit_offer_ready(id));
+        let report = interface.exit_rules(id);
+        assert!(report.offer.as_ref().unwrap().ok);
+        assert_eq!(report.forwarding, Some(true));
+        assert!(report.client.is_none());
+
+        // Unchanged: not applied again.
+        interface.sync_exit_rules().await;
+        assert_eq!(
+            rules
+                .exit()
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("apply"))
+                .count(),
+            1
+        );
+
+        // Forwarding off in the kernel: still installed, still ready, and said.
+        rules.exit().set_forwarding(Some(false));
+        routes.set_exit(
+            id,
+            ExitPolicy {
+                offer: true,
+                via: Some(peer(2)),
+            },
+        );
+        interface.sync_exit_rules().await;
+        assert!(rules.exit().installed().unwrap().client);
+        assert!(interface.exit_offer_ready(id));
+        let report = interface.exit_rules(id);
+        assert_eq!(report.forwarding, Some(false));
+        assert!(report.offer.unwrap().ok);
+        assert!(report.client.unwrap().ok);
+
+        // Turned off: removed, and no longer announced as ready.
+        routes.set_exit(id, ExitPolicy::default());
+        interface.sync_exit_rules().await;
+        assert!(rules.exit().installed().is_none());
+        assert!(!interface.exit_offer_ready(id));
+        assert_eq!(interface.exit_rules(id), ExitRulesReport::default());
+
+        routes.set_exit(id, offering());
+        interface.sync_exit_rules().await;
+        assert!(rules.exit().installed().is_some());
+        interface.remove().await;
+        assert!(
+            rules.exit().installed().is_none(),
+            "gone with the interface"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_exit_step_is_reported_and_the_agent_does_not_claim_to_be_an_exit_node() {
+        let rules = MockHostRules::new();
+        rules.exit().fail_with(Some("iptables needs root".into()));
+        let (interface, routes, id) = managed_interface(&rules, false).await;
+        routes.set_exit(id, offering());
+        interface.sync_exit_rules().await;
+
+        assert!(!interface.exit_offer_ready(id));
+        let offer = interface.exit_rules(id).offer.unwrap();
+        assert!(!offer.ok);
+        assert!(offer.detail.contains("iptables needs root"), "{offer:?}");
+
+        // It is tried again, not given up on, the next time it is asked.
+        rules.exit().fail_with(None);
+        interface.sync_exit_rules().await;
+        assert!(interface.exit_offer_ready(id));
+        interface.remove().await;
+    }
+
+    #[tokio::test]
+    async fn an_interface_without_a_host_cannot_be_an_exit_node_and_says_why() {
+        let (interface, _device, routes, _carrier, id) = interface(false).await;
+        routes.set_exit(
+            id,
+            ExitPolicy {
+                offer: true,
+                via: Some(peer(2)),
+            },
+        );
+        interface.sync_exit_rules().await;
+        assert!(!interface.exit_offer_ready(id));
+        let report = interface.exit_rules(id);
+        let offer = report.offer.unwrap();
+        assert!(!offer.ok);
+        assert!(offer.detail.contains("not on the host"), "{offer:?}");
+        assert!(!report.client.unwrap().ok);
+        interface.remove().await;
+    }
+
+    #[tokio::test]
+    async fn a_network_waiting_for_its_range_has_nothing_to_masquerade_yet() {
+        let rules = MockHostRules::new();
+        let (interface, routes, _id) = managed_interface(&rules, false).await;
+        let waiting = network("waiting");
+        routes
+            .set_network(
+                waiting,
+                NetworkRoutes {
+                    exit: offering(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        interface.sync_exit_rules().await;
+        assert!(rules.exit().installed().is_none());
+        let offer = interface.exit_rules(waiting).offer.unwrap();
+        assert!(offer.detail.contains("address range"), "{offer:?}");
         interface.remove().await;
     }
 }

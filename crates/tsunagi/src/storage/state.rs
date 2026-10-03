@@ -21,7 +21,7 @@ use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
 use crate::state::{RecordBody, SignedRecord};
 
 /// Schema version written by this build.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Key of the stored hostname setting.
 const SETTING_HOSTNAME: &str = "hostname";
@@ -42,6 +42,10 @@ pub struct StoredNetwork {
     pub auto_start: bool,
     /// Local broadcast participation, enabled unless explicitly disabled.
     pub broadcast: bool,
+    /// This agent offers itself as an exit node here. Off unless turned on.
+    pub exit_node: bool,
+    /// The member this device sends all its internet traffic through, if any.
+    pub exit_via: Option<[u8; 32]>,
 }
 
 /// The mandatory state store.
@@ -205,6 +209,17 @@ impl StateStore {
                      COMMIT;",
                 )
                 .map_err(|err| self.corrupt(format!("cannot migrate schema to 5: {err}")))?;
+        }
+        if found < 6 {
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+                     ALTER TABLE networks ADD COLUMN exit_node INTEGER NOT NULL DEFAULT 0 CHECK (exit_node IN (0,1));
+                     ALTER TABLE networks ADD COLUMN exit_via BLOB;
+                     PRAGMA user_version = 6;
+                     COMMIT;",
+                )
+                .map_err(|err| self.corrupt(format!("cannot migrate schema to 6: {err}")))?;
         }
         Ok(())
     }
@@ -451,11 +466,56 @@ impl StateStore {
         Ok(())
     }
 
+    /// Saves whether this agent offers itself as an exit node in a network.
+    pub fn set_exit_node(&self, network_id: NetworkId, enabled: bool) -> Result<()> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE networks SET exit_node = ?2 WHERE network_id = ?1",
+                params![network_id.as_bytes().as_slice(), enabled as i64],
+            )
+            .map_err(|err| Error::Storage(format!("cannot update exit node offer: {err}")))?;
+        if changed == 0 {
+            return Err(Error::NetworkUnknown(network_id));
+        }
+        Ok(())
+    }
+
+    /// Saves which member this device sends its internet traffic through.
+    ///
+    /// One device has one default route, so choosing an exit node in one
+    /// network clears the choice in every other.
+    pub fn set_exit_via(&self, network_id: NetworkId, via: Option<&[u8; 32]>) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| Error::Storage(format!("cannot update exit node: {err}")))?;
+        let changed = tx
+            .execute(
+                "UPDATE networks SET exit_via = ?2 WHERE network_id = ?1",
+                params![network_id.as_bytes().as_slice(), via.map(|v| v.as_slice())],
+            )
+            .map_err(|err| Error::Storage(format!("cannot update exit node: {err}")))?;
+        if changed == 0 {
+            return Err(Error::NetworkUnknown(network_id));
+        }
+        if via.is_some() {
+            tx.execute(
+                "UPDATE networks SET exit_via = NULL WHERE network_id != ?1",
+                params![network_id.as_bytes().as_slice()],
+            )
+            .map_err(|err| Error::Storage(format!("cannot update exit node: {err}")))?;
+        }
+        tx.commit()
+            .map_err(|err| Error::Storage(format!("cannot update exit node: {err}")))?;
+        Ok(())
+    }
+
     /// Lists every configured network.
     pub fn list_networks(&self) -> Result<Vec<StoredNetwork>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT network_id, name, secret, auto_start, broadcast FROM networks ORDER BY name")
+            .prepare("SELECT network_id, name, secret, auto_start, broadcast, exit_node, exit_via FROM networks ORDER BY name")
             .map_err(|err| Error::Storage(format!("cannot list networks: {err}")))?;
         let rows = stmt
             .query_map([], |row| {
@@ -463,13 +523,21 @@ impl StateStore {
                 let name: String = row.get(1)?;
                 let secret: Vec<u8> = row.get(2)?;
                 let auto_start: i64 = row.get(3)?;
-                Ok((id, name, secret, auto_start != 0, row.get::<_, bool>(4)?))
+                Ok((
+                    id,
+                    name,
+                    secret,
+                    auto_start != 0,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                ))
             })
             .map_err(|err| Error::Storage(format!("cannot list networks: {err}")))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id, name, secret, auto_start, broadcast) =
+            let (id, name, secret, auto_start, broadcast, exit_node, exit_via) =
                 row.map_err(|err| Error::Storage(format!("cannot read network row: {err}")))?;
             let id: [u8; 32] = id
                 .as_slice()
@@ -481,6 +549,8 @@ impl StateStore {
                 secret: NetworkSecret::from_bytes(secret)?,
                 auto_start,
                 broadcast,
+                exit_node,
+                exit_via: exit_via.and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok()),
             });
         }
         Ok(out)
@@ -775,6 +845,37 @@ mod broadcast_storage_tests {
     use crate::identity::NetworkKeys;
 
     #[test]
+    fn exit_node_choices_are_off_by_default_and_one_choice_clears_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path().join("state.sqlite")).unwrap();
+        let secret = NetworkSecret::from_bytes([5; 32]).unwrap();
+        let make = |name: &str| {
+            let name = NetworkName::new(name).unwrap();
+            let id = NetworkKeys::derive(&name, &secret).network_id();
+            store.upsert_network(id, &name, &secret, true).unwrap();
+            id
+        };
+        let (a, b) = (make("exit-a"), make("exit-b"));
+        let listed = || store.list_networks().unwrap();
+        assert!(
+            listed()
+                .iter()
+                .all(|n| !n.exit_node && n.exit_via.is_none())
+        );
+
+        store.set_exit_node(a, true).unwrap();
+        store.set_exit_via(a, Some(&[7; 32])).unwrap();
+        store.set_exit_via(b, Some(&[8; 32])).unwrap();
+        let by_id = |id: NetworkId| listed().into_iter().find(|n| n.network_id == id).unwrap();
+        assert!(by_id(a).exit_node, "offering is per network and kept");
+        assert_eq!(by_id(a).exit_via, None, "one default route: a was cleared");
+        assert_eq!(by_id(b).exit_via, Some([8; 32]));
+
+        store.set_exit_via(b, None).unwrap();
+        assert_eq!(by_id(b).exit_via, None);
+    }
+
+    #[test]
     fn a_remembered_hostname_survives_a_restart_and_follows_the_latest_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
@@ -813,7 +914,12 @@ mod broadcast_storage_tests {
         store.set_hostname("old-host").unwrap();
         store
             .conn
-            .execute_batch("ALTER TABLE networks DROP COLUMN broadcast; PRAGMA user_version=3;")
+            .execute_batch(
+                "ALTER TABLE networks DROP COLUMN broadcast; \
+             ALTER TABLE networks DROP COLUMN exit_node; \
+             ALTER TABLE networks DROP COLUMN exit_via; \
+             PRAGMA user_version=3;",
+            )
             .unwrap();
         drop(store);
         let store = StateStore::open(&path).unwrap();

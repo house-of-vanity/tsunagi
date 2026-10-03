@@ -50,7 +50,7 @@ fn pick_iptables(exists: impl Fn(&str) -> bool) -> Option<&'static str> {
 
 /// What running `iptables` produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Ran {
+pub(super) enum Ran {
     /// There is no `iptables` to run.
     Missing,
     /// It ran, and exited like this.
@@ -63,7 +63,7 @@ enum Ran {
 
 /// Runs `iptables` with these arguments. A function value so the flow below
 /// can be tested without touching the host.
-type Run<'a> = &'a dyn Fn(&[String]) -> Ran;
+pub(super) type Run<'a> = &'a dyn Fn(&[String]) -> Ran;
 
 /// The match and target of the rule, without the chain or position.
 fn rule_spec(plan: &BroadcastRulesPlan) -> Vec<String> {
@@ -88,7 +88,7 @@ fn rule_spec(plan: &BroadcastRulesPlan) -> Vec<String> {
 
 /// Waits briefly for the xtables lock instead of failing when another tool
 /// holds it.
-fn locked(args: impl IntoIterator<Item = String>) -> Vec<String> {
+pub(super) fn locked(args: impl IntoIterator<Item = String>) -> Vec<String> {
     ["-w", "5"]
         .into_iter()
         .map(str::to_string)
@@ -118,7 +118,7 @@ fn list_args() -> Vec<String> {
 
 /// Splits one `iptables -S` line into words, honouring double quotes, which
 /// `iptables` puts around comments that need them.
-fn split_rule_line(line: &str) -> Vec<String> {
+pub(super) fn split_rule_line(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
@@ -175,7 +175,7 @@ fn tagged_deletions(listing: &str, tag: &str) -> Vec<Vec<String>> {
 }
 
 /// A failure message with the likely fix for the likely cause.
-fn failure(stderr: &str) -> String {
+pub(super) fn failure(stderr: &str) -> String {
     let text = stderr.trim();
     let lower = text.to_ascii_lowercase();
     if lower.contains("permission denied") || lower.contains("must be root") {
@@ -261,7 +261,7 @@ fn clear_firewall(run: Run<'_>, interface: &str) {
 }
 
 /// Runs the real `iptables`.
-fn run_iptables(args: &[String]) -> Ran {
+pub(super) fn run_iptables(args: &[String]) -> Ran {
     let Some(program) = pick_iptables(|path| std::path::Path::new(path).is_file()) else {
         return Ran::Missing;
     };
@@ -283,7 +283,7 @@ fn run_iptables(args: &[String]) -> Ran {
 /// The Linux implementation: netlink for the route, `iptables` for the rule.
 #[derive(Debug)]
 pub struct LinuxHostRules {
-    route: RouteHandle,
+    pub(super) route: RouteHandle,
 }
 
 impl LinuxHostRules {
@@ -304,6 +304,10 @@ impl LinuxHostRules {
 impl BroadcastHostRules for LinuxHostRules {
     fn name(&self) -> &str {
         "netlink+iptables"
+    }
+
+    fn exit_rules(&self) -> Option<&dyn super::ExitHostRules> {
+        Some(self)
     }
 
     fn apply<'a>(&'a self, plan: &'a BroadcastRulesPlan) -> BoxFuture<'a, BroadcastRulesReport> {

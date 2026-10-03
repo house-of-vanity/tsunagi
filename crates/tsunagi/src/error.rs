@@ -120,6 +120,13 @@ pub enum Error {
         what: String,
     },
 
+    /// The request is understood and cannot be done as things stand.
+    #[error("{reason}")]
+    Rejected {
+        /// Why, phrased so the message stands on its own.
+        reason: String,
+    },
+
     /// Discovery backend failure. Never fatal for the agent.
     #[error("discovery error: {0}")]
     Discovery(String),

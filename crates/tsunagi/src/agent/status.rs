@@ -92,6 +92,8 @@ pub struct MemberStatus {
 pub struct PeerStatus {
     /// This authenticated peer accepts network broadcasts.
     pub broadcast: bool,
+    /// This authenticated peer offers itself as an exit node.
+    pub exit_node: bool,
     /// Authenticated endpoint id.
     pub endpoint_id: EndpointId,
     /// Which side this agent played in the handshake.
@@ -164,6 +166,14 @@ pub struct NetworkMetrics {
 pub struct NetworkStatus {
     /// Local broadcast participation in this network.
     pub broadcast: bool,
+    /// This agent offers itself as an exit node in this network.
+    pub exit_offer: bool,
+    /// The member this device sends all its internet traffic through.
+    pub exit_via: Option<EndpointId>,
+    /// Whether that member is connected and still offering to be one.
+    pub exit_via_online: bool,
+    /// What the host rules for the exit settings are doing.
+    pub exit_rules: crate::overlay::ExitRulesReport,
     /// Immutable deterministic description of the network space.
     pub descriptor: NetworkDescriptor,
     /// Network name, for convenience.

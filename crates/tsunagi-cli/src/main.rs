@@ -76,6 +76,12 @@ enum Command {
     Network(NetworkArgs),
     /// Shows the local resolver, and turns it on or off.
     Dns(DnsArgs),
+    /// Lists devices offering to be an exit node, and sends all this
+    /// device's internet traffic through one.
+    ///
+    /// The other half of `tsunagi network exit-node`, which is what makes a
+    /// device offer itself. A device uses one exit node at a time.
+    ExitNode(ExitNodeArgs),
     /// Removes everything this device has stored and starts over.
     Wipe(WipeArgs),
 }
@@ -103,6 +109,25 @@ enum DnsAction {
     },
     /// Stops serving, now and after every restart.
     Off,
+}
+
+#[derive(Debug, Args)]
+struct ExitNodeArgs {
+    #[command(flatten)]
+    paths: PathArgs,
+
+    /// Control socket to talk to. Derived from the state directory by default.
+    #[arg(long, env = "TSUNAGI_CONTROL_SOCKET")]
+    control_socket: Option<PathBuf>,
+
+    /// Only look in this network: exact name, full id or unique id prefix.
+    #[arg(long, short = 'n')]
+    network: Option<String>,
+
+    /// The device to use: its hostname, endpoint id or a unique prefix of
+    /// the id. `off` goes back to sending traffic the ordinary way. Omit to
+    /// list the devices that offer.
+    target: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -161,6 +186,20 @@ enum NetworkAction {
         /// New choice; omit to show the stored choice.
         #[arg(value_enum)]
         choice: Option<BroadcastChoice>,
+    },
+    /// Offers this device as an exit node in a network, or stops.
+    ///
+    /// Off unless turned on. While on, other members can send all their
+    /// internet traffic through this device, which can see it. The firewall
+    /// and NAT rules are installed by the agent; kernel forwarding is not
+    /// turned on for you, and is reported when it is off.
+    #[command(name = "exit-node")]
+    ExitNode {
+        /// Exact network name, full id or unique id prefix.
+        network: String,
+        /// Offer, or stop offering.
+        #[arg(value_enum)]
+        choice: BroadcastChoice,
     },
     /// Makes a network, or joins one, in the agent that is already running.
     ///
@@ -755,6 +794,7 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Join(args) => join_command(args).await,
         Command::Network(args) => network_command(args).await,
         Command::Dns(args) => dns_command(args).await,
+        Command::ExitNode(args) => exit_node_command(args).await,
         Command::Wipe(args) => wipe(args).await,
     }
 }
@@ -1544,6 +1584,47 @@ impl tsunagi::ipc::ReportSource for AgentControl {
         })
     }
 
+    fn set_exit_offer(
+        &self,
+        network_id: String,
+        enabled: bool,
+    ) -> tsunagi::BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async move {
+            let id = network_id
+                .parse()
+                .map_err(|err| format!("invalid network id: {err}"))?;
+            self.agent
+                .set_exit_offer(id, enabled)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(enabled)
+        })
+    }
+
+    fn set_exit_node(
+        &self,
+        network_id: String,
+        peer: Option<String>,
+    ) -> tsunagi::BoxFuture<'_, Result<Option<String>, String>> {
+        Box::pin(async move {
+            let id = network_id
+                .parse()
+                .map_err(|err| format!("invalid network id: {err}"))?;
+            let via = peer
+                .as_deref()
+                .map(|peer| {
+                    peer.parse::<EndpointId>()
+                        .map_err(|err| format!("`{peer}` is not an endpoint id: {err}"))
+                })
+                .transpose()?;
+            self.agent
+                .set_exit_via(id, via)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(peer)
+        })
+    }
+
     fn set_active(
         &self,
         network_id: String,
@@ -1700,6 +1781,9 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
         None => show_networks(&paths, &socket).await,
         Some(NetworkAction::Broadcast { network, choice }) => {
             broadcast_command(&paths, &socket, &network, choice).await
+        }
+        Some(NetworkAction::ExitNode { network, choice }) => {
+            exit_offer_command(&paths, &socket, &network, choice).await
         }
         Some(NetworkAction::Join(args)) => join_command(args).await,
         Some(NetworkAction::Stop { network }) => set_active(&paths, &socket, &network, false).await,
@@ -1998,6 +2082,293 @@ async fn broadcast_command(
         network.network_id
     );
     Ok(())
+}
+
+/// What to run to turn kernel forwarding on, which the agent never does.
+const FORWARDING_COMMAND: &str = "sudo sysctl -w net.ipv4.ip_forward=1";
+
+/// The warning for an exit node whose rules are in place while the kernel is
+/// not forwarding, so that nothing passes.
+fn forwarding_off_note() -> String {
+    format!(
+        "kernel forwarding is OFF, so nothing passes yet: run `{FORWARDING_COMMAND}` \
+         (and keep it across reboots with `net.ipv4.ip_forward = 1` in \
+         /etc/sysctl.d/99-tsunagi.conf)"
+    )
+}
+
+/// Offers this device as an exit node in a network, or stops.
+async fn exit_offer_command(
+    paths: &StoragePaths,
+    socket: &std::path::Path,
+    wanted: &str,
+    choice: BroadcastChoice,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let configured = stored_networks(paths);
+    let network = resolve_network(&configured, wanted)?;
+    let enabled = matches!(choice, BroadcastChoice::On);
+    let id = network.network_id.to_string();
+
+    if !tsunagi::ipc::is_serving(socket).await {
+        let storage = tsunagi::storage::Storage::open(paths)?;
+        storage.set_exit_node(network.network_id, enabled).await?;
+        storage.release_ownership_lock();
+        println!(
+            "exit node {} for `{}` ({}) with the next `tsunagi up`",
+            if enabled {
+                "will be offered"
+            } else {
+                "will not be offered"
+            },
+            network.name,
+            short(&id, 10)
+        );
+        return Ok(());
+    }
+
+    tsunagi::ipc::set_exit_offer(socket, &id, enabled).await?;
+    println!(
+        "exit node {} for `{}` ({})",
+        if enabled { "on" } else { "off" },
+        network.name,
+        short(&id, 10)
+    );
+    if !enabled {
+        return Ok(());
+    }
+    let status = tsunagi::ipc::request_status(socket).await?;
+    let Some(report) = status.networks.iter().find(|n| n.network_id == id) else {
+        return Ok(());
+    };
+    match &report.exit.offer_rules {
+        Some(rules) if rules.ok => println!("  rules  {}", rules.detail),
+        Some(rules) => eprintln!("warning: the rules are not all in place: {}", rules.detail),
+        None => eprintln!(
+            "warning: no rules were installed, so this device is not offered yet: the \
+             network needs an address on the overlay interface first"
+        ),
+    }
+    if report.exit.forwarding == Some(false) {
+        eprintln!("warning: {}", forwarding_off_note());
+    }
+    println!(
+        "\nMembers can now send all their internet traffic through this device, and it \
+         can see it. `tsunagi network exit-node {wanted} off` stops."
+    );
+    Ok(())
+}
+
+/// Every connected device that offers to be an exit node, across networks.
+fn exit_candidates(
+    networks: &[tsunagi::ipc::NetworkReport],
+) -> Vec<(&tsunagi::ipc::NetworkReport, &tsunagi::ipc::PeerReport)> {
+    networks
+        .iter()
+        .flat_map(|network| {
+            network
+                .peers
+                .iter()
+                .filter(|peer| peer.exit_node)
+                .map(move |peer| (network, peer))
+        })
+        .collect()
+}
+
+/// What to call a peer: its hostname, or a short form of its id.
+fn peer_label(peer: &tsunagi::ipc::PeerReport) -> String {
+    peer.hostname
+        .clone()
+        .unwrap_or_else(|| short(&peer.endpoint_id, 12))
+}
+
+/// The network a user named, among those the agent reports.
+fn select_networks<'a>(
+    networks: &'a [tsunagi::ipc::NetworkReport],
+    only: Option<&str>,
+) -> Result<Vec<&'a tsunagi::ipc::NetworkReport>, String> {
+    let Some(only) = only else {
+        return Ok(networks.iter().collect());
+    };
+    let only = only.trim().trim_end_matches('…');
+    let chosen: Vec<_> = networks
+        .iter()
+        .filter(|n| n.name == only || n.network_id == only || n.network_id.starts_with(only))
+        .collect();
+    if chosen.is_empty() {
+        return Err(format!("no network here is called or has the id `{only}`"));
+    }
+    Ok(chosen)
+}
+
+/// Finds the device a user means among those that offer to be an exit node.
+///
+/// By hostname, endpoint id or a unique prefix of the id. A name that is in
+/// several networks, or on several devices, is an error that lists them: a
+/// device that all traffic goes through must not be picked by guessing.
+fn resolve_exit_node<'a>(
+    networks: &'a [tsunagi::ipc::NetworkReport],
+    wanted: &str,
+    only: Option<&str>,
+) -> Result<
+    (
+        &'a tsunagi::ipc::NetworkReport,
+        &'a tsunagi::ipc::PeerReport,
+    ),
+    String,
+> {
+    let wanted = wanted.trim().trim_end_matches('…');
+    let scope = select_networks(networks, only)?;
+    let named: Vec<_> = scope
+        .iter()
+        .flat_map(|network| network.peers.iter().map(move |peer| (*network, peer)))
+        .filter(|(_, peer)| {
+            peer.hostname
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+                || peer.endpoint_id == wanted
+                || (wanted.len() >= 4 && peer.endpoint_id.starts_with(&wanted.to_ascii_lowercase()))
+        })
+        .collect();
+    let offering: Vec<_> = named.iter().filter(|(_, peer)| peer.exit_node).collect();
+    match offering.as_slice() {
+        [(network, peer)] => Ok((*network, *peer)),
+        [] => match named.first() {
+            Some((network, peer)) => Err(format!(
+                "`{}` is connected but does not offer to be an exit node. On that device: \
+                 tsunagi network exit-node {} on",
+                peer_label(peer),
+                network.name
+            )),
+            None => Err(format!(
+                "no connected device matches `{wanted}`. `tsunagi exit-node` lists the \
+                 ones that offer to be an exit node"
+            )),
+        },
+        several => {
+            let mut message = format!(
+                "`{wanted}` matches more than one exit node; say which with --network or a \
+                 longer id:"
+            );
+            for (network, peer) in several {
+                message.push_str(&format!(
+                    "\n  {}  ({})  in network {}",
+                    peer_label(peer),
+                    short(&peer.endpoint_id, 12),
+                    network.name
+                ));
+            }
+            Err(message)
+        }
+    }
+}
+
+/// `tsunagi exit-node`: list, use or stop using an exit node.
+async fn exit_node_command(args: ExitNodeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use report::{Health, Report, Row, Section};
+
+    let paths = args.paths.resolve()?;
+    let is_custom_state = args.paths.state_dir.is_some();
+    let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
+    if !tsunagi::ipc::is_serving(&socket).await {
+        return Err(
+            "no agent is running: an exit node is used through the running agent, which \
+             changes the routes of this device. Start it with `tsunagi up`."
+                .into(),
+        );
+    }
+    let status = tsunagi::ipc::request_status(&socket).await?;
+    let scope = select_networks(&status.networks, args.network.as_deref())?;
+
+    match args.target.as_deref() {
+        None => {
+            let mut section = Section::new("exit nodes");
+            let mut any = false;
+            for network in &scope {
+                for (_, peer) in exit_candidates(std::slice::from_ref(*network)) {
+                    any = true;
+                    let in_use = network.exit.via.as_deref() == Some(peer.endpoint_id.as_str());
+                    let mut detail = format!("network {}", network.name);
+                    if let Some(rtt) = peer.rtt_ms {
+                        detail.push_str(&format!("  ·  rtt {rtt}ms"));
+                    }
+                    if in_use {
+                        detail.push_str("  ·  IN USE");
+                    }
+                    section.push(Row::new(
+                        if in_use { Health::Good } else { Health::Info },
+                        peer_label(peer),
+                        detail,
+                    ));
+                }
+            }
+            if !any {
+                section.push(
+                    Row::new(
+                        Health::Info,
+                        "none",
+                        "no connected device offers to be an exit node",
+                    )
+                    .with_note("on that device: tsunagi network exit-node <network> on"),
+                );
+            }
+            let mut out = Report::new();
+            out.push(section);
+            print_report("tsunagi exit-node", &out)?;
+            if any {
+                println!(
+                    "\n`tsunagi exit-node <name|id>` uses one; `tsunagi exit-node off` stops."
+                );
+            }
+            Ok(())
+        }
+        Some(target) if target.eq_ignore_ascii_case("off") => {
+            let using: Vec<_> = scope.iter().filter(|n| n.exit.via.is_some()).collect();
+            if using.is_empty() {
+                println!("no exit node is in use");
+                return Ok(());
+            }
+            for network in using {
+                tsunagi::ipc::set_exit_node(&socket, &network.network_id, None).await?;
+                println!(
+                    "stopped using the exit node in `{}`: internet traffic leaves this \
+                     device the ordinary way again",
+                    network.name
+                );
+            }
+            Ok(())
+        }
+        Some(target) => {
+            let (network, peer) =
+                resolve_exit_node(&status.networks, target, args.network.as_deref())?;
+            tsunagi::ipc::set_exit_node(&socket, &network.network_id, Some(&peer.endpoint_id))
+                .await?;
+            println!(
+                "all internet traffic from this device now leaves through `{}` (network `{}`)",
+                peer_label(peer),
+                network.name
+            );
+            let after = tsunagi::ipc::request_status(&socket).await?;
+            if let Some(exit) = after
+                .networks
+                .iter()
+                .find(|n| n.network_id == network.network_id)
+                .map(|n| &n.exit)
+            {
+                match &exit.client_rules {
+                    Some(rules) if rules.ok => println!("  routes  {}", rules.detail),
+                    Some(rules) => {
+                        eprintln!("warning: the routes are not all in place: {}", rules.detail)
+                    }
+                    None => {}
+                }
+            }
+            eprintln!(
+                "\nThat device can see everything that is not encrypted. If it goes away the \
+                 traffic is dropped, not sent the old way; `tsunagi exit-node off` stops."
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn set_active(
@@ -2670,6 +3041,10 @@ struct MemberRow<'a> {
     overlay_address_v4: Option<&'a str>,
     tunnel: Option<&'a tsunagi::ipc::OverlayPeerReport>,
     failed_dials: u32,
+    /// It offers to be an exit node.
+    exit_node: bool,
+    /// It is the exit node this device sends its traffic through.
+    exit_in_use: bool,
 }
 
 impl MemberRow<'_> {
@@ -2703,6 +3078,8 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
             overlay_address_v4: None,
             tunnel: None,
             failed_dials: 0,
+            exit_node: false,
+            exit_in_use: false,
         })
     }
 
@@ -2716,6 +3093,7 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
     for peer in &network.peers {
         let row = entry(&mut rows, &peer.endpoint_id);
         row.hostname = peer.hostname.as_deref().or(row.hostname);
+        row.exit_node = peer.exit_node;
         row.transport = Some(&peer.transport);
         row.rtt_ms = peer.rtt_ms;
     }
@@ -2727,6 +3105,10 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
                 row.overlay_address_v4 = peer.address.as_deref();
             }
         }
+    }
+
+    for row in rows.values_mut() {
+        row.exit_in_use = network.exit.via.as_deref() == Some(row.endpoint_id);
     }
 
     // This agent is in the roster too — it signs claims like everyone else —
@@ -2851,6 +3233,9 @@ fn network_section(
             ),
         ));
     }
+    for row in exit_rows(network) {
+        section.push(row);
+    }
     let relayed = network.relay_forwarded + network.relay_sent_via + network.relay_received_via;
     if relayed > 0 {
         section.push(Row::new(
@@ -2955,6 +3340,87 @@ fn network_section(
     section
 }
 
+/// The exit-node rows of a network: what this device offers, and what it uses.
+///
+/// Nothing at all for a network that does neither, which is nearly all of
+/// them: an off switch is not worth a line in every report.
+fn exit_rows(network: &tsunagi::ipc::NetworkReport) -> Vec<report::Row> {
+    use report::{Health, Row};
+
+    let exit = &network.exit;
+    let mut rows = Vec::new();
+
+    if exit.offering {
+        let forwarding_off = exit.forwarding == Some(false);
+        let (rules_ok, detail) = match &exit.offer_rules {
+            Some(rules) => (rules.ok, rules.detail.clone()),
+            None => (false, "rules not installed yet".to_string()),
+        };
+        let row = Row::new(
+            if rules_ok && !forwarding_off {
+                Health::Good
+            } else {
+                Health::Degraded
+            },
+            "exit node",
+            format!("offered to members  ·  {detail}"),
+        );
+        rows.push(if forwarding_off {
+            row.with_note(forwarding_off_note())
+        } else {
+            row
+        });
+    }
+
+    if let Some(via) = &exit.via {
+        let name = exit_name(network, via);
+        let row = if !exit.via_online {
+            Row::new(Health::Broken, "using exit", format!("{name}  ·  OFFLINE")).with_note(
+                "internet traffic is dropped until it returns or you run \
+                 `tsunagi exit-node off`",
+            )
+        } else {
+            match &exit.client_rules {
+                Some(rules) if rules.ok => Row::new(
+                    Health::Good,
+                    "using exit",
+                    format!("{name}  ·  all internet traffic leaves through it"),
+                ),
+                Some(rules) => Row::new(
+                    Health::Degraded,
+                    "using exit",
+                    format!("{name}  ·  routes incomplete"),
+                )
+                .with_note(rules.detail.clone()),
+                None => Row::new(
+                    Health::Degraded,
+                    "using exit",
+                    format!("{name}  ·  routes not installed"),
+                ),
+            }
+        };
+        rows.push(row);
+    }
+    rows
+}
+
+/// What to call the device a network's exit node is, even while it is away.
+fn exit_name(network: &tsunagi::ipc::NetworkReport, id: &str) -> String {
+    network
+        .peers
+        .iter()
+        .find(|peer| peer.endpoint_id == id)
+        .and_then(|peer| peer.hostname.clone())
+        .or_else(|| {
+            network
+                .members
+                .iter()
+                .find(|member| member.endpoint_id == id)
+                .and_then(|member| member.hostname.clone())
+        })
+        .unwrap_or_else(|| short(id, 12))
+}
+
 /// One member: connected or not, and what is known either way.
 fn member_row(row: &MemberRow<'_>) -> report::Row {
     use report::{Health, Row};
@@ -2965,6 +3431,9 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
         let mut detail = "offline".to_string();
         if let Some(v4) = row.overlay_address_v4 {
             detail = format!("{v4:<15}  offline  ·  {v4} still reserved for it");
+        }
+        if row.exit_in_use {
+            detail.push_str("  ·  your exit node");
         }
         let out = Row::new(Health::Info, row.label(), detail);
         return if row.failed_dials > 0 {
@@ -2990,6 +3459,11 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     detail.push_str(&transport.to_lowercase());
     if let Some(rtt) = row.rtt_ms {
         detail.push_str(&format!("  rtt {rtt}ms"));
+    }
+    if row.exit_in_use {
+        detail.push_str("  ·  your exit node");
+    } else if row.exit_node {
+        detail.push_str("  ·  exit node");
     }
 
     let health = if !direct || (has_overlay && !tunnel_up) {
@@ -4276,6 +4750,7 @@ async fn build_report(
             };
 
             NetworkReport {
+                exit: exit_report(network),
                 broadcast: network.broadcast,
                 name: network.name.to_string(),
                 network_id: network.network_id.to_string(),
@@ -4292,6 +4767,7 @@ async fn build_report(
                         hostname: peer.hostname.clone(),
                         transport: peer.transport.to_string(),
                         rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
+                        exit_node: peer.exit_node,
                     })
                     .collect(),
                 members: network
@@ -4354,6 +4830,24 @@ async fn build_report(
             }
             tsunagi::overlay::Privilege::Unsupported => tsunagi::ipc::PrivilegeReport::Unsupported,
         },
+    }
+}
+
+/// One network's exit-node settings, as the control interface reports them.
+fn exit_report(network: &tsunagi::agent::NetworkStatus) -> tsunagi::ipc::ExitReport {
+    let rules = |report: &Option<tsunagi::overlay::RuleSetReport>| {
+        report.as_ref().map(|report| tsunagi::ipc::RuleSetReport {
+            ok: report.ok,
+            detail: report.detail.clone(),
+        })
+    };
+    tsunagi::ipc::ExitReport {
+        offering: network.exit_offer,
+        offer_rules: rules(&network.exit_rules.offer),
+        forwarding: network.exit_rules.forwarding,
+        via: network.exit_via.map(|peer| peer.to_string()),
+        via_online: network.exit_via_online,
+        client_rules: rules(&network.exit_rules.client),
     }
 }
 
@@ -4636,6 +5130,7 @@ mod status_tests {
     /// The situation that prompted this: one peer left and came back.
     fn network_after_a_peer_returned() -> NetworkReport {
         NetworkReport {
+            exit: Default::default(),
             broadcast: true,
             name: "LAB".into(),
             network_id: "xa7gyz".into(),
@@ -4649,6 +5144,7 @@ mod status_tests {
                 hostname: Some("music".into()),
                 transport: "direct".into(),
                 rtt_ms: Some(24),
+                exit_node: false,
             }],
             members: vec![
                 MemberReport {
@@ -4912,6 +5408,112 @@ mod status_tests {
         assert_eq!(rows[1].endpoint_id, AWAY);
     }
 
+    fn exit_peer(network: &mut NetworkReport, offers: bool) {
+        network.peers[0].exit_node = offers;
+    }
+
+    #[test]
+    fn a_network_that_neither_offers_nor_uses_an_exit_node_says_nothing() {
+        let network = network_after_a_peer_returned();
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert!(!text.contains("exit"), "{text}");
+    }
+
+    #[test]
+    fn offering_with_forwarding_off_is_degraded_and_says_the_command() {
+        let mut network = network_after_a_peer_returned();
+        network.exit.offering = true;
+        network.exit.offer_rules = Some(tsunagi::ipc::RuleSetReport {
+            ok: true,
+            detail: "ok (nat + forward)".into(),
+        });
+        network.exit.forwarding = Some(false);
+        let rows = exit_rows(&network);
+        assert_eq!(rows.len(), 1);
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert_eq!(out.worst(), Health::Degraded, "{text}");
+        assert!(
+            text.contains("sudo sysctl -w net.ipv4.ip_forward=1"),
+            "{text}"
+        );
+        assert!(text.contains("ok (nat + forward)"), "{text}");
+
+        network.exit.forwarding = Some(true);
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        assert_eq!(out.worst(), Health::Good, "{}", out.render(false));
+    }
+
+    #[test]
+    fn losing_the_exit_node_in_use_is_loud_and_says_the_traffic_is_dropped() {
+        let mut network = network_after_a_peer_returned();
+        exit_peer(&mut network, true);
+        network.exit.via = Some(ONLINE.into());
+        network.exit.via_online = true;
+        network.exit.client_rules = Some(tsunagi::ipc::RuleSetReport {
+            ok: true,
+            detail: "ok".into(),
+        });
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert_eq!(out.worst(), Health::Good, "{text}");
+        assert!(
+            text.contains("music  ·  all internet traffic leaves through it"),
+            "{text}"
+        );
+        assert!(text.contains("your exit node"), "{text}");
+
+        network.exit.via_online = false;
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert_eq!(out.worst(), Health::Broken, "{text}");
+        assert!(text.contains("OFFLINE"), "{text}");
+        assert!(text.contains("dropped until it returns"), "{text}");
+        assert!(text.contains("tsunagi exit-node off"), "{text}");
+    }
+
+    #[test]
+    fn an_exit_node_is_resolved_by_name_or_id_and_only_among_those_that_offer() {
+        let mut network = network_after_a_peer_returned();
+        let networks = |network: &NetworkReport| vec![network.clone()];
+
+        let err = resolve_exit_node(&networks(&network), "music", None).unwrap_err();
+        assert!(err.contains("does not offer to be an exit node"), "{err}");
+        let err = resolve_exit_node(&networks(&network), "nobody", None).unwrap_err();
+        assert!(err.contains("no connected device matches"), "{err}");
+
+        exit_peer(&mut network, true);
+        let all = networks(&network);
+        for wanted in ["music", "MUSIC", ONLINE, &ONLINE[..8]] {
+            let (found_network, peer) = resolve_exit_node(&all, wanted, None).unwrap();
+            assert_eq!(found_network.name, "LAB");
+            assert_eq!(peer.endpoint_id, ONLINE);
+        }
+        assert!(resolve_exit_node(&all, "music", Some("other")).is_err());
+        assert!(resolve_exit_node(&all, "music", Some("LAB")).is_ok());
+    }
+
+    #[test]
+    fn the_same_exit_node_in_two_networks_has_to_be_told_apart() {
+        let mut first = network_after_a_peer_returned();
+        exit_peer(&mut first, true);
+        let mut second = first.clone();
+        second.name = "OTHER".into();
+        second.network_id = "zzzzzz".into();
+        let both = vec![first, second];
+        let err = resolve_exit_node(&both, "music", None).unwrap_err();
+        assert!(err.contains("--network"), "{err}");
+        assert!(err.contains("LAB") && err.contains("OTHER"), "{err}");
+        let (network, _) = resolve_exit_node(&both, "music", Some("OTHER")).unwrap();
+        assert_eq!(network.name, "OTHER");
+    }
+
     #[test]
     fn an_offline_member_keeps_the_last_name_it_announced() {
         let mut network = network_after_a_peer_returned();
@@ -5047,6 +5649,8 @@ mod network_tests {
             NetworkSecret::from_bytes(&[secret.as_bytes(), &[0u8; 32]].concat()[..32]).unwrap();
         let keys = NetworkKeys::derive(&name, &secret);
         StoredNetwork {
+            exit_node: false,
+            exit_via: None,
             broadcast: true,
             network_id: keys.network_id(),
             name,
@@ -5268,6 +5872,8 @@ mod network_context_tests {
         let secret = NetworkSecret::from_bytes([seed; 32]).unwrap();
         let keys = NetworkKeys::derive(&name, &secret);
         StoredNetwork {
+            exit_node: false,
+            exit_via: None,
             broadcast: true,
             network_id: keys.network_id(),
             name,

@@ -746,6 +746,7 @@ networks first if the addresses should be freed.
 - [docs/protocol.md](docs/protocol.md) — identity derivation, framing, handshake.
 - [docs/sync-model.md](docs/sync-model.md) — the planned signed-state model and
   what is deliberately not built yet.
+- [docs/exit-node.md](docs/exit-node.md) — exit nodes: sending all traffic through a member.
 - [docs/threat-model.md](docs/threat-model.md) — threat model and known limits.
 - [docs/testing.md](docs/testing.md) — what the suite covers and what it does not.
 - [AGENTS.md](AGENTS.md) — rules for anyone (human or agent) changing this repo.

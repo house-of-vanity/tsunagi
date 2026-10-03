@@ -16,6 +16,7 @@ use tsunagi::ipc::{NetworkReport, StatusReport};
 
 use crate::agent::{AgentClient, Command, Snapshot};
 use crate::devices;
+use crate::exit;
 use crate::format;
 use crate::stats::{Traffic, Unit};
 
@@ -42,6 +43,8 @@ pub(crate) struct UiState {
     pub(crate) open_devices: BTreeSet<String>,
     /// Whether the About window is open.
     pub(crate) about_open: bool,
+    /// An exit-node choice waiting for the user to confirm it.
+    pub(crate) exit_confirm: Option<devices::ExitConfirm>,
 }
 
 impl Default for UiState {
@@ -52,6 +55,7 @@ impl Default for UiState {
             host_edit: None,
             open_devices: BTreeSet::new(),
             about_open: false,
+            exit_confirm: None,
         }
     }
 }
@@ -261,6 +265,36 @@ fn draw_network(
                     enabled: broadcast,
                 });
             }
+            let mut offering = network.exit.offering;
+            if ui
+                .checkbox(&mut offering, "exit node")
+                .on_hover_text(
+                    "let other members send all their internet traffic through this \
+                     device, which can see it",
+                )
+                .changed()
+            {
+                agent.send(Command::SetExitOffer {
+                    network_id: network.network_id.clone(),
+                    enabled: offering,
+                });
+            }
+        });
+        ui.horizontal(|ui| {
+            if let Some(via) = &network.exit.via {
+                ui.weak("exit");
+                ui.label(exit::name_of(network, via));
+                if ui
+                    .small_button("off")
+                    .on_hover_text("send internet traffic the ordinary way again")
+                    .clicked()
+                {
+                    agent.send(Command::SetExitNode {
+                        network_id: network.network_id.clone(),
+                        peer: None,
+                    });
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Show devices").clicked() {
                     state.open_devices.insert(network.network_id.clone());
@@ -276,7 +310,33 @@ fn draw_network(
                 }
             });
         });
+        for warning in exit::warnings(network) {
+            draw_exit_warning(ui, &warning);
+        }
     });
+}
+
+/// A prominent line about an exit node. One that carries a command copies it
+/// when clicked.
+fn draw_exit_warning(ui: &mut egui::Ui, warning: &exit::Warning) {
+    let text = egui::RichText::new(format!("{} {}", icon::WARNING, warning.text))
+        .color(exit::LOUD)
+        .strong();
+    let label = egui::Label::new(text).wrap();
+    match warning.copy {
+        Some(command) => {
+            let response = ui
+                .add(label.sense(egui::Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("click to copy the command");
+            if response.clicked() {
+                ui.ctx().copy_text(command.to_owned());
+            }
+        }
+        None => {
+            ui.add(label);
+        }
+    }
 }
 
 /// The join form: aligned name and secret, a generate button, and Join.

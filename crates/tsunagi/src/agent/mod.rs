@@ -388,6 +388,7 @@ impl Agent {
     async fn reserve_range(&self, network: NetworkId) -> RangePlan {
         let reserve = |wanted: Ipv4Range| {
             let reservation = crate::overlay::NetworkRoutes {
+                exit: Default::default(),
                 broadcast: Default::default(),
                 range: Some(wanted),
                 local: None,
@@ -603,6 +604,72 @@ impl Agent {
         }
     }
 
+    /// Offers this agent as an exit node in a network, or stops, now and
+    /// after restart. Off unless somebody turns it on.
+    pub async fn set_exit_offer(&self, network_id: NetworkId, enabled: bool) -> Result<()> {
+        self.inner
+            .storage
+            .set_exit_node(network_id, enabled)
+            .await?;
+        if self.is_active(network_id).await {
+            let (reply, receive) = oneshot::channel();
+            self.command(network_id, NetCommand::SetExitOffer { enabled, reply })
+                .await?;
+            receive.await.map_err(|_| Error::Stopped)?;
+        }
+        Ok(())
+    }
+
+    /// Sends this device's internet traffic through a member of a network,
+    /// or back the ordinary way with `None`.
+    ///
+    /// A device has one default route, so choosing in one network clears the
+    /// choice in the others. The member has to be connected and offering
+    /// to be an exit node. Remembered across restarts.
+    pub async fn set_exit_via(&self, network_id: NetworkId, via: Option<EndpointId>) -> Result<()> {
+        let active = self.is_active(network_id).await;
+        if via.is_some() && !active {
+            return Err(Error::NetworkNotActive(network_id));
+        }
+        if active {
+            let (reply, receive) = oneshot::channel();
+            self.command(network_id, NetCommand::SetExitVia { via, reply })
+                .await?;
+            receive
+                .await
+                .map_err(|_| Error::Stopped)?
+                .map_err(|reason| Error::Rejected { reason })?;
+        }
+        self.inner
+            .storage
+            .set_exit_via(network_id, via.map(|peer| *peer.as_bytes()))
+            .await?;
+        if via.is_some() {
+            // One default route: whatever the other networks were doing, they
+            // are not any more.
+            let others: Vec<NetworkId> = self
+                .inner
+                .networks
+                .read()
+                .await
+                .keys()
+                .copied()
+                .filter(|other| *other != network_id)
+                .collect();
+            for other in others {
+                let (reply, receive) = oneshot::channel();
+                if self
+                    .command(other, NetCommand::SetExitVia { via: None, reply })
+                    .await
+                    .is_ok()
+                {
+                    let _ = receive.await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Changes a network's local broadcast policy now and after restart.
     pub async fn set_broadcast(&self, network_id: NetworkId, enabled: bool) -> Result<()> {
         self.inner
@@ -662,16 +729,23 @@ impl Agent {
                     as Arc<dyn crate::discovery::NetworkDiscovery>,
             )
         };
-        let broadcast = self
+        let stored = self
             .inner
             .storage
             .list_networks()
             .await?
             .into_iter()
-            .find(|stored| stored.network_id == network_id)
-            .is_none_or(|stored| stored.broadcast);
+            .find(|stored| stored.network_id == network_id);
+        let broadcast = stored.as_ref().is_none_or(|stored| stored.broadcast);
+        let exit_offer = stored.as_ref().is_some_and(|stored| stored.exit_node);
+        let exit_via = stored
+            .as_ref()
+            .and_then(|stored| stored.exit_via)
+            .and_then(|bytes| EndpointId::from_bytes(&bytes).ok());
         let handle = network::spawn(RuntimeParams {
             broadcast,
+            exit_offer,
+            exit_via,
             keys,
             adapter: self.inner.adapter.clone(),
             storage: self.inner.storage.clone(),
@@ -733,6 +807,7 @@ impl Agent {
         }
         if let Some(interface) = self.inner.interface.get() {
             interface.sync_broadcast_rules().await;
+            interface.sync_exit_rules().await;
         }
         self.inner.storage.set_auto_start(network_id, false).await?;
         Ok(())
@@ -886,6 +961,12 @@ impl Agent {
             let keys = NetworkKeys::derive(&stored.name, &stored.secret);
             networks.push(NetworkStatus {
                 broadcast: stored.broadcast,
+                exit_offer: stored.exit_node,
+                exit_via: stored
+                    .exit_via
+                    .and_then(|bytes| EndpointId::from_bytes(&bytes).ok()),
+                exit_via_online: false,
+                exit_rules: Default::default(),
                 descriptor: keys.descriptor(),
                 name: stored.name,
                 network_id: stored.network_id,

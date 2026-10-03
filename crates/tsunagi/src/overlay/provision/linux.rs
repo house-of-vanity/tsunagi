@@ -48,7 +48,8 @@ use futures_util::TryStreamExt;
 use rtnetlink::packet_route::address::{AddressAttribute, AddressMessage};
 use rtnetlink::packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage};
 use rtnetlink::packet_route::route::RouteScope;
-use rtnetlink::{LinkMessageBuilder, LinkUnspec, RouteMessageBuilder};
+use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute, RuleMessage, RuleUidRange};
+use rtnetlink::{IpVersion, LinkMessageBuilder, LinkUnspec, RouteMessageBuilder};
 
 use crate::BoxFuture;
 use crate::overlay::OverlayError;
@@ -72,6 +73,11 @@ enum Command {
     SetBroadcastRoute(String, Ipv4Addr, Reply<()>),
     /// Remove that route from this interface.
     DelBroadcastRoute(String, Reply<()>),
+    /// Send the host's default traffic through this interface, except what
+    /// this user id sends.
+    SetExitClient(String, u32, Reply<()>),
+    /// Take those routing rules away again.
+    ClearExitClient(Reply<()>),
     /// Stop the thread.
     Stop,
 }
@@ -203,6 +209,20 @@ impl RouteHandle {
             Command::DelBroadcastRoute(interface, reply)
         })
     }
+
+    /// Sends the host's default traffic through `interface`, except what the
+    /// user id `uid` sends. Replaces what an earlier call set up.
+    pub(crate) fn set_exit_client(&self, interface: &str, uid: u32) -> Result<(), OverlayError> {
+        let interface = interface.to_string();
+        call_thread(&self.commands, |reply| {
+            Command::SetExitClient(interface, uid, reply)
+        })
+    }
+
+    /// Removes those rules. Succeeds when none are there.
+    pub(crate) fn clear_exit_client(&self) -> Result<(), OverlayError> {
+        call_thread(&self.commands, Command::ClearExitClient)
+    }
 }
 
 impl Drop for NetlinkProvisioner {
@@ -324,7 +344,11 @@ fn netlink_thread(requests: mpsc::Receiver<Command>) {
                     Command::Delete(_, reply)
                     | Command::Configure(_, reply)
                     | Command::SetBroadcastRoute(_, _, reply)
-                    | Command::DelBroadcastRoute(_, reply) => {
+                    | Command::DelBroadcastRoute(_, reply)
+                    | Command::SetExitClient(_, _, reply) => {
+                        let _ = reply.send(Err(OverlayError::Unavailable(message)));
+                    }
+                    Command::ClearExitClient(reply) => {
                         let _ = reply.send(Err(OverlayError::Unavailable(message)));
                     }
                     Command::Stop => return,
@@ -368,6 +392,22 @@ fn netlink_thread(requests: mpsc::Receiver<Command>) {
             Command::DelBroadcastRoute(name, reply) => {
                 let result = NetAdmin::acquire().and_then(|guard| {
                     let result = runtime.block_on(del_broadcast_route(&name));
+                    drop(guard);
+                    result
+                });
+                let _ = reply.send(result);
+            }
+            Command::SetExitClient(name, uid, reply) => {
+                let result = NetAdmin::acquire().and_then(|guard| {
+                    let result = runtime.block_on(set_exit_client(&name, uid));
+                    drop(guard);
+                    result
+                });
+                let _ = reply.send(result);
+            }
+            Command::ClearExitClient(reply) => {
+                let result = NetAdmin::acquire().and_then(|guard| {
+                    let result = runtime.block_on(clear_exit_client());
                     drop(guard);
                     result
                 });
@@ -596,6 +636,192 @@ async fn del_broadcast_route(name: &str) -> Result<(), OverlayError> {
     .await
 }
 
+/// The routing table that holds the exit node's default route: `tsun` in
+/// ASCII-ish hex, and nothing else uses it.
+const EXIT_TABLE: u32 = 0x7473;
+/// The main table.
+const MAIN_TABLE: u32 = 254;
+/// Where the exit rules sit, after Tailscale's 5270.
+const EXIT_BYPASS_PRIORITY: u32 = 5280;
+const EXIT_SPECIFIC_PRIORITY: u32 = 5290;
+const EXIT_DEFAULT_PRIORITY: u32 = 5300;
+
+/// The table a rule looks up.
+fn rule_table(rule: &RuleMessage) -> u32 {
+    rule.attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RuleAttribute::Table(table) => Some(*table),
+            _ => None,
+        })
+        .unwrap_or(u32::from(rule.header.table))
+}
+
+fn rule_priority(rule: &RuleMessage) -> Option<u32> {
+    rule.attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RuleAttribute::Priority(priority) => Some(*priority),
+            _ => None,
+        })
+}
+
+/// Whether a rule is one of the three this agent adds for an exit node.
+///
+/// Recognised by shape as well as priority: those numbers are not reserved,
+/// and a rule somebody else put at one of them must not be removed.
+fn is_exit_rule(rule: &RuleMessage) -> bool {
+    let table = rule_table(rule);
+    match rule_priority(rule) {
+        Some(EXIT_BYPASS_PRIORITY) => {
+            table == MAIN_TABLE
+                && rule
+                    .attributes
+                    .iter()
+                    .any(|attribute| matches!(attribute, RuleAttribute::UidRange(_)))
+        }
+        Some(EXIT_SPECIFIC_PRIORITY) => {
+            table == MAIN_TABLE
+                && rule
+                    .attributes
+                    .iter()
+                    .any(|attribute| matches!(attribute, RuleAttribute::SuppressPrefixLen(0)))
+        }
+        Some(EXIT_DEFAULT_PRIORITY) => table == EXIT_TABLE,
+        _ => false,
+    }
+}
+
+fn exit_default_route(index: Option<u32>) -> rtnetlink::packet_route::route::RouteMessage {
+    let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
+        .table_id(EXIT_TABLE);
+    if let Some(index) = index {
+        builder = builder.output_interface(index).scope(RouteScope::Link);
+    }
+    builder.build()
+}
+
+/// Removes the exit node's routing rules and its table. Nothing there is
+/// success: it also runs once at startup, for what a crashed run left.
+async fn clear_exit_client() -> Result<(), OverlayError> {
+    with_netlink(|handle| async move { remove_exit_client(&handle).await }).await
+}
+
+async fn remove_exit_client(handle: &rtnetlink::Handle) -> Result<(), OverlayError> {
+    let mut rules = handle.rule().get(IpVersion::V4).execute();
+    let mut ours = Vec::new();
+    while let Some(rule) = rules
+        .try_next()
+        .await
+        .map_err(|err| OverlayError::Unavailable(format!("cannot read the routing rules: {err}")))?
+    {
+        if is_exit_rule(&rule) {
+            ours.push(rule);
+        }
+    }
+    for rule in ours {
+        match handle.rule().del(rule).execute().await {
+            Ok(()) => {}
+            // Gone already.
+            Err(err) if err.to_string().contains("No such") => {}
+            Err(err) => {
+                return Err(OverlayError::Unavailable(format!(
+                    "cannot remove an exit node routing rule: {err}"
+                )));
+            }
+        }
+    }
+    match handle.route().del(exit_default_route(None)).execute().await {
+        Ok(()) => Ok(()),
+        // "No such process": no such route, which is the goal.
+        Err(err) if err.to_string().contains("No such") => Ok(()),
+        Err(err) => Err(OverlayError::Unavailable(format!(
+            "cannot remove the exit node default route: {err}"
+        ))),
+    }
+}
+
+/// Sets up the using side of an exit node.
+///
+/// ```text
+/// ip route replace default dev <if> table 0x7473
+/// ip rule add priority 5280 uidrange <uid>-<uid> lookup main
+/// ip rule add priority 5290 lookup main suppress_prefixlength 0
+/// ip rule add priority 5300 lookup 0x7473
+/// ```
+///
+/// What an earlier call left is removed first, so repeating it is safe, and
+/// the rules go in last, so a failure part way never leaves a rule that
+/// sends traffic to a table with no route in it.
+async fn set_exit_client(name: &str, uid: u32) -> Result<(), OverlayError> {
+    with_netlink(|handle| async move {
+        let index = link_index(&handle, name).await.ok_or_else(|| {
+            OverlayError::Unavailable(format!(
+                "interface `{name}` disappeared before the exit node routes could be added"
+            ))
+        })?;
+        remove_exit_client(&handle).await?;
+        let fail = |what: &str, err: rtnetlink::Error| {
+            OverlayError::Unavailable(format!("cannot add the exit node {what}: {err}"))
+        };
+        handle
+            .route()
+            .add(exit_default_route(Some(index)))
+            .replace()
+            .execute()
+            .await
+            .map_err(|err| fail("default route", err))?;
+
+        let mut bypass = handle
+            .rule()
+            .add()
+            .v4()
+            .table_id(MAIN_TABLE)
+            .action(RuleAction::ToTable)
+            .priority(EXIT_BYPASS_PRIORITY);
+        bypass
+            .message_mut()
+            .attributes
+            .push(RuleAttribute::UidRange(RuleUidRange {
+                start: uid,
+                end: uid,
+            }));
+        bypass
+            .execute()
+            .await
+            .map_err(|err| fail("rule for the agent's own traffic", err))?;
+
+        let mut specific = handle
+            .rule()
+            .add()
+            .v4()
+            .table_id(MAIN_TABLE)
+            .action(RuleAction::ToTable)
+            .priority(EXIT_SPECIFIC_PRIORITY);
+        specific
+            .message_mut()
+            .attributes
+            .push(RuleAttribute::SuppressPrefixLen(0));
+        specific
+            .execute()
+            .await
+            .map_err(|err| fail("rule for the specific routes", err))?;
+
+        handle
+            .rule()
+            .add()
+            .v4()
+            .table_id(EXIT_TABLE)
+            .action(RuleAction::ToTable)
+            .priority(EXIT_DEFAULT_PRIORITY)
+            .execute()
+            .await
+            .map_err(|err| fail("rule for the default route", err))
+    })
+    .await
+}
+
 async fn configure_link(configure: &Configure) -> Result<(), OverlayError> {
     let name = configure.name.as_str();
     with_netlink(|handle| async move {
@@ -735,6 +961,48 @@ mod tests {
             "link-local addresses are filtered out: {:?}",
             state.addresses
         );
+    }
+
+    fn rule(priority: u32, table: u32, extra: Vec<RuleAttribute>) -> RuleMessage {
+        let mut message = RuleMessage::default();
+        message.attributes.push(RuleAttribute::Priority(priority));
+        if table > 255 {
+            message.attributes.push(RuleAttribute::Table(table));
+        } else {
+            message.header.table = table as u8;
+        }
+        message.attributes.extend(extra);
+        message
+    }
+
+    #[test]
+    fn only_the_three_exit_rules_are_recognised_as_ours() {
+        let uid = RuleAttribute::UidRange(RuleUidRange { start: 5, end: 5 });
+        assert!(is_exit_rule(&rule(5280, 254, vec![uid.clone()])));
+        assert!(is_exit_rule(&rule(
+            5290,
+            254,
+            vec![RuleAttribute::SuppressPrefixLen(0)]
+        )));
+        assert!(is_exit_rule(&rule(5300, EXIT_TABLE, vec![])));
+
+        // Same priorities, somebody else's rules.
+        assert!(!is_exit_rule(&rule(5280, 254, vec![])));
+        assert!(!is_exit_rule(&rule(5290, 254, vec![])));
+        assert!(!is_exit_rule(&rule(5300, 52, vec![])));
+        assert!(!is_exit_rule(&rule(5270, 52, vec![])));
+        assert!(!is_exit_rule(&rule(5280, 100, vec![uid])));
+    }
+
+    #[test]
+    fn the_default_route_of_the_exit_table_names_the_table_and_the_interface() {
+        let route = exit_default_route(Some(7));
+        assert_eq!(route.header.destination_prefix_length, 0);
+        let debug = format!("{route:?}");
+        assert!(debug.contains(&format!("Table({EXIT_TABLE})")), "{debug}");
+        assert!(debug.contains("Oif(7)"), "{debug}");
+        // Deleting names no interface, so it matches whatever it was added on.
+        assert!(!format!("{:?}", exit_default_route(None)).contains("Oif"));
     }
 
     #[test]
