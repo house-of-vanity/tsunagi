@@ -19,6 +19,10 @@
 
 use crate::BoxFuture;
 
+use std::sync::{Arc, Mutex};
+
+use super::exit::{ExitHostPlan, ExitHostReport, ExitHostRules};
+use super::macos_exit::{apply_plan, clear_all, run_tool};
 use super::{BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport, RuleOutcome};
 
 /// The limited-broadcast destination routed through the overlay interface.
@@ -60,14 +64,19 @@ fn firewall_todo(plan: &BroadcastRulesPlan) -> String {
     )
 }
 
-/// The macOS implementation: `route` for the route, no firewall yet.
+/// The macOS implementation: `route` for the route, no firewall yet, and
+/// `pf` plus `route` for exit nodes (see [`super::macos_exit`]).
 #[derive(Debug, Default)]
-pub struct MacosHostRules;
+pub struct MacosHostRules {
+    /// The reference `pfctl -E` handed out, held while exit-node rules need
+    /// `pf` on and released when they are removed.
+    pub(super) pf_token: Arc<Mutex<Option<String>>>,
+}
 
 impl MacosHostRules {
     /// Creates the host rules.
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     /// Installs the route, replacing one this agent added earlier so the call
@@ -82,9 +91,44 @@ impl MacosHostRules {
     }
 }
 
+impl ExitHostRules for MacosHostRules {
+    fn apply<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, ExitHostReport> {
+        Box::pin(async move {
+            let job_plan = plan.clone();
+            let token = Arc::clone(&self.pf_token);
+            tokio::task::spawn_blocking(move || apply_plan(&run_tool, &token, &job_plan))
+                .await
+                .unwrap_or_else(|err| {
+                    let failed = RuleOutcome::Failed(format!("the task failed: {err}"));
+                    ExitHostReport {
+                        offer: plan
+                            .offer
+                            .iter()
+                            .map(|range| (*range, failed.clone()))
+                            .collect(),
+                        forwarding: None,
+                        client: plan.client.then_some(failed),
+                    }
+                })
+        })
+    }
+
+    fn clear<'a>(&'a self, interface: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let name = interface.to_string();
+            let token = Arc::clone(&self.pf_token);
+            let _ = tokio::task::spawn_blocking(move || clear_all(&run_tool, &token, &name)).await;
+        })
+    }
+}
+
 impl BroadcastHostRules for MacosHostRules {
     fn name(&self) -> &str {
         "route"
+    }
+
+    fn exit_rules(&self) -> Option<&dyn ExitHostRules> {
+        Some(self)
     }
 
     fn apply<'a>(&'a self, plan: &'a BroadcastRulesPlan) -> BoxFuture<'a, BroadcastRulesReport> {

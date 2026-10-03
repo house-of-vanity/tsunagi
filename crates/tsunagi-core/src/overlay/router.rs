@@ -293,6 +293,18 @@ impl RoutingTable {
         offers
     }
 
+    /// The range of every network in the table that has agreed one, sorted.
+    pub fn overlay_ranges(&self) -> Vec<Ipv4Range> {
+        let mut ranges: Vec<Ipv4Range> = self
+            .read()
+            .values()
+            .filter_map(|routes| routes.range)
+            .collect();
+        ranges.sort_by_key(|range| (range.base, range.prefix_len));
+        ranges.dedup();
+        ranges
+    }
+
     /// One network's exit-node settings and its range, if it is in the table.
     pub fn exit_settings(&self, network: NetworkId) -> Option<(ExitPolicy, Option<Ipv4Range>)> {
         self.read()

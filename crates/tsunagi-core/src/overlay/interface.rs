@@ -354,6 +354,7 @@ impl Interface {
             interface: self.name.clone(),
             offer: ranges,
             client: self.routes.exit_via().is_some(),
+            overlay: self.routes.overlay_ranges(),
         };
 
         let first = !std::mem::replace(&mut self.exit_state().cleaned, true);
@@ -398,9 +399,13 @@ impl Interface {
             tracing::warn!(
                 interface = %self.name,
                 "kernel forwarding is off for this interface, so nothing is forwarded for the \
-                 exit node yet: `sysctl -w net.ipv4.conf.{0}.forwarding=1` (or \
-                 `net.ipv4.ip_forward=1`), and set it in sysctl.d to keep it",
-                self.name
+                 exit node yet: {}",
+                if cfg!(target_os = "macos") {
+                    "`sysctl -w net.inet.ip.forwarding=1`, set again after every reboot"
+                } else {
+                    "`sysctl -w net.ipv4.ip_forward=1` (or `net.ipv4.conf.<interface>.forwarding=1`), \
+                     and set it in sysctl.d to keep it"
+                }
             );
         }
         match &report.client {
@@ -443,7 +448,7 @@ impl Interface {
                 "this overlay interface is not on the host (no TUN device), so there is \
                  nothing to forward to",
             ),
-            Some(false) => Some("exit nodes are only supported on Linux yet"),
+            Some(false) => Some("exit nodes are not supported on this platform yet"),
             Some(true) => None,
         };
         let failed = |detail: &str| RuleSetReport {

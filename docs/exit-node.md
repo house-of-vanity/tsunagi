@@ -59,6 +59,27 @@ be an exit node in one network and not in another.
   specific IPv6 routes keep working, and so does the agent's own IPv6. A host
   with no IPv6 has nothing to block and is left alone.
 
+## macOS
+
+macOS has no `iptables` and no per-user policy routing, so the same behaviour
+is built from `pf` and `route`. The agent runs as root there.
+
+- **Offering:** a `pf` anchor `com.apple/tsunagi-exit-<interface>` (the stock
+  `/etc/pf.conf` already evaluates `com.apple/*`) holds
+  `nat on <egress> from <range> to any -> (<egress>)` and a `pass in` rule.
+  `pf` is enabled if it was off, and that reference is released when the rules
+  go. Forwarding is only read: `sudo sysctl -w net.inet.ip.forwarding=1`, which
+  macOS forgets at reboot. The egress is the default route's interface **at the
+  time the rules are applied**; after it changes (Wi-Fi to Ethernet) switch the
+  offer off and on.
+- **Using:** `0.0.0.0/1` and `128.0.0.0/1` routes through the overlay interface,
+  and a `pf` `route-to` rule that sends the agent's own traffic (matched by its
+  user id, root) back out the physical interface, with translation to that
+  interface's address. Anything else you run as root also bypasses the tunnel.
+  IPv6 is blocked with rejecting `::/1` and `8000::/1` routes.
+- Not verified on a live host when this was written: run `tsng exit-node` and
+  check `sudo pfctl -a com.apple/tsunagi-exit-utunN -s rules -s nat`.
+
 ## What it does not do
 
 - **The agent must run as a system service** (its own user). The uid exemption

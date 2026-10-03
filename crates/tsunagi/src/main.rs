@@ -2085,15 +2085,25 @@ async fn broadcast_command(
 }
 
 /// What to run to turn kernel forwarding on, which the agent never does.
+#[cfg(target_os = "macos")]
+const FORWARDING_COMMAND: &str = "sudo sysctl -w net.inet.ip.forwarding=1";
+#[cfg(not(target_os = "macos"))]
 const FORWARDING_COMMAND: &str = "sudo sysctl -w net.ipv4.ip_forward=1";
+
+/// How to keep forwarding on across reboots.
+#[cfg(target_os = "macos")]
+const FORWARDING_PERSIST: &str = "macOS forgets it at reboot; set it again from a boot script \
+                                  such as a LaunchDaemon";
+#[cfg(not(target_os = "macos"))]
+const FORWARDING_PERSIST: &str =
+    "keep it across reboots with `net.ipv4.ip_forward = 1` in /etc/sysctl.d/99-tsunagi.conf";
 
 /// The warning for an exit node whose rules are in place while the kernel is
 /// not forwarding, so that nothing passes.
 fn forwarding_off_note() -> String {
     format!(
         "kernel forwarding is OFF, so nothing passes yet: run `{FORWARDING_COMMAND}` \
-         (and keep it across reboots with `net.ipv4.ip_forward = 1` in \
-         /etc/sysctl.d/99-tsunagi.conf)"
+         ({FORWARDING_PERSIST})"
     )
 }
 
@@ -5435,10 +5445,7 @@ mod status_tests {
         out.push(network_section(&network, OWN, false));
         let text = out.render(false);
         assert_eq!(out.worst(), Health::Degraded, "{text}");
-        assert!(
-            text.contains("sudo sysctl -w net.ipv4.ip_forward=1"),
-            "{text}"
-        );
+        assert!(text.contains(FORWARDING_COMMAND), "{text}");
         assert!(text.contains("ok (nat + forward)"), "{text}");
 
         network.exit.forwarding = Some(true);

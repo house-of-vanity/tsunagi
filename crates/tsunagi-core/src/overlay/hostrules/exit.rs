@@ -35,6 +35,10 @@ pub struct ExitHostPlan {
     pub offer: Vec<Ipv4Range>,
     /// Whether this device sends its internet traffic through a member.
     pub client: bool,
+    /// The range of every network on the interface. Only the using side
+    /// reads it, to keep this agent's own traffic *to* the overlay inside it
+    /// where the host has no per-user routing (macOS).
+    pub overlay: Vec<Ipv4Range>,
 }
 
 impl ExitHostPlan {
@@ -204,6 +208,7 @@ mod tests {
             interface: "tsun0".into(),
             offer: vec![range()],
             client: true,
+            overlay: vec![range()],
         };
         let report = rules.apply(&plan).await;
         assert_eq!(report.offer[0].1, RuleOutcome::Applied);
@@ -218,6 +223,7 @@ mod tests {
                 interface: "tsun0".into(),
                 offer: vec![range()],
                 client: false,
+                overlay: Vec::new(),
             })
             .await;
         assert_eq!(report.forwarding, Some(false));

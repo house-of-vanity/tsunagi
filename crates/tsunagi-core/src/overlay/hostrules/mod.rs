@@ -64,8 +64,11 @@ mod windows;
 #[cfg(all(feature = "tun-device", target_os = "windows"))]
 pub use windows::WindowsHostRules;
 
+// Compiled everywhere so its rule text and parsers are tested everywhere.
 #[cfg(all(feature = "tun-device", target_os = "macos"))]
 mod macos;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod macos_exit;
 #[cfg(all(feature = "tun-device", target_os = "macos"))]
 pub use macos::MacosHostRules;
 
