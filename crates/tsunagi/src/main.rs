@@ -2087,14 +2087,18 @@ async fn broadcast_command(
 /// What to run to turn kernel forwarding on, which the agent never does.
 #[cfg(target_os = "macos")]
 const FORWARDING_COMMAND: &str = "sudo sysctl -w net.inet.ip.forwarding=1";
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+const FORWARDING_COMMAND: &str = "Get-NetIPInterface | Set-NetIPInterface -Forwarding Enabled   # in an administrator PowerShell";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const FORWARDING_COMMAND: &str = "sudo sysctl -w net.ipv4.ip_forward=1";
 
 /// How to keep forwarding on across reboots.
 #[cfg(target_os = "macos")]
 const FORWARDING_PERSIST: &str = "macOS forgets it at reboot; set it again from a boot script \
                                   such as a LaunchDaemon";
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+const FORWARDING_PERSIST: &str = "the setting is kept across reboots";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const FORWARDING_PERSIST: &str =
     "keep it across reboots with `net.ipv4.ip_forward = 1` in /etc/sysctl.d/99-tsunagi.conf";
 

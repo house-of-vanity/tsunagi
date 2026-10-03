@@ -80,6 +80,21 @@ is built from `pf` and `route`. The agent runs as root there.
 - Not verified on a live host when this was written: run `tsng exit-node` and
   check `sudo pfctl -a com.apple/tsunagi-exit-utunN -s rules -s nat`.
 
+## Windows
+
+Offering only. Each offered range gets a WinNAT object
+`tsunagi-exit:<interface>:<range>` (`New-NetNat`), removed with the offer, the
+network and the agent. Forwarding is read for the overlay interface and never
+changed; Windows forwards per interface, so enable it on the ones involved
+(`Get-NetIPInterface | Set-NetIPInterface -Forwarding Enabled`, administrator
+PowerShell). Some Windows versions allow one NAT per host; a second range then
+reports its own failure.
+
+Using one is **not available**: Windows has no per-user routing, so the agent's
+own traffic cannot be kept out of a default route through the overlay and would
+loop. `tsng exit-node <name>` reports that and installs nothing. This was
+written without a Windows host to run it on.
+
 ## What it does not do
 
 - **The agent must run as a system service** (its own user). The uid exemption

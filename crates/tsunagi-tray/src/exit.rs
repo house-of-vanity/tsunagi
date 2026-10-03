@@ -15,7 +15,10 @@ pub(crate) const LOUD: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4a, 0x3c)
 /// What to run to turn kernel forwarding on, which the agent never does.
 #[cfg(target_os = "macos")]
 pub(crate) const FORWARDING_COMMAND: &str = "sudo sysctl -w net.inet.ip.forwarding=1";
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub(crate) const FORWARDING_COMMAND: &str =
+    "Get-NetIPInterface | Set-NetIPInterface -Forwarding Enabled";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(crate) const FORWARDING_COMMAND: &str = "sudo sysctl -w net.ipv4.ip_forward=1";
 
 /// One thing wrong, loud enough to read at a glance.

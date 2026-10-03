@@ -400,7 +400,9 @@ impl Interface {
                 interface = %self.name,
                 "kernel forwarding is off for this interface, so nothing is forwarded for the \
                  exit node yet: {}",
-                if cfg!(target_os = "macos") {
+                if cfg!(target_os = "windows") {
+                    "`Set-NetIPInterface -Forwarding Enabled` on the interfaces involved"
+                } else if cfg!(target_os = "macos") {
                     "`sysctl -w net.inet.ip.forwarding=1`, set again after every reboot"
                 } else {
                     "`sysctl -w net.ipv4.ip_forward=1` (or `net.ipv4.conf.<interface>.forwarding=1`), \

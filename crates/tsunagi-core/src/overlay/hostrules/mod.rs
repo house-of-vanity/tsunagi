@@ -61,6 +61,8 @@ pub use linux::LinuxHostRules;
 // Compiled everywhere so the scripts it builds are tested everywhere; only
 // the type that runs them is exported on Windows.
 mod windows;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod windows_exit;
 #[cfg(all(feature = "tun-device", target_os = "windows"))]
 pub use windows::WindowsHostRules;
 

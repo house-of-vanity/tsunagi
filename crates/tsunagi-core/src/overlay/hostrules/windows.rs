@@ -29,6 +29,8 @@
 
 use crate::BoxFuture;
 
+use super::exit::{ExitHostPlan, ExitHostReport, ExitHostRules};
+use super::windows_exit;
 use super::{BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport, RuleOutcome, tag_for};
 
 /// A PowerShell single-quoted literal, with any embedded quote doubled.
@@ -113,6 +115,11 @@ fn powershell_path() -> std::path::PathBuf {
 
 /// Runs a script and returns what it said on failure.
 fn run_powershell(script: &str) -> Result<(), String> {
+    run_powershell_output(script).map(|_| ())
+}
+
+/// Runs a script and returns what it printed, or what it said on failure.
+fn run_powershell_output(script: &str) -> Result<String, String> {
     let output = std::process::Command::new(powershell_path())
         .args([
             "-NoProfile",
@@ -125,7 +132,7 @@ fn run_powershell(script: &str) -> Result<(), String> {
         .output()
         .map_err(|err| format!("could not run PowerShell: {err}"))?;
     if output.status.success() {
-        return Ok(());
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let text = if stderr.trim().is_empty() {
@@ -155,9 +162,47 @@ impl WindowsHostRules {
     }
 }
 
+impl ExitHostRules for WindowsHostRules {
+    fn apply<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, ExitHostReport> {
+        Box::pin(async move {
+            let job = plan.clone();
+            tokio::task::spawn_blocking(move || {
+                windows_exit::apply_plan(&|script| run_powershell_output(script), &job)
+            })
+            .await
+            .unwrap_or_else(|err| {
+                let failed = RuleOutcome::Failed(format!("the task failed: {err}"));
+                ExitHostReport {
+                    offer: plan
+                        .offer
+                        .iter()
+                        .map(|range| (*range, failed.clone()))
+                        .collect(),
+                    forwarding: None,
+                    client: plan.client.then_some(failed),
+                }
+            })
+        })
+    }
+
+    fn clear<'a>(&'a self, interface: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let name = interface.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                windows_exit::clear_all(&|script| run_powershell_output(script), &name)
+            })
+            .await;
+        })
+    }
+}
+
 impl BroadcastHostRules for WindowsHostRules {
     fn name(&self) -> &str {
         "windows-netsecurity"
+    }
+
+    fn exit_rules(&self) -> Option<&dyn ExitHostRules> {
+        Some(self)
     }
 
     fn apply<'a>(&'a self, plan: &'a BroadcastRulesPlan) -> BoxFuture<'a, BroadcastRulesReport> {
