@@ -3156,7 +3156,18 @@ fn dns_absent_section() -> report::Section {
 struct MemberRow<'a> {
     endpoint_id: &'a str,
     hostname: Option<&'a str>,
-    /// `Some` exactly when there is an authenticated session right now.
+    /// Whether it can be reached now, by any path: the agent's own answer,
+    /// the same one every other client gives.
+    online: bool,
+    /// How packets reach it.
+    path: Option<&'a tsunagi::ipc::DataPathReport>,
+    /// What to call the member the first of those links goes to.
+    via_label: Option<String>,
+    /// The name it claimed that another member holds, and what to call the
+    /// holder.
+    name_taken: Option<(&'a str, String)>,
+    /// `Some` exactly when there is an authenticated session right now: how
+    /// that control connection reaches the peer.
     transport: Option<&'a str>,
     rtt_ms: Option<u64>,
     overlay_address_v4: Option<&'a str>,
@@ -3170,7 +3181,7 @@ struct MemberRow<'a> {
 
 impl MemberRow<'_> {
     fn online(&self) -> bool {
-        self.transport.is_some()
+        self.online
     }
 
     /// What to call it: the name it announced — the last one, when it is
@@ -3194,6 +3205,10 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
         rows.entry(id).or_insert_with(|| MemberRow {
             endpoint_id: id,
             hostname: None,
+            online: false,
+            path: None,
+            via_label: None,
+            name_taken: None,
             transport: None,
             rtt_ms: None,
             overlay_address_v4: None,
@@ -3210,11 +3225,19 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
         row.overlay_address_v4 = member.overlay_address_v4.as_deref();
         row.failed_dials = member.failed_dials;
         row.hostname = member.hostname.as_deref();
+        row.online = member.online;
+        row.path = Some(&member.path);
+        row.name_taken = member
+            .hostname_conflict
+            .as_ref()
+            .map(|conflict| (conflict.name.as_str(), exit_name(network, &conflict.holder)));
     }
     for peer in &network.peers {
         let row = entry(&mut rows, &peer.endpoint_id);
         row.hostname = peer.hostname.as_deref().or(row.hostname);
         row.exit_node = peer.exit_node;
+        row.online = true;
+        row.path = Some(&peer.path);
         row.transport = Some(&peer.transport);
         row.rtt_ms = peer.rtt_ms;
     }
@@ -3230,6 +3253,9 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
 
     for row in rows.values_mut() {
         row.exit_in_use = network.exit.via.as_deref() == Some(row.endpoint_id);
+        if let Some(tsunagi::ipc::DataPathReport::Relayed { via, .. }) = row.path {
+            row.via_label = Some(exit_name(network, via));
+        }
     }
 
     // This agent is in the roster too — it signs claims like everyone else —
@@ -3282,6 +3308,23 @@ fn network_section(
             .with_note(
                 "a network is its name *and* its secret, so these two share nothing. \
                  Usually a mistyped secret; `tsng network secret` shows which is which.",
+            ),
+        );
+    }
+    if let Some(taken) = &network.hostname_conflict {
+        section.push(
+            Row::new(
+                Health::Degraded,
+                "hostname",
+                format!(
+                    "`{}` is held by {}, which claimed it first",
+                    taken.name,
+                    exit_name(network, &taken.holder)
+                ),
+            )
+            .with_note(
+                "this device works by address, but nobody finds it by that name. \
+                 Pick another with `tsng id hostname <name>`.",
             ),
         );
     }
@@ -3547,7 +3590,10 @@ fn exit_name(network: &tsunagi::ipc::NetworkReport, id: &str) -> String {
 fn member_row(row: &MemberRow<'_>) -> report::Row {
     use report::{Health, Row};
 
-    let Some(transport) = row.transport else {
+    let taken = row.name_taken.as_ref().map(|(name, holder)| {
+        format!("  ·  name `{name}` is held by {holder}: reachable by address only")
+    });
+    if !row.online {
         // Away. Not a fault of this agent, and in a mesh of laptops it is the
         // ordinary condition, so it is stated rather than flagged.
         let mut detail = "offline".to_string();
@@ -3557,6 +3603,7 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
         if row.exit_in_use {
             detail.push_str("  ·  your exit node");
         }
+        detail.extend(taken);
         let out = Row::new(Health::Info, row.label(), detail);
         return if row.failed_dials > 0 {
             // Attributed to the member it concerns, rather than left as a
@@ -3568,17 +3615,36 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
         } else {
             out
         };
-    };
+    }
 
-    let direct = transport.eq_ignore_ascii_case("direct");
+    use tsunagi::ipc::DataPathReport;
+    let direct_control = row
+        .transport
+        .is_none_or(|transport| transport.eq_ignore_ascii_case("direct"));
     let tunnel_up = row.tunnel.is_some_and(|tunnel| tunnel.is_up());
     let has_overlay = row.tunnel.is_some();
+    // Online is online: a member reached through others is as much here as
+    // one reached directly, and is said to be reached that way.
+    let (path, data_path_good) = match row.path {
+        Some(DataPathReport::Direct { transport }) => (format!("direct {transport}"), true),
+        Some(DataPathReport::Relayed { hops, .. }) => (
+            format!(
+                "relayed via {} ({hops} hops)",
+                row.via_label.as_deref().unwrap_or("another member")
+            ),
+            false,
+        ),
+        Some(DataPathReport::None) | None => ("connected, no data path yet".to_string(), false),
+    };
 
     let mut detail = String::new();
     if let Some(v4) = row.overlay_address_v4 {
         detail.push_str(&format!("{v4:<15}  "));
     }
-    detail.push_str(&transport.to_lowercase());
+    detail.push_str(&path);
+    if let Some(transport) = row.transport {
+        detail.push_str(&format!("  ·  control {}", transport.to_lowercase()));
+    }
     if let Some(rtt) = row.rtt_ms {
         detail.push_str(&format!("  rtt {rtt}ms"));
     }
@@ -3587,8 +3653,9 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     } else if row.exit_node {
         detail.push_str("  ·  exit node");
     }
+    detail.extend(taken);
 
-    let health = if !direct || (has_overlay && !tunnel_up) {
+    let health = if !data_path_good || !direct_control || (has_overlay && !tunnel_up) {
         Health::Degraded
     } else {
         Health::Good
@@ -4890,6 +4957,7 @@ async fn build_report(
                         transport: peer.transport.to_string(),
                         rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
                         exit_node: peer.exit_node,
+                        path: data_path_report(&peer.data_path),
                     })
                     .collect(),
                 members: network
@@ -4911,6 +4979,9 @@ async fn build_report(
                             .last_hostname
                             .clone()
                             .or_else(|| member.hostname.clone()),
+                        online: member.online,
+                        path: data_path_report(&member.data_path),
+                        hostname_conflict: member.hostname_conflict.as_ref().map(conflict_report),
                     })
                     .collect(),
                 range: network.range.map(|range| range.to_string()),
@@ -4922,6 +4993,7 @@ async fn build_report(
                     network.metrics.control_messages_received,
                 ),
                 overlay,
+                hostname_conflict: network.hostname_conflict.as_ref().map(conflict_report),
             }
         })
         .collect();
@@ -4952,6 +5024,28 @@ async fn build_report(
             }
             tsunagi::overlay::Privilege::Unsupported => tsunagi::ipc::PrivilegeReport::Unsupported,
         },
+    }
+}
+
+fn data_path_report(path: &tsunagi::agent::DataPath) -> tsunagi::ipc::DataPathReport {
+    match path {
+        tsunagi::agent::DataPath::None => tsunagi::ipc::DataPathReport::None,
+        tsunagi::agent::DataPath::Direct { transport } => tsunagi::ipc::DataPathReport::Direct {
+            transport: transport.clone(),
+        },
+        tsunagi::agent::DataPath::Relayed { hops, via } => tsunagi::ipc::DataPathReport::Relayed {
+            hops: *hops,
+            via: via.to_string(),
+        },
+    }
+}
+
+fn conflict_report(
+    conflict: &tsunagi::agent::HostnameConflict,
+) -> tsunagi::ipc::HostnameConflictReport {
+    tsunagi::ipc::HostnameConflictReport {
+        name: conflict.name.clone(),
+        holder: conflict.holder.to_string(),
     }
 }
 
@@ -5260,6 +5354,7 @@ mod status_tests {
     fn network_after_a_peer_returned() -> NetworkReport {
         NetworkReport {
             exit: Default::default(),
+            hostname_conflict: None,
             broadcast: true,
             name: "LAB".into(),
             network_id: "xa7gyz".into(),
@@ -5274,6 +5369,9 @@ mod status_tests {
                 transport: "direct".into(),
                 rtt_ms: Some(24),
                 exit_node: false,
+                path: tsunagi::ipc::DataPathReport::Direct {
+                    transport: "wg".into(),
+                },
             }],
             members: vec![
                 MemberReport {
@@ -5281,12 +5379,18 @@ mod status_tests {
                     overlay_address_v4: Some("10.13.37.69".into()),
                     failed_dials: 0,
                     hostname: None,
+                    ..Default::default()
                 },
                 MemberReport {
                     endpoint_id: ONLINE.into(),
                     overlay_address_v4: Some("10.13.37.237".into()),
                     failed_dials: 0,
                     hostname: None,
+                    online: true,
+                    path: tsunagi::ipc::DataPathReport::Direct {
+                        transport: "wg".into(),
+                    },
+                    ..Default::default()
                 },
             ],
             range: Some("10.13.37.0/24".into()),
@@ -5528,6 +5632,7 @@ mod status_tests {
             overlay_address_v4: Some("10.13.37.99".into()),
             failed_dials: 9,
             hostname: None,
+            ..Default::default()
         });
 
         let rows = member_rows(&network, OWN);
@@ -5648,6 +5753,7 @@ mod status_tests {
             overlay_address_v4: Some("10.13.37.99".into()),
             failed_dials: 0,
             hostname: Some("laptop".into()),
+            ..Default::default()
         });
 
         let rows = member_rows(&network, OWN);
@@ -5668,6 +5774,7 @@ mod status_tests {
             overlay_address_v4: Some("10.13.37.99".into()),
             failed_dials: 9,
             hostname: None,
+            ..Default::default()
         });
 
         let mut out = report::Report::new();
@@ -5679,6 +5786,69 @@ mod status_tests {
         assert!(text.contains("10.13.37.99 still reserved for it"), "{text}");
         assert!(text.contains("9 dial attempt(s) failed"), "{text}");
         assert!(text.contains("1 of 2 online"), "{text}");
+    }
+
+    #[test]
+    fn a_member_reached_through_another_is_online_and_says_through_whom() {
+        // No direct link, a path through somebody else: online all the same,
+        // and said to be, rather than being shown as away or as a fault.
+        let mut network = network_after_a_peer_returned();
+        network.members.push(MemberReport {
+            endpoint_id: AWAY.into(),
+            overlay_address_v4: Some("10.13.37.99".into()),
+            hostname: Some("laptop".into()),
+            online: true,
+            path: tsunagi::ipc::DataPathReport::Relayed {
+                hops: 2,
+                via: ONLINE.into(),
+            },
+            ..Default::default()
+        });
+
+        let rows = member_rows(&network, OWN);
+        let away = rows.iter().find(|row| row.endpoint_id == AWAY).unwrap();
+        assert!(away.online());
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert!(text.contains("2 of 2 online"), "{text}");
+        assert!(
+            text.contains("relayed via music (2 hops)"),
+            "names the member it goes through: {text}"
+        );
+        assert!(!text.contains("offline"), "{text}");
+        assert_eq!(out.worst(), Health::Degraded, "{text}");
+    }
+
+    #[test]
+    fn a_name_somebody_else_holds_is_said_on_both_the_member_and_this_device() {
+        let mut network = network_after_a_peer_returned();
+        network.members[1].hostname_conflict = Some(tsunagi::ipc::HostnameConflictReport {
+            name: "music".into(),
+            holder: OWN.into(),
+        });
+        let text = {
+            let mut out = report::Report::new();
+            out.push(network_section(&network, OWN, false));
+            out.render(false)
+        };
+        assert!(
+            text.contains("name `music` is held by") && text.contains("reachable by address only"),
+            "{text}"
+        );
+
+        let mut network = network_after_a_peer_returned();
+        network.hostname_conflict = Some(tsunagi::ipc::HostnameConflictReport {
+            name: "studio".into(),
+            holder: ONLINE.into(),
+        });
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert!(text.contains("`studio` is held by music"), "{text}");
+        assert!(text.contains("tsng id hostname"), "{text}");
+        assert_eq!(out.worst(), Health::Degraded, "{text}");
     }
 
     #[test]
@@ -5710,6 +5880,9 @@ mod status_tests {
         // With a peer connected the same counter is just history.
         let mut network = network_after_a_peer_returned();
         network.peers.clear();
+        for member in &mut network.members {
+            member.online = false;
+        }
         network.overlay = Some(overlay(Vec::new()));
         network.handshake_failures = 4;
 

@@ -49,9 +49,9 @@ with relay fallback), and keep the network state among themselves.
 
 - **Two things to know:** a network name and a secret. A secret is generated for you when you make a network.
 - **Direct, encrypted links** between members (WireGuard cryptography), with relay fallback behind strict NATs.
-- **Names for machines:** `server.home` just works, even while `server` is switched off.
+- **Names for machines:** `server.home` just works, even while `server` is switched off. A name belongs to whoever claimed it first; a later device with the same name keeps working by address and is told so.
 - **Exit nodes:** send all your internet traffic through any member that offers one.
-- **Multi-hop:** members that can't reach each other directly are routed through a member that can.
+- **Multi-hop:** members that can't reach each other directly are routed through a member that can, over whatever kind of link each hop has. A member reached that way is online, and shown as relayed; traffic moves to a direct link by itself the moment one comes up.
 - **LAN games:** UDP broadcasts are relayed, so "LAN" lobbies show up across the mesh.
 - **Several networks at once** on one device.
 - **Tray app** for Windows, macOS and Linux; a command line for everything.

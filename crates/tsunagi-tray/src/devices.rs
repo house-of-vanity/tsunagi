@@ -9,12 +9,16 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
-use tsunagi::ipc::{NetworkReport, OverlayPeerReport};
+use tsunagi::ipc::{DataPathReport, NetworkReport, OverlayPeerReport};
 
 use crate::agent::{AgentClient, Command};
 use crate::exit;
 use crate::format;
 use crate::stats::{Traffic, Unit};
+
+/// A device that works but not as well as it could: reached through others,
+/// or with a name somebody else holds.
+const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa4, 0x2c);
 
 /// A readable title for a network's window.
 pub(crate) fn title(network: &NetworkReport) -> String {
@@ -23,7 +27,15 @@ pub(crate) fn title(network: &NetworkReport) -> String {
 
 /// One row of the device table, built from a tunnel and/or a signed member.
 struct Device<'a> {
+    /// The agent's own answer to whether it can be reached by any path.
     online: bool,
+    /// How packets reach it.
+    path: Option<&'a DataPathReport>,
+    /// What to call the member its traffic goes through, when it does.
+    via_name: Option<String>,
+    /// The name it claimed that another member holds, and what to call that
+    /// member.
+    name_taken: Option<(&'a str, String)>,
     /// The last hostname seen for it, kept while it is offline.
     hostname: Option<&'a str>,
     /// What clicking the hostname copies: `hostname.network`, so it resolves.
@@ -92,6 +104,13 @@ fn name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
                 format::copy_field(ui, &format!("({})", short_id(device.id)), device.id);
             }
             _ => format::copy_field(ui, &short_id(device.id), device.id),
+        }
+        if let Some((name, holder)) = &device.name_taken {
+            ui.label(egui::RichText::new(egui_phosphor::regular::WARNING).color(AMBER))
+                .on_hover_text(format!(
+                    "`{name}` was claimed first by {holder}. This device works by address, \
+                     but nobody finds it by that name."
+                ));
         }
     });
 }
@@ -276,6 +295,11 @@ fn known_ids<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<&'a str> {
     ids
 }
 
+/// How many other devices can be reached now, by any path.
+pub(crate) fn online_count(network: &NetworkReport, own_id: &str) -> usize {
+    devices(network, own_id).iter().filter(|d| d.online).count()
+}
+
 /// How many other devices this network knows of, connected or not.
 pub(crate) fn known_count(network: &NetworkReport, own_id: &str) -> usize {
     known_ids(network, own_id).len()
@@ -310,10 +334,29 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
         .map(|id| {
             let overlay = overlay_peers.iter().find(|p| p.endpoint_id == id);
             let member = network.members.iter().find(|m| m.endpoint_id == id);
-            let online = overlay.is_some_and(|p| p.handshake_secs_ago.is_some());
+            let online = member.is_some_and(|m| m.online)
+                || network.peers.iter().any(|p| p.endpoint_id == id);
+            let path = network
+                .peers
+                .iter()
+                .find(|p| p.endpoint_id == id)
+                .map(|p| &p.path)
+                .or_else(|| member.map(|m| &m.path));
+            let via_name = match path {
+                Some(DataPathReport::Relayed { via, .. }) => Some(exit::name_of(network, via)),
+                _ => None,
+            };
+            let name_taken = member.and_then(|m| {
+                m.hostname_conflict
+                    .as_ref()
+                    .map(|c| (c.name.as_str(), exit::name_of(network, &c.holder)))
+            });
             let hostname = hostnames.get(id).copied();
             Device {
                 online,
+                path,
+                via_name,
+                name_taken,
                 hostname,
                 copy: hostname.map(|h| format!("{h}.{}", network.name)),
                 id,
@@ -463,15 +506,7 @@ fn device_table(
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
             for (column, header) in [
-                "device",
-                "exit",
-                "proto",
-                "address",
-                "handshake",
-                "pkts",
-                "bytes",
-                "rate",
-                "plot",
+                "device", "exit", "proto", "address", "link", "pkts", "bytes", "rate", "plot",
             ]
             .into_iter()
             .enumerate()
@@ -496,13 +531,7 @@ fn device_table(
                         ui.weak("—");
                     }
                 });
-                cell(ui, 4, &mut widths, |ui| {
-                    ui.label(
-                        device
-                            .handshake_secs
-                            .map_or_else(|| "offline".to_string(), format::age),
-                    );
-                });
+                cell(ui, 4, &mut widths, |ui| link_cell(ui, device));
 
                 match device.overlay.filter(|_| device.online) {
                     Some(peer) => {
@@ -580,6 +609,121 @@ fn device_table(
     ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
 }
 
+/// How a device is reached, and how long its tunnel has been up.
+///
+/// A device reached through others is online, over a longer path, and says
+/// so: the colour is the only difference in how it is treated.
+fn link_cell(ui: &mut egui::Ui, device: &Device<'_>) {
+    if !device.online {
+        ui.label("offline");
+        return;
+    }
+    let (path, good) = match device.path {
+        Some(DataPathReport::Direct { transport }) => (format!("direct · {transport}"), true),
+        Some(DataPathReport::Relayed { hops, .. }) => (
+            format!(
+                "via {} · {hops} hops",
+                device.via_name.as_deref().unwrap_or("another device")
+            ),
+            false,
+        ),
+        Some(DataPathReport::None) | None => ("no data path".to_string(), false),
+    };
+    let age = device.handshake_secs.map(format::age);
+    let text = match age {
+        Some(age) => format!("{path} · {age}"),
+        None => path,
+    };
+    let response = if good {
+        ui.label(text)
+    } else {
+        ui.label(egui::RichText::new(text).color(AMBER))
+    };
+    if !good {
+        response.on_hover_text(match device.path {
+            Some(DataPathReport::Relayed { .. }) => {
+                "no direct link yet: traffic goes through another device, and moves to a \
+                 direct link by itself as soon as one comes up"
+            }
+            _ => "connected, but no path carries packets yet",
+        });
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use tsunagi::ipc::{HostnameConflictReport, MemberReport};
+
+    fn member(id: &str, online: bool, path: DataPathReport) -> MemberReport {
+        MemberReport {
+            endpoint_id: id.into(),
+            online,
+            path,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_device_reached_through_another_is_online_whatever_its_tunnel_says() {
+        // The tray used to call a device online only while its tunnel had
+        // handshaken, which disagreed with the command line about the same
+        // device. Both now read the agent's answer.
+        let network = NetworkReport {
+            members: vec![
+                member("own", true, DataPathReport::None),
+                member(
+                    "far",
+                    true,
+                    DataPathReport::Relayed {
+                        hops: 2,
+                        via: "near".into(),
+                    },
+                ),
+                member("away", false, DataPathReport::None),
+            ],
+            ..Default::default()
+        };
+        let all = devices(&network, "own");
+        let far = all.iter().find(|d| d.id == "far").unwrap();
+        assert!(far.online);
+        assert!(matches!(
+            far.path,
+            Some(DataPathReport::Relayed { hops: 2, .. })
+        ));
+        assert!(!all.iter().find(|d| d.id == "away").unwrap().online);
+        assert_eq!(online_count(&network, "own"), 1);
+        assert_eq!(known_count(&network, "own"), 2);
+    }
+
+    #[test]
+    fn a_name_somebody_else_holds_is_carried_to_the_row() {
+        let mut taken = member("late", true, DataPathReport::None);
+        taken.hostname_conflict = Some(HostnameConflictReport {
+            name: "music".into(),
+            holder: "early".into(),
+        });
+        let network = NetworkReport {
+            members: vec![member("early", true, DataPathReport::None), taken],
+            ..Default::default()
+        };
+        let all = devices(&network, "own");
+        let late = all.iter().find(|d| d.id == "late").unwrap();
+        assert_eq!(
+            late.name_taken.as_ref().map(|(name, _)| *name),
+            Some("music")
+        );
+        assert!(
+            all.iter()
+                .find(|d| d.id == "early")
+                .unwrap()
+                .name_taken
+                .is_none()
+        );
+    }
 }

@@ -3,8 +3,8 @@ use super::{FlowId, PeerId};
 use crate::config::{MAX_DATA_DATAGRAM, ROUTING_HOP_LIMIT};
 use bytes::{BufMut, Bytes, BytesMut};
 
-pub(crate) const HEADER: usize = 2 + 32 + 32 + 8;
-const VERSION: u8 = 1;
+pub(crate) const HEADER: usize = 2 + 32 + 32 + 8 + 8;
+const VERSION: u8 = 2;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Header {
@@ -12,6 +12,15 @@ pub(crate) struct Header {
     pub destination: PeerId,
     pub remaining: u8,
     pub flow: FlowId,
+    /// Which end-to-end protocol the payload belongs to, whatever links carry it.
+    pub protocol: u64,
+}
+
+/// A stable 64-bit tag for a protocol id (FNV-1a), the same on every member.
+pub(crate) fn protocol_tag(name: &str) -> u64 {
+    name.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Option<Header> {
@@ -28,16 +37,24 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Header> {
         destination: bytes[34..66].try_into().ok()?,
         remaining: bytes[1],
         flow: u64::from_be_bytes(bytes[66..74].try_into().ok()?),
+        protocol: u64::from_be_bytes(bytes[74..82].try_into().ok()?),
     })
 }
 
-pub(crate) fn encode(source: PeerId, destination: PeerId, flow: FlowId, payload: &[u8]) -> Bytes {
+pub(crate) fn encode(
+    source: PeerId,
+    destination: PeerId,
+    flow: FlowId,
+    protocol: u64,
+    payload: &[u8],
+) -> Bytes {
     let mut bytes = BytesMut::with_capacity(HEADER + payload.len());
     bytes.put_u8(VERSION);
     bytes.put_u8(ROUTING_HOP_LIMIT);
     bytes.extend_from_slice(&source);
     bytes.extend_from_slice(&destination);
     bytes.put_u64(flow);
+    bytes.put_u64(protocol);
     bytes.extend_from_slice(payload);
     bytes.freeze()
 }
@@ -58,7 +75,7 @@ mod tests {
     use super::*;
     #[test]
     fn transit_reuses_the_buffer_and_rejects_invalid_headers() {
-        let frame = encode([1; 32], [2; 32], 17, &[42; 1280]);
+        let frame = encode([1; 32], [2; 32], 17, protocol_tag("wg"), &[42; 1280]);
         let address = frame.as_ptr();
         let frame = decrement(frame);
         assert_eq!(
@@ -66,7 +83,10 @@ mod tests {
             address,
             "no payload copy for an owned buffer"
         );
-        assert_eq!(decode(&frame).unwrap().remaining, ROUTING_HOP_LIMIT - 1);
+        let header = decode(&frame).unwrap();
+        assert_eq!(header.remaining, ROUTING_HOP_LIMIT - 1);
+        assert_eq!(header.protocol, protocol_tag("wg"));
+        assert_ne!(protocol_tag("wg"), protocol_tag("wg-quic"));
         assert_eq!(&frame[HEADER..], &[42; 1280]);
         for length in 0..HEADER {
             assert!(decode(&frame[..length]).is_none());

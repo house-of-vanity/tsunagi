@@ -32,7 +32,8 @@ use super::events::Event;
 use super::session::{self, Session, SessionEvent};
 use super::shutdown::Shutdown;
 use super::status::{
-    CandidateStatus, MemberStatus, NetworkMetrics, NetworkState, NetworkStatus, PeerStatus,
+    CandidateStatus, DataPath, HostnameConflict, MemberStatus, NetworkMetrics, NetworkState,
+    NetworkStatus, PeerStatus,
 };
 
 /// An inbound connection that already passed the handshake.
@@ -320,6 +321,10 @@ struct Runtime {
             std::time::Instant,
         ),
     >,
+    /// The protocols this agent last announced, in the order it announced
+    /// them. The order is its preference, and the lower of two ids settles
+    /// which protocol a pair runs.
+    local_capabilities: Vec<PluginCapability>,
     /// What this agent last told its peers it could reach, so it is only
     /// said again when it changed.
     announced_reach: HashSet<crate::proto::message::ReachableLink>,
@@ -338,6 +343,9 @@ struct Runtime {
     /// publish a claim afterwards — the periodic check, a peer's records
     /// arriving — would silently take it back.
     released: bool,
+    /// The name this agent last said was taken, so it is said once per
+    /// change rather than on every round.
+    reported_name_taken: Option<HostnameConflict>,
     /// The address last reported as absent from the interface, so it is said
     /// once rather than for ever.
     reported_missing: Option<std::net::Ipv4Addr>,
@@ -366,6 +374,16 @@ impl Runtime {
         let (link_results_tx, link_results_rx) = mpsc::channel(64);
         let (candidate_tx, discovery_candidates) =
             mpsc::channel(params.limits.max_discovery_candidates.max(1));
+        let hub = crate::dataplane::relay::RelayHub::new(network_id, local_id);
+        // The order the protocols were configured in is also how links are
+        // preferred when a neighbour can be reached over more than one.
+        hub.set_priority(
+            params
+                .plugins
+                .iter()
+                .map(|plugin| plugin.protocol_id().to_string())
+                .collect(),
+        );
         let discovery_worker = params.discovery.as_ref().map(|backend| {
             DiscoveryWorker::spawn(
                 backend.clone(),
@@ -393,8 +411,9 @@ impl Runtime {
             dial_results_tx,
             dial_results_rx,
             links: HashMap::new(),
-            hub: crate::dataplane::relay::RelayHub::new(network_id, local_id),
+            hub,
             reachable: HashMap::new(),
+            local_capabilities: Vec::new(),
             announced_reach: HashSet::new(),
             opening: HashSet::new(),
             link_results_tx,
@@ -403,6 +422,7 @@ impl Runtime {
             reported_mismatch: HashSet::new(),
             released: false,
             reported_missing: None,
+            reported_name_taken: None,
             state: StateSet::new(),
             pending_state: Vec::new(),
             own_version: 0,
@@ -617,6 +637,8 @@ impl Runtime {
                 tracing::debug!(%err, "could not queue re-announcement");
             }
         }
+        // What was announced decides which protocol each pair runs.
+        self.update_paths();
     }
 
     /// Queues a message without blocking the runtime loop.
@@ -669,6 +691,7 @@ impl Runtime {
         // alone, so something has to look again; this runs on a timer and
         // the check is a comparison when nothing has changed.
         self.ensure_own_claim().await;
+        self.report_hostname_taken();
         // The same timer repairs the relay picture: reachability is soft
         // state, repeated while it holds and forgotten when it stops.
         self.update_paths();
@@ -1031,12 +1054,25 @@ impl Runtime {
             }
         };
 
+        // A name keeps the time it was first claimed for as long as this
+        // member keeps the name, so a later claimant cannot overtake it by
+        // the passage of time, and a new or changed name starts the clock
+        // afresh.
+        let hostname_since = wanted_hostname.as_ref().map(|name| {
+            let kept = self
+                .state
+                .get(&self.local_id)
+                .filter(|record| record.body.hostname() == Some(name.as_str()))
+                .and_then(|record| record.body.hostname_since());
+            kept.unwrap_or_else(unix_millis)
+        });
         let body = RecordBody::Claim {
             address: wanted_address,
             // The range only travels with an address, so a member of an
             // IPv6-only network does not assert one.
             range: wanted_address.and(range),
             hostname: wanted_hostname,
+            hostname_since,
         };
 
         // Nothing to say is not the same as saying nothing changed: a member
@@ -1100,6 +1136,7 @@ impl Runtime {
         for (peer, records) in std::mem::take(&mut self.pending_state) {
             self.receive_state(peer, records).await;
         }
+        self.report_hostname_taken();
     }
 
     /// Sends everything we know to every peer.
@@ -1658,68 +1695,93 @@ impl Runtime {
         }
     }
 
+    /// The protocol this agent and a member run their tunnel in, if they have
+    /// one in common.
+    ///
+    /// Both ends must name the same one without asking each other, and what
+    /// each side was configured to prefer can differ. So the member with the
+    /// lower id decides, by the order it announces its protocols in, and the
+    /// other side reads that order from the announcement it already has.
+    fn tunnel_protocol(&self, session: &Session) -> Option<String> {
+        let usable = |ours: &[PluginCapability], theirs: &[PluginCapability], name: &str| {
+            ours.iter().any(|capability| {
+                capability.enabled
+                    && capability.protocol == name
+                    && theirs.iter().any(|other| {
+                        other.enabled
+                            && other.protocol == name
+                            && other.version == capability.version
+                    })
+            })
+        };
+        let (decides, other) = if self.local_id.as_bytes() < session.peer.as_bytes() {
+            (&self.local_capabilities, &session.capabilities)
+        } else {
+            (&session.capabilities, &self.local_capabilities)
+        };
+        decides
+            .iter()
+            .find(|capability| usable(decides, other, &capability.protocol))
+            .map(|capability| capability.protocol.clone())
+    }
+
     /// Builds the graph off the packet path. Every remote row comes from that
-    /// member's authenticated control session; stale or incompatible rows never
-    /// enter the graph. The hub replaces an immutable table only on changes.
+    /// member's authenticated control session, and a row says only who that
+    /// member has a link to, never what kind of link: a member in the middle
+    /// needs no protocol in common with either end. Stale rows never enter the
+    /// graph. The hub replaces an immutable table only on changes.
     fn update_paths(&mut self) {
         self.reachable.retain(|peer, (_, heard)| {
             heard.elapsed() < REACH_EXPIRY && self.sessions.contains_key(peer)
         });
-        for (protocol, version) in self.served_protocols() {
-            let peers: Vec<_> = self
-                .sessions
-                .values()
-                .filter(|session| {
-                    session.capabilities.iter().any(|capability| {
-                        capability.enabled
-                            && capability.protocol == protocol
-                            && capability.version == version
-                    })
-                })
-                .map(|session| session.peer)
-                .collect();
-            let mut members: HashSet<_> = peers.iter().map(|peer| *peer.as_bytes()).collect();
-            members.insert(*self.local_id.as_bytes());
-            let graph = self
-                .reachable
-                .iter()
-                .filter(|(peer, _)| members.contains(peer.as_bytes()))
-                .map(|(peer, (links, _))| {
-                    let mut neighbors: Vec<_> = links
-                        .iter()
-                        .filter(|link| {
-                            link.protocol == protocol
-                                && members.contains(&link.peer)
-                                && link.peer != *peer.as_bytes()
-                        })
-                        .map(|link| link.peer)
-                        .collect();
-                    neighbors.sort_unstable();
-                    (*peer.as_bytes(), neighbors)
-                })
-                .collect();
-            self.hub.set_topology(&protocol, graph, members);
-            for peer in peers {
-                if self.hub.has_link(peer, &protocol) || !self.hub.reachable(peer, &protocol) {
-                    continue;
-                }
-                let Some(plugin) = self
-                    .params
-                    .plugins
+        let mut members: HashSet<_> = self.sessions.keys().map(|peer| *peer.as_bytes()).collect();
+        members.insert(*self.local_id.as_bytes());
+        let graph = self
+            .reachable
+            .iter()
+            .filter(|(peer, _)| members.contains(peer.as_bytes()))
+            .map(|(peer, (links, _))| {
+                let mut neighbors: Vec<_> = links
                     .iter()
-                    .find(|plugin| plugin.protocol_id() == protocol)
-                    .cloned()
-                else {
-                    continue;
-                };
-                let link = self.hub.link(peer, &protocol);
-                let path = link.path_description();
-                let max_datagram = link.max_datagram_size();
-                plugin.on_peer_link(self.network_id, peer, link);
+                    .filter(|link| members.contains(&link.peer) && link.peer != *peer.as_bytes())
+                    .map(|link| link.peer)
+                    .collect();
+                neighbors.sort_unstable();
+                neighbors.dedup();
+                (*peer.as_bytes(), neighbors)
+            })
+            .collect();
+        self.hub.set_topology(graph, members);
+
+        let wanted: Vec<(EndpointId, String)> = self
+            .sessions
+            .values()
+            .filter_map(|session| Some((session.peer, self.tunnel_protocol(session)?)))
+            .collect();
+        for (peer, protocol) in wanted {
+            if self.hub.has_link(peer, &protocol) || !self.hub.reachable(peer) {
+                continue;
+            }
+            let Some(plugin) = self
+                .params
+                .plugins
+                .iter()
+                .find(|plugin| plugin.protocol_id() == protocol)
+                .cloned()
+            else {
+                continue;
+            };
+            let link = self.hub.link(peer, &protocol);
+            let relayed = self.hub.route(peer).is_some_and(|route| route.hops > 1);
+            let path = link.path_description();
+            let max_datagram = link.max_datagram_size();
+            plugin.on_peer_link(self.network_id, peer, link);
+            // A direct link has already been reported as one.
+            if relayed {
                 self.emit(Event::DataLinkUp {
                     network: self.network_id,
                     peer,
-                    protocol: protocol.clone(),
+                    protocol,
                     path,
                     max_datagram,
                 });
@@ -1786,30 +1848,25 @@ impl Runtime {
 
     /// Hands a link to the plugin that owns its protocol.
     fn adopt_link(&mut self, peer: EndpointId, protocol: String, link: SharedLink) {
-        let Some(plugin) = self
+        if !self
             .params
             .plugins
             .iter()
-            .find(|plugin| plugin.protocol_id() == protocol)
-            .cloned()
-        else {
+            .any(|plugin| plugin.protocol_id() == protocol)
+        {
             return;
-        };
+        }
 
         let path = link.path_description();
+        let max_datagram = link.max_datagram_size();
         self.links
             .insert((peer, protocol.clone()), Arc::clone(&link));
-        // The protocol is handed the hub's link, not this one: the same
-        // object for as long as the peer is a peer, whatever happens to
-        // the path under it. A tunnel is not torn down because a direct
-        // link came or went.
-        let first_time = !self.hub.has_link(peer, &protocol);
+        // What this is, is a way to reach the peer. Which protocol's
+        // tunnel runs over it is decided in `update_paths`, and that tunnel
+        // is handed the hub's link, not this one: the same object for as
+        // long as the peer is a peer, whatever happens to the path under
+        // it. A tunnel is not torn down because a direct link came or went.
         self.hub.set_direct(peer, &protocol, link);
-        let shared = self.hub.link(peer, &protocol);
-        let max_datagram = shared.max_datagram_size();
-        if first_time {
-            plugin.on_peer_link(self.network_id, peer, shared);
-        }
         self.metrics.data_links_established += 1;
         self.emit(Event::DataLinkUp {
             network: self.network_id,
@@ -1941,6 +1998,13 @@ impl Runtime {
             });
         }
         capabilities.truncate(self.params.limits.max_capabilities);
+        self.local_capabilities = capabilities
+            .iter()
+            .map(|capability| PluginCapability {
+                data: Vec::new(),
+                ..capability.clone()
+            })
+            .collect();
         let exit_node = self.exit_ready();
         self.announced_exit = exit_node;
         Announcement {
@@ -2175,6 +2239,69 @@ impl Runtime {
 
     // ----------------------------------------------------------------- status
 
+    /// Whether a member can be reached now, by any path.
+    ///
+    /// The single definition every client reports: a live control session,
+    /// or a data path to it through other members. Being reached over a long
+    /// path is being online; how well is `data_path`'s to say.
+    fn is_online(&self, peer: EndpointId) -> bool {
+        peer == self.local_id || self.sessions.contains_key(&peer) || self.hub.reachable(peer)
+    }
+
+    /// How packets reach a member, which says nothing about whether it is
+    /// there.
+    fn data_path(&self, peer: EndpointId) -> DataPath {
+        match self.hub.route(peer) {
+            None => DataPath::None,
+            Some(route) if route.hops <= 1 => DataPath::Direct {
+                transport: self
+                    .hub
+                    .direct_kinds(peer)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default(),
+            },
+            Some(route) => DataPath::Relayed {
+                hops: route.hops,
+                via: route.via,
+            },
+        }
+    }
+
+    /// Says so when this agent's own name is held by someone else, and
+    /// again if that changes. Never anything but a statement: the agent keeps
+    /// working by address either way.
+    fn report_hostname_taken(&mut self) {
+        let taken = self.hostname_conflict_of(&self.local_id);
+        if taken == self.reported_name_taken {
+            return;
+        }
+        if let Some(conflict) = &taken {
+            tracing::warn!(
+                network = %self.network_id,
+                name = %conflict.name,
+                holder = %conflict.holder.fmt_short(),
+                "this name was claimed first by another member; it stays reachable by \
+                 address but is not found by this name until it is renamed"
+            );
+            self.emit(Event::HostnameTaken {
+                network: self.network_id,
+                name: conflict.name.clone(),
+                holder: conflict.holder,
+            });
+        }
+        self.reported_name_taken = taken;
+    }
+
+    fn hostname_conflict_of(&self, author: &EndpointId) -> Option<HostnameConflict> {
+        self.state
+            .hostname_taken(author)
+            .map(|(name, holder)| HostnameConflict {
+                name: name.to_string(),
+                holder,
+            })
+    }
+
     fn status(&self) -> NetworkStatus {
         let served = self.served_protocols();
         let mut peers: Vec<PeerStatus> = self
@@ -2212,6 +2339,7 @@ impl Runtime {
                     control_messages_received: session.messages_received,
                     control_bytes_sent: session.bytes_sent,
                     control_bytes_received: session.bytes_received,
+                    data_path: self.data_path(session.peer),
                 }
             })
             .collect();
@@ -2249,6 +2377,9 @@ impl Runtime {
                     overlay_address_v4: self.state.address_of(&endpoint_id),
                     hostname: self.state.hostname_of(&endpoint_id).map(str::to_string),
                     last_hostname: self.known_hostnames.get(&endpoint_id).cloned(),
+                    hostname_conflict: self.hostname_conflict_of(&endpoint_id),
+                    online: self.is_online(endpoint_id),
+                    data_path: self.data_path(endpoint_id),
                 })
             })
             .collect();
@@ -2276,6 +2407,7 @@ impl Runtime {
             peers,
             candidates,
             members,
+            hostname_conflict: self.hostname_conflict_of(&self.local_id),
             range: self.effective_range(),
             // Only worth reporting while it is actually stuck: with a
             // fallback in play the configured range being another
@@ -2288,6 +2420,15 @@ impl Runtime {
             relay: self.hub.counters(),
         }
     }
+}
+
+/// Milliseconds since the Unix epoch, for the time a name was first claimed.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(u64::MAX, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Which side dialled, given a role and the two identities.

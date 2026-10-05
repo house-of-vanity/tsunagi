@@ -67,10 +67,41 @@ impl Tally {
     }
 }
 
+/// The links to one neighbour, best first. Which transport carries a frame
+/// is decided here and nowhere else: the end-to-end protocol is in the
+/// envelope and never depends on it.
 #[derive(Debug)]
 struct NextHop {
     peer: PeerId,
-    link: SharedLink,
+    links: Box<[SharedLink]>,
+}
+
+impl NextHop {
+    fn usable(&self) -> bool {
+        self.links.iter().any(|link| !link.is_closed())
+    }
+
+    fn first_open(&self) -> Option<&SharedLink> {
+        self.links.iter().find(|link| !link.is_closed())
+    }
+
+    /// Hands a frame to the best open link that accepts it. A link that
+    /// cannot carry the frame (too large for its path, closed a moment ago)
+    /// leaves it to the next one; the frame is only copied when there is
+    /// another to try.
+    fn send(&self, frame: Bytes) -> Result<(), TransportError> {
+        let mut open = self.links.iter().filter(|link| !link.is_closed());
+        let Some(mut current) = open.next() else {
+            return Err(TransportError::Closed);
+        };
+        for next in open {
+            if current.send(frame.clone()).is_ok() {
+                return Ok(());
+            }
+            current = next;
+        }
+        current.send(frame)
+    }
 }
 
 #[derive(Debug)]
@@ -82,21 +113,22 @@ struct ForwardRoute {
 impl ForwardRoute {
     fn select(&self, source: &PeerId, flow: FlowId) -> Option<&NextHop> {
         if self.next.len() == 1 {
-            return self.next.first().filter(|hop| !hop.link.is_closed());
+            return self.next.first().filter(|hop| hop.usable());
         }
         let seed = u64::from_le_bytes(source[..8].try_into().ok()?);
         let start = mix64(flow ^ seed) as usize % self.next.len();
         // Stable fallback if a link closed just before its table was replaced.
         (0..self.next.len())
             .map(|i| &self.next[(start + i) % self.next.len()])
-            .find(|hop| !hop.link.is_closed())
+            .find(|hop| hop.usable())
     }
 }
 
 #[derive(Debug, Default)]
 struct ForwardingTable {
     routes: HashMap<PeerId, ForwardRoute>,
-    inboxes: HashMap<PeerId, mpsc::Sender<Bytes>>,
+    /// Local delivery, by who sent it and which end-to-end protocol it is.
+    inboxes: HashMap<(PeerId, u64), mpsc::Sender<Bytes>>,
     members: HashSet<PeerId>,
 }
 
@@ -121,7 +153,7 @@ impl Plane {
             return;
         }
         if header.destination == self.local {
-            let Some(inbox) = table.inboxes.get(&header.source) else {
+            let Some(inbox) = table.inboxes.get(&(header.source, header.protocol)) else {
                 self.tally.dropped_unknown.fetch_add(1, Ordering::Relaxed);
                 return;
             };
@@ -144,7 +176,7 @@ impl Plane {
             self.tally.dropped_no_link.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if hop.link.send(envelope::decrement(frame)).is_ok() {
+        if hop.send(envelope::decrement(frame)).is_ok() {
             self.tally.forwarded.fetch_add(1, Ordering::Relaxed);
         } else {
             self.tally.dropped_no_link.fetch_add(1, Ordering::Relaxed);
@@ -152,27 +184,65 @@ impl Plane {
     }
 }
 
+/// One physical link to a neighbour, of whatever kind of transport.
 #[derive(Debug)]
-struct Protocol {
-    plane: Arc<Plane>,
-    graph: HashMap<PeerId, Vec<PeerId>>,
-    members: HashSet<PeerId>,
-    raw: HashMap<PeerId, SharedLink>,
-    readers: HashMap<PeerId, JoinHandle<()>>,
-    links: HashMap<PeerId, Arc<PeerLink>>,
+struct RawLink {
+    kind: String,
+    link: SharedLink,
+    reader: JoinHandle<()>,
 }
 
-impl Protocol {
+/// How a destination is reached right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteSummary {
+    /// Number of transport links to it. One is a direct link.
+    pub hops: u8,
+    /// The neighbour the first link goes to. For a direct link that is the
+    /// destination itself.
+    pub via: EndpointId,
+}
+
+#[derive(Debug)]
+struct State {
+    plane: Arc<Plane>,
+    /// Transport kinds, best first. A neighbour with several links is
+    /// reached over the first of these it has.
+    priority: Vec<String>,
+    graph: HashMap<PeerId, Vec<PeerId>>,
+    members: HashSet<PeerId>,
+    raw: HashMap<PeerId, Vec<RawLink>>,
+    links: HashMap<(PeerId, String), Arc<PeerLink>>,
+}
+
+impl State {
+    fn rank(&self, kind: &str) -> usize {
+        self.priority
+            .iter()
+            .position(|known| known == kind)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// A neighbour's links, best kind first.
+    fn ordered(&self, peer: &PeerId) -> Vec<&RawLink> {
+        let mut links: Vec<&RawLink> = self
+            .raw
+            .get(peer)
+            .map(|links| links.iter().collect())
+            .unwrap_or_default();
+        links.sort_by_key(|raw| (self.rank(&raw.kind), raw.kind.clone()));
+        links
+    }
+
     fn publish(&self) {
         let mut graph = self.graph.clone();
-        graph.insert(
-            self.plane.local,
-            self.raw
-                .iter()
-                .filter(|(_, link)| !link.is_closed())
-                .map(|(peer, _)| *peer)
-                .collect(),
-        );
+        let mut neighbours: Vec<PeerId> = self
+            .raw
+            .iter()
+            .filter(|(_, links)| links.iter().any(|raw| !raw.link.is_closed()))
+            .map(|(peer, _)| *peer)
+            .collect();
+        neighbours.sort_unstable();
+        graph.insert(self.plane.local, neighbours);
         let routing = RoutingTable::build(self.plane.local, &graph, ROUTING_HOP_LIMIT);
         let routes = routing
             .iter()
@@ -181,10 +251,12 @@ impl Protocol {
                     .next_hops
                     .iter()
                     .filter_map(|id| {
-                        self.raw.get(id).map(|link| NextHop {
-                            peer: *id,
-                            link: link.clone(),
-                        })
+                        let links: Box<[_]> = self
+                            .ordered(id)
+                            .into_iter()
+                            .map(|raw| raw.link.clone())
+                            .collect();
+                        (!links.is_empty()).then_some(NextHop { peer: *id, links })
                     })
                     .collect();
                 (!next.is_empty()).then_some((
@@ -204,17 +276,21 @@ impl Protocol {
             inboxes: self
                 .links
                 .iter()
-                .map(|(peer, link)| (*peer, link.inbox_tx.clone()))
+                .map(|((peer, _), link)| ((*peer, link.tag), link.inbox_tx.clone()))
                 .collect(),
         }));
     }
+
+    fn stop_readers(&mut self) {
+        for raw in self.raw.values().flatten() {
+            raw.reader.abort();
+        }
+    }
 }
 
-impl Drop for Protocol {
+impl Drop for State {
     fn drop(&mut self) {
-        for task in self.readers.values() {
-            task.abort();
-        }
+        self.stop_readers();
         for link in self.links.values() {
             link.close();
         }
@@ -222,12 +298,17 @@ impl Drop for Protocol {
     }
 }
 
-/// One network's transport links and independently published protocol tables.
+/// One network's transport links and its published forwarding table.
+///
+/// There is one table for the whole network, whatever protocols run over it.
+/// A link is a way to reach a neighbour; a protocol is an end-to-end channel
+/// to a peer. The two meet only in the envelope, which names the protocol, so
+/// a tunnel keeps working over any mix of transports and a middle member
+/// needs no protocol in common with either end.
 #[derive(Debug)]
 pub struct RelayHub {
     network: NetworkId,
-    local: PeerId,
-    protocols: Mutex<HashMap<String, Protocol>>,
+    state: Mutex<State>,
     tally: Arc<Tally>,
     changed: Arc<Notify>,
 }
@@ -235,40 +316,38 @@ pub struct RelayHub {
 impl RelayHub {
     /// Creates the router at this network's local endpoint.
     pub fn new(network: NetworkId, local: EndpointId) -> Arc<Self> {
+        let tally = Arc::new(Tally::default());
         Arc::new(Self {
             network,
-            local: *local.as_bytes(),
-            protocols: Mutex::default(),
-            tally: Arc::default(),
+            state: Mutex::new(State {
+                plane: Arc::new(Plane {
+                    local: *local.as_bytes(),
+                    table: ArcSwap::from_pointee(ForwardingTable::default()),
+                    tally: tally.clone(),
+                }),
+                priority: Vec::new(),
+                graph: HashMap::new(),
+                members: HashSet::new(),
+                raw: HashMap::new(),
+                links: HashMap::new(),
+            }),
+            tally,
             changed: Arc::default(),
         })
     }
 
-    fn protocols(&self) -> std::sync::MutexGuard<'_, HashMap<String, Protocol>> {
-        self.protocols
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    fn protocol<'a>(
-        &self,
-        protocols: &'a mut HashMap<String, Protocol>,
-        name: &str,
-    ) -> &'a mut Protocol {
-        protocols
-            .entry(name.to_owned())
-            .or_insert_with(|| Protocol {
-                plane: Arc::new(Plane {
-                    local: self.local,
-                    table: ArcSwap::from_pointee(ForwardingTable::default()),
-                    tally: self.tally.clone(),
-                }),
-                graph: HashMap::new(),
-                members: HashSet::new(),
-                raw: HashMap::new(),
-                readers: HashMap::new(),
-                links: HashMap::new(),
-            })
+    /// Sets which kinds of transport are preferred, best first, when a
+    /// neighbour can be reached over more than one.
+    pub fn set_priority(&self, kinds: Vec<String>) {
+        let mut state = self.state();
+        if state.priority != kinds {
+            state.priority = kinds;
+            state.publish();
+        }
     }
 
     /// Wakes the control loop promptly when a transport reader ends.
@@ -282,14 +361,11 @@ impl RelayHub {
     }
 
     /// Publishes authenticated topology. Refreshing identical state is cheap.
-    pub fn set_topology(
-        &self,
-        protocol: &str,
-        graph: HashMap<PeerId, Vec<PeerId>>,
-        members: HashSet<PeerId>,
-    ) {
-        let mut protocols = self.protocols();
-        let state = self.protocol(&mut protocols, protocol);
+    ///
+    /// Every row of `graph` is one member's own account of who it has a link
+    /// to; what kind of link it is does not matter here.
+    pub fn set_topology(&self, graph: HashMap<PeerId, Vec<PeerId>>, members: HashSet<PeerId>) {
+        let mut state = self.state();
         if state.graph != graph || state.members != members {
             state.graph = graph;
             state.members = members;
@@ -298,22 +374,44 @@ impl RelayHub {
     }
 
     /// Whether the current table has a path to this destination.
-    pub fn reachable(&self, peer: EndpointId, protocol: &str) -> bool {
-        self.protocols().get(protocol).is_some_and(|state| {
-            state
-                .plane
-                .table
-                .load()
-                .routes
-                .contains_key(peer.as_bytes())
+    pub fn reachable(&self, peer: EndpointId) -> bool {
+        self.state()
+            .plane
+            .table
+            .load()
+            .routes
+            .contains_key(peer.as_bytes())
+    }
+
+    /// How a destination is reached right now, if it is.
+    pub fn route(&self, peer: EndpointId) -> Option<RouteSummary> {
+        let table = self.state().plane.table.load_full();
+        let route = table.routes.get(peer.as_bytes())?;
+        let via = EndpointId::from_bytes(&route.next.first()?.peer).ok()?;
+        Some(RouteSummary {
+            hops: route.hops,
+            via,
         })
     }
 
-    /// Stable logical link, preserved across topology changes.
+    /// The kinds of transport with an open direct link to a peer, best
+    /// first.
+    pub fn direct_kinds(&self, peer: EndpointId) -> Vec<String> {
+        let state = self.state();
+        state
+            .ordered(peer.as_bytes())
+            .into_iter()
+            .filter(|raw| !raw.link.is_closed())
+            .map(|raw| raw.kind.clone())
+            .collect()
+    }
+
+    /// Stable end-to-end channel for a protocol, preserved across topology
+    /// and transport changes.
     pub fn link(&self, peer: EndpointId, protocol: &str) -> Arc<PeerLink> {
-        let mut protocols = self.protocols();
-        let state = self.protocol(&mut protocols, protocol);
-        if let Some(link) = state.links.get(peer.as_bytes()) {
+        let mut state = self.state();
+        let key = (*peer.as_bytes(), protocol.to_owned());
+        if let Some(link) = state.links.get(&key) {
             return link.clone();
         }
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX);
@@ -321,88 +419,118 @@ impl RelayHub {
         let link = Arc::new(PeerLink {
             network: self.network,
             peer,
+            tag: envelope::protocol_tag(protocol),
             plane: state.plane.clone(),
             inbox_tx,
             inbox_rx: tokio::sync::Mutex::new(inbox_rx),
             closed,
         });
-        state.links.insert(*peer.as_bytes(), link.clone());
+        state.links.insert(key, link.clone());
         state.publish();
         link
     }
 
-    /// Whether the protocol already owns its logical link.
+    /// Whether the protocol already owns its end-to-end channel to a peer.
     pub fn has_link(&self, peer: EndpointId, protocol: &str) -> bool {
-        self.protocols()
-            .get(protocol)
-            .is_some_and(|state| state.links.contains_key(peer.as_bytes()))
+        self.state()
+            .links
+            .contains_key(&(*peer.as_bytes(), protocol.to_owned()))
     }
 
     /// Installs a raw transport link and starts its independent ingress reader.
-    pub fn set_direct(&self, peer: EndpointId, protocol: &str, raw: SharedLink) {
+    ///
+    /// A neighbour may have one link per kind of transport; installing a
+    /// second of the same kind replaces the first.
+    pub fn set_direct(&self, peer: EndpointId, kind: &str, raw: SharedLink) {
         if raw.network() != self.network || raw.peer() != peer {
             return;
         }
-        let mut protocols = self.protocols();
-        let state = self.protocol(&mut protocols, protocol);
+        let mut state = self.state();
         let id = *peer.as_bytes();
-        if let Some(old) = state.readers.remove(&id) {
-            old.abort();
-        }
-        state.raw.insert(id, raw.clone());
-        state.publish();
         let plane = state.plane.clone();
         let changed = self.changed.clone();
-        state.readers.insert(
-            id,
-            tokio::spawn(async move {
-                let mut batch = 0;
-                while let Some(frame) = raw.recv().await {
-                    plane.receive(id, frame);
-                    batch += 1;
-                    if batch == 64 {
-                        tokio::task::yield_now().await;
-                        batch = 0;
-                    }
+        let reader_link = raw.clone();
+        let reader = tokio::spawn(async move {
+            let mut batch = 0;
+            while let Some(frame) = reader_link.recv().await {
+                plane.receive(id, frame);
+                batch += 1;
+                if batch == 64 {
+                    tokio::task::yield_now().await;
+                    batch = 0;
                 }
-                changed.notify_one();
-            }),
-        );
+            }
+            changed.notify_one();
+        });
+        let links = state.raw.entry(id).or_default();
+        if let Some(position) = links.iter().position(|known| known.kind == kind) {
+            links.remove(position).reader.abort();
+        }
+        links.push(RawLink {
+            kind: kind.to_owned(),
+            link: raw,
+            reader,
+        });
+        state.publish();
     }
 
-    /// Removes a physical link without tearing down end-to-end protocol state.
-    pub fn clear_direct(&self, peer: EndpointId, protocol: &str) {
-        if let Some(state) = self.protocols().get_mut(protocol) {
-            state.raw.remove(peer.as_bytes());
-            if let Some(task) = state.readers.remove(peer.as_bytes()) {
-                task.abort();
+    /// Removes one physical link without tearing down end-to-end protocol state.
+    pub fn clear_direct(&self, peer: EndpointId, kind: &str) {
+        let mut state = self.state();
+        let mut changed = false;
+        if let Some(links) = state.raw.get_mut(peer.as_bytes()) {
+            if let Some(position) = links.iter().position(|known| known.kind == kind) {
+                links.remove(position).reader.abort();
+                changed = true;
             }
+            if links.is_empty() {
+                state.raw.remove(peer.as_bytes());
+            }
+        }
+        if changed {
             state.publish();
         }
     }
 
     /// Revokes all links and topology involving a departed authenticated peer.
     pub fn remove_peer(&self, peer: EndpointId) {
-        for state in self.protocols().values_mut() {
-            state.raw.remove(peer.as_bytes());
-            if let Some(task) = state.readers.remove(peer.as_bytes()) {
-                task.abort();
+        let mut state = self.state();
+        if let Some(links) = state.raw.remove(peer.as_bytes()) {
+            for raw in links {
+                raw.reader.abort();
             }
-            if let Some(link) = state.links.remove(peer.as_bytes()) {
+        }
+        let gone: Vec<_> = state
+            .links
+            .keys()
+            .filter(|(id, _)| id == peer.as_bytes())
+            .cloned()
+            .collect();
+        for key in gone {
+            if let Some(link) = state.links.remove(&key) {
                 link.close();
             }
-            state.members.remove(peer.as_bytes());
-            state.graph.remove(peer.as_bytes());
-            for neighbors in state.graph.values_mut() {
-                neighbors.retain(|id| id != peer.as_bytes());
-            }
-            state.publish();
         }
+        state.members.remove(peer.as_bytes());
+        state.graph.remove(peer.as_bytes());
+        for neighbors in state.graph.values_mut() {
+            neighbors.retain(|id| id != peer.as_bytes());
+        }
+        state.publish();
     }
 
     /// Stops every reader and releases all transport handles.
     pub fn close(&self) {
-        self.protocols().clear();
+        let mut state = self.state();
+        state.stop_readers();
+        state.raw.clear();
+        for link in state.links.values() {
+            link.close();
+        }
+        state.links.clear();
+        state.graph.clear();
+        state.members.clear();
+        state.plane.table.store(Arc::default());
     }
 }
 
@@ -411,6 +539,7 @@ impl RelayHub {
 pub struct PeerLink {
     network: NetworkId,
     peer: EndpointId,
+    tag: u64,
     plane: Arc<Plane>,
     inbox_tx: mpsc::Sender<Bytes>,
     inbox_rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
@@ -454,10 +583,11 @@ impl PacketLink for PeerLink {
         let hop = route
             .select(&self.plane.local, flow)
             .ok_or(TransportError::Closed)?;
-        hop.link.send(envelope::encode(
+        hop.send(envelope::encode(
             self.plane.local,
             *self.peer.as_bytes(),
             flow,
+            self.tag,
             &payload,
         ))?;
         if route.hops > 1 {
@@ -489,7 +619,9 @@ impl PacketLink for PeerLink {
     fn path_description(&self) -> String {
         let table = self.plane.table.load();
         match table.routes.get(self.peer.as_bytes()) {
-            Some(route) if route.hops == 1 => route.next[0].link.path_description(),
+            Some(route) if route.hops == 1 => route.next[0]
+                .first_open()
+                .map_or_else(|| "unreachable".into(), |link| link.path_description()),
             Some(route) => format!(
                 "relay {} hops via {} ({} equal paths)",
                 route.hops,

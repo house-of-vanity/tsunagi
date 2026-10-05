@@ -42,6 +42,7 @@ fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::R
                             transport: format!("{:?}", peer.transport),
                             rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
                             exit_node: peer.exit_node,
+                            path: Default::default(),
                         })
                         .collect(),
                     overlay: plugin.overview(net.network_id).map(|view| {

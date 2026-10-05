@@ -129,6 +129,19 @@ pub enum Event {
         /// Why it is not up.
         reason: String,
     },
+    /// The name this agent claimed was claimed first by another member.
+    ///
+    /// Nothing stops working: this agent keeps its address and every
+    /// connection. It just is not found by that name until it is renamed or
+    /// the member that holds the name lets it go.
+    HostnameTaken {
+        /// The network.
+        network: NetworkId,
+        /// The name that is taken.
+        name: String,
+        /// The member that holds it.
+        holder: EndpointId,
+    },
     /// An IP plugin reported an error. Never fatal.
     PluginError {
         /// The network the call was scoped to.

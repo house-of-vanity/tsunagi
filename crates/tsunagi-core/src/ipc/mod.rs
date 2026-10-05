@@ -484,9 +484,41 @@ pub struct NetworkReport {
     pub range_conflict: Option<String>,
     /// The overlay, when a protocol is running one.
     pub overlay: Option<OverlayReport>,
+    /// This agent's own name, when another member claimed it first.
+    pub hostname_conflict: Option<HostnameConflictReport>,
     /// Exit-node settings: whether this agent offers one, and whether it
     /// uses one.
     pub exit: ExitReport,
+}
+
+/// How packets reach a member right now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataPathReport {
+    /// Nothing carries packets to it: it is away, or only connected for
+    /// control while a data path is being set up.
+    #[default]
+    None,
+    /// A direct link.
+    Direct {
+        /// The kind of transport carrying it, e.g. `wg`.
+        transport: String,
+    },
+    /// Through other members.
+    Relayed {
+        /// Number of links on the way, at least two.
+        hops: u8,
+        /// The member the first of them goes to, as an endpoint id.
+        via: String,
+    },
+}
+
+/// A name somebody else claimed first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostnameConflictReport {
+    /// The name that is taken.
+    pub name: String,
+    /// The member that holds it, as an endpoint id.
+    pub holder: String,
 }
 
 /// One member of the network, from signed state.
@@ -500,6 +532,15 @@ pub struct MemberReport {
     pub failed_dials: u32,
     /// The last hostname this agent saw it announce, kept while it is away.
     pub hostname: Option<String>,
+    /// Whether this agent can reach it now, by any path. The one answer
+    /// every client gives to "is it online": a member reached through
+    /// others is online, over a longer path.
+    pub online: bool,
+    /// How packets reach it.
+    pub path: DataPathReport,
+    /// The name it claimed, when somebody else claimed it first. It still
+    /// works by address; it is not found by that name.
+    pub hostname_conflict: Option<HostnameConflictReport>,
 }
 
 /// One control plane peer.
@@ -516,6 +557,8 @@ pub struct PeerReport {
     pub rtt_ms: Option<u64>,
     /// The peer offers itself as an exit node in this network.
     pub exit_node: bool,
+    /// How packets reach it.
+    pub path: DataPathReport,
 }
 
 /// The WireGuard overlay of one network.
@@ -779,7 +822,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 17]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 18]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///

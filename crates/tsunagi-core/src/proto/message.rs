@@ -20,7 +20,7 @@ use crate::error::ProtocolError;
 /// The version in the ALPN is the wire-compatibility version of the control
 /// protocol. It is independent of the network identity scheme version, so
 /// bumping it must not change any existing [`crate::NetworkId`].
-pub const ALPN: &[u8] = b"tsunagi/ctrl/4";
+pub const ALPN: &[u8] = b"tsunagi/ctrl/5";
 
 /// ALPN of the tsunagi data plane.
 ///
@@ -30,9 +30,11 @@ pub const ALPN: &[u8] = b"tsunagi/ctrl/4";
 /// transport underneath can be replaced without touching the control protocol.
 ///
 /// Version 4 adds source, destination, hop limit and stable flow id above
-/// transport fragmentation. All members must upgrade together. Persistent
-/// identities and network configuration do not change.
-pub const DATA_ALPN: &[u8] = b"tsunagi/data/4";
+/// transport fragmentation. Version 5 adds the end-to-end protocol to that
+/// envelope, so a tunnel no longer depends on the kind of link under it, and
+/// a first-claimed time to a signed hostname claim. All members must upgrade
+/// together. Persistent identities and network configuration do not change.
+pub const DATA_ALPN: &[u8] = b"tsunagi/data/5";
 
 /// Largest plugin protocol identifier accepted when opening a data channel.
 pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
@@ -41,7 +43,7 @@ pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
 pub const MAX_SIGNATURE_LEN: usize = 64;
 
 /// Control protocol version carried inside the handshake.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// First message of the handshake, sent by the initiator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

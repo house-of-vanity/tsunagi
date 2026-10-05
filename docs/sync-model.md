@@ -43,7 +43,9 @@ document trusted merely because the neighbour who forwarded it signed it.
 - Duplicates do not change the result.
 - Two conflicting signed records at the same version from the same author need
   explicit handling; they are not resolved by luck.
-- Neither arrival order nor system clocks decide a winner.
+- Neither arrival order nor the receiving replica's clock decides a winner. The
+  one thing an author's own clock is used for is the time it first claimed a
+  hostname, signed into its record (see below).
 - Compaction must not drop what is needed to stop revoked records being
   resurrected.
 
@@ -52,6 +54,22 @@ document trusted merely because the neighbour who forwarded it signed it.
 A hostname is a mutable binding to a persistent author, not an identity. A
 rename must be a signed record that revokes the specific old binding and
 announces the new one, ideally atomically in one record.
+
+A hostname belongs to the member that claimed it **first**. Each claim carries
+`hostname_since`, the author's own time in milliseconds when it first claimed
+that exact name, signed with the rest of the record and kept across every later
+version that keeps the name; renaming starts it afresh. Replicas order claims
+by `(hostname_since, author id)`, a pure function of the records, so every
+replica names the same holder whatever order the records arrived in and there
+is no race to lose. A member that arrives later with a name already held keeps
+working by address and keeps its claim, but is not found by that name on any
+member; it is told so in its status and in `tsng status`, and finds the name
+again if the holder renames or releases it.
+
+It is the author's word, so a member with a clock set far back can claim an
+older time. That can reorder who holds a *name* and nothing else — addresses,
+keys and everything the data plane trusts are decided without it — and anybody
+who knows the secret could take a name by other means anyway.
 
 Turning a computer off is not a revocation of its hostname and does not remove
 the participant. Revocations are not dropped merely because they are old, and

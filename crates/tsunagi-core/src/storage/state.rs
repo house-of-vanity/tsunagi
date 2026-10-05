@@ -21,7 +21,7 @@ use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
 use crate::state::{RecordBody, SignedRecord};
 
 /// Schema version written by this build.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Key of the stored hostname setting.
 const SETTING_HOSTNAME: &str = "hostname";
@@ -220,6 +220,23 @@ impl StateStore {
                      COMMIT;",
                 )
                 .map_err(|err| self.corrupt(format!("cannot migrate schema to 6: {err}")))?;
+        }
+        // Migration 6 -> 7: a claim gained the time its hostname was first
+        // claimed, which changed the signing domain. Records signed before
+        // no longer verify, so they are discarded rather than kept as rows
+        // every read has to reject; each member re-publishes its own claim on
+        // its next run and the others arrive again from their authors. The
+        // version counter is kept, so nothing is ever published twice at one
+        // version.
+        if found < 7 {
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+                     DELETE FROM signed_records;
+                     PRAGMA user_version = 7;
+                     COMMIT;",
+                )
+                .map_err(|err| self.corrupt(format!("cannot migrate schema to 7: {err}")))?;
         }
         Ok(())
     }

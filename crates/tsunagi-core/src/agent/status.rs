@@ -59,6 +59,43 @@ pub struct OverlayStatus {
     pub broadcast_rules: Option<crate::overlay::BroadcastRulesReport>,
 }
 
+/// How packets reach a member right now.
+///
+/// Being reachable is one thing and being reachable well is another, and
+/// the second is never a reason to call a member away: a member that can only
+/// be reached through somebody else is online, over a longer path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataPath {
+    /// Nothing carries packets to it yet. The member is connected for
+    /// control only, which is the state of a data path being set up.
+    None,
+    /// A direct link, of the named kind of transport.
+    Direct {
+        /// The kind of transport carrying it, e.g. `wg`.
+        transport: String,
+    },
+    /// Through other members.
+    Relayed {
+        /// Number of links on the way, at least two.
+        hops: u8,
+        /// The member the first of them goes to.
+        via: EndpointId,
+    },
+}
+
+/// A name that a member claimed and somebody else holds.
+///
+/// A name belongs to whoever claimed it first. The member that claimed it
+/// later is still a member and still reachable by its address; it is just
+/// not found by that name, on any member of the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostnameConflict {
+    /// The name that is taken.
+    pub name: String,
+    /// The member that holds it.
+    pub holder: EndpointId,
+}
+
 /// A member the signed state knows about, connected or not.
 ///
 /// This is the durable roster: it comes from signed records, so a member that
@@ -85,6 +122,15 @@ pub struct MemberStatus {
     /// Not signed, so it is a convenience for naming a member that is away
     /// and never a claim: the zone is served from `hostname`.
     pub last_hostname: Option<String>,
+    /// The name it claimed, when somebody else claimed it first.
+    pub hostname_conflict: Option<HostnameConflict>,
+    /// Whether this agent can reach it now, by any path: a live control
+    /// session, or a data path through other members. The one answer to "is
+    /// it online" for every client, so that none of them has to work it out
+    /// from a different part of the picture. This agent counts as online.
+    pub online: bool,
+    /// How packets reach it. [`DataPath::None`] while it is offline.
+    pub data_path: DataPath,
 }
 
 /// Status of one authenticated session.
@@ -128,6 +174,8 @@ pub struct PeerStatus {
     pub control_bytes_sent: u64,
     /// Control payload bytes read from this session.
     pub control_bytes_received: u64,
+    /// How packets reach this peer right now.
+    pub data_path: DataPath,
 }
 
 /// Counters scoped to one logical network.
@@ -188,6 +236,10 @@ pub struct NetworkStatus {
     pub candidates: Vec<CandidateStatus>,
     /// Members the signed state knows about, whether connected or not.
     pub members: Vec<MemberStatus>,
+    /// This agent's own name, when another member claimed it first and so
+    /// holds it. This agent keeps working by address; nobody finds it by
+    /// this name until it is renamed or the other member lets it go.
+    pub hostname_conflict: Option<HostnameConflict>,
     /// The overlay range this network uses, once it has one.
     pub range: Option<crate::state::Ipv4Range>,
     /// The range it could not have, because another network on this agent

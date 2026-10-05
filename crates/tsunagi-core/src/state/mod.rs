@@ -150,7 +150,7 @@ pub fn derived_ipv4_range(network: NetworkId) -> Ipv4Range {
 }
 
 /// Frozen domain separator for the bytes a record signature covers.
-pub const RECORD_DOMAIN: &str = "tsunagi-signed-record-v2";
+pub const RECORD_DOMAIN: &str = "tsunagi-signed-record-v3";
 
 /// Longest hostname a record may carry.
 ///
@@ -207,6 +207,18 @@ pub enum RecordBody {
         range: Option<Ipv4Range>,
         /// The name this author answers to.
         hostname: Option<String>,
+        /// When this author first claimed that name, in milliseconds since
+        /// the Unix epoch, kept across every later version that keeps the
+        /// name. It is what makes a name belong to whoever claimed it first
+        /// rather than to whoever happens to sort lowest, so a member that
+        /// arrives later with the same name cannot take it over.
+        ///
+        /// The author's own word: a member with a wrong clock can claim an
+        /// earlier time. That costs it nothing it could not do by other
+        /// means, since anybody who knows the network secret is a member,
+        /// and it cannot take an address or reach anything it was not
+        /// already entitled to.
+        hostname_since: Option<u64>,
     },
     /// This author gives up everything it claimed.
     ///
@@ -243,6 +255,14 @@ impl RecordBody {
         }
     }
 
+    /// When the author first claimed the hostname, if it has one.
+    pub fn hostname_since(&self) -> Option<u64> {
+        match self {
+            RecordBody::Claim { hostname_since, .. } => *hostname_since,
+            RecordBody::Release => None,
+        }
+    }
+
     fn canonical(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(96);
         match self {
@@ -250,6 +270,7 @@ impl RecordBody {
                 address,
                 range,
                 hostname,
+                hostname_since,
             } => {
                 push_lp(&mut out, b"claim");
                 push_opt(
@@ -270,6 +291,13 @@ impl RecordBody {
                         .as_deref(),
                 );
                 push_opt(&mut out, hostname.as_deref().map(str::as_bytes));
+                push_opt(
+                    &mut out,
+                    hostname_since
+                        .map(|since| since.to_be_bytes())
+                        .as_ref()
+                        .map(|bytes| &bytes[..]),
+                );
             }
             RecordBody::Release => {
                 push_lp(&mut out, b"release");
@@ -391,8 +419,12 @@ impl SignedRecord {
             address,
             range,
             hostname,
+            hostname_since,
         } = &self.body
         {
+            if hostname.is_none() && hostname_since.is_some() {
+                return Err(StateError::Malformed("a time was claimed for no hostname"));
+            }
             // Bounds before anything is believed, because all of this came
             // off the network.
             if let Some(range) = range {
@@ -585,31 +617,52 @@ impl StateSet {
 
     /// Who currently holds each claimed hostname.
     ///
-    /// The same rule as addresses, for the same reason: a name is owned, two
-    /// members may claim one, and every replica has to reach the same answer
-    /// about who has it without asking anybody.
+    /// A name belongs to the member that claimed it first, and the others
+    /// that claim it keep working by address but are not found by that name.
+    /// "First" is the time each author signed into its own claim, with the
+    /// lower id deciding a tie and a claim with no time counting as last, so
+    /// every replica reaches the same answer about who has it without
+    /// asking anybody. It is a pure function of the records: nothing depends
+    /// on the order they arrived in, so there is no race to lose.
     pub fn hostname_holders(&self) -> HashMap<String, EndpointId> {
-        let mut holders: HashMap<String, EndpointId> = HashMap::new();
+        let mut holders: HashMap<String, (u64, EndpointId)> = HashMap::new();
         for (author, record) in &self.records {
             let Some(hostname) = record.body.hostname() else {
                 continue;
             };
+            let claim = (record.body.hostname_since().unwrap_or(u64::MAX), *author);
             holders
                 .entry(hostname.to_string())
                 .and_modify(|held| {
-                    if author.as_bytes() < held.as_bytes() {
-                        *held = *author;
+                    if (claim.0, claim.1.as_bytes()) < (held.0, held.1.as_bytes()) {
+                        *held = claim;
                     }
                 })
-                .or_insert(*author);
+                .or_insert(claim);
         }
         holders
+            .into_iter()
+            .map(|(hostname, (_, author))| (hostname, author))
+            .collect()
     }
 
     /// The hostname an author holds, if it holds one uncontested.
     pub fn hostname_of(&self, author: &EndpointId) -> Option<&str> {
         let hostname = self.records.get(author)?.body.hostname()?;
         (self.hostname_holders().get(hostname) == Some(author)).then_some(hostname)
+    }
+
+    /// The name an author claimed and the member that holds it instead, when
+    /// somebody who claimed it earlier does.
+    pub fn hostname_taken(&self, author: &EndpointId) -> Option<(&str, EndpointId)> {
+        let hostname = self.records.get(author)?.body.hostname()?;
+        let holder = *self.hostname_holders().get(hostname)?;
+        (holder != *author).then_some((hostname, holder))
+    }
+
+    /// When an author first claimed the name it holds now, if it has one.
+    pub fn hostname_since_of(&self, author: &EndpointId) -> Option<u64> {
+        self.records.get(author)?.body.hostname_since()
     }
 
     /// The address an author holds, if it holds one uncontested.
@@ -661,6 +714,7 @@ mod tests {
             address: Some(address.parse().unwrap()),
             range: Some(range()),
             hostname: None,
+            hostname_since: None,
         }
     }
 
@@ -720,6 +774,7 @@ mod tests {
                 address: Some("10.99.0.1".parse().unwrap()),
                 range: Some(range()),
                 hostname: None,
+                hostname_since: None,
             },
         );
         assert!(matches!(outside.verify(id), Err(StateError::Malformed(_))));
@@ -735,6 +790,7 @@ mod tests {
                     prefix_len: 31,
                 }),
                 hostname: None,
+                hostname_since: None,
             },
         );
         assert!(matches!(no_hosts.verify(id), Err(StateError::Malformed(_))));
@@ -776,6 +832,7 @@ mod tests {
                     address: None,
                     range: None,
                     hostname: Some(bad.to_string()),
+                    hostname_since: None,
                 },
             );
             assert!(
@@ -797,6 +854,7 @@ mod tests {
                 address: Some("10.13.37.5".parse().unwrap()),
                 range: None,
                 hostname: None,
+                hostname_since: None,
             },
         );
         assert!(matches!(record.verify(id), Err(StateError::Malformed(_))));
@@ -818,6 +876,7 @@ mod tests {
                     address: None,
                     range: None,
                     hostname: Some("music".into()),
+                    hostname_since: None,
                 },
             )
         };
@@ -860,6 +919,7 @@ mod tests {
                     address: None,
                     range: None,
                     hostname: Some(name.to_string()),
+                    hostname_since: None,
                 },
             )
         };
@@ -879,6 +939,109 @@ mod tests {
         assert_eq!(set.hostname_of(&secret.public()), Some("new"));
     }
 
+    fn named_at(
+        secret: &SecretKey,
+        id: NetworkId,
+        version: u64,
+        name: &str,
+        since: u64,
+    ) -> SignedRecord {
+        SignedRecord::sign(
+            secret,
+            id,
+            version,
+            RecordBody::Claim {
+                address: None,
+                range: None,
+                hostname: Some(name.into()),
+                hostname_since: Some(since),
+            },
+        )
+    }
+
+    #[test]
+    fn a_name_belongs_to_whoever_claimed_it_first_whatever_their_ids_or_arrival_order() {
+        let id = network("naming");
+        let mut keys = [SecretKey::generate(), SecretKey::generate()];
+        keys.sort_by_key(|key| *key.public().as_bytes());
+        let [low, high] = keys;
+
+        // The member with the higher id claimed first, so it holds the name,
+        // and the lower id does not take it back by sorting first.
+        let early = named_at(&high, id, 1, "music", 1_000);
+        let late = named_at(&low, id, 1, "music", 2_000);
+        for order in [[&early, &late], [&late, &early]] {
+            let mut set = StateSet::new();
+            for record in order {
+                set.merge(id, (*record).clone()).unwrap();
+            }
+            assert_eq!(set.hostname_of(&high.public()), Some("music"));
+            assert_eq!(set.hostname_of(&low.public()), None);
+            assert_eq!(
+                set.hostname_taken(&low.public()),
+                Some(("music", high.public()))
+            );
+            assert_eq!(set.hostname_taken(&high.public()), None);
+        }
+
+        // At the same instant the lower id decides, the same way everywhere.
+        let mut set = StateSet::new();
+        set.merge(id, named_at(&high, id, 1, "music", 5)).unwrap();
+        set.merge(id, named_at(&low, id, 1, "music", 5)).unwrap();
+        assert_eq!(set.hostname_of(&low.public()), Some("music"));
+        assert_eq!(set.hostname_of(&high.public()), None);
+    }
+
+    #[test]
+    fn a_name_that_loses_is_found_again_once_the_holder_lets_it_go() {
+        let id = network("naming");
+        let first = SecretKey::generate();
+        let second = SecretKey::generate();
+        let mut set = StateSet::new();
+        set.merge(id, named_at(&first, id, 1, "music", 1)).unwrap();
+        set.merge(id, named_at(&second, id, 1, "music", 2)).unwrap();
+        assert_eq!(set.hostname_of(&second.public()), None);
+
+        // Renaming starts the clock afresh, so it cannot be used to jump the
+        // queue for a name somebody else already holds.
+        set.merge(id, named_at(&first, id, 2, "other", 3)).unwrap();
+        assert_eq!(set.hostname_of(&second.public()), Some("music"));
+        set.merge(id, named_at(&first, id, 3, "music", 4)).unwrap();
+        assert_eq!(set.hostname_of(&second.public()), Some("music"));
+        assert_eq!(set.hostname_of(&first.public()), None);
+
+        // And a release hands it on.
+        set.merge(id, SignedRecord::sign(&second, id, 2, RecordBody::Release))
+            .unwrap();
+        assert_eq!(set.hostname_of(&first.public()), Some("music"));
+    }
+
+    #[test]
+    fn a_time_with_no_name_is_not_a_valid_claim() {
+        let id = network("naming");
+        let secret = SecretKey::generate();
+        let record = SignedRecord::sign(
+            &secret,
+            id,
+            1,
+            RecordBody::Claim {
+                address: None,
+                range: None,
+                hostname: None,
+                hostname_since: Some(1),
+            },
+        );
+        assert!(matches!(record.verify(id), Err(StateError::Malformed(_))));
+
+        // The time is signed: moving it breaks the signature, so nobody can
+        // improve another member's place in the queue.
+        let mut forged = named_at(&secret, id, 1, "music", 9_000);
+        if let RecordBody::Claim { hostname_since, .. } = &mut forged.body {
+            *hostname_since = Some(1);
+        }
+        assert_eq!(forged.verify(id).unwrap_err(), StateError::BadSignature);
+    }
+
     #[test]
     fn a_release_gives_up_the_name_as_well_as_the_address() {
         let secret = SecretKey::generate();
@@ -894,6 +1057,7 @@ mod tests {
                     address: Some("10.13.37.5".parse().unwrap()),
                     range: Some(range()),
                     hostname: Some("music".into()),
+                    hostname_since: None,
                 },
             ),
         )
@@ -1057,6 +1221,7 @@ mod tests {
                     address: Some("10.99.0.7".parse().unwrap()),
                     range: Some(custom),
                     hostname: None,
+                    hostname_since: None,
                 },
             ),
         )

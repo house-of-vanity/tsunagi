@@ -9,7 +9,7 @@ Two versions exist and are independent:
 
 - **Identity scheme**, `tsunagi-network-id-v1`. Frozen. Changing it creates a
   different network space for the same name and secret.
-- **Control protocol**, ALPN `tsunagi/ctrl/4`, `PROTOCOL_VERSION = 4`.
+- **Control protocol**, ALPN `tsunagi/ctrl/5`, `PROTOCOL_VERSION = 5`.
 
 Upgrading the crate or bumping the control protocol must never change an
 existing `NetworkId`.
@@ -135,7 +135,7 @@ event does not report a network id.
 ## The data plane protocol
 
 IP plugin packets never travel on a control connection. They use their own
-ALPN, `tsunagi/data/4`, on their own iroh connection:
+ALPN, `tsunagi/data/5`, on their own iroh connection:
 
 ```text
 initiator -> responder : (the same membership handshake as above)
@@ -172,31 +172,45 @@ holding up subsequent packets. Packet IDs are scoped to a QUIC connection;
 reassembly is created only after the membership handshake. All limits live in
 `config.rs`. There is no transport-layer retransmission added by this framing.
 
-Version 4 adds a routing envelope inside the transport fragmentation framing:
+Version 4 added a routing envelope inside the transport fragmentation framing,
+and version 5 added the end-to-end protocol to it:
 
 | field | bytes | encoding |
 |---|---:|---|
-| envelope version | 1 | `1` |
+| envelope version | 1 | `2` |
 | remaining hops | 1 | initially `16`; transit decrements, drops at `1` |
 | source peer | 32 | original endpoint public key |
 | destination peer | 32 | final endpoint public key |
 | flow id | 8 | big endian opaque stable hash supplied by the plugin |
+| protocol | 8 | big endian FNV-1a of the end-to-end protocol id (`wg`, `tcp-tls`, ...) |
 | payload | remaining | end-to-end encrypted plugin bytes |
 
-The fixed header is 74 bytes. Zero/oversized hop limits, unknown versions,
+The fixed header is 82 bytes. Zero/oversized hop limits, unknown versions,
 short frames, oversized datagrams and unknown sources are rejected. A frame
-addressed here is delivered to its source's protocol inbox; transit goes straight
-to its next transport. The network and protocol are bound to the authenticated
-transport connection, not supplied by the frame. Intermediate nodes cannot
-decrypt or authenticate the inner WireGuard payload; the destination does that.
-Flow ids are routing hints, not authorization proofs.
+addressed here is delivered to the inbox of its source and protocol; transit
+goes straight to its next transport, whatever kind of transport that is. The
+network is bound to the authenticated transport connection, not supplied by
+the frame. The protocol names which end-to-end tunnel the payload belongs to
+and is independent of the links it crosses: a datagram of one protocol can
+travel over a link opened for another, and a middle member needs no protocol
+in common with either end. Intermediate nodes cannot decrypt or authenticate
+the inner payload; the destination's tunnel does that, so a frame naming the
+wrong protocol or a forged source is simply discarded there. Flow ids are
+routing hints, not authorization proofs.
 
-Control ALPN 3 carries `Reachable { links: [{ peer, protocol }] }`. Each row
-belongs to the authenticated sender and is replaced atomically, expires after
-90 seconds, and is withdrawn on session closure. Only compatible authenticated
-members enter a protocol's graph; local edges always come from actual links.
+`Reachable { links: [{ peer, protocol }] }` lists the sender's direct links;
+`protocol` is the kind of transport the link is, for diagnostics, and routing
+ignores it. Each row belongs to the authenticated sender and is replaced
+atomically, expires after 90 seconds, and is withdrawn on session closure. Only
+authenticated members enter the graph; local edges always come from actual
+links.
 Announcements refresh on the existing control maintenance interval and are
 sent immediately on link changes. Topology stays volatile, outside signed state.
+
+Version 5 also adds `hostname_since` to a signed hostname claim (signing domain
+`tsunagi-signed-record-v3`): a name belongs to whoever claimed it first. Stored
+records signed before are discarded on upgrade and re-published by their
+authors.
 
 Upgrade both endpoints and intermediate peers together. Older control and data
 ALPNs cannot interoperate. The network secret, device identity, identity
@@ -220,7 +234,7 @@ not affect other networks.
 | `Pong { seq, payload }` | the echoed reply |
 | `State { records }` | a snapshot of signed records, merged into what the receiver holds |
 | `Peers { peers }` | unverified member address hints, requiring their own handshake |
-| `Reachable { links }` | sender's current direct data links, scoped by protocol |
+| `Reachable { links }` | sender's current direct data links, by kind of transport |
 | `Bye { reason }` | graceful goodbye; not a revocation of anything |
 
 `broadcast` is a per-network local opt-in, enabled by default and treated as

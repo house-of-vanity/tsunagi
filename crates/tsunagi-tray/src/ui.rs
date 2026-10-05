@@ -243,8 +243,8 @@ fn draw_network(
                 }
                 ui.weak("peers");
                 ui.label(format!(
-                    "{} connected · {} known",
-                    network.peers.len(),
+                    "{} online · {} known",
+                    devices::online_count(network, own_id),
                     devices::known_count(network, own_id)
                 ));
                 ui.end_row();

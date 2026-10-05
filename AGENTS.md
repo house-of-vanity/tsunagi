@@ -59,8 +59,10 @@ Keep these separate. Crossing them is the main thing to review for.
   other peers goes link in, link out: it is never written to the middle's
   interface or decrypted there. Multihop routing has a bounded hop limit;
   equal-cost next hops are chosen per flow. Reachability is first-hand and
-  volatile: each authenticated member advertises its own protocol-specific
-  links. Build routing tables on topology changes, never per packet. Transit
+  volatile: each authenticated member advertises its own direct links, of
+  whatever kind. A link is a way to reach a neighbour and a protocol is an
+  end-to-end tunnel to a peer; the two meet only in the envelope, so a
+  tunnel never depends on which transports carry it. Build routing tables on topology changes, never per packet. Transit
   must not acquire a routing mutex or wait for a protocol/TUN reader.
 - **Broadcast fanout belongs at local IP ingress.** Participation is local to
   each network, enabled by default, persisted and advertised to authenticated

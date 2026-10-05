@@ -16,6 +16,9 @@ fn peer(seed: u8) -> EndpointId {
 fn id(seed: u8) -> PeerId {
     *peer(seed).as_bytes()
 }
+fn tag() -> u64 {
+    envelope::protocol_tag("ip")
+}
 
 #[derive(Debug)]
 struct Wire {
@@ -78,9 +81,8 @@ impl PacketLink for Wire {
     }
 }
 
-fn topology(hub: &RelayHub, protocol: &str, edges: &[(u8, &[u8])], members: &[u8]) {
+fn topology(hub: &RelayHub, edges: &[(u8, &[u8])], members: &[u8]) {
     hub.set_topology(
-        protocol,
         edges
             .iter()
             .map(|(a, bs)| (id(*a), bs.iter().map(|b| id(*b)).collect()))
@@ -96,7 +98,7 @@ async fn ecmp_is_per_flow_direct_wins_and_existing_tunnel_survives_changes() {
     let c = Wire::new(3, true);
     hub.set_direct(peer(2), "ip", b.clone());
     hub.set_direct(peer(3), "ip", c.clone());
-    topology(&hub, "ip", &[(2, &[4]), (3, &[4])], &[1, 2, 3, 4]);
+    topology(&hub, &[(2, &[4]), (3, &[4])], &[1, 2, 3, 4]);
     let link = hub.link(peer(4), "ip");
     let mut chosen = HashMap::new();
     for _ in 0..8 {
@@ -132,7 +134,7 @@ async fn ecmp_is_per_flow_direct_wins_and_existing_tunnel_survives_changes() {
     }
     assert_eq!(c.take().len(), 100);
     hub.clear_direct(peer(2), "ip");
-    topology(&hub, "ip", &[(3, &[])], &[1, 2, 3, 4]);
+    topology(&hub, &[(3, &[])], &[1, 2, 3, 4]);
     assert!(link.send(Bytes::new()).is_err());
     assert!(!link.is_closed());
     assert!(Arc::ptr_eq(&link, &hub.link(peer(4), "ip")));
@@ -152,8 +154,8 @@ async fn transport_reader_forwards_without_any_plugin_reader_and_isolates_protoc
     let c = Wire::new(3, true);
     hub.set_direct(peer(1), "ip", a.clone());
     hub.set_direct(peer(3), "ip", c.clone());
-    topology(&hub, "ip", &[(3, &[4])], &[1, 2, 3, 4]);
-    let frame = envelope::encode(id(1), id(4), 91, b"end-to-end encrypted");
+    topology(&hub, &[(3, &[4])], &[1, 2, 3, 4]);
+    let frame = envelope::encode(id(1), id(4), 91, tag(), b"end-to-end encrypted");
     let pointer = frame.as_ptr();
     a.feed.send(frame).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -170,9 +172,133 @@ async fn transport_reader_forwards_without_any_plugin_reader_and_isolates_protoc
         ROUTING_HOP_LIMIT - 1
     );
     assert_eq!(&sent[0][RELAY_OVERHEAD..], b"end-to-end encrypted");
-    let isolated = hub.link(peer(4), "other-ip");
-    assert!(isolated.send(Bytes::new()).is_err());
     assert_eq!(hub.counters().forwarded, 1);
+    hub.close();
+}
+
+#[tokio::test]
+async fn a_frame_is_delivered_only_to_the_protocol_it_names() {
+    let hub = RelayHub::new(network(), peer(2));
+    hub.set_direct(peer(1), "ip", Wire::new(1, true));
+    let ip = hub.link(peer(1), "ip");
+    let other = hub.link(peer(1), "other-ip");
+    let plane = ip.plane.clone();
+    plane.receive(id(1), envelope::encode(id(1), id(2), 0, tag(), b"for ip"));
+    plane.receive(
+        id(1),
+        envelope::encode(
+            id(1),
+            id(2),
+            0,
+            envelope::protocol_tag("other-ip"),
+            b"for other",
+        ),
+    );
+    plane.receive(
+        id(1),
+        envelope::encode(
+            id(1),
+            id(2),
+            0,
+            envelope::protocol_tag("nobody-runs-this"),
+            b"for nobody",
+        ),
+    );
+    assert_eq!(ip.recv().await.unwrap(), Bytes::from_static(b"for ip"));
+    assert_eq!(
+        other.recv().await.unwrap(),
+        Bytes::from_static(b"for other")
+    );
+    assert_eq!(hub.counters().dropped_unknown, 1);
+    hub.close();
+}
+
+/// A middle member joins two neighbours over different transports, and the
+/// two ends share a protocol the middle has never heard of.
+#[tokio::test]
+async fn a_tunnel_crosses_a_middle_member_whose_links_are_of_different_kinds() {
+    let a = RelayHub::new(network(), peer(1));
+    let c = RelayHub::new(network(), peer(3));
+    let b = RelayHub::new(network(), peer(2));
+    let a_to_c = Wire::new(3, true);
+    let c_to_a = Wire::new(1, true);
+    let c_to_b = Wire::new(2, true);
+    let b_to_c = Wire::new(3, true);
+    a.set_direct(peer(3), "wg", a_to_c.clone());
+    c.set_direct(peer(1), "wg", c_to_a);
+    c.set_direct(peer(2), "wg-quic", c_to_b.clone());
+    b.set_direct(peer(3), "wg-quic", b_to_c.clone());
+    topology(&a, &[(3, &[1, 2])], &[1, 2, 3]);
+    topology(&b, &[(3, &[1, 2])], &[1, 2, 3]);
+    topology(&c, &[(1, &[3]), (2, &[3])], &[1, 2, 3]);
+
+    let outgoing = a.link(peer(2), "tunnel");
+    let incoming = b.link(peer(1), "tunnel");
+    outgoing
+        .send_flow(Bytes::from_static(b"sealed"), 5)
+        .unwrap();
+    let frame = a_to_c.take().remove(0);
+
+    // The middle forwards it onto its other kind of link without looking
+    // inside.
+    c.state().plane.receive(id(1), frame);
+    let frame = c_to_b.take().remove(0);
+    assert_eq!(c.counters().forwarded, 1);
+
+    b.state().plane.receive(id(3), frame);
+    assert_eq!(
+        incoming.recv().await.unwrap(),
+        Bytes::from_static(b"sealed")
+    );
+    assert_eq!(b.counters().received_via, 1);
+    assert_eq!(
+        b.route(peer(1)),
+        Some(RouteSummary {
+            hops: 2,
+            via: peer(3)
+        })
+    );
+    a.close();
+    b.close();
+    c.close();
+}
+
+#[tokio::test]
+async fn a_neighbour_is_reached_over_the_preferred_kind_and_falls_back_when_it_is_lost() {
+    let hub = RelayHub::new(network(), peer(1));
+    hub.set_priority(vec!["wg".into(), "tcp-tls".into(), "wg-quic".into()]);
+    let slow = Wire::new(2, true);
+    let fast = Wire::new(2, true);
+    hub.set_direct(peer(2), "wg-quic", slow.clone());
+    let link = hub.link(peer(2), "tunnel");
+    link.send(Bytes::from_static(b"one")).unwrap();
+    assert_eq!(slow.take().len(), 1);
+    assert_eq!(hub.direct_kinds(peer(2)), ["wg-quic"]);
+
+    // A better kind appears: traffic moves to it with nothing to redo.
+    hub.set_direct(peer(2), "wg", fast.clone());
+    assert_eq!(hub.direct_kinds(peer(2)), ["wg", "wg-quic"]);
+    link.send(Bytes::from_static(b"two")).unwrap();
+    assert_eq!(fast.take().len(), 1);
+    assert!(slow.take().is_empty());
+
+    // It dies: the worse one carries on, and the logical link is untouched.
+    fast.dead.store(true, Ordering::Relaxed);
+    link.send(Bytes::from_static(b"three")).unwrap();
+    assert_eq!(slow.take().len(), 1);
+    assert!(!link.is_closed());
+    assert_eq!(
+        hub.route(peer(2)),
+        Some(RouteSummary {
+            hops: 1,
+            via: peer(2)
+        })
+    );
+
+    hub.clear_direct(peer(2), "wg-quic");
+    hub.clear_direct(peer(2), "wg");
+    assert!(!hub.reachable(peer(2)));
+    assert!(Arc::ptr_eq(&link, &hub.link(peer(2), "tunnel")));
     hub.close();
 }
 
@@ -184,18 +310,21 @@ async fn local_delivery_is_bounded_and_malformed_or_unknown_sources_are_dropped(
     let link = hub.link(peer(1), "ip");
     let plane = link.plane.clone();
     for _ in 0..INBOX + 1 {
-        plane.receive(id(1), envelope::encode(id(1), id(2), 0, b"ip"));
+        plane.receive(id(1), envelope::encode(id(1), id(2), 0, tag(), b"ip"));
     }
     assert_eq!(hub.counters().dropped_congested, 1);
     for _ in 0..INBOX {
         assert_eq!(link.recv().await.unwrap(), Bytes::from_static(b"ip"));
     }
     plane.receive(id(1), Bytes::from_static(b"broken"));
-    plane.receive(id(1), envelope::encode(id(9), id(2), 0, b"unknown member"));
+    plane.receive(
+        id(1),
+        envelope::encode(id(9), id(2), 0, tag(), b"unknown member"),
+    );
     assert_eq!(hub.counters().dropped_unknown, 2);
     plane.receive(
         id(1),
-        envelope::encode(id(1), id(9), 0, b"unknown destination"),
+        envelope::encode(id(1), id(9), 0, tag(), b"unknown destination"),
     );
     assert_eq!(hub.counters().dropped_no_link, 1);
     hub.close();
@@ -210,11 +339,11 @@ async fn inconsistent_tables_cannot_loop_beyond_the_hop_limit() {
     a.set_direct(peer(2), "ip", ab.clone());
     b.set_direct(peer(1), "ip", ba.clone());
     // Deliberately inconsistent snapshots while updates are in flight.
-    topology(&a, "ip", &[(2, &[4])], &[1, 2, 3, 4]);
-    topology(&b, "ip", &[(1, &[4])], &[1, 2, 3, 4]);
+    topology(&a, &[(2, &[4])], &[1, 2, 3, 4]);
+    topology(&b, &[(1, &[4])], &[1, 2, 3, 4]);
     let ap = a.link(peer(4), "ip").plane.clone();
     let bp = b.link(peer(4), "ip").plane.clone();
-    let mut frame = envelope::encode(id(3), id(4), 7, b"transit");
+    let mut frame = envelope::encode(id(3), id(4), 7, tag(), b"transit");
     for turn in 0..ROUTING_HOP_LIMIT {
         let (plane, incoming, wire) = if turn % 2 == 0 {
             (&ap, id(2), &ab)
@@ -253,7 +382,7 @@ async fn forwarding_benchmark() {
     hub.set_direct(peer(3), "ip", wire.clone());
     let alternate = Wire::new(5, false);
     hub.set_direct(peer(5), "ip", alternate.clone());
-    topology(&hub, "ip", &[(3, &[4]), (5, &[4])], &[1, 2, 3, 4, 5]);
+    topology(&hub, &[(3, &[4]), (5, &[4])], &[1, 2, 3, 4, 5]);
     let plane = hub.link(peer(4), "ip").plane.clone();
     let source = id(1);
     let destination = id(4);
@@ -264,7 +393,9 @@ async fn forwarding_benchmark() {
         const BATCHES: usize = 100;
         for _ in 0..BATCHES {
             let frames: Vec<_> = (0..COUNT)
-                .map(|flow| envelope::encode(source, destination, flow as u64, &vec![42; size]))
+                .map(|flow| {
+                    envelope::encode(source, destination, flow as u64, tag(), &vec![42; size])
+                })
                 .collect();
             let start = std::time::Instant::now();
             for frame in frames {

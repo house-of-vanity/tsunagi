@@ -15,12 +15,27 @@ the default 1280-byte interface MTU also works on small QUIC paths.
 ## Graph and lifecycle
 
 Each authenticated control session advertises that peer's own direct data
-links, including the plugin protocol. Tables are separate for each network
-and protocol; only members offering a matching enabled protocol version enter
-the graph. A snapshot refreshes on the maintenance interval, expires after
-90 seconds, and is withdrawn when the session ends. Link arrival, closure and
-changed announcements rebuild routes immediately. Unchanged announcements
-refresh their age without republishing the forwarding snapshot.
+links. There is one table for each network, whatever protocols run over it: a
+link is a way to reach a neighbour, and a protocol is an end-to-end tunnel to a
+peer. The envelope names the protocol, so the two are independent. A neighbour
+reached over several kinds of transport (UDP, TCP, QUIC datagrams) is sent to
+over the best open one, in the order the protocols were configured, and over
+the next if that one fails or cannot carry the frame. Every authenticated
+member enters the graph; a member in the middle needs no protocol in common
+with either end, only a link to each. A snapshot refreshes on the maintenance
+interval, expires after 90 seconds, and is withdrawn when the session ends.
+Link arrival, closure and changed announcements rebuild routes immediately.
+Unchanged announcements refresh their age without republishing the forwarding
+snapshot.
+
+Which protocol a pair of members runs their tunnel in is settled without
+asking: the member with the lower endpoint id decides, by the order it
+announces its protocols in, among those both have enabled at the same wire
+version. Both ends read the same answer from what they already hold. The
+tunnel is created as soon as the peer is reachable by any path, and it does not
+change when a direct link comes or goes underneath it: as soon as a direct
+link comes up it is shorter than the path through others, and traffic moves to
+it with nothing to redo. The user sees only a lower round-trip time.
 
 Breadth-first search computes the shortest directed paths and every equal-cost
 first hop in sorted order. An actual direct link always wins. The first row is
@@ -30,14 +45,29 @@ loops if different nodes have not yet received the same topology update.
 
 The existing control plane still forms authenticated pairwise sessions.
 Routing provides multihop **data** paths among these members; it does not add
-control-plane flooding or carry control sessions through the data plane.
+control-plane flooding or carry control sessions through the data plane, so a
+member that has no control session with another has no data path to it either.
 Announcements are volatile, not durable membership or availability guarantees.
+
+## What "online" means
+
+One definition, computed by the agent and reported identically by `tsng status`
+and the tray: a member is online when this agent can reach it by any path — a
+live authenticated control session (QUIC keep-alive every 5 seconds, so a
+vanished peer is noticed within about 15), or a data path to it through other
+members. It is never inferred from ping, which a firewall may block, or from a
+tunnel's last handshake, which says only when traffic last flowed.
+
+How it is reached is reported separately: `direct` over a named transport,
+`relayed` through a named member over N hops, or no data path yet while one is
+being set up. Being relayed is not being degraded in any way but distance, and
+is shown so it is not a surprise.
 
 ## Packet path
 
 The control loop binds next hops to transport handles in an immutable table
 and publishes it through `ArcSwap`. Readers do not acquire the topology mutex.
-The transit routine validates the fixed 74-byte envelope, looks up the source
+The transit routine validates the fixed 82-byte envelope, looks up the source
 and destination, selects a cached next hop, decrements one byte, and calls the
 transport's synchronous datagram send. It never searches the graph, formats an
 endpoint string, validates an Ed25519 key, decrypts, or touches TUN.
@@ -86,5 +116,5 @@ counts sends without storing frames. Results are CPU forwarding cost, **not**
 end-to-end network latency or VPN throughput; encryption, fragmentation,
 sockets, congestion and scheduling contribute separately.
 
-Wire compatibility: control ALPN `tsunagi/ctrl/4`, data ALPN `tsunagi/data/4`.
+Wire compatibility: control ALPN `tsunagi/ctrl/5`, data ALPN `tsunagi/data/5`.
 Upgrade every participant together; saved identities and network state persist.
