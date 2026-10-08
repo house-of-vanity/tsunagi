@@ -1661,8 +1661,10 @@ async fn lan_broadcast_fanout_is_scoped_opt_in_and_does_not_reflood() {
         bytes[28..].copy_from_slice(b"LAN GAME");
         // UDP checksum zero is valid for IPv4.
         let sum: u32 = bytes[..20]
-            .chunks_exact(2)
-            .map(|w| u16::from_be_bytes([w[0], w[1]]) as u32)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|w| u16::from_be_bytes(*w) as u32)
             .sum();
         let checksum = !((sum & 0xffff) + (sum >> 16)) as u16;
         bytes[10..12].copy_from_slice(&checksum.to_be_bytes());

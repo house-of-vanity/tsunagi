@@ -3626,15 +3626,17 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     // Online is online: a member reached through others is as much here as
     // one reached directly, and is said to be reached that way.
     let (path, data_path_good) = match row.path {
-        Some(DataPathReport::Direct { transport }) => (format!("direct {transport}"), true),
+        Some(DataPathReport::Direct { transport }) => {
+            (format!("data path direct over {transport}"), true)
+        }
         Some(DataPathReport::Relayed { hops, .. }) => (
             format!(
-                "relayed via {} ({hops} hops)",
+                "data path via {} · {hops} hops",
                 row.via_label.as_deref().unwrap_or("another member")
             ),
             false,
         ),
-        Some(DataPathReport::None) | None => ("connected, no data path yet".to_string(), false),
+        Some(DataPathReport::None) | None => ("connected · no data path yet".to_string(), false),
     };
 
     let mut detail = String::new();
@@ -3643,7 +3645,7 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     }
     detail.push_str(&path);
     if let Some(transport) = row.transport {
-        detail.push_str(&format!("  ·  control {}", transport.to_lowercase()));
+        detail.push_str(&format!("  ·  control path {}", transport.to_lowercase()));
     }
     if let Some(rtt) = row.rtt_ms {
         detail.push_str(&format!("  rtt {rtt}ms"));
@@ -3670,13 +3672,13 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
         };
         out = out.with_note(match tunnel.handshake_secs_ago {
             Some(secs) => {
-                let stats = format!(
-                    "tunnel up ({proto}), {} tx {} rx {}{}",
-                    if proto == "tcp-tls" {
-                        format!("uptime {secs}s,")
-                    } else {
-                        format!("handshake {secs}s ago,")
-                    },
+                let health = if proto == "tcp-tls" {
+                    format!("uptime {secs}s")
+                } else {
+                    format!("handshake {secs}s ago")
+                };
+                format!(
+                    "end-to-end tunnel {proto} · {health} · tx {} rx {}{}  ·  transport detail: {}",
                     tunnel.tx_packets,
                     tunnel.rx_packets,
                     if tunnel.dropped > 0 {
@@ -3684,14 +3686,20 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
                     } else {
                         String::new()
                     },
-                );
-                format!("{stats:<48}  ·  {}", tunnel.path)
+                    tunnel.path
+                )
             }
             None => {
                 if proto == "wg-quic" || proto == "wg" {
-                    "no WireGuard handshake yet; the tunnel cannot carry traffic".to_string()
+                    format!(
+                        "end-to-end tunnel {proto} · no WireGuard handshake yet; the tunnel \
+                         cannot carry traffic"
+                    )
                 } else {
-                    format!("no {proto} handshake yet; the tunnel cannot carry traffic")
+                    format!(
+                        "end-to-end tunnel {proto} · no {proto} handshake yet; the tunnel \
+                         cannot carry traffic"
+                    )
                 }
             }
         });
@@ -5814,7 +5822,7 @@ mod status_tests {
         let text = out.render(false);
         assert!(text.contains("2 of 2 online"), "{text}");
         assert!(
-            text.contains("relayed via music (2 hops)"),
+            text.contains("data path via music · 2 hops"),
             "names the member it goes through: {text}"
         );
         assert!(!text.contains("offline"), "{text}");
@@ -5907,10 +5915,40 @@ mod status_tests {
         out.push(network_section(&network, OWN, false));
         let text = out.render(false);
         assert_eq!(out.worst(), Health::Good, "{text}");
-        assert!(text.contains("tunnel up (tcp-tls)"), "{text}");
+        assert!(text.contains("end-to-end tunnel tcp-tls"), "{text}");
         assert!(text.contains("uptime 42s"), "{text}");
         assert!(text.contains("tx 100 rx 200"), "{text}");
-        assert!(text.contains("tcp-tls via 192.0.2.1:443"), "{text}");
+        assert!(
+            text.contains("transport detail: tcp-tls via 192.0.2.1:443"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_tunnel_and_data_transport_are_named_separately() {
+        let mut network = network_after_a_peer_returned();
+        network.peers[0].path = tsunagi::ipc::DataPathReport::Direct {
+            transport: "tcp-tls".into(),
+        };
+        network.members[1].path = network.peers[0].path.clone();
+        let mut t = tunnel(ONLINE, Some(1));
+        t.protocol = "wg".into();
+        t.path = "tcp-tls via 192.0.2.1:443".into();
+        network.overlay = Some(overlay(vec![t]));
+
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert!(text.contains("data path direct over tcp-tls"), "{text}");
+        assert!(text.contains("control path direct"), "{text}");
+        assert!(
+            text.contains("end-to-end tunnel wg · handshake 1s ago"),
+            "{text}"
+        );
+        assert!(
+            text.contains("transport detail: tcp-tls via 192.0.2.1:443"),
+            "{text}"
+        );
     }
 }
 

@@ -42,7 +42,8 @@ struct Device<'a> {
     copy: Option<String>,
     /// The full endpoint id, which clicking the short form copies.
     id: &'a str,
-    proto: &'a str,
+    /// End-to-end tunnel protocol, independent of the path carrying it.
+    tunnel_protocol: &'a str,
     address: Option<String>,
     handshake_secs: Option<u64>,
     overlay: Option<&'a OverlayPeerReport>,
@@ -360,7 +361,7 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
                 hostname,
                 copy: hostname.map(|h| format!("{h}.{}", network.name)),
                 id,
-                proto: overlay.map_or("—", |p| p.protocol.as_str()),
+                tunnel_protocol: overlay.map_or("—", |p| p.protocol.as_str()),
                 address: overlay
                     .and_then(|p| p.address.clone())
                     .or_else(|| member.and_then(|m| m.overlay_address_v4.clone())),
@@ -389,9 +390,9 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
 const COLUMN_SAMPLES: [&str; 9] = [
     "",
     "exit",
-    "tcp-tls",
+    "wg-quic · waiting for handshake",
     "255.255.255.255",
-    "23h 59m",
+    "direct over tcp-tls",
     "99999/99999",
     "1023.9 MB / 1023.9 MB",
     "1023.9 kB/s",
@@ -506,13 +507,36 @@ fn device_table(
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
             for (column, header) in [
-                "device", "exit", "proto", "address", "link", "pkts", "bytes", "rate", "plot",
+                "device",
+                "exit",
+                "end-to-end",
+                "address",
+                "data path",
+                "pkts",
+                "bytes",
+                "rate",
+                "plot",
             ]
             .into_iter()
             .enumerate()
             {
                 cell(ui, column, &mut widths, |ui| {
-                    ui.weak(header);
+                    let response = ui.weak(header);
+                    match column {
+                        2 => {
+                            response.on_hover_text(
+                                "Protocol that encrypts traffic between this device and the \
+                                 destination. It is independent of the route carrying it.",
+                            );
+                        }
+                        4 => {
+                            response.on_hover_text(
+                                "Current route carrying the encrypted tunnel traffic. `direct \
+                                 over tcp-tls` means one Tsunagi hop with no mesh relay.",
+                            );
+                        }
+                        _ => {}
+                    }
                 });
             }
             ui.end_row();
@@ -523,7 +547,7 @@ fn device_table(
                     exit_cell(ui, device, network_id, confirm);
                 });
                 cell(ui, 2, &mut widths, |ui| {
-                    ui.label(device.proto);
+                    tunnel_cell(ui, device);
                 });
                 cell(ui, 3, &mut widths, |ui| match &device.address {
                     Some(address) => format::copy_field(ui, address, address),
@@ -531,7 +555,7 @@ fn device_table(
                         ui.weak("—");
                     }
                 });
-                cell(ui, 4, &mut widths, |ui| link_cell(ui, device));
+                cell(ui, 4, &mut widths, |ui| data_path_cell(ui, device));
 
                 match device.overlay.filter(|_| device.online) {
                     Some(peer) => {
@@ -609,45 +633,95 @@ fn device_table(
     ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
 }
 
-/// How a device is reached, and how long its tunnel has been up.
+/// A protocol name as it should appear in the table.
+fn displayed_protocol(protocol: &str) -> &str {
+    if protocol.is_empty() {
+        "wg-quic"
+    } else {
+        protocol
+    }
+}
+
+/// The end-to-end tunnel and its own health, without transport details.
+fn tunnel_text(protocol: &str, handshake_secs: Option<u64>) -> String {
+    let protocol = displayed_protocol(protocol);
+    if protocol == "—" {
+        return protocol.to_string();
+    }
+    match handshake_secs {
+        Some(secs) if protocol == "tcp-tls" => {
+            format!("{protocol} · up {}", format::age(secs))
+        }
+        Some(secs) => format!("{protocol} · handshake {} ago", format::age(secs)),
+        None => format!("{protocol} · waiting for handshake"),
+    }
+}
+
+fn tunnel_cell(ui: &mut egui::Ui, device: &Device<'_>) {
+    let protocol = displayed_protocol(device.tunnel_protocol);
+    let text = tunnel_text(protocol, device.handshake_secs);
+    if protocol == "—" {
+        ui.weak(text);
+        return;
+    }
+    let hint = match device.path {
+        Some(DataPathReport::Direct { transport }) => format!(
+            "The end-to-end {protocol} tunnel is currently carried over a direct {transport} \
+             transport."
+        ),
+        Some(DataPathReport::Relayed { hops, .. }) => format!(
+            "The end-to-end {protocol} tunnel is currently carried through other devices over \
+             {hops} transport hops."
+        ),
+        Some(DataPathReport::None) | None => {
+            format!("The end-to-end {protocol} tunnel does not have a data path carrying it yet.")
+        }
+    };
+    ui.label(text).on_hover_text(hint);
+}
+
+/// Current route text and whether that route is the preferred direct form.
+fn data_path_text(
+    path: Option<&DataPathReport>,
+    via_name: Option<&str>,
+    online: bool,
+) -> (String, bool) {
+    if !online {
+        return ("offline".into(), false);
+    }
+    match path {
+        Some(DataPathReport::Direct { transport }) => (format!("direct over {transport}"), true),
+        Some(DataPathReport::Relayed { hops, .. }) => (
+            format!("via {} · {hops} hops", via_name.unwrap_or("another device")),
+            false,
+        ),
+        Some(DataPathReport::None) | None => ("no data path yet".into(), false),
+    }
+}
+
+/// How a device is reached right now.
 ///
 /// A device reached through others is online, over a longer path, and says
 /// so: the colour is the only difference in how it is treated.
-fn link_cell(ui: &mut egui::Ui, device: &Device<'_>) {
-    if !device.online {
-        ui.label("offline");
-        return;
-    }
-    let (path, good) = match device.path {
-        Some(DataPathReport::Direct { transport }) => (format!("direct · {transport}"), true),
-        Some(DataPathReport::Relayed { hops, .. }) => (
-            format!(
-                "via {} · {hops} hops",
-                device.via_name.as_deref().unwrap_or("another device")
-            ),
-            false,
-        ),
-        Some(DataPathReport::None) | None => ("no data path".to_string(), false),
-    };
-    let age = device.handshake_secs.map(format::age);
-    let text = match age {
-        Some(age) => format!("{path} · {age}"),
-        None => path,
-    };
+fn data_path_cell(ui: &mut egui::Ui, device: &Device<'_>) {
+    let (text, good) = data_path_text(device.path, device.via_name.as_deref(), device.online);
     let response = if good {
         ui.label(text)
     } else {
         ui.label(egui::RichText::new(text).color(AMBER))
     };
-    if !good {
-        response.on_hover_text(match device.path {
-            Some(DataPathReport::Relayed { .. }) => {
-                "no direct link yet: traffic goes through another device, and moves to a \
-                 direct link by itself as soon as one comes up"
-            }
-            _ => "connected, but no path carries packets yet",
-        });
-    }
+    response.on_hover_text(match device.path {
+        Some(DataPathReport::Direct { .. }) => {
+            "One Tsunagi hop with no mesh relay. The end-to-end tunnel may use a different \
+             protocol from this transport."
+        }
+        Some(DataPathReport::Relayed { .. }) => {
+            "No direct transport yet: traffic goes through another device, and moves to a \
+             direct path by itself as soon as one comes up."
+        }
+        _ if device.online => "Connected, but no data path carries packets yet.",
+        _ => "This device is not reachable now.",
+    });
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -725,5 +799,45 @@ mod tests {
                 .name_taken
                 .is_none()
         );
+    }
+
+    #[test]
+    fn tunnel_and_direct_transport_are_named_as_different_layers() {
+        assert_eq!(tunnel_text("wg", Some(1)), "wg · handshake 1s ago");
+        assert_eq!(
+            data_path_text(
+                Some(&DataPathReport::Direct {
+                    transport: "tcp-tls".into(),
+                }),
+                None,
+                true,
+            ),
+            ("direct over tcp-tls".into(), true)
+        );
+        assert_eq!(tunnel_text("tcp-tls", Some(42)), "tcp-tls · up 42s");
+    }
+
+    #[test]
+    fn incomplete_and_longer_paths_stay_explicit() {
+        assert_eq!(
+            tunnel_text("wg-quic", None),
+            "wg-quic · waiting for handshake"
+        );
+        assert_eq!(
+            data_path_text(
+                Some(&DataPathReport::Relayed {
+                    hops: 2,
+                    via: "near".into(),
+                }),
+                Some("iris"),
+                true,
+            ),
+            ("via iris · 2 hops".into(), false)
+        );
+        assert_eq!(
+            data_path_text(Some(&DataPathReport::None), None, true),
+            ("no data path yet".into(), false)
+        );
+        assert_eq!(data_path_text(None, None, false), ("offline".into(), false));
     }
 }
