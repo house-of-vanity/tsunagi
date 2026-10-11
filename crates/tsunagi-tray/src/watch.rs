@@ -22,6 +22,8 @@ pub(crate) enum Health {
     Disconnected,
     /// Connected, nothing out of the ordinary.
     Connected,
+    /// At least one configured network is blocked by an overlapping active range.
+    RangeConflict,
     /// This device's traffic leaves through an exit node, and that works.
     ExitNode,
 }
@@ -33,6 +35,13 @@ impl Health {
         let Some(report) = report else {
             return Self::Disconnected;
         };
+        if report
+            .networks
+            .iter()
+            .any(|network| network.auto_start && !network.range_conflicts.is_empty())
+        {
+            return Self::RangeConflict;
+        }
         if !report
             .networks
             .iter()
@@ -56,6 +65,7 @@ impl Health {
         match self {
             Self::Disconnected => "tsunagi: not connected",
             Self::Connected => "tsunagi: connected",
+            Self::RangeConflict => "tsunagi: network range conflict; open to switch networks",
             Self::ExitNode => "tsunagi: using an exit node",
         }
     }
@@ -106,6 +116,24 @@ mod tests {
             networks,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn overlapping_networks_are_visible_even_while_other_peers_are_connected() {
+        let mut blocked = NetworkReport {
+            auto_start: true,
+            ..Default::default()
+        };
+        blocked
+            .range_conflicts
+            .push(tsunagi::ipc::RangeConflictReport {
+                name: "other".into(),
+                network_id: "other-id".into(),
+                range: "10.90.0.0/16".into(),
+            });
+        let status = report(vec![network(2, ExitReport::default()), blocked]);
+        assert_eq!(Health::of(Some(&status)), Health::RangeConflict);
+        assert!(Health::RangeConflict.label().contains("switch networks"));
     }
 
     #[test]

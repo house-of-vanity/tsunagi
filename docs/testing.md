@@ -98,6 +98,13 @@ a batch does not stop the rest, and allocation is deterministic, spread out,
 walks past everything taken and reports a full range instead of handing out a
 duplicate.
 
+`tests/range_conflicts.rs` checks isolated first members choosing the same
+range, persistence across restart, preservation of legacy ranges, exclusion
+of equal and nested ranges, late authenticated conflicts, switching all
+blockers, automatic resume, cancelling a suspended network's resume and
+concurrent switch requests. These use real agents, loopback handshakes and
+SQLite; they do not change host network settings.
+
 `tests/local_control.rs` covers the local control socket end to end: a client
 asking a running agent for status over a real Unix socket, joining and
 leaving a network through it, a leftover socket file being replaced while a

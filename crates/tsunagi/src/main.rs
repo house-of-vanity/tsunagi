@@ -226,7 +226,9 @@ enum NetworkAction {
         /// Exact network name, full id or unique id prefix.
         network: String,
     },
-    /// Serves a stopped network again, from where it left off.
+    /// Serves a stopped network again, suspending networks with overlapping ranges.
+    ///
+    /// Suspended networks resume when this one stops. The choice survives restart.
     Start {
         /// Exact network name, full id or unique id prefix.
         network: String,
@@ -351,7 +353,7 @@ fn resolve_ipv4_range(
             text.parse::<Ipv4Range>()
                 .map_err(|err| format!("--ipv4-range {text}: {err}"))?,
         )),
-        None => Ok(Some(tsunagi::state::DEFAULT_IPV4_RANGE)),
+        None => Ok(None),
     }
 }
 
@@ -489,8 +491,8 @@ struct UpArgs {
 
     /// IPv4 overlay range, as `address/prefix`, or `none` to disable IPv4.
     ///
-    /// Defaults to 10.13.37.0/24. Only the first member to join decides:
-    /// a network that has already settled on a range wins, and a joining
+    /// Defaults to a stable pseudorandom /24 derived from the network id.
+    /// A network that has already settled on a range wins, and a joining
     /// agent adopts what it finds. Addresses are allocated from it and
     /// recorded in signed state, so each member keeps its own across
     /// restarts and long absences.
@@ -1672,6 +1674,7 @@ impl tsunagi::ipc::ReportSource for AgentControl {
                 network_id: network_id.to_string(),
                 already_configured: already,
                 name_shared_with: shared,
+                active: self.agent.is_active(network_id).await,
             })
         })
     }
@@ -1743,36 +1746,50 @@ impl tsunagi::ipc::ReportSource for AgentControl {
             let wanted: tsunagi::NetworkId = network_id
                 .parse()
                 .map_err(|err| format!("`{network_id}` is not a network id: {err}"))?;
-            let name = self
+            let configured = self
                 .agent
                 .list_networks()
                 .await
                 .map_err(|err| err.to_string())?
                 .into_iter()
                 .find(|network| network.network_id == wanted)
-                .map(|network| network.name.as_str().to_string())
                 .ok_or_else(|| format!("this agent is not in {wanted}"))?;
 
+            let name = configured.name.to_string();
             let was = self.agent.is_active(wanted).await;
-            if was != active {
+            let mut suspended = Vec::new();
+            if active && !was {
                 // Both of these also remember the answer, so a restart
                 // does what the last instruction said.
-                if active {
-                    self.agent
-                        .activate_network(wanted)
-                        .await
-                        .map_err(|err| err.to_string())?;
-                } else {
-                    self.agent
-                        .deactivate_network(wanted)
-                        .await
-                        .map_err(|err| err.to_string())?;
-                }
+                let before = self.agent.status().await.map_err(|err| err.to_string())?;
+                let stopped = self
+                    .agent
+                    .switch_network(wanted)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                suspended = before
+                    .networks
+                    .iter()
+                    .filter(|n| stopped.contains(&n.network_id))
+                    .filter_map(|n| {
+                        Some(tsunagi::ipc::RangeConflictReport {
+                            network_id: n.network_id.to_string(),
+                            name: n.name.to_string(),
+                            range: n.range?.to_string(),
+                        })
+                    })
+                    .collect();
+            } else if !active {
+                self.agent
+                    .pause_network(wanted)
+                    .await
+                    .map_err(|err| err.to_string())?;
             }
             Ok(tsunagi::ipc::ActiveReport {
                 name,
                 active,
-                changed: was != active,
+                changed: was != active || configured.auto_start != active,
+                suspended,
             })
         })
     }
@@ -1972,21 +1989,28 @@ async fn join_network(
         .await?;
         // The id in full either way: it is what every other command takes,
         // and the shortened form in a report is for reading, not copying.
-        match standing {
-            NetworkStanding::New => {
-                println!("joined `{}` ({})", report.name, report.network_id)
+        if !report.active {
+            println!(
+                "configured `{}` ({}); stopped because its range overlaps an active network. `tsng network start {}` switches to it and suspends conflicting networks",
+                report.name, report.network_id, report.network_id
+            );
+        } else {
+            match standing {
+                NetworkStanding::New => {
+                    println!("joined `{}` ({})", report.name, report.network_id)
+                }
+                NetworkStanding::Known => println!(
+                    "`{}` ({}) was already here; it is running",
+                    report.name, report.network_id
+                ),
+                // Joining is an instruction to run it, so it undoes a stop —
+                // said out loud, because a pause that ends without a word is
+                // a pause nobody can rely on.
+                NetworkStanding::Stopped => println!(
+                    "`{}` ({}) was stopped; it is running again",
+                    report.name, report.network_id
+                ),
             }
-            NetworkStanding::Known => println!(
-                "`{}` ({}) was already here; it is running",
-                report.name, report.network_id
-            ),
-            // Joining is an instruction to run it, so it undoes a stop —
-            // said out loud, because a pause that ends without a word is
-            // a pause nobody can rely on.
-            NetworkStanding::Stopped => println!(
-                "`{}` ({}) was stopped; it is running again",
-                report.name, report.network_id
-            ),
         }
         if let Some(other) = &report.name_shared_with {
             eprintln!(
@@ -2110,6 +2134,13 @@ async fn show_networks(
                 format!(
                     "`tsng network stop {}` pauses it, `leave` gives it up",
                     short(&id, 10)
+                ),
+            ),
+            Some(live) if !live.range_conflicts.is_empty() => (
+                "stopped · range conflict".to_string(),
+                format!(
+                    "{}; `tsng network start {id}` switches to this network and suspends them until it stops",
+                    conflict_description(live)
                 ),
             ),
             Some(_) => (
@@ -2517,6 +2548,12 @@ async fn set_active(
             (true, true) => println!("started `{}` ({})", report.name, short(&id, 10)),
             (true, false) => println!("`{}` ({}) was already running", report.name, short(&id, 10)),
         }
+        for suspended in &report.suspended {
+            println!(
+                "suspended `{}` ({}): {} overlaps; it resumes when the conflicting network stops",
+                suspended.name, suspended.network_id, suspended.range
+            );
+        }
         if !report.active {
             eprintln!(
                 "\nNothing was announced: to the others this device is away, and the address \
@@ -2530,7 +2567,11 @@ async fn set_active(
 
     // No agent: the stored flag is what the next start reads.
     let storage = tsunagi::storage::Storage::open(paths)?;
-    storage.set_auto_start(network.network_id, active).await?;
+    if active {
+        storage.prefer_network(network.network_id).await?;
+    } else {
+        storage.set_auto_start(network.network_id, false).await?;
+    }
     storage.release_ownership_lock();
     println!(
         "`{name}` ({}) will {} with the next `tsng up`",
@@ -3274,6 +3315,15 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
     rows
 }
 
+fn conflict_description(network: &tsunagi::ipc::NetworkReport) -> String {
+    network
+        .range_conflicts
+        .iter()
+        .map(|c| format!("`{}` ({}) uses {}", c.name, c.network_id, c.range))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// One network: what it is, who is in it, and what has happened since start.
 fn network_section(
     network: &tsunagi::ipc::NetworkReport,
@@ -3328,19 +3378,12 @@ fn network_section(
             ),
         );
     }
-    if let Some(conflict) = &network.range_conflict {
-        section.push(
-            Row::new(
-                Health::Degraded,
-                "range",
-                format!("cannot use {conflict}: another network here already does"),
-            )
-            .with_note(
-                "one agent has one interface, so an address belongs to one network. \
-                 This one waits to adopt whatever its members settle on; give it \
-                 `--ipv4-range` of its own to propose one.",
-            ),
-        );
+    if !network.range_conflicts.is_empty() {
+        section.push(Row::new(Health::Degraded, "range conflict", conflict_description(network))
+            .with_note(format!("`tsng network start {}` switches to this network and suspends the listed networks; they resume when it stops", network.network_id)));
+    } else if let Some(conflict) = &network.range_conflict {
+        section.push(Row::new(Health::Degraded, "range", format!("cannot use {conflict}: another network here already does"))
+            .with_note(format!("`tsng network start {}` switches to this network and suspends conflicting networks", network.network_id)));
     }
 
     if let Some(overlay) = &network.overlay {
@@ -4375,10 +4418,12 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         ]));
 
     let mut config = AgentConfig::new(paths.clone())
-        .with_overlay_ipv4_range(ipv4_range)
         .with_transport(args.reach.into())
         .with_discovery(discovery)
         .with_discovery_interval(Duration::from_secs(5));
+    if args.ipv4_range.is_some() {
+        config = config.with_overlay_ipv4_range(ipv4_range);
+    }
     if dht_enabled(&args) {
         config = config.with_dht(MainlineDiscovery::default());
     }
@@ -4947,6 +4992,7 @@ async fn build_report(
             };
 
             NetworkReport {
+                auto_start: network.auto_start,
                 exit: exit_report(network),
                 broadcast: network.broadcast,
                 name: network.name.to_string(),
@@ -4994,6 +5040,15 @@ async fn build_report(
                     .collect(),
                 range: network.range.map(|range| range.to_string()),
                 range_conflict: network.range_conflict.map(|range| range.to_string()),
+                range_conflicts: network
+                    .range_conflicts
+                    .iter()
+                    .map(|c| tsunagi::ipc::RangeConflictReport {
+                        network_id: c.network_id.to_string(),
+                        name: c.name.to_string(),
+                        range: c.range.to_string(),
+                    })
+                    .collect(),
                 dial_failures: network.metrics.dial_failures,
                 handshake_failures: network.metrics.handshake_failures,
                 control_messages: (
@@ -5361,6 +5416,7 @@ mod status_tests {
     /// The situation that prompted this: one peer left and came back.
     fn network_after_a_peer_returned() -> NetworkReport {
         NetworkReport {
+            auto_start: true,
             exit: Default::default(),
             hostname_conflict: None,
             broadcast: true,
@@ -5403,6 +5459,7 @@ mod status_tests {
             ],
             range: Some("10.13.37.0/24".into()),
             range_conflict: None,
+            range_conflicts: Vec::new(),
             // Everything below happened while the peer was away.
             dial_failures: 9,
             handshake_failures: 0,
@@ -5534,7 +5591,36 @@ mod status_tests {
         let text = out.render(false);
         assert!(text.contains("no range to allocate from"), "{text}");
         assert!(text.contains("another network here already does"), "{text}");
-        assert!(text.contains("--ipv4-range"), "the fix is named: {text}");
+        assert!(
+            text.contains("tsng network start"),
+            "the fix is named: {text}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_network_names_all_blockers_and_the_switch_action() {
+        let mut network = network_after_a_peer_returned();
+        network.active = false;
+        network.overlay = None;
+        network.range_conflicts = vec![tsunagi::ipc::RangeConflictReport {
+            name: "other-network".into(),
+            network_id: "full-other-network-id".into(),
+            range: "10.13.0.0/16".into(),
+        }];
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        let health = out.worst();
+        for detail in [
+            "other-network",
+            "full-other-network-id",
+            "10.13.0.0/16",
+            "tsng network start xa7gyz",
+            "resume when it stops",
+        ] {
+            assert!(text.contains(detail), "missing {detail}: {text}");
+        }
+        assert_eq!(health, Health::Degraded);
     }
 
     #[test]

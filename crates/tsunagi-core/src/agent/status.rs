@@ -209,9 +209,22 @@ pub struct NetworkMetrics {
     pub data_link_failures: u64,
 }
 
+/// An active network preventing another network from starting locally.
+#[derive(Debug, Clone)]
+pub struct RangeConflict {
+    /// The blocking network's public identifier.
+    pub network_id: NetworkId,
+    /// Its configured name.
+    pub name: NetworkName,
+    /// Its overlapping overlay range.
+    pub range: crate::state::Ipv4Range,
+}
+
 /// Status of one network.
 #[derive(Debug, Clone)]
 pub struct NetworkStatus {
+    /// Whether this network is requested to start or resume automatically.
+    pub auto_start: bool,
     /// Local broadcast participation in this network.
     pub broadcast: bool,
     /// This agent offers itself as an exit node in this network.
@@ -242,13 +255,10 @@ pub struct NetworkStatus {
     pub hostname_conflict: Option<HostnameConflict>,
     /// The overlay range this network uses, once it has one.
     pub range: Option<crate::state::Ipv4Range>,
-    /// The range it could not have, because another network on this agent
-    /// already holds it.
-    ///
-    /// One agent has one interface, so an address belongs to one network.
-    /// This network waits to adopt whatever its members settle on instead of
-    /// proposing something it could not route.
+    /// The first overlapping active range; `range_conflicts` identifies all blockers.
     pub range_conflict: Option<crate::state::Ipv4Range>,
+    /// Active networks that would be suspended by switching to this network.
+    pub range_conflicts: Vec<RangeConflict>,
     /// Per-network counters.
     pub metrics: NetworkMetrics,
     /// What has gone through a peer in the middle, in both directions.

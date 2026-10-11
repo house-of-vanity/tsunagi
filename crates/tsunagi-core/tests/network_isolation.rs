@@ -265,10 +265,7 @@ async fn deactivating_one_network_leaves_the_agent_and_others_running() {
 
 #[tokio::test]
 async fn two_networks_on_one_agent_each_get_a_range_of_their_own() {
-    // One agent, one interface: the configured range can only belong to one
-    // of them. The second does not go without — it takes the range derived
-    // from its own id, which every one of its members derives identically,
-    // so it is an agreement and not a local invention.
+    // Each network derives its range independently of activation order.
     let discovery = SharedMemoryDiscovery::new();
     let (first, first_secret) = network("two-ranges-one");
     let (second, second_secret) = network("two-ranges-two");
@@ -309,8 +306,8 @@ async fn two_networks_on_one_agent_each_get_a_range_of_their_own() {
         "different networks, different addresses"
     );
     assert!(
-        tsunagi::state::DEFAULT_IPV4_RANGE.contains(addresses.0),
-        "the first keeps the configured range: {}",
+        tsunagi::state::derived_ipv4_range(one).contains(addresses.0),
+        "the first uses its derived range: {}",
         addresses.0
     );
     assert!(
@@ -319,7 +316,7 @@ async fn two_networks_on_one_agent_each_get_a_range_of_their_own() {
         addresses.1
     );
     assert!(
-        !tsunagi::state::DEFAULT_IPV4_RANGE.contains(addresses.1),
+        !tsunagi::state::derived_ipv4_range(one).contains(addresses.1),
         "and not in the one the first network holds"
     );
 

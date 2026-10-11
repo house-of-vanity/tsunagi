@@ -109,6 +109,30 @@ impl WgAgent {
         .await
     }
 
+    async fn spawn_auto(discovery: &SharedMemoryDiscovery, tag: &str) -> Self {
+        let dir = TempDir::new().unwrap();
+        let tuns = MemoryTunFactory::new();
+        let plugin = WireguardPlugin::open(
+            WireguardConfig::new(dir.path().join("wireguard"))
+                .with_reconcile(Duration::from_millis(20), Duration::from_millis(250)),
+        )
+        .await
+        .unwrap();
+        let agent = Agent::spawn(
+            config_with(dir.path(), discovery)
+                .with_interface(Arc::new(tuns.clone()), tag, 1280)
+                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+        )
+        .await
+        .unwrap();
+        Self {
+            dir,
+            agent,
+            plugin,
+            tuns,
+        }
+    }
+
     /// Starts an agent with an explicit overlay range, or none at all.
     async fn spawn_range(
         discovery: &SharedMemoryDiscovery,
@@ -989,7 +1013,7 @@ async fn two_networks_share_one_interface_with_keys_and_ranges_of_their_own() {
     let (name_b, secret_b) = network("wg-right");
     let beta_range = Some("10.99.0.0/16".parse::<Ipv4Range>().unwrap());
 
-    let hub = WgAgent::spawn(&discovery, "th").await;
+    let hub = WgAgent::spawn_auto(&discovery, "th").await;
     let left = WgAgent::spawn(&discovery, "tl").await;
     let right = WgAgent::spawn_range(&discovery, "tr", beta_range).await;
 

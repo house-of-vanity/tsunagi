@@ -448,12 +448,16 @@ impl StateStore {
 
     /// Sets the auto-start flag of a configured network.
     pub fn set_auto_start(&self, network_id: NetworkId, auto_start: bool) -> Result<()> {
-        self.conn
+        let changed = self
+            .conn
             .execute(
                 "UPDATE networks SET auto_start = ?2 WHERE network_id = ?1",
                 params![network_id.as_bytes().as_slice(), auto_start as i64],
             )
             .map_err(|err| Error::Storage(format!("cannot update network: {err}")))?;
+        if changed == 0 {
+            return Err(Error::NetworkUnknown(network_id));
+        }
         Ok(())
     }
 
@@ -796,6 +800,44 @@ impl StateStore {
             )
             .map_err(|err| Error::Storage(format!("cannot forget hostnames: {err}")))?;
         Ok(())
+    }
+
+    /// Atomically enables a network and puts it first in the startup order.
+    pub fn prefer_network(&self, network: NetworkId) -> Result<()> {
+        let configured = self.list_networks()?;
+        if !configured.iter().any(|n| n.network_id == network) {
+            return Err(Error::NetworkUnknown(network));
+        }
+        let existing = self.get_setting("network_start_order")?.unwrap_or_default();
+        let mut order = vec![network];
+        for word in existing.split(',') {
+            if let Ok(id) = word.parse::<NetworkId>()
+                && configured.iter().any(|n| n.network_id == id)
+                && !order.contains(&id)
+            {
+                order.push(id);
+            }
+        }
+        let value = order
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| Error::Storage(format!("cannot begin network preference: {err}")))?;
+        transaction
+            .execute(
+                "UPDATE networks SET auto_start = 1 WHERE network_id = ?1",
+                params![network.as_bytes().as_slice()],
+            )
+            .map_err(|err| Error::Storage(format!("cannot enable network: {err}")))?;
+        transaction.execute("INSERT INTO settings (key, value) VALUES ('network_start_order', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![value])
+            .map_err(|err| Error::Storage(format!("cannot store network preference: {err}")))?;
+        transaction
+            .commit()
+            .map_err(|err| Error::Storage(format!("cannot commit network preference: {err}")))
     }
 
     /// Reads an arbitrary setting.

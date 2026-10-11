@@ -277,6 +277,7 @@ impl tsunagi::ipc::ReportSource for Control {
                 network_id: network_id.to_string(),
                 already_configured: already,
                 name_shared_with: None,
+                active: self.0.is_active(network_id).await,
             })
         })
     }

@@ -272,6 +272,33 @@ impl Storage {
             .await
     }
 
+    /// Configured networks in the user's most recently selected order.
+    pub async fn network_start_order(&self) -> Result<Vec<NetworkId>> {
+        self.with_state(|state| {
+            let configured = state.list_networks()?;
+            let text = state
+                .get_setting("network_start_order")?
+                .unwrap_or_default();
+            let mut order = Vec::new();
+            for word in text.split(',') {
+                if let Ok(id) = word.parse::<NetworkId>()
+                    && configured.iter().any(|n| n.network_id == id)
+                    && !order.contains(&id)
+                {
+                    order.push(id);
+                }
+            }
+            Ok(order)
+        })
+        .await
+    }
+
+    /// Prefers this network at startup without disabling suspended networks.
+    pub async fn prefer_network(&self, network: NetworkId) -> Result<()> {
+        self.with_state(move |state| state.prefer_network(network))
+            .await
+    }
+
     /// Removes a network configuration and its cached hints.
     pub async fn remove_network(&self, network_id: NetworkId) -> Result<()> {
         self.with_state(move |state| {

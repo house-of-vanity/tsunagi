@@ -183,7 +183,21 @@ async fn run(
             .await
             .map(|report| {
                 let state = if report.active { "started" } else { "stopped" };
-                format!("{} {}", state, report.name)
+                if report.suspended.is_empty() {
+                    format!("{} {}", state, report.name)
+                } else {
+                    format!(
+                        "{} {}; suspended {} until it stops",
+                        state,
+                        report.name,
+                        report
+                            .suspended
+                            .iter()
+                            .map(|n| format!("{} ({})", n.name, n.network_id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
             })
             .map_err(|err| err.to_string()),
         Command::SetBroadcast {
@@ -211,7 +225,17 @@ async fn run(
         }
         Command::Join { name, secret } => ipc::join_network(socket, &name, &secret)
             .await
-            .map(|report| format!("joined {}", report.name))
+            .map(|report| {
+                format!(
+                    "{} {}",
+                    if report.active {
+                        "joined"
+                    } else {
+                        "configured; stopped by range conflict:"
+                    },
+                    report.name
+                )
+            })
             .map_err(|err| err.to_string()),
         Command::Leave { network_id } => ipc::leave_network(socket, &network_id)
             .await

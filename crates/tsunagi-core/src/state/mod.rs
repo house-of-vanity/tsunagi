@@ -109,12 +109,8 @@ impl std::str::FromStr for Ipv4Range {
     }
 }
 
-/// The IPv4 overlay range used unless something else is configured or agreed.
-///
-/// A small, specific `/24`: memorable, and far less likely to overlap a
-/// network the machine is already on than taking a whole `/8` or `/10` would
-/// be. Because addresses are allocated rather than derived, 254 of them is
-/// plenty for the size of network this is for.
+/// The legacy default range, retained for existing networks and explicit use.
+/// New networks use [`derived_ipv4_range`] by default.
 pub const DEFAULT_IPV4_RANGE: Ipv4Range = Ipv4Range {
     base: Ipv4Addr::new(10, 13, 37, 0),
     prefix_len: 24,
@@ -122,15 +118,10 @@ pub const DEFAULT_IPV4_RANGE: Ipv4Range = Ipv4Range {
 
 /// A range derived from a network's own identity.
 ///
-/// One agent has one interface, so two of its networks cannot both use the
-/// configured range. The second needs another one — and it cannot be picked
-/// locally, because every member has to arrive at the same answer without
-/// being told. So it comes from the network id, which every member already
-/// has and nobody can choose: the same network derives the same range on
-/// every device.
-///
-/// Inside 10/8 like the default, and never equal to it, so the first
-/// network keeps what it has always had.
+/// Every member independently derives the same pseudorandom `/24` in 10/8,
+/// including isolated first members. Stored signed ranges take precedence.
+/// The derivation is kept stable for networks already using it; the legacy
+/// default is excluded. Distinct network ids can still produce collisions.
 pub fn derived_ipv4_range(network: NetworkId) -> Ipv4Range {
     let bytes = network.as_bytes();
     let second = bytes[0];
@@ -673,15 +664,20 @@ impl StateSet {
 
     /// The range the network settled on, if anybody has said.
     ///
-    /// When claims disagree, the one from the lowest author id wins, so every
-    /// replica reaches the same answer. A participant joining later therefore
-    /// adopts the range already in use instead of imposing its own.
+    /// A legacy or explicit range takes precedence over the derived default,
+    /// so a fresh member's default cannot renumber an established network.
+    /// Other disagreements use the lowest author id, independently of arrival
+    /// order. The signed record format and network identity remain unchanged.
     pub fn agreed_range(&self) -> Option<Ipv4Range> {
-        let mut authors: Vec<&EndpointId> = self.records.keys().collect();
-        authors.sort_by_key(|author| *author.as_bytes());
-        authors
-            .into_iter()
-            .find_map(|author| self.records.get(author)?.body.range())
+        self.records
+            .iter()
+            .filter_map(|(author, record)| {
+                let range = record.body.range()?;
+                let derived = derived_ipv4_range(NetworkId::from_bytes(record.network));
+                Some(((range == derived, *author.as_bytes()), range))
+            })
+            .min_by_key(|(priority, _)| *priority)
+            .map(|(_, range)| range)
     }
 
     /// The highest version this author has published, as far as is known.
@@ -1263,7 +1259,7 @@ mod tests {
         assert_eq!(once.base.octets()[0], 10, "inside 10/8 like the default");
         assert_ne!(
             once, DEFAULT_IPV4_RANGE,
-            "the default belongs to whichever network asked first"
+            "the legacy default remains excluded"
         );
 
         // A different network derives a different range, which is the
@@ -1274,5 +1270,35 @@ mod tests {
         )
         .network_id();
         assert_ne!(once, derived_ipv4_range(other));
+    }
+
+    #[test]
+    fn a_derived_default_cannot_displace_a_legacy_or_explicit_range() {
+        let id = network("range-migration");
+        let a = SecretKey::generate();
+        let b = SecretKey::generate();
+        let (low, high) = if a.public().as_bytes() < b.public().as_bytes() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        for established in [DEFAULT_IPV4_RANGE, "10.90.0.0/16".parse().unwrap()] {
+            let body = |range: Ipv4Range| RecordBody::Claim {
+                address: Some(Ipv4Addr::from(u32::from(range.base) + 1)),
+                range: Some(range),
+                hostname: None,
+                hostname_since: None,
+            };
+            let fresh = SignedRecord::sign(&low, id, 1, body(derived_ipv4_range(id)));
+            let existing = SignedRecord::sign(&high, id, 1, body(established));
+            for records in [
+                vec![fresh.clone(), existing.clone()],
+                vec![existing.clone(), fresh.clone()],
+            ] {
+                let mut state = StateSet::new();
+                state.merge_all(id, records);
+                assert_eq!(state.agreed_range(), Some(established));
+            }
+        }
     }
 }

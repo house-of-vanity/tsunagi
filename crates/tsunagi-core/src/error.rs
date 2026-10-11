@@ -97,6 +97,19 @@ pub enum Error {
     #[error("network {0} is not configured")]
     NetworkUnknown(NetworkId),
 
+    /// An overlay range overlaps networks already active on this agent.
+    #[error(
+        "network {network} cannot start: {range} overlaps active networks {conflicts:?}; switch to it to suspend those networks"
+    )]
+    NetworkRangeConflict {
+        /// Network that could not start.
+        network: NetworkId,
+        /// Its agreed or proposed range.
+        range: crate::state::Ipv4Range,
+        /// Active networks that must be suspended first.
+        conflicts: Vec<NetworkId>,
+    },
+
     /// No session with that peer exists in the given network.
     #[error("no authenticated session with peer {peer} in network {network}")]
     NoSuchPeer {

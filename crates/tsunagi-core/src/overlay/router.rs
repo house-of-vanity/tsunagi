@@ -72,7 +72,7 @@ pub enum RouteError {
     #[error(
         "network {network} uses {range}, which overlaps {other_range} already in use by \
          {other}. One agent has one interface, so an address can belong to only one of \
-         them: give one network a different range."
+         them: stop the other network before starting this one."
     )]
     Overlap {
         /// The network being added.
@@ -365,6 +365,25 @@ impl RoutingTable {
         })
     }
 
+    /// All active networks whose reserved ranges intersect this range.
+    pub fn overlapping_networks(
+        &self,
+        network: NetworkId,
+        range: Ipv4Range,
+    ) -> Vec<(NetworkId, Ipv4Range)> {
+        let mut conflicts: Vec<_> = self
+            .read()
+            .iter()
+            .filter_map(|(other, routes)| {
+                let other_range = routes.range?;
+                (*other != network && ranges_overlap(range, other_range))
+                    .then_some((*other, other_range))
+            })
+            .collect();
+        conflicts.sort_by_key(|(id, _)| *id);
+        conflicts
+    }
+
     /// How many networks the table covers.
     pub fn len(&self) -> usize {
         self.read().len()
@@ -510,7 +529,7 @@ mod tests {
         let err = table.set_network(second, routes()).unwrap_err();
         let RouteError::Overlap { other, .. } = err;
         assert_eq!(other, first);
-        assert!(err.to_string().contains("different range"), "{err}");
+        assert!(err.to_string().contains("stop the other network"), "{err}");
         assert_eq!(table.len(), 1, "the overlapping network is not added");
 
         // A range of its own is fine.

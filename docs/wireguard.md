@@ -92,8 +92,8 @@ and then recorded as a signed fact**, using the model in
 [sync-model.md](sync-model.md).
 
 ```text
-default range          10.13.37.0/24   (override with --ipv4-range)
-who decides            the first member to claim; later ones adopt what they find
+default range          stable pseudorandom /24 in 10/8, derived from NetworkId
+who decides            all members derive the default; signed explicit ranges win
 who signs              the claiming member, with its persistent device key
 where it is kept       state.sqlite, and every replica that has seen it
 what a return costs    nothing: the old address is reclaimed
@@ -120,11 +120,34 @@ the same address at the same moment are resolved by a rule both compute
 identically — the lower endpoint id keeps it — and the loser simply allocates
 again with a higher version.
 
-**The range is agreed, not configured per member.** `--ipv4-range` says what
-this agent would use; a network that has already settled on something else
-wins, and the agent adopts it. So the flag matters for whoever starts the
-network and is harmless afterwards. Pass `--ipv4-range none` for an IPv6-only
-overlay.
+**The range is agreed, not configured per member.** New networks use the
+same deterministic `/24` on every device, independently of which network a
+member activates first or whether any peers are reachable. The derivation
+is unchanged from the former fallback; network identity and signed record
+encoding are unchanged. Distinct network ids can still derive the same range.
+
+`--ipv4-range` proposes an explicit range; existing signed ranges take
+precedence over the new derived default, including the former `10.13.37.0/24`.
+Among disagreeing non-default ranges the lowest author id still wins. Updated
+members propagate their adopted range in their signed claims; older releases
+still apply their original selection rule until those claims converge.
+`--ipv4-range none` disables local proposals, as before.
+
+An agent reserves each active network's range before starting its runtime.
+Overlapping ranges, including nested blocks such as a `/24` inside a `/16`,
+cannot run simultaneously. A late authenticated state update that introduces
+an overlap suspends that network before publishing new allocations to plugins
+or the interface. Other networks continue running.
+
+Status includes every blocking network's name, id and range. `tsng network
+start <name-or-id>` and the tray's switch button stop all blockers before
+starting the selected network. Suspended networks keep their startup request
+and resume when the blocker stops or is forgotten. A manual stop cancels that
+request even for a network already suspended. The user's preference order is
+stored locally, so the same selection wins at the next startup; it is never
+advertised or treated as a remote network setting. Local IPC uses wire version
+19 for the new reports: restart the agent and tray together after upgrading.
+The peer control protocol and signed record encoding do not change.
 
 The agent puts the address on the interface itself, as soon as the network has
 agreed on it — no restart, and the interface is not recreated, which would

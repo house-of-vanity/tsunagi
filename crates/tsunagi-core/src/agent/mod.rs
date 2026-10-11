@@ -27,14 +27,14 @@ mod status;
 pub use events::Event;
 pub use status::{
     AgentStatus, CandidateStatus, DataPath, HostnameConflict, MemberStatus, NetworkMetrics,
-    NetworkState, NetworkStatus, OverlayStatus, PeerStatus,
+    NetworkState, NetworkStatus, OverlayStatus, PeerStatus, RangeConflict,
 };
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use iroh::{EndpointAddr, EndpointId};
-use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::BoxFuture;
@@ -90,6 +90,10 @@ struct Inner {
     events: broadcast::Sender<Event>,
     networks: RwLock<HashMap<NetworkId, NetworkHandle>>,
     shutdown: Shutdown,
+    /// Serialises start, stop, switching and conflict cleanup, including teardown.
+    lifecycle: Mutex<()>,
+    range_changed: watch::Sender<()>,
+    range_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     accept_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     plugin_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     transport: std::sync::OnceLock<Arc<dyn PacketTransport>>,
@@ -234,6 +238,7 @@ impl Agent {
         let (events, _) = broadcast::channel(config.limits.event_buffer);
         let limits = Arc::new(config.limits.clone());
 
+        let (range_changed, range_updates) = watch::channel(());
         let inner = Arc::new(Inner {
             limits,
             storage,
@@ -243,6 +248,9 @@ impl Agent {
             events,
             networks: RwLock::new(HashMap::new()),
             shutdown: Shutdown::new(),
+            lifecycle: Mutex::new(()),
+            range_changed,
+            range_task: std::sync::Mutex::new(None),
             accept_task: std::sync::Mutex::new(None),
             plugin_task: std::sync::Mutex::new(None),
             transport: std::sync::OnceLock::new(),
@@ -326,11 +334,16 @@ impl Agent {
 
         let agent = Self { inner };
 
-        for stored in agent.inner.storage.list_networks().await? {
-            if stored.auto_start {
-                let keys = NetworkKeys::derive(&stored.name, &stored.secret);
-                agent.activate_with_keys(keys).await?;
-            }
+        {
+            let _guard = agent.inner.lifecycle.lock().await;
+            agent.resume_networks_locked().await?;
+        }
+        let task = tokio::spawn(range_conflict_loop(
+            Arc::downgrade(&agent.inner),
+            range_updates,
+        ));
+        if let Ok(mut guard) = agent.inner.range_task.lock() {
+            *guard = Some(task);
         }
 
         Ok(agent)
@@ -374,100 +387,65 @@ impl Agent {
         Ok(())
     }
 
-    /// Reserves the configured overlay range for a network, if it can.
-    ///
-    /// Done here, where activations are serialised, rather than inside the
-    /// runtime: whether a range is free depends on what the other networks
-    /// took, and deciding that in a task would make the answer depend on
-    /// which task ran first.
-    ///
-    /// `None` means this agent will not propose a range for that network and
-    /// waits to adopt whatever it settles on. One agent has one interface, so
-    /// proposing a range it could not route would be worse than having none:
-    /// the lowest author's range wins, and the collision would spread.
-    async fn reserve_range(&self, network: NetworkId) -> RangePlan {
-        let reserve = |wanted: Ipv4Range| {
-            let reservation = crate::overlay::NetworkRoutes {
-                exit: Default::default(),
-                broadcast: Default::default(),
-                range: Some(wanted),
-                local: None,
-                peers: Vec::new(),
-            };
-            self.inner.routes.set_network(network, reservation).is_ok()
-        };
-
-        // If this network already has signed records in storage, check if its
-        // members have already agreed on a range. If so, preserve and reserve
-        // THAT range rather than preemptively seizing the default configured range.
-        let stored_records = self
-            .inner
-            .storage
-            .signed_records(network)
-            .await
-            .unwrap_or_default();
-        let mut state_set = crate::state::StateSet::new();
-        state_set.merge_all(network, stored_records);
-        if let Some(agreed) = state_set.agreed_range() {
-            if reserve(agreed) {
-                return RangePlan {
-                    propose: if Some(agreed) == self.inner.config.overlay_ipv4_range {
-                        Some(agreed)
-                    } else {
-                        None
-                    },
-                    ..RangePlan::default()
-                };
+    /// Signed state always wins over a default or an explicit proposal.
+    async fn desired_range(&self, network: NetworkId) -> Result<Option<Ipv4Range>> {
+        let records = self.inner.storage.signed_records(network).await?;
+        let mut state = crate::state::StateSet::new();
+        state.merge_all(network, records);
+        Ok(state.agreed_range().or_else(|| {
+            if self.inner.config.overlay_ipv4_auto {
+                Some(crate::state::derived_ipv4_range(network))
             } else {
-                tracing::warn!(
-                    %network,
-                    range = %agreed,
-                    "agreed range for this network overlaps another network already active on this interface"
-                );
-                return RangePlan {
-                    conflict: Some(agreed),
-                    ..RangePlan::default()
-                };
+                self.inner.config.overlay_ipv4_range
+            }
+        }))
+    }
+
+    async fn range_conflicts(
+        &self,
+        network: NetworkId,
+        range: Option<Ipv4Range>,
+    ) -> Result<Vec<RangeConflict>> {
+        let Some(range) = range else {
+            return Ok(Vec::new());
+        };
+        let overlapping = self.inner.routes.overlapping_networks(network, range);
+        let stored = self.inner.storage.list_networks().await?;
+        Ok(overlapping
+            .into_iter()
+            .filter_map(|(id, range)| {
+                let name = stored.iter().find(|n| n.network_id == id)?.name.clone();
+                Some(RangeConflict {
+                    network_id: id,
+                    name,
+                    range,
+                })
+            })
+            .collect())
+    }
+
+    /// Starts requested networks in saved preference order, skipping overlaps.
+    /// Called with the lifecycle lock held; skipped networks remain requested.
+    async fn resume_networks_locked(&self) -> Result<()> {
+        let order = self.inner.storage.network_start_order().await?;
+        let mut stored = self.inner.storage.list_networks().await?;
+        stored.sort_by_key(|n| {
+            order
+                .iter()
+                .position(|id| *id == n.network_id)
+                .unwrap_or(usize::MAX)
+        });
+        for network in stored {
+            if !network.auto_start || self.is_active(network.network_id).await {
+                continue;
+            }
+            let keys = NetworkKeys::derive(&network.name, &network.secret);
+            match self.activate_with_keys_locked(keys).await {
+                Ok(()) | Err(Error::NetworkRangeConflict { .. }) => {}
+                Err(err) => return Err(err),
             }
         }
-
-        let Some(configured) = self.inner.config.overlay_ipv4_range else {
-            return RangePlan::default();
-        };
-
-        // The configured range first, so a network a device has always had
-        // keeps the addresses it has always had.
-        if reserve(configured) {
-            return RangePlan {
-                propose: Some(configured),
-                ..RangePlan::default()
-            };
-        }
-
-        // A second network on the same agent cannot have it — one agent,
-        // one interface — so it falls back to the range derived from its
-        // own id, which every one of its members derives identically
-        // without being told.
-        let derived = crate::state::derived_ipv4_range(network);
-        if reserve(derived) {
-            tracing::info!(
-                %network,
-                range = %derived,
-                "another network here holds the configured range; this one uses the \
-                 range derived from its id unless its members settled another"
-            );
-            return RangePlan {
-                fallback: Some(derived),
-                conflict: Some(configured),
-                ..RangePlan::default()
-            };
-        }
-
-        tracing::info!(%network, "not proposing a range for this network");
-        RangePlan {
-            conflict: Some(configured),
-            ..RangePlan::default()
-        }
+        Ok(())
     }
 
     /// The overlay interface this agent owns, when it has one.
@@ -546,6 +524,9 @@ impl Agent {
     /// The same `(name, secret)` always produces the same [`NetworkId`], on
     /// every device.
     ///
+    /// An overlapping network stays configured and requested, but inactive;
+    /// use [`Agent::switch_network`] to suspend the blockers explicitly.
+    ///
     /// This is declarative and therefore **idempotent**: joining a network
     /// that is already active succeeds and changes nothing. That matters
     /// because a configured network is activated automatically at startup, so
@@ -599,7 +580,9 @@ impl Agent {
         }
         match self.activate_with_keys(keys).await {
             // Already a member of exactly this network space: nothing to do.
-            Ok(()) | Err(Error::NetworkAlreadyActive(_)) => Ok(network_id),
+            Ok(())
+            | Err(Error::NetworkAlreadyActive(_))
+            | Err(Error::NetworkRangeConflict { .. }) => Ok(network_id),
             Err(err) => Err(err),
         }
     }
@@ -703,7 +686,44 @@ impl Agent {
         self.activate_with_keys(keys).await
     }
 
+    /// Switches to a configured network, suspending every overlapping network.
+    /// Suspended networks retain their auto-start request and resume when free.
+    /// Returns the networks suspended by this request.
+    pub async fn switch_network(&self, network_id: NetworkId) -> Result<Vec<NetworkId>> {
+        let _guard = self.inner.lifecycle.lock().await;
+        if self.inner.shutdown.is_triggered() {
+            return Err(Error::Stopped);
+        }
+        let stored = self
+            .inner
+            .storage
+            .list_networks()
+            .await?
+            .into_iter()
+            .find(|n| n.network_id == network_id)
+            .ok_or(Error::NetworkUnknown(network_id))?;
+        let range = self.desired_range(network_id).await?;
+        let conflicts = self.range_conflicts(network_id, range).await?;
+        self.inner.storage.prefer_network(network_id).await?;
+        let mut stopped = Vec::new();
+        for conflict in conflicts {
+            self.stop_network_locked(conflict.network_id).await?;
+            stopped.push(conflict.network_id);
+        }
+        if !self.is_active(network_id).await {
+            self.activate_with_keys_locked(NetworkKeys::derive(&stored.name, &stored.secret))
+                .await?;
+        }
+        self.resume_networks_locked().await?;
+        Ok(stopped)
+    }
+
     async fn activate_with_keys(&self, keys: NetworkKeys) -> Result<()> {
+        let _guard = self.inner.lifecycle.lock().await;
+        self.activate_with_keys_locked(keys).await
+    }
+
+    async fn activate_with_keys_locked(&self, keys: NetworkKeys) -> Result<()> {
         if self.inner.shutdown.is_triggered() {
             return Err(Error::Stopped);
         }
@@ -712,8 +732,36 @@ impl Agent {
         if networks.contains_key(&network_id) {
             return Err(Error::NetworkAlreadyActive(network_id));
         }
-
-        let range = self.reserve_range(network_id).await;
+        let stored = self
+            .inner
+            .storage
+            .list_networks()
+            .await?
+            .into_iter()
+            .find(|stored| stored.network_id == network_id);
+        let range = self.desired_range(network_id).await?;
+        if let Some(range) = range {
+            let conflicts = self.inner.routes.overlapping_networks(network_id, range);
+            if !conflicts.is_empty() {
+                return Err(Error::NetworkRangeConflict {
+                    network: network_id,
+                    range,
+                    conflicts: conflicts.into_iter().map(|(id, _)| id).collect(),
+                });
+            }
+            self.inner
+                .routes
+                .set_network(
+                    network_id,
+                    crate::overlay::NetworkRoutes {
+                        range: Some(range),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|err| Error::Rejected {
+                    reason: err.to_string(),
+                })?;
+        }
         let mut backends = Vec::new();
         if let Some(discovery) = &self.inner.config.discovery {
             backends.push(discovery.clone());
@@ -729,13 +777,7 @@ impl Agent {
                     as Arc<dyn crate::discovery::NetworkDiscovery>,
             )
         };
-        let stored = self
-            .inner
-            .storage
-            .list_networks()
-            .await?
-            .into_iter()
-            .find(|stored| stored.network_id == network_id);
+
         let broadcast = stored.as_ref().is_none_or(|stored| stored.broadcast);
         let exit_offer = stored.as_ref().is_some_and(|stored| stored.exit_node);
         let exit_via = stored
@@ -763,9 +805,8 @@ impl Agent {
             device_secret: self.inner.identity.signing_key(),
             #[cfg(feature = "testing")]
             unreachable_data_peers: Arc::clone(&self.inner.config.unreachable_data_peers),
-            ipv4_range: range.propose,
-            ipv4_fallback: range.fallback,
-            range_conflict: range.conflict,
+            ipv4_range: range,
+            range_changed: self.inner.range_changed.clone(),
         });
         networks.insert(network_id, handle);
         drop(networks);
@@ -786,6 +827,30 @@ impl Agent {
     /// it does not remove this agent from anyone else's view of the network.
     /// Other networks keep running.
     pub async fn deactivate_network(&self, network_id: NetworkId) -> Result<()> {
+        let _guard = self.inner.lifecycle.lock().await;
+        if !self.is_active(network_id).await {
+            return Err(Error::NetworkNotActive(network_id));
+        }
+        self.inner.storage.set_auto_start(network_id, false).await?;
+        self.stop_network_locked(network_id).await?;
+        self.resume_networks_locked().await
+    }
+
+    /// Stops a configured network, including one already suspended by overlap.
+    /// Clears its auto-start request so it will not resume behind the user.
+    pub async fn pause_network(&self, network_id: NetworkId) -> Result<()> {
+        let _guard = self.inner.lifecycle.lock().await;
+        if self.inner.shutdown.is_triggered() {
+            return Err(Error::Stopped);
+        }
+        self.inner.storage.set_auto_start(network_id, false).await?;
+        if self.is_active(network_id).await {
+            self.stop_network_locked(network_id).await?;
+        }
+        self.resume_networks_locked().await
+    }
+
+    async fn stop_network_locked(&self, network_id: NetworkId) -> Result<()> {
         let handle = {
             let mut networks = self.inner.networks.write().await;
             networks
@@ -814,7 +879,6 @@ impl Agent {
             interface.sync_broadcast_rules().await;
             interface.sync_exit_rules().await;
         }
-        self.inner.storage.set_auto_start(network_id, false).await?;
         Ok(())
     }
 
@@ -824,17 +888,15 @@ impl Agent {
     /// Local and silent: nobody is told. [`Agent::leave_network`] is the one
     /// that says goodbye first, and is what a person means by leaving.
     pub async fn forget_network(&self, network_id: NetworkId) -> Result<()> {
+        let _guard = self.inner.lifecycle.lock().await;
         if self.is_active(network_id).await {
-            self.deactivate_network(network_id).await?;
+            self.stop_network_locked(network_id).await?;
         }
         self.inner.storage.remove_network(network_id).await?;
-        // Whatever a protocol kept for this network goes with it. The
-        // agent cannot know what that is, only that there is no longer any
-        // reason to hold it.
         for plugin in &self.inner.config.plugins {
             plugin.on_network_forgotten(network_id);
         }
-        Ok(())
+        self.resume_networks_locked().await
     }
 
     /// Leaves a network: gives up what was claimed, then forgets it.
@@ -958,13 +1020,17 @@ impl Agent {
         let mut networks = Vec::new();
         for stored in self.inner.storage.list_networks().await? {
             if active.contains(&stored.network_id)
-                && let Ok(status) = self.network_status(stored.network_id).await
+                && let Ok(mut status) = self.network_status(stored.network_id).await
             {
+                status.auto_start = stored.auto_start;
                 networks.push(status);
                 continue;
             }
             let keys = NetworkKeys::derive(&stored.name, &stored.secret);
+            let range = self.desired_range(stored.network_id).await?;
+            let range_conflicts = self.range_conflicts(stored.network_id, range).await?;
             networks.push(NetworkStatus {
+                auto_start: stored.auto_start,
                 broadcast: stored.broadcast,
                 exit_offer: stored.exit_node,
                 exit_via: stored
@@ -978,12 +1044,13 @@ impl Agent {
                 state: NetworkState::Inactive,
                 peers: Vec::new(),
                 candidates: Vec::new(),
-                // An inactive network has no runtime to ask; the roster and
-                // the range come from one. Empty, not invented.
+                // The range is available from signed state or the deterministic
+                // default even while the network has no runtime.
                 members: Vec::new(),
                 hostname_conflict: None,
-                range: None,
-                range_conflict: None,
+                range,
+                range_conflict: range_conflicts.first().map(|conflict| conflict.range),
+                range_conflicts,
                 metrics: NetworkMetrics::default(),
                 relay: Default::default(),
             });
@@ -1039,6 +1106,7 @@ impl Agent {
     /// After this returns, the state directory can be opened by another agent.
     pub async fn shutdown(&self) {
         self.inner.shutdown.trigger();
+        let lifecycle_guard = self.inner.lifecycle.lock().await;
 
         let handles: Vec<NetworkHandle> = {
             let mut networks = self.inner.networks.write().await;
@@ -1048,6 +1116,7 @@ impl Agent {
             handle.stop().await;
         }
 
+        drop(lifecycle_guard);
         if let Some(dht) = &self.inner.config.dht {
             dht.shutdown().await;
         }
@@ -1064,6 +1133,7 @@ impl Agent {
         for (what, handle) in [
             ("inbound connections", &self.inner.accept_task),
             ("plugin requests", &self.inner.plugin_task),
+            ("range conflicts", &self.inner.range_task),
         ] {
             let task = handle.lock().ok().and_then(|mut guard| guard.take());
             if let Some(task) = task {
@@ -1107,16 +1177,44 @@ impl Agent {
     }
 }
 
-/// What a network may propose as its overlay range, and what it cannot have.
-#[derive(Debug, Clone, Copy, Default)]
-struct RangePlan {
-    /// Proposed straight away: the configured range, when it is free here.
-    propose: Option<Ipv4Range>,
-    /// Proposed after a moment, when the configured range is another
-    /// network's: the range derived from this network's own id.
-    fallback: Option<Ipv4Range>,
-    /// The configured range, when this network cannot have it.
-    conflict: Option<Ipv4Range>,
+/// Processes coalesced conflict notifications without blocking a network actor.
+async fn range_conflict_loop(inner: Weak<Inner>, mut updates: watch::Receiver<()>) {
+    loop {
+        let Some(owner) = inner.upgrade() else {
+            return;
+        };
+        let shutdown = owner.shutdown.clone();
+        drop(owner);
+        tokio::select! {
+            _ = shutdown.wait() => return,
+            result = updates.changed() => if result.is_err() { return; },
+        }
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let agent = Agent { inner };
+        let _guard = agent.inner.lifecycle.lock().await;
+        if agent.inner.shutdown.is_triggered() {
+            return;
+        }
+        let blocked: Vec<_> = agent
+            .inner
+            .networks
+            .read()
+            .await
+            .iter()
+            .filter(|(_, h)| h.range_blocked.load(std::sync::atomic::Ordering::Acquire))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in blocked {
+            if let Err(err) = agent.stop_network_locked(id).await {
+                tracing::warn!(%err, "cannot suspend overlapping network");
+            }
+        }
+        if let Err(err) = agent.resume_networks_locked().await {
+            tracing::warn!(%err, "cannot resume suspended networks");
+        }
+    }
 }
 
 /// How long a release is given to reach the sessions it was queued on.

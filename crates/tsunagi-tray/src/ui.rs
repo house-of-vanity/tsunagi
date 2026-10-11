@@ -252,13 +252,30 @@ fn draw_network(
 
         format::sparkline(ui, series, state.unit, 34.0);
 
+        if !network.range_conflicts.is_empty() {
+            ui.colored_label(BAD, "Stopped: overlapping network ranges");
+            for conflict in &network.range_conflicts {
+                ui.label(format!("{} ({}) uses {}", conflict.name, conflict.network_id, conflict.range));
+            }
+            ui.label("Switching suspends these networks until this network stops, then resumes them automatically.");
+            if network.auto_start { ui.weak("This network will resume automatically when its range is free."); }
+        }
         ui.horizontal(|ui| {
-            let mut active = network.active;
-            if ui.checkbox(&mut active, "active").changed() {
-                agent.send(Command::SetActive {
-                    network_id: network.network_id.clone(),
-                    active,
-                });
+            if !network.active && !network.range_conflicts.is_empty() {
+                if ui.button("Switch to this network").clicked() {
+                    agent.send(Command::SetActive { network_id: network.network_id.clone(), active: true });
+                }
+                if network.auto_start && ui.button("Keep stopped").clicked() {
+                    agent.send(Command::SetActive { network_id: network.network_id.clone(), active: false });
+                }
+            } else {
+                let mut active = network.active;
+                if ui.checkbox(&mut active, "active").changed() {
+                    agent.send(Command::SetActive {
+                        network_id: network.network_id.clone(),
+                        active,
+                    });
+                }
             }
             let mut broadcast = network.broadcast;
             if ui.checkbox(&mut broadcast, "broadcast").changed() {

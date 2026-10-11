@@ -324,6 +324,9 @@ pub struct ActiveReport {
     /// Stopping something already stopped is not an error — it is the state
     /// asked for — but it is worth saying which happened.
     pub changed: bool,
+    /// Networks suspended by switching to this network.
+    #[serde(default)]
+    pub suspended: Vec<RangeConflictReport>,
 }
 
 /// What happened when a network was joined.
@@ -345,6 +348,13 @@ pub struct JoinedReport {
     /// Almost always a mistyped secret, and the one thing that makes two
     /// sections of a report look like one network.
     pub name_shared_with: Option<String>,
+    /// Whether it started; false means it is configured but blocked by overlap.
+    #[serde(default = "joined_active_default")]
+    pub active: bool,
+}
+
+fn joined_active_default() -> bool {
+    true
 }
 
 /// What happened when a network was left.
@@ -437,9 +447,23 @@ pub struct DnsReport {
     pub names: u32,
 }
 
+/// An active network with an overlapping overlay range.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeConflictReport {
+    /// Public network id, for unambiguous selection.
+    pub network_id: String,
+    /// Configured network name.
+    pub name: String,
+    /// The overlapping range.
+    pub range: String,
+}
+
 /// One network.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkReport {
+    /// Whether the network starts or resumes automatically when its range is free.
+    #[serde(default)]
+    pub auto_start: bool,
     /// Whether this agent participates in LAN broadcasts in this network.
     #[serde(default)]
     pub broadcast: bool,
@@ -482,6 +506,9 @@ pub struct NetworkReport {
     /// The range it could not have, because another network on this agent
     /// already holds it.
     pub range_conflict: Option<String>,
+    /// Networks that switching to this network would suspend.
+    #[serde(default)]
+    pub range_conflicts: Vec<RangeConflictReport>,
     /// The overlay, when a protocol is running one.
     pub overlay: Option<OverlayReport>,
     /// This agent's own name, when another member claimed it first.
@@ -822,7 +849,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 18]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 19]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///

@@ -78,6 +78,7 @@ fn colour_of(health: Health) -> [u8; 3] {
     match health {
         Health::Disconnected => DARK_RED,
         Health::Connected => BLUE,
+        Health::RangeConflict => [0xd9, 0x91, 0x20],
         Health::ExitNode => GREEN,
     }
 }

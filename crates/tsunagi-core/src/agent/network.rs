@@ -137,6 +137,7 @@ pub(crate) struct NetworkHandle {
     pub(crate) commands: mpsc::Sender<NetCommand>,
     shutdown: Shutdown,
     task: JoinHandle<()>,
+    pub(crate) range_blocked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NetworkHandle {
@@ -177,17 +178,8 @@ pub(crate) struct RuntimeParams {
     /// The IPv4 overlay range this agent would use, if the network has not
     /// already settled on another one.
     pub(crate) ipv4_range: Option<Ipv4Range>,
-    /// The range it was configured with but cannot have, because another
-    /// network on this agent holds it.
-    pub(crate) range_conflict: Option<Ipv4Range>,
-    /// The range derived from this network's own id, proposed when the
-    /// configured one belongs to another network here.
-    ///
-    /// Held back at first: a network that already exists has a range of its
-    /// own, and a member that proposed before hearing anything would be
-    /// arguing with it instead of adopting it. Every member derives the
-    /// same one, so once the wait is over there is nothing to argue about.
-    pub(crate) ipv4_fallback: Option<Ipv4Range>,
+    /// Coalesced notifications to the agent's lifecycle manager.
+    pub(crate) range_changed: tokio::sync::watch::Sender<()>,
     /// How data plane links are opened. `None` disables the data plane.
     pub(crate) transport: Option<Arc<dyn PacketTransport>>,
 }
@@ -236,8 +228,10 @@ pub(crate) fn spawn(params: RuntimeParams) -> NetworkHandle {
     let (commands_tx, commands_rx) = mpsc::channel(64);
 
     let runtime_shutdown = shutdown.clone();
+    let range_blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runtime_blocked = Arc::clone(&range_blocked);
     let task = tokio::spawn(async move {
-        let mut runtime = Runtime::new(params, runtime_shutdown);
+        let mut runtime = Runtime::new(params, runtime_shutdown, runtime_blocked);
         runtime.run(commands_rx).await;
     });
 
@@ -246,6 +240,7 @@ pub(crate) fn spawn(params: RuntimeParams) -> NetworkHandle {
         commands: commands_tx,
         shutdown,
         task,
+        range_blocked,
     }
 }
 
@@ -256,14 +251,6 @@ pub(crate) fn spawn(params: RuntimeParams) -> NetworkHandle {
 /// revoked wrongly — a relay that disappears stops being chosen by
 /// itself, a few announcements later.
 const REACH_EXPIRY: Duration = Duration::from_secs(90);
-
-/// How long a network waits to be told its range before proposing the one
-/// derived from its id.
-///
-/// Only for that fallback: the configured range is proposed at once, as it
-/// always was. This is the window in which an existing network's records
-/// can arrive and be adopted instead.
-const RANGE_PROPOSAL_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 struct ProtocolDialState {
@@ -287,8 +274,9 @@ struct Runtime {
     discovery_worker: Option<DiscoveryWorker>,
     discovery_candidates: mpsc::Receiver<Candidate>,
     params: RuntimeParams,
-    /// When this runtime started, for the fallback range's grace period.
-    activated: std::time::Instant,
+    range_blocked: Arc<std::sync::atomic::AtomicBool>,
+    /// Last range successfully published to the agent's routing table.
+    published_range: Option<Ipv4Range>,
     network_id: NetworkId,
     local_id: EndpointId,
     shutdown: Shutdown,
@@ -366,7 +354,11 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(params: RuntimeParams, shutdown: Shutdown) -> Self {
+    fn new(
+        params: RuntimeParams,
+        shutdown: Shutdown,
+        range_blocked: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         let network_id = params.keys.network_id();
         let local_id = params.adapter.endpoint_id();
         let (session_events_tx, session_events_rx) = mpsc::channel(256);
@@ -398,7 +390,8 @@ impl Runtime {
             discovery_worker,
             discovery_candidates,
             params,
-            activated: std::time::Instant::now(),
+            range_blocked,
+            published_range: None,
             network_id,
             local_id,
             shutdown,
@@ -968,35 +961,27 @@ impl Runtime {
         if let Some(agreed) = self.state.agreed_range() {
             return Some(agreed);
         }
-        // Nobody has settled one yet, so this agent would be proposing its
-        // own. It must not propose a range it cannot route: one agent has
-        // one interface, and claiming an address in a range another network
-        // already owns would spread the collision rather than contain it —
-        // "the lowest author's range wins" would carry it to everybody.
-        if let Some(wanted) = self.params.ipv4_range
+        self.params.ipv4_range
+    }
+
+    /// A late signed range can conflict even though activation was safe.
+    /// Fail closed before touching claims, plugins or the host interface.
+    fn suspend_if_overlapping(&self) -> bool {
+        if let Some(range) = self.effective_range()
             && self
                 .params
                 .routes
-                .would_overlap(self.network_id, wanted)
-                .is_none()
+                .would_overlap(self.network_id, range)
+                .is_some()
         {
-            return Some(wanted);
+            self.range_blocked
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.params.routes.remove_network(self.network_id);
+            self.shutdown.trigger();
+            self.params.range_changed.send_replace(());
+            return true;
         }
-
-        // The configured range is another network's here, so this one falls
-        // back to the range derived from its id — after a moment's wait, so
-        // that a network which already exists gets to say what it uses
-        // first. Every member derives the same one, so members that reach
-        // this point agree without negotiating.
-        let fallback = self.params.ipv4_fallback?;
-        if self.activated.elapsed() < RANGE_PROPOSAL_GRACE {
-            return None;
-        }
-        self.params
-            .routes
-            .would_overlap(self.network_id, fallback)
-            .is_none()
-            .then_some(fallback)
+        false
     }
 
     /// Makes sure this agent holds an address, claiming one if it does not.
@@ -1006,7 +991,7 @@ impl Runtime {
     async fn ensure_own_claim(&mut self) {
         // On the way out. Claiming again here is how a goodbye becomes a
         // hello nobody asked for.
-        if self.released {
+        if self.released || self.suspend_if_overlapping() {
             return;
         }
         let wanted_hostname = {
@@ -1296,6 +1281,9 @@ impl Runtime {
 
     /// Tells the plugins who holds which overlay address.
     async fn publish_allocations(&mut self) {
+        if self.shutdown.is_triggered() || self.suspend_if_overlapping() {
+            return;
+        }
         let Some(range) = self.effective_range() else {
             return;
         };
@@ -1306,10 +1294,6 @@ impl Runtime {
             .map(|(address, holder)| (holder, address))
             .collect();
         allocations.sort_by_key(|(holder, _)| *holder.as_bytes());
-
-        for plugin in &self.params.plugins {
-            plugin.on_address_allocation(self.network_id, range, &allocations);
-        }
 
         // And the system level's own view, which is what decides whose
         // packet is whose. The local address is kept out of the peer list:
@@ -1326,17 +1310,27 @@ impl Runtime {
                 .map(|(holder, address)| (*address, *holder))
                 .collect(),
         };
-        if let Err(err) = self.params.routes.set_network(self.network_id, routes) {
-            // Reported once per change rather than swallowed: two networks
-            // wanting the same addresses is a thing the user has to settle.
-            self.metrics.plugin_errors += 1;
-            self.emit(Event::PluginError {
-                network: self.network_id,
-                protocol: "overlay".into(),
-                reason: err.to_string(),
-            });
+        if self
+            .params
+            .routes
+            .set_network(self.network_id, routes)
+            .is_err()
+        {
+            self.range_blocked
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.params.routes.remove_network(self.network_id);
+            self.shutdown.trigger();
+            self.params.range_changed.send_replace(());
             return;
         }
+        for plugin in &self.params.plugins {
+            plugin.on_address_allocation(self.network_id, range, &allocations);
+        }
+        if self.published_range != Some(range) {
+            self.published_range = Some(range);
+            self.params.range_changed.send_replace(());
+        }
+
         let Some(interface) = self.params.interface.clone() else {
             return;
         };
@@ -2387,6 +2381,7 @@ impl Runtime {
         members.dedup_by(|a, b| a.endpoint_id == b.endpoint_id);
 
         NetworkStatus {
+            auto_start: true,
             broadcast: self.params.broadcast,
             exit_offer: self.params.exit_offer,
             exit_via: self.params.exit_via,
@@ -2409,13 +2404,8 @@ impl Runtime {
             members,
             hostname_conflict: self.hostname_conflict_of(&self.local_id),
             range: self.effective_range(),
-            // Only worth reporting while it is actually stuck: with a
-            // fallback in play the configured range being another
-            // network's is how it is meant to work, not a fault.
-            range_conflict: self
-                .params
-                .range_conflict
-                .filter(|_| self.effective_range().is_none()),
+            range_conflict: None,
+            range_conflicts: Vec::new(),
             metrics: self.metrics.clone(),
             relay: self.hub.counters(),
         }

@@ -81,7 +81,17 @@ tsng join -n home -s tsn1…        # every other machine
 tsng status                       # who is online, over which path
 ```
 
-Every member gets an address in `10.13.37.0/24` and a name like `<host>.home`.
+Every new network gets a stable pseudorandom `/24` in `10.0.0.0/8`, derived
+from its network id. Its members agree on that range even when starting offline,
+and each gets a name like `<host>.home`. Existing signed ranges are preserved.
+
+If two configured networks have overlapping ranges, the agent runs only one.
+`tsng status`, `tsng network` and the tray show which network blocks the
+other. `tsng network start <name-or-id>` or the tray’s “Switch to this network”
+button suspends the conflicting networks. They resume automatically when the
+selected network stops; the selection survives restarting the agent. Explicitly
+stopping a suspended network cancels its automatic resume.
+
 Machines are called `tsunagi-<id>` until you rename them: `tsng id hostname laptop`.
 
 ### Exit nodes

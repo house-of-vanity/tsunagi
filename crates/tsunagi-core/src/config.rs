@@ -339,7 +339,11 @@ pub struct AgentConfig {
     pub interface_name: String,
     /// The interface MTU.
     pub interface_mtu: u32,
-    /// The IPv4 overlay range this agent proposes.
+    /// Whether new networks derive their IPv4 range from their network id.
+    ///
+    /// Enabled by default. Explicit ranges and IPv4 opt-out disable this.
+    pub overlay_ipv4_auto: bool,
+    /// The IPv4 overlay range this agent proposes when automatic selection is off.
     ///
     /// Addresses are allocated from it and recorded in signed state, so a
     /// participant keeps the same one across restarts. A network that has
@@ -373,7 +377,8 @@ impl AgentConfig {
             tun_factory: None,
             interface_name: "tsun0".to_string(),
             interface_mtu: 1280,
-            overlay_ipv4_range: Some(crate::state::DEFAULT_IPV4_RANGE),
+            overlay_ipv4_auto: true,
+            overlay_ipv4_range: None,
         }
     }
 
@@ -445,6 +450,7 @@ impl AgentConfig {
 
     /// Sets the IPv4 overlay range this agent proposes, or disables IPv4.
     pub fn with_overlay_ipv4_range(mut self, range: Option<crate::state::Ipv4Range>) -> Self {
+        self.overlay_ipv4_auto = false;
         self.overlay_ipv4_range = range;
         self
     }

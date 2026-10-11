@@ -162,7 +162,7 @@ async fn rejoining_after_leaving_is_not_taken_for_a_stale_record() {
     })
     .await;
     assert!(
-        tsunagi::state::DEFAULT_IPV4_RANGE.contains(again),
+        tsunagi::state::derived_ipv4_range(network_id).contains(again),
         "an address in the network's range: {again}"
     );
 

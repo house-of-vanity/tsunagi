@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -50,8 +50,13 @@ fn read_networks(dir: &TempDir) -> Vec<tsunagi::storage::StoredNetwork> {
 /// An agent with no network at all, the way a daemon is started before
 /// anything has been decided.
 fn start_bare(port: u16) -> Running {
+    start_bare_range(port, None)
+}
+
+fn start_bare_range(port: u16, range: Option<&str>) -> Running {
     let dir = TempDir::new().unwrap();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_tsng"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tsng"));
+    command
         .arg("up")
         .arg("--state-dir")
         .arg(dir.path().join("state"))
@@ -62,11 +67,31 @@ fn start_bare(port: u16) -> Running {
         .arg(format!("127.0.0.1:{port}"))
         .args(["--log", "error", "--status-interval", "0"])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("the agent binary starts");
-    std::thread::sleep(Duration::from_secs(2));
-    Running { child, dir }
+        .stderr(std::process::Stdio::null());
+    if let Some(range) = range {
+        command.args(["--ipv4-range", range]);
+    }
+    let child = command.spawn().expect("the agent binary starts");
+    let mut agent = Running { child, dir };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let socket = tsunagi::ipc::control_socket_path(&agent.dir.path().join("state"));
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !tsunagi::ipc::is_serving(&socket).await {
+                assert!(
+                    agent.child.try_wait().unwrap().is_none(),
+                    "agent exited before becoming ready"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("agent becomes ready");
+    });
+    agent
 }
 
 /// An agent already in one network, the way most of these start.
@@ -460,4 +485,140 @@ fn an_exit_node_is_offered_per_network_only_when_asked_and_nobody_offers_by_defa
         "{}",
         String::from_utf8_lossy(&unknown.stderr)
     );
+}
+
+#[test]
+fn overlapping_networks_are_reported_and_cli_start_switches_then_resumes() {
+    let agent = start_bare_range(0, Some("10.90.0.0/16"));
+    for name in ["resident", "games"] {
+        let joined = agent.run(&["join", "-n", name, "-s", "a-secret-for-the-conflict-test"]);
+        assert!(
+            joined.status.success(),
+            "{}",
+            String::from_utf8_lossy(&joined.stderr)
+        );
+        if name == "games" {
+            let text = String::from_utf8_lossy(&joined.stdout);
+            assert!(
+                text.contains("stopped because its range overlaps"),
+                "{text}"
+            );
+            assert!(!text.contains("it is running"), "{text}");
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let socket = tsunagi::ipc::control_socket_path(&agent.dir.path().join("state"));
+    let snapshot = || {
+        runtime
+            .block_on(tsunagi::ipc::request_status(&socket))
+            .unwrap()
+    };
+    let before = snapshot();
+    let resident = before
+        .networks
+        .iter()
+        .find(|n| n.name == "resident")
+        .unwrap();
+    let games = before.networks.iter().find(|n| n.name == "games").unwrap();
+    assert!(resident.active);
+    assert!(!games.active);
+    assert_eq!(games.range_conflicts[0].network_id, resident.network_id);
+    assert_eq!(games.range_conflicts[0].name, "resident");
+    for args in [vec!["status"], vec!["network"]] {
+        let result = agent.run(&args);
+        let text = String::from_utf8_lossy(&result.stdout);
+        assert!(text.contains("range conflict"), "{text}");
+        assert!(text.contains(&resident.network_id), "{text}");
+        assert!(text.contains("tsng network start"), "{text}");
+    }
+    let switched = agent.run(&["network", "start", "games"]);
+    assert!(
+        switched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switched.stderr)
+    );
+    let text = String::from_utf8_lossy(&switched.stdout);
+    assert!(
+        text.contains("started `games`") && text.contains("suspended `resident`"),
+        "{text}"
+    );
+    let after = snapshot();
+    assert!(
+        after
+            .networks
+            .iter()
+            .find(|n| n.name == "games")
+            .unwrap()
+            .active
+    );
+    assert!(
+        !after
+            .networks
+            .iter()
+            .find(|n| n.name == "resident")
+            .unwrap()
+            .active
+    );
+    assert!(agent.run(&["network", "stop", "games"]).status.success());
+    assert!(
+        snapshot()
+            .networks
+            .iter()
+            .find(|n| n.name == "resident")
+            .unwrap()
+            .active
+    );
+
+    assert!(agent.run(&["network", "start", "games"]).status.success());
+    let stop_suspended = agent.run(&["network", "stop", "resident"]);
+    assert!(stop_suspended.status.success());
+    assert!(String::from_utf8_lossy(&stop_suspended.stdout).contains("stopped `resident`"));
+    assert!(agent.run(&["network", "stop", "games"]).status.success());
+    assert!(
+        snapshot()
+            .networks
+            .iter()
+            .all(|n| !n.active && !n.auto_start)
+    );
+}
+
+#[test]
+fn cli_defaults_derive_each_networks_range() {
+    let agent = start_bare(0);
+    for name in ["derived-one", "derived-two"] {
+        assert!(
+            agent
+                .run(&["join", "-n", name, "-s", "a-secret-for-the-derived-test"])
+                .status
+                .success()
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let socket = tsunagi::ipc::control_socket_path(&agent.dir.path().join("state"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let report = runtime
+            .block_on(tsunagi::ipc::request_status(&socket))
+            .unwrap();
+        if report.networks.iter().all(|n| n.range.is_some()) {
+            assert_eq!(report.networks.len(), 2);
+            for network in report.networks {
+                let id = network.network_id.parse().unwrap();
+                assert!(network.active);
+                assert_eq!(
+                    network.range,
+                    Some(tsunagi::state::derived_ipv4_range(id).to_string())
+                );
+            }
+            break;
+        }
+        assert!(Instant::now() < deadline, "networks allocate ranges");
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
