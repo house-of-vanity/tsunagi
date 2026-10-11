@@ -166,6 +166,8 @@ pub struct Limits {
     pub max_capabilities: usize,
     /// Largest opaque plugin payload, in bytes.
     pub max_capability_data_len: usize,
+    /// Largest private transport negotiation payload (also hard-capped at 4096 bytes).
+    pub max_transport_payload_len: usize,
     /// Largest accepted echo payload in a ping/pong exchange, in bytes.
     pub max_echo_payload_len: usize,
     /// Largest accepted free-text reason string, in bytes.
@@ -204,6 +206,7 @@ impl Default for Limits {
             max_frame_len: 64 * 1024,
             max_hostname_len: 255,
             max_capabilities: 16,
+            max_transport_payload_len: 4096,
             max_capability_data_len: 4 * 1024,
             max_echo_payload_len: 4 * 1024,
             max_reason_len: 256,

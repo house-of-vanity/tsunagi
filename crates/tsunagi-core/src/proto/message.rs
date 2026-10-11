@@ -20,7 +20,7 @@ use crate::error::ProtocolError;
 /// The version in the ALPN is the wire-compatibility version of the control
 /// protocol. It is independent of the network identity scheme version, so
 /// bumping it must not change any existing [`crate::NetworkId`].
-pub const ALPN: &[u8] = b"tsunagi/ctrl/5";
+pub const ALPN: &[u8] = b"tsunagi/ctrl/6";
 
 /// ALPN of the tsunagi data plane.
 ///
@@ -43,7 +43,9 @@ pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
 pub const MAX_SIGNATURE_LEN: usize = 64;
 
 /// Control protocol version carried inside the handshake.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
+
+pub use crate::dataplane::transport::{MAX_TRANSPORT_PAYLOAD, TransportPayload};
 
 /// First message of the handshake, sent by the initiator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +116,13 @@ pub struct DataOpenAck {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ControlMessage {
+    /// Private transport negotiation; never persisted or rebroadcast.
+    Transport {
+        /// Transport protocol id; the payload stays opaque to the core.
+        protocol: String,
+        /// Secret negotiation data, redacted in diagnostics.
+        payload: TransportPayload,
+    },
     /// Hostname and capability announcement.
     Announce(Announcement),
     /// A small request used to verify that the exchange works.
@@ -264,6 +273,17 @@ pub fn validate_capability(
 /// network, the other networks or the agent.
 pub fn validate(message: &ControlMessage, limits: &Limits) -> Result<(), ProtocolError> {
     match message {
+        ControlMessage::Transport { protocol, payload } => {
+            if protocol.is_empty() {
+                return Err(ProtocolError::Malformed("empty transport protocol"));
+            }
+            check_len("transport.protocol", protocol.len(), MAX_PROTOCOL_ID_LEN)?;
+            check_len(
+                "transport.payload",
+                payload.as_bytes().len(),
+                limits.max_transport_payload_len.min(MAX_TRANSPORT_PAYLOAD),
+            )?;
+        }
         ControlMessage::Peers { peers } => {
             check_len("peers", peers.len(), limits.max_state_records)?;
             for hint in peers {
@@ -320,6 +340,7 @@ pub fn validate(message: &ControlMessage, limits: &Limits) -> Result<(), Protoco
 /// A short, stable label for a message kind, for metrics and diagnostics.
 pub fn kind(message: &ControlMessage) -> &'static str {
     match message {
+        ControlMessage::Transport { .. } => "transport",
         ControlMessage::Announce(_) => "announce",
         ControlMessage::Ping { .. } => "ping",
         ControlMessage::Pong { .. } => "pong",

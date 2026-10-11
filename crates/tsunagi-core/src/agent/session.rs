@@ -70,7 +70,7 @@ pub(crate) struct Session {
     pub(crate) conn: Connection,
     /// Already encoded frame payloads, so the runtime can account for the exact
     /// number of control bytes it queues.
-    pub(crate) outbound: mpsc::Sender<Vec<u8>>,
+    pub(crate) outbound: mpsc::Sender<zeroize::Zeroizing<Vec<u8>>>,
     pub(crate) hostname: Option<String>,
     pub(crate) capabilities: Vec<PluginCapability>,
     pub(crate) broadcast: bool,
@@ -244,7 +244,7 @@ pub(crate) fn spawn(
 
 async fn writer_task(
     mut send: SendStream,
-    mut outbound: mpsc::Receiver<Vec<u8>>,
+    mut outbound: mpsc::Receiver<zeroize::Zeroizing<Vec<u8>>>,
     limits: Arc<Limits>,
     shutdown: Shutdown,
     parent: Shutdown,
@@ -331,6 +331,7 @@ async fn reader_task(
             }
         };
 
+        let payload = zeroize::Zeroizing::new(payload);
         let bytes = payload.len();
         let envelope: Envelope = match decode(&payload) {
             Ok(envelope) => envelope,

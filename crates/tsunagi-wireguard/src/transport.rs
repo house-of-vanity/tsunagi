@@ -231,6 +231,9 @@ impl WireguardLink {
 }
 
 impl PacketLink for WireguardLink {
+    fn close(&self) {
+        WireguardLink::close(self);
+    }
     fn network(&self) -> NetworkId {
         self.network
     }

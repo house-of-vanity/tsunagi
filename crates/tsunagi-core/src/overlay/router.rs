@@ -384,6 +384,24 @@ impl RoutingTable {
         conflicts
     }
 
+    /// Current signed allocations used for encrypted data delivery checks.
+    pub(crate) fn probe_addresses(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+    ) -> Option<(Ipv4Addr, Ipv4Addr)> {
+        let table = self.read();
+        let routes = table.get(&network)?;
+        Some((
+            routes.local?,
+            routes
+                .peers
+                .iter()
+                .find(|(_, holder)| *holder == peer)
+                .map(|(address, _)| *address)?,
+        ))
+    }
+
     /// How many networks the table covers.
     pub fn len(&self) -> usize {
         self.read().len()

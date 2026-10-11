@@ -6246,11 +6246,32 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tsunagi-awg",
  "tsunagi-core",
  "tsunagi-tcp-tls",
  "tsunagi-wg-quic",
  "tsunagi-wireguard",
  "windows-service",
+]
+
+[[package]]
+name = "tsunagi-awg"
+version = "0.1.0"
+dependencies = [
+ "boringtun",
+ "bytes",
+ "chacha20 0.9.1",
+ "iroh",
+ "postcard",
+ "rand 0.10.3",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tsunagi-core",
+ "tsunagi-wg-quic",
+ "tsunagi-wireguard",
+ "zeroize",
 ]
 
 [[package]]

@@ -107,6 +107,11 @@ The tray does the same with a checkbox. An exit node sees everything you send
 through it, so use only members you trust.
 [Details and per-OS notes](docs/exit-node.md).
 
+The default data transport order is `wg,awg,wg-quic,tcp-tls`. AWG negotiates a
+fresh masking profile and outer keys for each pair connection attempt, including
+reentry after fallback. Sustained data loss triggers switching independently of
+the iroh control connection. [Configuration and limits](docs/amnezia.md).
+
 ## Platforms
 
 | Platform                  | Build        | CLI `tsng` | Tray | Exit node: offer / use | Packages                            |
@@ -184,6 +189,7 @@ The [threat model](docs/threat-model.md) says what this does and doesn't protect
 [Architecture](docs/architecture.md) ·
 [Protocol](docs/protocol.md) ·
 [WireGuard data plane](docs/wireguard.md) ·
+[Pairwise Amnezia transport](docs/amnezia.md) ·
 [Routing](docs/routing.md) ·
 [Exit nodes](docs/exit-node.md) ·
 [Threat model](docs/threat-model.md) ·

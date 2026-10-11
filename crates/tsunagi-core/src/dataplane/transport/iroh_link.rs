@@ -97,6 +97,9 @@ impl IrohLink {
 }
 
 impl PacketLink for IrohLink {
+    fn close(&self) {
+        self.conn.close(0u32.into(), b"data link retired");
+    }
     fn network(&self) -> NetworkId {
         self.network
     }

@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 tsunagi-core = { path = "../tsunagi-core", version = "0.1.0", features = ["tun-device", "dns-publish"] }
 tsunagi-wireguard = { path = "../tsunagi-wireguard", version = "0.1.0" }
+tsunagi-awg = { path = "../tsunagi-awg", version = "0.1.0" }
 tsunagi-wg-quic = { path = "../tsunagi-wg-quic", version = "0.1.0" }
 tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls", version = "0.1.0" }
 iroh.workspace = true

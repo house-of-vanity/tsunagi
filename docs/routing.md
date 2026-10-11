@@ -96,6 +96,14 @@ topology change can move a flow; datagrams remain unreliable and unordered,
 and there is no promise to preserve order across a physical path failure.
 Logical peer links and end-to-end encryption state survive these changes.
 
+## Carrier health and switching
+
+Carrier setup failures and persistent encrypted delivery loss advance the
+initiator's ordered fallback cycle. Logical end-to-end links survive while
+physical links are retired explicitly. The AWG carrier negotiates a fresh
+private pair profile on every reentry, without changing topology's durable
+state. See [amnezia.md](amnezia.md) for thresholds and bounds.
+
 ## Verification and measurement
 
 The default offline suite exercises four real agents, iroh transports and
@@ -116,5 +124,5 @@ counts sends without storing frames. Results are CPU forwarding cost, **not**
 end-to-end network latency or VPN throughput; encryption, fragmentation,
 sockets, congestion and scheduling contribute separately.
 
-Wire compatibility: control ALPN `tsunagi/ctrl/5`, data ALPN `tsunagi/data/5`.
+Wire compatibility: control ALPN `tsunagi/ctrl/6`, data ALPN `tsunagi/data/5`.
 Upgrade every participant together; saved identities and network state persist.

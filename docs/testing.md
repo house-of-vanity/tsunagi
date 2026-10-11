@@ -177,3 +177,10 @@ TSUNAGI_TEST_LOG=tsunagi=debug cargo test --test multi_peer -- --nocapture
 
 The library never installs a global subscriber; the harness opts in only when
 that variable is set.
+
+The `tsunagi-awg` suite runs real pair negotiation and masked UDP WireGuard
+engines with memory TUNs. A loss wrapper drops datagrams at the carrier boundary
+without substituting iroh, membership, encryption or SQLite. It checks runtime
+loss detection, fallback and fresh profiles, in addition to restart and input
+validation. Tests are offline; public STUN/DPI/NAT effectiveness needs separate
+real-network validation.

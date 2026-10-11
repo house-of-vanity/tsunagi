@@ -26,8 +26,8 @@ Read this before relying on anything here. The protocol is in
   neither receive nor forge another member's traffic. See
   [wireguard.md](wireguard.md#address-ownership-is-enforced-not-announced).
 - **Tunnelled traffic is end-to-end encrypted by WireGuard**, independently of
-  this crate. The transport underneath is also encrypted by iroh, but the
-  tunnel's confidentiality does not depend on that.
+  this crate. Carriers may be iroh, TLS, direct WG or
+  pairwise AWG; confidentiality does not depend on a particular carrier.
 - **Resource bounds.** Frame lengths are validated before allocation; strings,
   lists, queues, concurrent dials and in-flight handshakes are all bounded;
   handshakes, dials and writes have timeouts.
@@ -113,3 +113,14 @@ for key separation, HMAC-SHA256 for the membership proof, constant-time
 verification, iroh's Ed25519 endpoint keys and QUIC/TLS for the transport, and
 RFC 5705 TLS exporter output for channel binding. There is no custom encryption
 layer and no custom PAKE.
+
+## Pairwise AWG masking
+
+AWG profiles, PSKs and outer keys are private to one authenticated pair attempt,
+not shared network state. Address candidates are unverified until authenticated
+outer WireGuard data arrives. Header protection and structured signature packets
+reduce fixed wire markers; they do not guarantee admission by DPI or hide traffic
+analysis. iroh control availability remains a prerequisite. Encrypted end-to-end
+delivery probes detect sustained carrier loss, never confer membership and pass
+the same signed source/destination admission as ordinary IP traffic. See
+[amnezia.md](amnezia.md) for limits and tested scope.

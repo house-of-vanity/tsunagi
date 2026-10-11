@@ -169,6 +169,21 @@ impl PacketSink for Sink {
             let Some(inner) = self.0.upgrade() else {
                 return;
             };
+            if let Some(payload) = crate::dataplane::transport::health::ip_payload(&packet) {
+                if let Some(header) = crate::overlay::IpHeader::parse(&packet)
+                    && let (std::net::IpAddr::V4(source), std::net::IpAddr::V4(destination)) =
+                        (header.source(), header.destination())
+                    && inner.routes.may_send_from(network, peer, source)
+                    && inner.routes.is_local_destination(network, destination)
+                    && let Some(handle) = inner.networks.read().await.get(&network)
+                {
+                    let _ = handle.commands.try_send(NetCommand::HealthProbe {
+                        peer,
+                        packet: bytes::Bytes::copy_from_slice(payload),
+                    });
+                }
+                return;
+            }
             let Some(interface) = inner.interface.get() else {
                 return;
             };
@@ -186,6 +201,35 @@ impl PacketSink for Sink {
 /// with its open databases and its directory lock — would never be released.
 #[derive(Debug)]
 struct TransportCtx(Weak<Inner>);
+
+impl crate::dataplane::transport::ControlSender for TransportCtx {
+    fn send<'a>(
+        &'a self,
+        network: NetworkId,
+        peer: EndpointId,
+        protocol: &'a str,
+        payload: crate::proto::message::TransportPayload,
+    ) -> crate::BoxFuture<'a, std::result::Result<(), crate::dataplane::transport::TransportError>>
+    {
+        Box::pin(async move {
+            let inner = self
+                .0
+                .upgrade()
+                .ok_or(crate::dataplane::transport::TransportError::Closed)?;
+            Agent { inner }
+                .send(
+                    network,
+                    peer,
+                    crate::proto::message::ControlMessage::Transport {
+                        protocol: protocol.into(),
+                        payload,
+                    },
+                )
+                .await
+                .map_err(|err| crate::dataplane::transport::TransportError::Other(err.to_string()))
+        })
+    }
+}
 
 impl TransportContext for TransportCtx {
     fn snapshot(&self) -> crate::BoxFuture<'_, HashMap<NetworkId, NetworkKeys>> {
@@ -302,6 +346,7 @@ impl Agent {
                 inner.config.custom_transports.clone(),
             ))
         };
+        transport.attach_control(Arc::new(TransportCtx(Arc::downgrade(&inner))));
         let _ = inner.transport.set(transport);
 
         if let CacheOutcome::Reset(reason) = inner.storage.cache_outcome().clone() {

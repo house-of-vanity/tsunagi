@@ -1,0 +1,30 @@
+[package]
+name = "tsunagi-awg"
+version = "0.1.0"
+description = "Ephemeral pairwise Amnezia transport for Tsunagi."
+edition.workspace = true
+rust-version.workspace = true
+license = "WTFPL AND Apache-2.0"
+repository.workspace = true
+
+[dependencies]
+tsunagi-core = { path = "../tsunagi-core" }
+tsunagi-wg-quic = { path = "../tsunagi-wg-quic" }
+tsunagi-wireguard = { path = "../tsunagi-wireguard" }
+iroh.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync", "macros"] }
+serde.workspace = true
+postcard.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+rand = "0.10"
+zeroize = { version = "1.9", features = ["derive"] }
+boringtun = { version = "0.7.1", default-features = false }
+chacha20 = "0.9"
+
+[dev-dependencies]
+tsunagi-core = { path = "../tsunagi-core", features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

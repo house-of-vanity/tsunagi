@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::{DiscoveryPolicy, Limits, ReconnectPolicy};
+use crate::dataplane::transport::health::{HealthLink, ProbeRoute, Settings as HealthSettings};
 use crate::dataplane::transport::{InboundLink, PacketLink, PacketTransport, SharedLink};
 use crate::dataplane::{PluginCapability, SharedPlugin};
 use crate::discovery::worker::DiscoveryWorker;
@@ -59,6 +60,10 @@ pub(crate) enum NetCommand {
     },
     /// A peer opened a data plane link towards us.
     InboundLink(Box<InboundLink>),
+    HealthProbe {
+        peer: EndpointId,
+        packet: bytes::Bytes,
+    },
     Status {
         reply: oneshot::Sender<Box<NetworkStatus>>,
     },
@@ -123,6 +128,7 @@ impl std::fmt::Debug for NetCommand {
             NetCommand::SetHostname(_) => f.write_str("SetHostname"),
             NetCommand::Release { .. } => f.write_str("Release"),
             NetCommand::PluginError { protocol, .. } => write!(f, "PluginError({protocol})"),
+            NetCommand::HealthProbe { peer, .. } => write!(f, "HealthProbe({})", peer.fmt_short()),
             NetCommand::ProtocolFailure { peer, protocol, .. } => {
                 write!(f, "ProtocolFailure({}, {protocol})", peer.fmt_short())
             }
@@ -261,6 +267,12 @@ struct ProtocolDialState {
 const DATA_LINK_BASE_BACKOFF: Duration = Duration::from_secs(3);
 const DATA_LINK_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
+fn next_protocol_index(supported: &[String], last_failed: Option<&str>) -> usize {
+    last_failed
+        .and_then(|failed| supported.iter().position(|p| p == failed))
+        .map_or(0, |i| (i + 1) % supported.len().max(1))
+}
+
 fn data_link_backoff(failures: u32) -> Duration {
     if failures == 0 {
         return Duration::ZERO;
@@ -292,7 +304,9 @@ struct Runtime {
     ///
     /// The direct ones. What a protocol holds is the hub's link for that
     /// peer, which outlives any particular path.
-    links: HashMap<(EndpointId, String), SharedLink>,
+    links: HashMap<(EndpointId, String), Arc<HealthLink>>,
+    pending_health: HashMap<(EndpointId, String), HealthSettings>,
+    last_failed_protocol: HashMap<EndpointId, String>,
     /// Every data link of this network, and what is reached through what.
     hub: Arc<crate::dataplane::relay::RelayHub>,
     /// Which peers each peer says it has a live link with, and when it
@@ -404,6 +418,8 @@ impl Runtime {
             dial_results_tx,
             dial_results_rx,
             links: HashMap::new(),
+            pending_health: HashMap::new(),
+            last_failed_protocol: HashMap::new(),
             hub,
             reachable: HashMap::new(),
             local_capabilities: Vec::new(),
@@ -491,7 +507,12 @@ impl Runtime {
         // any more, and a sender blocked on a full queue would stall shutdown.
         self.session_events_rx.close();
         self.hub.close();
+        for link in self.links.values() {
+            link.close();
+        }
         self.links.clear();
+        self.pending_health.clear();
+        self.last_failed_protocol.clear();
         self.protocol_dial_states.clear();
         let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
         for peer in peers {
@@ -595,12 +616,20 @@ impl Runtime {
                     reason,
                 });
             }
+            NetCommand::HealthProbe { peer, packet } => {
+                for ((p, _), link) in &self.links {
+                    if *p == peer {
+                        link.receive_probe(packet.clone());
+                    }
+                }
+            }
             NetCommand::ProtocolFailure {
                 peer,
                 protocol,
                 reason,
             } => {
-                if self.links.remove(&(peer, protocol.clone())).is_some() {
+                if let Some(link) = self.links.remove(&(peer, protocol.clone())) {
+                    link.close();
                     self.hub.clear_direct(peer, &protocol);
                 }
                 self.metrics.data_link_failures += 1;
@@ -655,7 +684,7 @@ impl Runtime {
             peer: peer.fmt_short().to_string(),
         })?;
 
-        match session.outbound.try_send(encoded) {
+        match session.outbound.try_send(zeroize::Zeroizing::new(encoded)) {
             Ok(()) => {
                 session.messages_sent += 1;
                 session.bytes_sent += bytes;
@@ -1423,6 +1452,7 @@ impl Runtime {
     }
 
     fn record_protocol_failure(&mut self, peer: EndpointId, protocol: &str) {
+        self.last_failed_protocol.insert(peer, protocol.to_string());
         let key = (peer, protocol.to_string());
         let entry = self
             .protocol_dial_states
@@ -1461,7 +1491,17 @@ impl Runtime {
             }
         }
         for (peer, protocol) in dead {
-            self.links.remove(&(peer, protocol.clone()));
+            let reason = self
+                .links
+                .remove(&(peer, protocol.clone()))
+                .map(|link| {
+                    let reason = link
+                        .failure_reason()
+                        .unwrap_or_else(|| "link closed".into());
+                    link.close();
+                    reason
+                })
+                .unwrap_or_else(|| "link closed".into());
             // Only the direct path is gone. Whether the peer is still
             // reachable through somebody is decided below; the protocol's
             // link stays either way.
@@ -1471,7 +1511,7 @@ impl Runtime {
                 network: self.network_id,
                 peer,
                 protocol,
-                reason: "link closed".into(),
+                reason,
             });
         }
 
@@ -1512,12 +1552,21 @@ impl Runtime {
                 continue;
             }
 
-            let chosen = supported.iter().find(|proto| {
-                match self.protocol_dial_states.get(&(peer, (*proto).clone())) {
-                    Some(state) => state.cooldown_until <= now,
-                    None => true,
-                }
-            });
+            let start = next_protocol_index(
+                &supported,
+                self.last_failed_protocol.get(&peer).map(String::as_str),
+            );
+            let chosen = supported
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(supported.len())
+                .find(
+                    |proto| match self.protocol_dial_states.get(&(peer, (*proto).clone())) {
+                        Some(state) => state.cooldown_until <= now,
+                        None => true,
+                    },
+                );
 
             if let Some(proto) = chosen {
                 wanted.push((peer, proto.clone()));
@@ -1831,7 +1880,11 @@ impl Runtime {
     }
 
     fn install_link(&mut self, inbound: InboundLink) {
-        if self.no_direct_data(inbound.peer) {
+        if self.no_direct_data(inbound.peer)
+            || inbound.link.is_closed()
+            || !self.sessions.contains_key(&inbound.peer)
+        {
+            inbound.link.close();
             return;
         }
         self.record_protocol_success(inbound.peer, &inbound.protocol);
@@ -1842,6 +1895,14 @@ impl Runtime {
 
     /// Hands a link to the plugin that owns its protocol.
     fn adopt_link(&mut self, peer: EndpointId, protocol: String, link: SharedLink) {
+        if link.is_closed()
+            || link.network() != self.network_id
+            || link.peer() != peer
+            || !self.sessions.contains_key(&peer)
+        {
+            link.close();
+            return;
+        }
         if !self
             .params
             .plugins
@@ -1851,10 +1912,42 @@ impl Runtime {
             return;
         }
 
+        let key = (peer, protocol.clone());
+        let settings = if self.local_id.as_bytes() < peer.as_bytes() {
+            let settings = HealthSettings::fresh();
+            if let Ok(bytes) = postcard::to_stdvec(&(protocol.clone(), settings.clone())) {
+                let _ = self.send_to(
+                    peer,
+                    ControlMessage::Transport {
+                        protocol: "link-health".into(),
+                        payload: crate::proto::message::TransportPayload::new(bytes),
+                    },
+                );
+            }
+            Some(settings)
+        } else {
+            self.pending_health.remove(&key)
+        };
+        let route = self
+            .sessions
+            .get(&peer)
+            .and_then(|s| self.tunnel_protocol(s))
+            .and_then(|name| self.params.plugins.iter().find(|p| p.protocol_id() == name))
+            .map(|plugin| ProbeRoute {
+                plugin: plugin.clone(),
+                routes: self.params.routes.clone(),
+                network: self.network_id,
+                peer,
+                max_probe_size: self.params.interface.as_ref().map_or(540, |interface| {
+                    (interface.mtu() as usize).saturating_sub(36)
+                }),
+            });
+        let link = HealthLink::new(link, self.local_id, settings, route);
         let path = link.path_description();
         let max_datagram = link.max_datagram_size();
-        self.links
-            .insert((peer, protocol.clone()), Arc::clone(&link));
+        if let Some(old) = self.links.insert(key, Arc::clone(&link)) {
+            old.close();
+        }
         // What this is, is a way to reach the peer. Which protocol's
         // tunnel runs over it is decided in `update_paths`, and that tunnel
         // is handed the hub's link, not this one: the same object for as
@@ -1878,6 +1971,8 @@ impl Runtime {
         self.hub.remove_peer(peer);
         self.reachable.remove(&peer);
         self.protocol_dial_states.retain(|(p, _), _| *p != peer);
+        self.last_failed_protocol.remove(&peer);
+        self.pending_health.retain(|(p, _), _| *p != peer);
         let keys: Vec<(EndpointId, String)> = self
             .links
             .keys()
@@ -1885,7 +1980,9 @@ impl Runtime {
             .cloned()
             .collect();
         for key in keys {
-            self.links.remove(&key);
+            if let Some(link) = self.links.remove(&key) {
+                link.close();
+            }
             self.emit(Event::DataLinkDown {
                 network: self.network_id,
                 peer,
@@ -2134,6 +2231,50 @@ impl Runtime {
 
     fn dispatch_message(&mut self, peer: EndpointId, message: ControlMessage) {
         match &message {
+            ControlMessage::Transport { protocol, payload } => {
+                if protocol == "link-health" {
+                    // Only the elected initiator supplies a profile, for an enabled,
+                    // mutually supported physical protocol in this authenticated session.
+                    if peer.as_bytes() >= self.local_id.as_bytes() {
+                        return;
+                    }
+                    let Ok((name, settings)) =
+                        postcard::from_bytes::<(String, HealthSettings)>(payload.as_bytes())
+                    else {
+                        return;
+                    };
+                    if name.len() > crate::dataplane::MAX_PROTOCOL_ID_LEN
+                        || !self.served_protocols().iter().any(|(p, v)| {
+                            p == &name
+                                && self.sessions.get(&peer).is_some_and(|s| {
+                                    s.capabilities
+                                        .iter()
+                                        .any(|c| c.enabled && c.protocol == name && c.version == *v)
+                                })
+                        })
+                    {
+                        return;
+                    }
+                    let key = (peer, name);
+                    // Negotiation and inbound installation are separate queues.
+                    // Keep the newest settings even if the previous physical
+                    // link is still in the map when this control frame arrives.
+                    if let Some(link) = self.links.get(&key)
+                        && !link.is_closed()
+                    {
+                        link.configure(settings.clone());
+                    }
+                    self.pending_health.insert(key, settings);
+                    return;
+                }
+                if let Some(transport) = &self.params.transport
+                    && let Err(err) =
+                        transport.on_control(self.network_id, peer, protocol, payload.as_bytes())
+                {
+                    tracing::debug!(%err, "transport negotiation rejected");
+                }
+                return;
+            }
             ControlMessage::Announce(announcement) => {
                 let capabilities = announcement.capabilities.clone();
                 if let Some(session) = self.sessions.get_mut(&peer) {
@@ -2650,5 +2791,19 @@ mod relay_host_tests {
         );
         assert_eq!(relay_host("https:///").as_deref(), None);
         assert_eq!(relay_host("https://bad host/").as_deref(), None);
+    }
+}
+
+#[cfg(test)]
+mod fallback_order_tests {
+    use super::next_protocol_index;
+    #[test]
+    fn degradation_advances_the_cycle_even_after_earlier_cooldowns_expire() {
+        let protocols = ["wg", "awg", "wg-quic", "tcp-tls"].map(str::to_owned);
+        assert_eq!(next_protocol_index(&protocols, None), 0);
+        for (i, p) in protocols.iter().enumerate() {
+            assert_eq!(next_protocol_index(&protocols, Some(p)), (i + 1) % 4);
+        }
+        assert_eq!(next_protocol_index(&protocols, Some("removed")), 0);
     }
 }

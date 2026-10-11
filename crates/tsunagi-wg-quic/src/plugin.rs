@@ -79,6 +79,8 @@ pub const WIREGUARD_OVERHEAD: u32 = 32;
 /// Configuration of the WireGuard plugin.
 #[derive(Debug, Clone)]
 pub struct WireguardConfig {
+    /// Diagnostic protocol id when this end-to-end engine is reused by another carrier.
+    pub protocol: &'static str,
     /// Directory for the plugin's own key store. Separate from agent state.
     pub state_dir: PathBuf,
     /// WireGuard keepalive, which keeps tunnels and their links warm.
@@ -100,6 +102,7 @@ impl WireguardConfig {
     /// Creates a configuration rooted at `state_dir` with sensible defaults.
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
+            protocol: WIREGUARD_PROTOCOL,
             state_dir: state_dir.into(),
             keepalive: Some(25),
             mtu: DEFAULT_MTU,
@@ -394,7 +397,7 @@ impl Worker {
     fn report(&self, network: NetworkId, reason: impl std::fmt::Display) {
         tracing::warn!(network = %network.fmt_short(), %reason, "wireguard plugin error");
         if let Some(context) = self.context.get() {
-            context.report_error(network, WIREGUARD_PROTOCOL, reason.to_string());
+            context.report_error(network, self.config.protocol, reason.to_string());
         }
     }
 
@@ -647,7 +650,7 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
 
 impl IpPlugin for WireguardPlugin {
     fn protocol_id(&self) -> &str {
-        WIREGUARD_PROTOCOL
+        self.worker.config.protocol
     }
 
     fn protocol_version(&self) -> u16 {
@@ -686,7 +689,7 @@ impl IpPlugin for WireguardPlugin {
         // Identity only. Where to send packets is the transport's business.
         let announcement = WgAnnouncement::new(network, &state.key.public());
         Ok(Some(PluginCapability {
-            protocol: WIREGUARD_PROTOCOL.to_string(),
+            protocol: self.worker.config.protocol.to_string(),
             version: crate::announcement::ANNOUNCEMENT_VERSION,
             enabled: true,
             data: announcement.encode()?,

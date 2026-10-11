@@ -9,10 +9,14 @@ Two versions exist and are independent:
 
 - **Identity scheme**, `tsunagi-network-id-v1`. Frozen. Changing it creates a
   different network space for the same name and secret.
-- **Control protocol**, ALPN `tsunagi/ctrl/5`, `PROTOCOL_VERSION = 5`.
+- **Control protocol**, ALPN `tsunagi/ctrl/6`, `PROTOCOL_VERSION = 6`.
 
 Upgrading the crate or bumping the control protocol must never change an
 existing `NetworkId`.
+
+Control version 6 adds private transport negotiation for pairwise AWG and data
+delivery checks. Data ALPN remains `tsunagi/data/5`. All members must upgrade
+together; network ids and stored state are unchanged. See [amnezia.md](amnezia.md).
 
 ## Canonical encoding
 
@@ -230,6 +234,7 @@ not affect other networks.
 | message | meaning |
 |---|---|
 | `Announce { hostname, capabilities, broadcast }` | this agent's hostname, IP-plugin capabilities and local broadcast participation |
+| `Transport { protocol, payload }` | private, bounded per-peer transport negotiation; never state or a public message event |
 | `Ping { seq, payload }` | small request used to verify the exchange |
 | `Pong { seq, payload }` | the echoed reply |
 | `State { records }` | a snapshot of signed records, merged into what the receiver holds |

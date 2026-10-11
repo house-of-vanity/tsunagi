@@ -115,6 +115,7 @@ pub struct TcpTlsLink {
     peer: EndpointId,
     tx: mpsc::Sender<Bytes>,
     rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
+    tasks: [tokio::task::AbortHandle; 2],
     closed_notify: Arc<Notify>,
     is_closed: Arc<AtomicBool>,
     remote_addr: String,
@@ -136,7 +137,7 @@ impl TcpTlsLink {
 
         let closed_flag_w = Arc::clone(&is_closed);
         let closed_notify_w = Arc::clone(&closed_notify);
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             while let Some(msg) = rx_out.recv().await {
                 if msg.len() > MAX_FRAME_SIZE {
                     continue;
@@ -158,7 +159,7 @@ impl TcpTlsLink {
 
         let closed_flag_r = Arc::clone(&is_closed);
         let closed_notify_r = Arc::clone(&closed_notify);
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             let mut len_buf = [0u8; 2];
             loop {
                 if reader.read_exact(&mut len_buf).await.is_err() {
@@ -185,6 +186,7 @@ impl TcpTlsLink {
             peer,
             tx: tx_out,
             rx: tokio::sync::Mutex::new(rx_in),
+            tasks: [writer_task.abort_handle(), reader_task.abort_handle()],
             closed_notify,
             is_closed,
             remote_addr,
@@ -192,7 +194,19 @@ impl TcpTlsLink {
     }
 }
 
+impl Drop for TcpTlsLink {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
 impl PacketLink for TcpTlsLink {
+    fn close(&self) {
+        self.is_closed.store(true, Ordering::Release);
+        self.closed_notify.notify_waiters();
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
     fn network(&self) -> NetworkId {
         self.network
     }

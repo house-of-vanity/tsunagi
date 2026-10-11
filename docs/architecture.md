@@ -20,8 +20,9 @@ network secret. The core moves an opaque, bounded payload and never parses it.
 a `PacketLink` — an authenticated, unreliable datagram channel to one peer for
 one protocol — and never learn how it is carried.
 
-The separation between the two planes is **logical, not physical**. Both ride
-on iroh, on different ALPNs and different connections. That is deliberate:
+The separation between the two planes is **logical, not physical**. The control plane uses
+iroh; the data plane can use iroh on its own ALPN and connection, or independent
+UDP/TLS carriers. That is deliberate:
 iroh's whole value is hole punching a direct path between peers behind NAT,
 with a relay as fallback, and a data plane that refused to use it would have to
 reimplement all of it. What the separation buys is that `proto` knows nothing
@@ -31,6 +32,10 @@ either can be replaced on its own.
 A plugin talks to the core through three narrow hooks — `on_network_activated`,
 a `PluginContext` for re-announcements and error reports, and a bounded
 `shutdown` — so the core never learns anything protocol-specific.
+
+Private pair negotiation uses a bounded transport sender supplied by the core.
+Protocol crates do not encode or parse control messages and never receive the
+network secret. No pair profiles enter signed state.
 
 A data plane failure never stops the daemon: the control plane keeps running
 and the agent stays manageable.
@@ -68,6 +73,7 @@ And in crates of their own:
 
 | crate | responsibility |
 |---|---|
+| `tsunagi-awg` | ephemeral pairwise Amnezia masking, private negotiation and independently encrypted UDP carriers; reuses the end-to-end WireGuard engine |
 | `tsunagi-wg-quic` | the `wg-quic` protocol: its keys, its announcement, its tunnels |
 | `tsunagi` | the command line agent, built as the `tsng` executable: the only place that owns a runtime, a logger and signals |
 
