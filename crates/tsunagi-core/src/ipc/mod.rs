@@ -171,6 +171,13 @@ pub fn default_control_socket_path() -> PathBuf {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Request {
+    /// Replace one network's ordered local data-plane selection.
+    SetProtocols {
+        /// Public network identifier.
+        network_id: String,
+        /// Protocol names, best first; empty selects control only.
+        protocols: Vec<String>,
+    },
     /// Report what the agent is doing.
     Status,
     /// Set local broadcast participation in one configured network.
@@ -255,6 +262,13 @@ pub enum Request {
 impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Request::SetProtocols {
+                network_id,
+                protocols,
+            } => write!(
+                f,
+                "SetProtocols {{ {network_id}, protocols: {protocols:?} }}"
+            ),
             Request::Status => f.write_str("Status"),
             Request::SetBroadcast {
                 network_id,
@@ -286,6 +300,8 @@ impl std::fmt::Debug for Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Response {
+    /// Accepted ordered protocol selection.
+    Protocols(Vec<String>),
     /// A status report.
     Status(Box<StatusReport>),
     /// Accepted local broadcast participation.
@@ -377,6 +393,8 @@ pub struct LeftReport {
 /// Everything the agent is doing, in one snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusReport {
+    /// Data-plane protocols this agent can enable at runtime.
+    pub available_protocols: Vec<ProtocolReport>,
     /// This device's persistent endpoint id.
     pub endpoint_id: String,
     /// Hostname announced to peers.
@@ -458,9 +476,20 @@ pub struct RangeConflictReport {
     pub range: String,
 }
 
+/// A data-plane protocol available in the running agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolReport {
+    /// Stable protocol name used by the CLI and network negotiation.
+    pub name: String,
+    /// A short description of encryption and transport.
+    pub summary: String,
+}
+
 /// One network.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkReport {
+    /// Enabled local data-plane protocols, in preference order.
+    pub protocols: Vec<String>,
     /// Whether the network starts or resumes automatically when its range is free.
     #[serde(default)]
     pub auto_start: bool,
@@ -720,6 +749,14 @@ impl OverlayPeerReport {
 /// running and what they can report or change. That is what keeps this module
 /// free of any knowledge of them.
 pub trait ReportSource: Send + Sync + 'static {
+    /// Saves and applies a local ordered protocol set for one network.
+    fn set_protocols(
+        &self,
+        _network_id: String,
+        _protocols: Vec<String>,
+    ) -> BoxFuture<'_, std::result::Result<Vec<String>, String>> {
+        Box::pin(async { Err("this agent cannot change protocols".into()) })
+    }
     /// Produces a fresh report.
     fn report(&self) -> BoxFuture<'_, StatusReport>;
 
@@ -849,7 +886,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 19]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 20]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///
@@ -873,6 +910,13 @@ where
             }
         };
     let response = match request {
+        Request::SetProtocols {
+            network_id,
+            protocols,
+        } => match source.set_protocols(network_id, protocols).await {
+            Ok(protocols) => Response::Protocols(protocols),
+            Err(reason) => Response::Error(reason),
+        },
         Request::Status => Response::Status(Box::new(source.report().await)),
         Request::SetBroadcast {
             network_id,
@@ -1028,7 +1072,24 @@ pub async fn join_network_with_broadcast(
     }
 }
 
-/// Changes one network's broadcast participation while the agent runs.
+/// Replaces the enabled data-plane protocols of one configured network.
+pub async fn set_protocols(
+    socket: &Path,
+    network_id: &str,
+    protocols: Vec<String>,
+) -> Result<Vec<String>> {
+    let request = Request::SetProtocols {
+        network_id: network_id.to_owned(),
+        protocols,
+    };
+    match exchange(socket, &request, EXCHANGE_TIMEOUT).await? {
+        Response::Protocols(protocols) => Ok(protocols),
+        Response::Error(reason) => Err(Error::Storage(reason)),
+        other => Err(Error::Storage(format!("unexpected response: {other:?}"))),
+    }
+}
+
+/// Changes local broadcast participation in a network.
 pub async fn set_broadcast(
     path: impl AsRef<Path>,
     network_id: &str,

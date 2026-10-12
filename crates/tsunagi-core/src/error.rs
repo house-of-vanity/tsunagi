@@ -15,6 +15,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// An ordered local data-plane protocol selection is invalid.
+    #[error("invalid protocol selection: {0}")]
+    InvalidProtocols(String),
     /// The supplied network name does not satisfy the documented rules.
     #[error("invalid network name: {0}")]
     InvalidNetworkName(&'static str),

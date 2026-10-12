@@ -54,6 +54,10 @@ fn start_bare(port: u16) -> Running {
 }
 
 fn start_bare_range(port: u16, range: Option<&str>) -> Running {
+    start_bare_config(port, range, None)
+}
+
+fn start_bare_config(port: u16, range: Option<&str>, protocols: Option<&str>) -> Running {
     let dir = TempDir::new().unwrap();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tsng"));
     command
@@ -70,6 +74,9 @@ fn start_bare_range(port: u16, range: Option<&str>) -> Running {
         .stderr(std::process::Stdio::null());
     if let Some(range) = range {
         command.args(["--ipv4-range", range]);
+    }
+    if let Some(protocols) = protocols {
+        command.args(["--protocol", protocols]);
     }
     let child = command.spawn().expect("the agent binary starts");
     let mut agent = Running { child, dir };
@@ -110,6 +117,147 @@ fn start(network: &str, port: u16) -> Running {
         String::from_utf8_lossy(&joined.stderr)
     );
     agent
+}
+
+#[test]
+fn protocols_absent_from_startup_can_be_enabled_and_changed_offline() {
+    let mut agent = start_bare_config(0, None, Some("none"));
+    assert!(
+        agent
+            .run(&[
+                "join",
+                "--network",
+                "from-control-only",
+                "--secret",
+                "a-control-only-test-secret"
+            ])
+            .status
+            .success()
+    );
+    let initial = agent.run(&["protocols", "from-control-only"]);
+    assert!(initial.status.success());
+    assert!(String::from_utf8_lossy(&initial.stdout).contains("protocols none"));
+    let enabled = agent.run(&["protocols", "from-control-only", "awg"]);
+    assert!(
+        enabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    assert_eq!(
+        read_networks(&agent.dir)[0].protocols,
+        Some(vec!["awg".into()])
+    );
+    agent.child.kill().unwrap();
+    agent.child.wait().unwrap();
+    let saved = agent.run(&["protocols", "from-control-only", "wg-quic,awg"]);
+    assert!(
+        saved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    assert!(String::from_utf8_lossy(&saved.stdout).contains("agent stopped"));
+    assert_eq!(
+        read_networks(&agent.dir)[0].protocols,
+        Some(vec!["wg-quic".into(), "awg".into()])
+    );
+}
+
+#[test]
+fn protocols_are_changed_live_per_network_and_saved_without_changing_the_service() {
+    let agent = start("protocol-choice", 0);
+    assert!(
+        agent
+            .run(&[
+                "join",
+                "--network",
+                "other-choice",
+                "--secret",
+                "other-secret-for-cli-test"
+            ])
+            .status
+            .success()
+    );
+    let before = read_networks(&agent.dir);
+    let other_id = before
+        .iter()
+        .find(|n| n.name.as_str() == "other-choice")
+        .unwrap()
+        .network_id;
+    let changed = agent.run(&["protocols", "protocol-choice", "awg,wg-quic"]);
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    let shown = agent.run(&["protocols", "protocol-choice"]);
+    assert!(shown.status.success());
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("awg,wg-quic"));
+    let saved = read_networks(&agent.dir);
+    assert_eq!(
+        saved
+            .iter()
+            .find(|n| n.name.as_str() == "protocol-choice")
+            .unwrap()
+            .protocols,
+        Some(vec!["awg".into(), "wg-quic".into()])
+    );
+    assert_eq!(
+        saved
+            .iter()
+            .find(|n| n.network_id == other_id)
+            .unwrap()
+            .protocols,
+        before
+            .iter()
+            .find(|n| n.network_id == other_id)
+            .unwrap()
+            .protocols
+    );
+    for invalid in ["unknown", "awg,awg", "none,awg"] {
+        assert!(
+            !agent
+                .run(&["protocols", "protocol-choice", invalid])
+                .status
+                .success()
+        );
+    }
+    assert!(!agent.run(&["protocols", "missing", "awg"]).status.success());
+    let disabled = agent.run(&["protocols", "protocol-choice", "none"]);
+    assert!(
+        disabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    assert_eq!(
+        read_networks(&agent.dir)
+            .iter()
+            .find(|n| n.name.as_str() == "protocol-choice")
+            .unwrap()
+            .protocols,
+        Some(Vec::new())
+    );
+    assert!(
+        agent
+            .run(&["network", "stop", "protocol-choice"])
+            .status
+            .success()
+    );
+    assert!(
+        agent
+            .run(&["protocols", "protocol-choice", "wg-quic"])
+            .status
+            .success()
+    );
+    assert!(
+        agent
+            .run(&["network", "start", "protocol-choice"])
+            .status
+            .success()
+    );
+    assert!(
+        String::from_utf8_lossy(&agent.run(&["protocols", "protocol-choice"]).stdout)
+            .contains("wg-quic")
+    );
 }
 
 #[test]

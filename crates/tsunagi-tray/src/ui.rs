@@ -123,7 +123,7 @@ pub(crate) fn draw(
                         ui.weak("No networks yet — join one below.");
                     }
                     for network in &report.networks {
-                        draw_network(ui, agent, state, traffic, network, &report.endpoint_id);
+                        draw_network(ui, agent, state, traffic, network, report);
                     }
                 });
         }
@@ -202,7 +202,7 @@ fn draw_network(
     state: &mut UiState,
     traffic: &Traffic,
     network: &NetworkReport,
-    own_id: &str,
+    report: &StatusReport,
 ) {
     ui.add_space(6.0);
     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -244,11 +244,13 @@ fn draw_network(
                 ui.weak("peers");
                 ui.label(format!(
                     "{} online · {} known",
-                    devices::online_count(network, own_id),
-                    devices::known_count(network, own_id)
+                    devices::online_count(network, &report.endpoint_id),
+                    devices::known_count(network, &report.endpoint_id)
                 ));
                 ui.end_row();
             });
+
+        draw_protocols(ui, agent, network, &report.available_protocols);
 
         format::sparkline(ui, series, state.unit, 34.0);
 
@@ -343,6 +345,83 @@ fn draw_network(
             draw_exit_warning(ui, &warning);
         }
     });
+}
+
+fn draw_protocols(
+    ui: &mut egui::Ui,
+    agent: &AgentClient,
+    network: &NetworkReport,
+    available: &[tsunagi::ipc::ProtocolReport],
+) {
+    let summary = if network.protocols.is_empty() {
+        "none".into()
+    } else {
+        network.protocols.join(", ")
+    };
+    egui::CollapsingHeader::new(format!("protocols  {summary}"))
+        .id_salt(("protocols", &network.network_id))
+        .show(ui, |ui| {
+            ui.weak("Preference order; changes apply immediately and are saved.");
+            let mut selected = network.protocols.clone();
+            let mut changed = false;
+            ui.add_enabled_ui(!agent.snapshot().busy, |ui| {
+                // Enabled items follow the user's preference; unchecked items
+                // follow the agent's catalog. The worker refreshes after edits.
+                let ordered: Vec<_> = network
+                    .protocols
+                    .iter()
+                    .filter_map(|name| available.iter().find(|p| &p.name == name))
+                    .chain(
+                        available
+                            .iter()
+                            .filter(|p| !network.protocols.contains(&p.name)),
+                    )
+                    .collect();
+                for protocol in ordered {
+                    ui.horizontal(|ui| {
+                        let mut on = selected.contains(&protocol.name);
+                        if ui.checkbox(&mut on, &protocol.name).changed() {
+                            if on {
+                                selected.push(protocol.name.clone());
+                            } else {
+                                selected.retain(|p| p != &protocol.name);
+                            }
+                            changed = true;
+                        }
+                        if let Some(index) = selected.iter().position(|p| p == &protocol.name) {
+                            if ui
+                                .add_enabled(index > 0, egui::Button::new("↑"))
+                                .on_hover_text("prefer earlier")
+                                .clicked()
+                            {
+                                selected.swap(index, index - 1);
+                                changed = true;
+                            }
+                            if ui
+                                .add_enabled(index + 1 < selected.len(), egui::Button::new("↓"))
+                                .on_hover_text("prefer later")
+                                .clicked()
+                            {
+                                selected.swap(index, index + 1);
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.indent(("description", &network.network_id, &protocol.name), |ui| {
+                        ui.weak(&protocol.summary);
+                    });
+                }
+            });
+            if selected.is_empty() {
+                ui.weak("Control only; no IP traffic in this network.");
+            }
+            if changed {
+                agent.send(Command::SetProtocols {
+                    network_id: network.network_id.clone(),
+                    protocols: selected,
+                });
+            }
+        });
 }
 
 /// A prominent line about an exit node. One that carries a command copies it

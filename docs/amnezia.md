@@ -8,6 +8,21 @@ tsng up --protocol awg
 tsng up --protocol wg,awg,wg-quic,tcp-tls
 ```
 
+The startup list is the initial per-network preference. A saved network choice
+overrides it and can enable any built-in protocol at runtime:
+
+```sh
+tsng protocols home awg,wg-quic
+tsng protocols home awg
+```
+
+Changes are local to this device, persist across restarts, and retire existing
+data links and end-to-end channels for that network before renegotiation.
+Authenticated control sessions, membership, addresses and other networks stay
+live. Removing every protocol (`none` in the CLI, all checkboxes off in the tray)
+leaves the network control-only. This is different from automatic carrier
+fallback, which preserves the selected end-to-end channel.
+
 `awg` is Tsunagi AWG wire version 1. Its packet masking engine is adapted from
 [RunaRoo/AmneziaWG-RS](https://github.com/RunaRoo/AmneziaWG-RS), with the pinned
 source and license recorded in

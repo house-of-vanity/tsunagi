@@ -254,6 +254,12 @@ impl Storage {
             .await
     }
 
+    /// Persists the ordered protocol selection off the async executor.
+    pub async fn set_protocols(&self, network_id: NetworkId, protocols: Vec<String>) -> Result<()> {
+        self.with_state(move |state| state.set_protocols(network_id, &protocols))
+            .await
+    }
+
     /// Persists whether this agent offers itself as an exit node in a network.
     pub async fn set_exit_node(&self, network_id: NetworkId, enabled: bool) -> Result<()> {
         self.with_state(move |state| state.set_exit_node(network_id, enabled))

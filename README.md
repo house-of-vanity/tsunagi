@@ -112,6 +112,23 @@ fresh masking profile and outer keys for each pair connection attempt, including
 reentry after fallback. Sustained data loss triggers switching independently of
 the iroh control connection. [Configuration and limits](docs/amnezia.md).
 
+Change a network's protocol selection without editing its service or restarting:
+
+```sh
+tsng protocols                         # available protocols and settings
+tsng protocols home                    # this device's choice for home
+tsng protocols home awg,wg-quic         # prefer AWG, retain QUIC as fallback
+tsng protocols home none                # control plane only
+```
+
+Exact network names, full ids and unique id prefixes work here. The choice is
+local to this device, saved per network and applied immediately; an offline
+change applies on the next start. In the tray, expand **protocols** on a network
+tile to toggle protocols or change their preference order. Both endpoints need
+a common protocol at the same wire version. `tsng up --protocol` supplies the
+initial defaults for networks without a saved choice; it does not restrict
+which built-in protocols can be enabled later.
+
 ## Platforms
 
 | Platform                  | Build        | CLI `tsng` | Tray | Exit node: offer / use | Packages                            |

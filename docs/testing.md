@@ -184,3 +184,17 @@ without substituting iroh, membership, encryption or SQLite. It checks runtime
 loss detection, fallback and fresh profiles, in addition to restart and input
 validation. Tests are offline; public STUN/DPI/NAT effectiveness needs separate
 real-network validation.
+
+Runtime protocol selection tests switch real AWG and iroh/QUIC carriers and
+end-to-end WireGuard tunnels from either endpoint-id role, carry full-size
+packets, keep another active network's tunnels unchanged, disable and re-enable
+the data plane without losing control sessions, and preserve selection after
+restart. CLI tests use a real agent process and control socket to exercise
+selection by network name, stopped networks, invalid lists, and persisted
+control-only configuration, offline updates, and enabling a protocol absent
+from the startup list. A real AWG test starts without a TUN, creates the single
+memory interface on enablement, and races rapid changes against pending opens.
+SQLite tests migrate schema 7 to 8 without changing
+identity, secrets or signed records, preserve order and explicit empty choices,
+and reject malformed stored selections. These checks use memory TUNs and do
+not establish GUI rendering or behavior on an actual OS interface.

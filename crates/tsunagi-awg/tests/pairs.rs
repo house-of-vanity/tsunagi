@@ -25,6 +25,7 @@ use tsunagi_wg_quic::WireguardConfig;
 struct Node {
     agent: Agent,
     plugin: Arc<AwgPlugin>,
+    quic: Option<Arc<tsunagi_wg_quic::WireguardPlugin>>,
     transport: Arc<AwgTransport>,
     tuns: MemoryTunFactory,
     loss: Arc<AtomicBool>,
@@ -48,6 +49,16 @@ impl Node {
         fallback: bool,
         mtu: u32,
     ) -> Self {
+        Self::open_selected(root, discovery, interface, fallback, mtu, None).await
+    }
+    async fn open_selected(
+        root: &Path,
+        discovery: &SharedMemoryDiscovery,
+        interface: &str,
+        fallback: bool,
+        mtu: u32,
+        default_protocols: Option<Vec<String>>,
+    ) -> Self {
         let identity =
             tsunagi::storage::StateStore::open(tsunagi::StoragePaths::under(root).state_db())
                 .unwrap()
@@ -70,9 +81,9 @@ impl Node {
         let tuns = MemoryTunFactory::new();
         let mut config = config_with(root, discovery)
             .with_interface(Arc::new(tuns.clone()), interface, mtu)
-            .with_overlay_ipv4_range(Some(tsunagi::state::DEFAULT_IPV4_RANGE))
             .with_plugin(plugin.clone() as Arc<dyn IpPlugin>)
             .with_custom_transport(AWG_PROTOCOL, faults);
+        let mut quic_plugin = None;
         if fallback {
             let quic = tsunagi_wg_quic::WireguardPlugin::open(
                 WireguardConfig::new(root.join("wg-quic"))
@@ -81,8 +92,10 @@ impl Node {
             )
             .await
             .unwrap();
-            config = config.with_plugin(quic);
+            config = config.with_plugin(quic.clone());
+            quic_plugin = Some(quic);
         }
+        config.default_protocols = default_protocols;
         let agent = Agent::spawn(config).await.unwrap();
         let inbound_agent = agent.clone();
         let inbound_transport = transport.clone();
@@ -96,6 +109,7 @@ impl Node {
         Self {
             agent,
             plugin,
+            quic: quic_plugin,
             transport,
             tuns,
             loss,
@@ -162,6 +176,235 @@ async fn exchange(a: &Node, b: &Node, id: NetworkId) {
             bytes
         );
     }
+}
+
+#[tokio::test]
+async fn a_control_only_agent_enables_real_data_without_restart_and_cancels_stale_attempts() {
+    let discovery = SharedMemoryDiscovery::new();
+    let roots = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+    let a = Node::open_selected(
+        roots[0].path(),
+        &discovery,
+        "initial-none-a",
+        true,
+        1280,
+        Some(vec![]),
+    )
+    .await;
+    let b = Node::open_selected(
+        roots[1].path(),
+        &discovery,
+        "initial-none-b",
+        true,
+        1280,
+        Some(vec![]),
+    )
+    .await;
+    let (name, secret) = network("enable-after-control-only");
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    wait_for_peers(&a.agent, id, 1).await;
+    wait_for_peers(&b.agent, id, 1).await;
+    assert!(a.agent.overlay().is_none());
+    assert!(b.agent.overlay().is_none());
+    for node in [&a, &b] {
+        assert!(
+            node.agent
+                .network_status(id)
+                .await
+                .unwrap()
+                .protocols
+                .is_empty()
+        );
+        node.agent
+            .set_protocols(id, vec!["awg".into()])
+            .await
+            .unwrap();
+        assert!(node.agent.overlay().is_some());
+    }
+    a.ready(id, 1).await;
+    b.ready(id, 1).await;
+    exchange(&a, &b, id).await;
+    let before = a.agent.overlay().unwrap().interface;
+    // Changes race unfinished opens and prepared plugin callbacks; the last
+    // selection must win even if an earlier open has completed in its queue.
+    for selection in [
+        vec!["wg-quic".into()],
+        vec![],
+        vec!["awg".into()],
+        vec![],
+        vec!["awg".into()],
+    ] {
+        a.agent.set_protocols(id, selection).await.unwrap();
+    }
+    a.ready(id, 1).await;
+    b.ready(id, 1).await;
+    exchange(&a, &b, id).await;
+    assert_eq!(a.agent.overlay().unwrap().interface, before);
+    for node in [&a, &b] {
+        let status = node.agent.network_status(id).await.unwrap();
+        assert_eq!(status.protocols, ["awg"]);
+        assert_eq!(status.metrics.sessions_established, 1);
+        assert_eq!(status.metrics.disconnects, 0);
+    }
+    a.agent.shutdown().await;
+    b.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn runtime_protocol_selection_replaces_real_tunnels_and_survives_restart() {
+    let discovery = SharedMemoryDiscovery::new();
+    let roots = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+    let a = Node::open_with_fallback(roots[0].path(), &discovery, "runtime-a", true).await;
+    let b = Node::open_with_fallback(roots[1].path(), &discovery, "runtime-b", true).await;
+    let (name, secret) = network("runtime-protocols");
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.ready(id, 1).await;
+    b.ready(id, 1).await;
+    exchange(&a, &b, id).await;
+
+    let (other_name, other_secret, other_id) = loop {
+        let (name, secret) = network("unchanged-runtime-network");
+        let other_id = tsunagi::identity::NetworkKeys::derive(&name, &secret).network_id();
+        if tsunagi::state::derived_ipv4_range(id) != tsunagi::state::derived_ipv4_range(other_id) {
+            break (name, secret, other_id);
+        }
+    };
+    a.agent
+        .join_network(&other_name, &other_secret)
+        .await
+        .unwrap();
+    b.agent
+        .join_network(&other_name, &other_secret)
+        .await
+        .unwrap();
+    a.ready(other_id, 1).await;
+    b.ready(other_id, 1).await;
+    let other_before = a
+        .agent
+        .network_status(other_id)
+        .await
+        .unwrap()
+        .metrics
+        .data_links_established;
+
+    for node in [&a, &b] {
+        let before = node.agent.network_status(id).await.unwrap().protocols;
+        for invalid in [vec!["unknown".into()], vec!["awg".into(), "awg".into()]] {
+            assert!(node.agent.set_protocols(id, invalid).await.is_err());
+            assert_eq!(
+                node.agent.network_status(id).await.unwrap().protocols,
+                before
+            );
+        }
+    }
+    // Exercise updates initiated by either endpoint-id role, including an
+    // empty set. Membership and the control session stay alive throughout.
+    for node in [&a, &b] {
+        node.agent.set_protocols(id, Vec::new()).await.unwrap();
+        wait_until("peer accepts control-only selection", || async {
+            let other = if node.agent.endpoint_id() == a.agent.endpoint_id() {
+                &b
+            } else {
+                &a
+            };
+            let status = other.agent.network_status(id).await.ok()?;
+            (status.peers.len() == 1
+                && status.peers[0].protocols.is_empty()
+                && matches!(status.peers[0].data_path, tsunagi::agent::DataPath::None))
+            .then_some(())
+        })
+        .await;
+        assert_eq!(node.agent.network_status(id).await.unwrap().peers.len(), 1);
+        node.agent
+            .set_protocols(id, vec!["wg-quic".into(), "awg".into()])
+            .await
+            .unwrap();
+    }
+    a.agent
+        .set_protocols(id, vec!["wg-quic".into()])
+        .await
+        .unwrap();
+    wait_until("real QUIC replaces AWG", || async {
+        let a_status = a.agent.network_status(id).await.ok()?;
+        let b_status = b.agent.network_status(id).await.ok()?;
+        (a_status.peers[0].protocols == ["wg-quic"]
+            && b_status.peers[0].protocols == ["wg-quic"]
+            && !matches!(a_status.peers[0].data_path, tsunagi::agent::DataPath::None)
+            && !matches!(b_status.peers[0].data_path, tsunagi::agent::DataPath::None)
+            && a.transport.overview(id).iter().all(|p| p.closed)
+            && b.transport.overview(id).iter().all(|p| p.closed))
+        .then_some(())
+    })
+    .await;
+    // Get addresses from the system allocation: the disabled AWG plugin no
+    // longer has a live view of this network.
+    for (source, dest) in [(&a, &b), (&b, &a)] {
+        wait_until("QUIC end-to-end handshake", || async {
+            source
+                .quic
+                .as_ref()?
+                .overview(id)?
+                .peers
+                .iter()
+                .any(|p| p.tunnel.as_ref().is_some_and(|t| t.health.is_up()))
+                .then_some(())
+        })
+        .await;
+        let addr = |n: &Node| {
+            n.quic
+                .as_ref()
+                .unwrap()
+                .overview(id)
+                .unwrap()
+                .overlay_address_v4
+                .unwrap()
+        };
+        let bytes = packet(addr(source), addr(dest), 1280);
+        source.tun().push_from_os(bytes.clone());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), dest.tun().pop_to_os())
+                .await
+                .unwrap()
+                .unwrap(),
+            bytes
+        );
+    }
+    assert_eq!(
+        a.agent
+            .network_status(other_id)
+            .await
+            .unwrap()
+            .metrics
+            .data_links_established,
+        other_before
+    );
+    exchange(&a, &b, other_id).await;
+    a.agent.shutdown().await;
+    let restarted = Node::open_with_fallback(roots[0].path(), &discovery, "runtime-a", true).await;
+    wait_for_peers(&restarted.agent, id, 1).await;
+    assert_eq!(
+        restarted.agent.network_status(id).await.unwrap().protocols,
+        ["wg-quic"]
+    );
+    assert_eq!(
+        b.agent.network_status(other_id).await.unwrap().protocols,
+        ["awg", "wg-quic"]
+    );
+    restarted.ready(other_id, 1).await;
+    b.ready(other_id, 1).await;
+    exchange(&restarted, &b, other_id).await;
+    restarted
+        .agent
+        .set_protocols(id, vec!["awg".into()])
+        .await
+        .unwrap();
+    restarted.ready(id, 1).await;
+    b.ready(id, 1).await;
+    exchange(&restarted, &b, id).await;
+    restarted.agent.shutdown().await;
+    b.agent.shutdown().await;
 }
 #[tokio::test]
 async fn real_pairs_carry_full_size_packets_and_restart_with_fresh_profiles() {

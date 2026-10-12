@@ -69,8 +69,8 @@ enum Command {
     Up(Box<UpArgs>),
     /// Reports this device, what the agent is doing, and what this host can do.
     Status(StatusArgs),
-    /// Shows the protocols this build can carry packets with.
-    Protocols,
+    /// Lists protocols, or shows and changes one network's selection at runtime.
+    Protocols(ProtocolsArgs),
     /// Makes a network, or joins one — the command that does the work.
     ///
     /// The same as `tsng network join`, at the top level because it is
@@ -105,6 +105,23 @@ struct DnsArgs {
 
     #[command(subcommand)]
     action: Option<DnsAction>,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  tsng protocols\n  tsng protocols home\n  tsng protocols home awg,wg-quic\n  tsng protocols home none\n\nThe selection is local to this device, saved per network and applied immediately.\nBoth endpoints need a common protocol at the same wire version."
+)]
+struct ProtocolsArgs {
+    #[command(flatten)]
+    paths: PathArgs,
+    /// Control socket to talk to; uses the running service by default.
+    #[arg(long, env = "TSUNAGI_CONTROL_SOCKET")]
+    control_socket: Option<PathBuf>,
+    /// Network's exact name, id or unique id prefix.
+    network: Option<String>,
+    /// Replace the selection, best first: awg,wg-quic; none disables data traffic.
+    #[arg(value_name = "LIST", requires = "network")]
+    protocols: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -465,11 +482,13 @@ struct UpArgs {
     #[arg(long, help_heading = "System")]
     no_tun: bool,
 
-    /// Protocols to carry packets with, best first.
+    /// Initial protocol selection for networks without a saved choice, best first.
     ///
     /// A pair of peers uses one they both have at the same wire version. A
     /// peer with none in common keeps its control plane and gets no data
-    /// plane. `none` runs the control plane alone.
+    /// plane. `none` runs the control plane alone. `tsng protocols NETWORK LIST`
+    /// changes and saves each network's choice while this agent runs; any
+    /// built-in protocol can be enabled, even if absent from this initial list.
     #[arg(
         long = "protocol",
         value_name = "LIST",
@@ -897,7 +916,7 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Id(args) => id(args).await,
         Command::Up(args) => up(*args).await,
         Command::Status(args) => status(args).await,
-        Command::Protocols => show_protocols(),
+        Command::Protocols(args) => protocols_command(args).await,
         Command::Join(args) => join_command(args).await,
         Command::Network(args) => network_command(args).await,
         Command::Dns(args) => dns_command(args).await,
@@ -1454,6 +1473,7 @@ const PROTOCOLS: &[ProtocolSpec] = &[
 ];
 
 /// One `-o` setting, and the protocol it was aimed at.
+#[derive(Clone)]
 struct Setting {
     /// `Some` when written as `protocol:key=value`.
     protocol: Option<String>,
@@ -1704,6 +1724,23 @@ impl tsunagi::ipc::ReportSource for AgentControl {
         })
     }
 
+    fn set_protocols(
+        &self,
+        network_id: String,
+        protocols: Vec<String>,
+    ) -> tsunagi::BoxFuture<'_, Result<Vec<String>, String>> {
+        Box::pin(async move {
+            let id = network_id
+                .parse()
+                .map_err(|err| format!("invalid network id: {err}"))?;
+            self.agent
+                .set_protocols(id, protocols.clone())
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(protocols)
+        })
+    }
+
     fn set_exit_offer(
         &self,
         network_id: String,
@@ -1866,43 +1903,136 @@ fn resolve_network<'a>(
     networks: &'a [tsunagi::storage::StoredNetwork],
     wanted: &str,
 ) -> Result<&'a tsunagi::storage::StoredNetwork, String> {
+    let entries: Vec<_> = networks
+        .iter()
+        .map(|n| (n.network_id.to_string(), n.name.as_str().to_owned()))
+        .collect();
+    resolve_network_index(&entries, wanted).map(|i| &networks[i])
+}
+
+/// Shared selector rules for stored networks and secret-free live reports.
+fn resolve_network_index(networks: &[(String, String)], wanted: &str) -> Result<usize, String> {
     let wanted = wanted.trim_matches(|c: char| c.is_ascii_whitespace());
     if wanted.is_empty() {
-        return Err("select a network by name or id; `tsng network` lists them".to_string());
+        return Err("select a network by name or id; `tsng network` lists them".into());
     }
-    if let Some(network) = networks
-        .iter()
-        .find(|network| network.network_id.to_string() == wanted)
-    {
-        return Ok(network);
+    if let Some(index) = networks.iter().position(|(id, _)| id == wanted) {
+        return Ok(index);
     }
-    // Only id prefixes lose a copied report ellipsis; names are used verbatim.
     let prefix = wanted.trim_end_matches('…');
-    let matched: Vec<&tsunagi::storage::StoredNetwork> = networks
+    let matches: Vec<_> = networks
         .iter()
-        .filter(|network| {
-            network.name.as_str() == wanted
-                || (!prefix.is_empty() && network.network_id.to_string().starts_with(prefix))
-        })
+        .enumerate()
+        .filter(|(_, (id, name))| name == wanted || (!prefix.is_empty() && id.starts_with(prefix)))
         .collect();
-    match matched.as_slice() {
-        [one] => Ok(one),
+    match matches.as_slice() {
+        [(index, _)] => Ok(*index),
         [] => Err(format!(
-            "no configured network matches name or id `{wanted}`; \
-             `tsng network` lists them"
+            "no configured network matches name or id `{wanted}`; `tsng network` lists them"
         )),
-        several => {
-            let candidates = several
+        several => Err(format!(
+            "`{wanted}` matches {} networks; use the full id or a unique id prefix:\n{}",
+            several.len(),
+            several
                 .iter()
-                .map(|network| format!("  `{}`  {}", network.name, network.network_id))
+                .map(|(_, (id, name))| format!("  `{name}`  {id}"))
                 .collect::<Vec<_>>()
-                .join("\n");
-            Err(format!(
-                "`{wanted}` matches {} networks; use the full id or a unique id prefix:\n{candidates}",
-                several.len()
-            ))
-        }
+                .join("\n")
+        )),
     }
+}
+
+fn parse_protocol_list(text: &str) -> Result<Vec<String>, String> {
+    if text.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for name in text.split(',') {
+        let name = name.trim();
+        let name = if name.eq_ignore_ascii_case("wireguard") {
+            WG_PROTOCOL
+        } else {
+            name
+        };
+        if !PROTOCOLS.iter().any(|spec| spec.name == name) {
+            return Err(format!(
+                "unknown protocol `{name}`; use wg,awg,wg-quic,tcp-tls or `none` alone. Run `tsng protocols` for details"
+            ));
+        }
+        if names.iter().any(|n| n == name) {
+            return Err(format!("protocol `{name}` is listed more than once"));
+        }
+        names.push(name.to_owned());
+    }
+    Ok(names)
+}
+
+async fn protocols_command(args: ProtocolsArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(selector) = args.network else {
+        return show_protocols();
+    };
+    let requested = args
+        .protocols
+        .as_deref()
+        .map(parse_protocol_list)
+        .transpose()?;
+    let custom = args.paths.state_dir.is_some();
+    let paths = args.paths.resolve()?;
+    let socket = control_socket(&paths, args.control_socket.as_ref(), custom);
+    if tsunagi::ipc::is_serving(&socket).await {
+        let report = tsunagi::ipc::request_status(&socket).await?;
+        let entries: Vec<_> = report
+            .networks
+            .iter()
+            .map(|n| (n.network_id.clone(), n.name.clone()))
+            .collect();
+        let network = &report.networks[resolve_network_index(&entries, &selector)?];
+        let protocols = match requested {
+            Some(protocols) => {
+                tsunagi::ipc::set_protocols(&socket, &network.network_id, protocols).await?
+            }
+            None => network.protocols.clone(),
+        };
+        println!(
+            "protocols {} for `{}` ({}) · preference order",
+            if protocols.is_empty() {
+                "none".into()
+            } else {
+                protocols.join(",")
+            },
+            network.name,
+            network.network_id
+        );
+    } else {
+        // Take the directory ownership lock even for an offline edit. Never
+        // write behind a live agent whose socket cannot be reached.
+        let storage = tsunagi::storage::Storage::open(&paths)?;
+        let configured = storage.list_networks().await?;
+        let network = resolve_network(&configured, &selector)?;
+        let protocols = match requested {
+            Some(protocols) => {
+                storage
+                    .set_protocols(network.network_id, protocols.clone())
+                    .await?;
+                Some(protocols)
+            }
+            None => network.protocols.clone(),
+        };
+        let shown = protocols
+            .map(|names| {
+                if names.is_empty() {
+                    "none".into()
+                } else {
+                    names.join(",")
+                }
+            })
+            .unwrap_or_else(|| "defaults from tsng up --protocol".into());
+        println!(
+            "protocols {shown} for `{}` ({}) · agent stopped; applies on next start",
+            network.name, network.network_id
+        );
+    }
+    Ok(())
 }
 
 /// `tsng network`: what this device belongs to, and leaving it.
@@ -4445,43 +4575,24 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // What the user asked for is checked first, before anything that could
     // fail for a reason of its own: a misspelled protocol or setting is
     // their mistake to see, not something to bury under a privilege error.
-    let wanted: Vec<&ProtocolSpec> = {
-        let mut wanted = Vec::new();
-        for name in args
-            .protocols
-            .iter()
-            .filter(|name| !name.eq_ignore_ascii_case("none"))
-        {
-            // Accept "wireguard" as a convenience alias for the canonical "wg".
-            let canonical = if name.eq_ignore_ascii_case("wireguard") {
-                WG_PROTOCOL
-            } else {
-                name.as_str()
-            };
-            let Some(spec) = PROTOCOLS.iter().find(|spec| spec.name == canonical) else {
-                let known: Vec<&str> = PROTOCOLS.iter().map(|spec| spec.name).collect();
-                return Err(format!(
-                    "this build has no protocol called `{name}`; it has {}. \
-                     Run `tsng protocols` to see what each one takes.",
-                    known.join(", ")
-                )
-                .into());
-            };
-            wanted.push(spec);
-        }
-        wanted
-    };
+    let initial = parse_protocol_list(&args.protocols.join(","))?;
+    let wanted: Vec<&ProtocolSpec> = initial
+        .iter()
+        .filter_map(|name| PROTOCOLS.iter().find(|spec| spec.name == name))
+        .collect();
+    config.default_protocols = Some(initial);
 
     let settings = parse_settings(&args.protocol_options)?;
     // A setting nobody takes is a mistake, not a preference: one that was
     // silently dropped looks exactly like one that did not work.
     for setting in &settings {
-        if !wanted
+        if !PROTOCOLS
             .iter()
+            .filter(|spec| setting.protocol.is_some() || wanted.iter().any(|p| p.name == spec.name))
             .any(|spec| !settings_for(spec, std::slice::from_ref(setting)).is_empty())
         {
             return Err(format!(
-                "no selected protocol takes `{}`; run `tsng protocols` to see what they do",
+                "no configured protocol takes `{}`; qualify disabled protocol settings as protocol:key=value. Run `tsng protocols` for details",
                 setting.key
             )
             .into());
@@ -4497,7 +4608,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut tcp_tls_plugin = None;
     let mut pure_wg_plugin: Option<Arc<PureWgPlugin>> = None;
     let mut pure_wg_transport: Option<Arc<PureWgTransport>> = None;
-    if !wanted.is_empty() {
+    if !PROTOCOLS.is_empty() {
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
         } else {
@@ -4507,8 +4618,17 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         config = config.with_interface(tun_factory, args.interface.clone(), mtu);
     }
 
-    for spec in &wanted {
-        let options = settings_for(spec, &settings);
+    for spec in PROTOCOLS {
+        // Unqualified options keep targeting the initial selection; explicitly
+        // scoped options also configure protocols that will be enabled later.
+        let scoped: Vec<_> = settings
+            .iter()
+            .filter(|setting| {
+                setting.protocol.is_some() || wanted.iter().any(|p| p.name == spec.name)
+            })
+            .cloned()
+            .collect();
+        let options = settings_for(spec, &scoped);
         match spec.name {
             AWG_PROTOCOL => {
                 let mut wg = WireguardConfig::new(paths.state_dir.join("awg"));
@@ -5112,6 +5232,7 @@ async fn build_report(
             };
 
             NetworkReport {
+                protocols: network.protocols.clone(),
                 auto_start: network.auto_start,
                 exit: exit_report(network),
                 broadcast: network.broadcast,
@@ -5182,6 +5303,13 @@ async fn build_report(
         .collect();
 
     StatusReport {
+        available_protocols: PROTOCOLS
+            .iter()
+            .map(|p| tsunagi::ipc::ProtocolReport {
+                name: p.name.into(),
+                summary: p.summary.into(),
+            })
+            .collect(),
         endpoint_id: status.endpoint_id.to_string(),
         hostname: status.hostname.clone(),
         bound_sockets: status
@@ -5536,6 +5664,7 @@ mod status_tests {
     /// The situation that prompted this: one peer left and came back.
     fn network_after_a_peer_returned() -> NetworkReport {
         NetworkReport {
+            protocols: vec!["wg-quic".into()],
             auto_start: true,
             exit: Default::default(),
             hostname_conflict: None,
@@ -6219,6 +6348,7 @@ mod network_tests {
             NetworkSecret::from_bytes(&[secret.as_bytes(), &[0u8; 32]].concat()[..32]).unwrap();
         let keys = NetworkKeys::derive(&name, &secret);
         StoredNetwork {
+            protocols: None,
             exit_node: false,
             exit_via: None,
             broadcast: true,
@@ -6442,6 +6572,7 @@ mod network_context_tests {
         let secret = NetworkSecret::from_bytes([seed; 32]).unwrap();
         let keys = NetworkKeys::derive(&name, &secret);
         StoredNetwork {
+            protocols: None,
             exit_node: false,
             exit_via: None,
             broadcast: true,

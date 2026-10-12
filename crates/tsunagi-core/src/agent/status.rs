@@ -223,6 +223,8 @@ pub struct RangeConflict {
 /// Status of one network.
 #[derive(Debug, Clone)]
 pub struct NetworkStatus {
+    /// Enabled local data-plane protocols, in preference order.
+    pub protocols: Vec<String>,
     /// Whether this network is requested to start or resume automatically.
     pub auto_start: bool,
     /// Local broadcast participation in this network.

@@ -58,6 +58,8 @@ use shutdown::Shutdown;
 /// Summary of a configured network, whether or not it is running.
 #[derive(Debug, Clone)]
 pub struct ConfiguredNetwork {
+    /// Enabled local data-plane protocols, in preference order.
+    pub protocols: Vec<String>,
     /// Saved local broadcast participation.
     pub broadcast: bool,
     /// Public network identifier.
@@ -104,6 +106,37 @@ struct Inner {
 }
 
 impl Inner {
+    /// Called under the lifecycle lock after startup: an initially
+    /// control-only agent creates its one interface on first enablement.
+    async fn ensure_interface(self: &Arc<Self>) {
+        if self.interface.get().is_some() {
+            return;
+        }
+        if let Some(factory) = self.config.tun_factory.clone() {
+            let carrier = Arc::new(Carrier(Arc::downgrade(self))) as Arc<dyn PacketCarrier>;
+            match crate::overlay::Interface::start(
+                factory,
+                self.config.interface_name.clone(),
+                self.config.interface_mtu,
+                Arc::clone(&self.routes),
+                carrier,
+            )
+            .await
+            {
+                Ok(interface) => {
+                    let _ = self.interface.set(Arc::new(interface));
+                }
+                Err(err) => {
+                    let _ = self.events.send(Event::PluginError {
+                        network: NetworkId::from_bytes([0u8; 32]),
+                        protocol: "overlay".into(),
+                        reason: err.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
     /// The name this agent currently answers to.
     fn read_hostname(&self) -> String {
         match self.hostname.read() {
@@ -265,12 +298,90 @@ impl TransportContext for TransportCtx {
 }
 
 impl Agent {
+    fn effective_protocols(&self, saved: Option<&Vec<String>>) -> Vec<String> {
+        saved
+            .or(self.inner.config.default_protocols.as_ref())
+            .cloned()
+            .unwrap_or_else(|| {
+                self.inner
+                    .config
+                    .plugins
+                    .iter()
+                    .map(|p| p.protocol_id().to_owned())
+                    .collect()
+            })
+    }
+
+    fn selected_plugins(&self, protocols: &[String]) -> Vec<crate::dataplane::SharedPlugin> {
+        protocols
+            .iter()
+            .filter_map(|name| {
+                self.inner
+                    .config
+                    .plugins
+                    .iter()
+                    .find(|p| p.protocol_id() == name)
+                    .cloned()
+            })
+            .collect()
+    }
+
+    /// Saves and immediately applies a network's ordered local protocol set.
+    /// An empty set disables data traffic while retaining control sessions.
+    pub async fn set_protocols(&self, network_id: NetworkId, protocols: Vec<String>) -> Result<()> {
+        crate::dataplane::validate_protocols(&protocols, self.inner.limits.max_capabilities)?;
+        for name in &protocols {
+            if !self
+                .inner
+                .config
+                .plugins
+                .iter()
+                .any(|p| p.protocol_id() == name)
+            {
+                return Err(Error::InvalidProtocols(format!(
+                    "this agent has no `{name}` plugin"
+                )));
+            }
+        }
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.inner
+            .storage
+            .set_protocols(network_id, protocols.clone())
+            .await?;
+        if self.is_active(network_id).await {
+            let (reply, receive) = oneshot::channel();
+            if !protocols.is_empty() {
+                self.inner.ensure_interface().await;
+            }
+            self.command(
+                network_id,
+                NetCommand::SetProtocols {
+                    protocols,
+                    interface: self.inner.interface.get().cloned(),
+                    reply,
+                },
+            )
+            .await?;
+            receive.await.map_err(|_| Error::Stopped)?;
+        }
+        Ok(())
+    }
     /// Starts an agent.
     ///
     /// Opens the state store (taking its ownership lock), restores the
     /// persistent device identity, binds the iroh endpoint and activates every
     /// configured network whose auto-start flag is set.
     pub async fn spawn(config: AgentConfig) -> Result<Self> {
+        if let Some(protocols) = &config.default_protocols {
+            crate::dataplane::validate_protocols(protocols, config.limits.max_capabilities)?;
+            for name in protocols {
+                if !config.plugins.iter().any(|p| p.protocol_id() == name) {
+                    return Err(Error::InvalidProtocols(format!(
+                        "this agent has no `{name}` plugin"
+                    )));
+                }
+            }
+        }
         let storage = Storage::open(&config.paths)?;
         let identity = storage.device_identity().await?;
         let adapter = EndpointAdapter::bind(&config, &identity).await?;
@@ -303,31 +414,13 @@ impl Agent {
             config,
         });
 
-        // One interface for the agent, if it was given a way to make one.
-        // Failing to is reported and not fatal: the control plane works, and
-        // so do the protocols, they just have nowhere to put packets.
-        if let Some(factory) = inner.config.tun_factory.clone() {
-            let carrier = Arc::new(Carrier(Arc::downgrade(&inner))) as Arc<dyn PacketCarrier>;
-            match crate::overlay::Interface::start(
-                factory,
-                inner.config.interface_name.clone(),
-                inner.config.interface_mtu,
-                Arc::clone(&inner.routes),
-                carrier,
-            )
-            .await
-            {
-                Ok(interface) => {
-                    let _ = inner.interface.set(Arc::new(interface));
-                }
-                Err(err) => {
-                    let _ = inner.events.send(Event::PluginError {
-                        network: NetworkId::from_bytes([0u8; 32]),
-                        protocol: "overlay".into(),
-                        reason: err.to_string(),
-                    });
-                }
-            }
+        if inner
+            .config
+            .default_protocols
+            .as_ref()
+            .is_none_or(|names| !names.is_empty())
+        {
+            inner.ensure_interface().await;
         }
 
         // The data plane rides on iroh too, which is where it gets hole
@@ -364,8 +457,9 @@ impl Agent {
         if !inner.config.plugins.is_empty() {
             let (plugin_tx, plugin_rx) = mpsc::channel(64);
             let sink = inner
-                .interface
-                .get()
+                .config
+                .tun_factory
+                .as_ref()
                 .map(|_| Arc::new(Sink(Arc::downgrade(&inner))) as Arc<dyn PacketSink>);
             let context = PluginContext::new(plugin_tx, inner.identity.endpoint_id(), sink);
             for plugin in &inner.config.plugins {
@@ -824,6 +918,12 @@ impl Agent {
         };
 
         let broadcast = stored.as_ref().is_none_or(|stored| stored.broadcast);
+        let protocols =
+            self.effective_protocols(stored.as_ref().and_then(|s| s.protocols.as_ref()));
+        let plugins = self.selected_plugins(&protocols);
+        if !plugins.is_empty() {
+            self.inner.ensure_interface().await;
+        }
         let exit_offer = stored.as_ref().is_some_and(|stored| stored.exit_node);
         let exit_via = stored
             .as_ref()
@@ -842,7 +942,8 @@ impl Agent {
             discovery,
             discovery_interval: self.inner.config.discovery_interval,
             discovery_policy: self.inner.config.discovery_policy.clone(),
-            plugins: self.inner.config.plugins.clone(),
+            available_plugins: self.inner.config.plugins.clone(),
+            plugins: plugins.clone(),
             routes: Arc::clone(&self.inner.routes),
             interface: self.inner.interface.get().cloned(),
             hostname: self.inner.read_hostname(),
@@ -856,7 +957,7 @@ impl Agent {
         networks.insert(network_id, handle);
         drop(networks);
 
-        for plugin in &self.inner.config.plugins {
+        for plugin in &plugins {
             plugin.on_network_activated(network_id);
         }
 
@@ -997,6 +1098,7 @@ impl Agent {
             .await?
             .into_iter()
             .map(|stored| ConfiguredNetwork {
+                protocols: self.effective_protocols(stored.protocols.as_ref()),
                 broadcast: stored.broadcast,
                 network_id: stored.network_id,
                 name: stored.name,
@@ -1075,6 +1177,7 @@ impl Agent {
             let range = self.desired_range(stored.network_id).await?;
             let range_conflicts = self.range_conflicts(stored.network_id, range).await?;
             networks.push(NetworkStatus {
+                protocols: self.effective_protocols(stored.protocols.as_ref()),
                 auto_start: stored.auto_start,
                 broadcast: stored.broadcast,
                 exit_offer: stored.exit_node,

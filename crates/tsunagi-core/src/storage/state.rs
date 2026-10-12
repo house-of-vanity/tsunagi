@@ -21,7 +21,7 @@ use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
 use crate::state::{RecordBody, SignedRecord};
 
 /// Schema version written by this build.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Key of the stored hostname setting.
 const SETTING_HOSTNAME: &str = "hostname";
@@ -32,6 +32,8 @@ const SETTING_HOSTNAME: &str = "hostname";
 /// and zeroizes on drop.
 #[derive(Debug, Clone)]
 pub struct StoredNetwork {
+    /// Ordered local protocol override; absent inherits the agent's defaults.
+    pub protocols: Option<Vec<String>>,
     /// Derived public network identifier.
     pub network_id: NetworkId,
     /// Network name.
@@ -237,6 +239,16 @@ impl StateStore {
                      COMMIT;",
                 )
                 .map_err(|err| self.corrupt(format!("cannot migrate schema to 7: {err}")))?;
+        }
+        if found < 8 {
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+                ALTER TABLE networks ADD COLUMN protocols TEXT;
+                PRAGMA user_version = 8;
+                COMMIT;",
+                )
+                .map_err(|err| self.corrupt(format!("cannot migrate schema to 8: {err}")))?;
         }
         Ok(())
     }
@@ -476,6 +488,25 @@ impl StateStore {
         Ok(())
     }
 
+    /// Saves a local ordered protocol selection without changing membership.
+    pub fn set_protocols(&self, network_id: NetworkId, protocols: &[String]) -> Result<()> {
+        crate::dataplane::validate_protocols(
+            protocols,
+            crate::config::Limits::default().max_capabilities,
+        )?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE networks SET protocols = ?2 WHERE network_id = ?1",
+                params![network_id.as_bytes().as_slice(), protocols.join(",")],
+            )
+            .map_err(|err| Error::Storage(format!("cannot update protocols: {err}")))?;
+        if changed == 0 {
+            return Err(Error::NetworkUnknown(network_id));
+        }
+        Ok(())
+    }
+
     /// Removes a network configuration entirely.
     pub fn remove_network(&self, network_id: NetworkId) -> Result<()> {
         self.conn
@@ -536,7 +567,7 @@ impl StateStore {
     pub fn list_networks(&self) -> Result<Vec<StoredNetwork>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT network_id, name, secret, auto_start, broadcast, exit_node, exit_via FROM networks ORDER BY name")
+            .prepare("SELECT network_id, name, secret, auto_start, broadcast, exit_node, exit_via, protocols FROM networks ORDER BY name")
             .map_err(|err| Error::Storage(format!("cannot list networks: {err}")))?;
         let rows = stmt
             .query_map([], |row| {
@@ -552,19 +583,37 @@ impl StateStore {
                     row.get::<_, bool>(4)?,
                     row.get::<_, bool>(5)?,
                     row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|err| Error::Storage(format!("cannot list networks: {err}")))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (id, name, secret, auto_start, broadcast, exit_node, exit_via) =
+            let (id, name, secret, auto_start, broadcast, exit_node, exit_via, protocols) =
                 row.map_err(|err| Error::Storage(format!("cannot read network row: {err}")))?;
+            let protocols = protocols
+                .map(|text| {
+                    let max = crate::config::Limits::default().max_capabilities;
+                    if text.len() > max * (crate::dataplane::MAX_PROTOCOL_ID_LEN + 1) {
+                        return Err(self.corrupt("stored protocol selection is too long"));
+                    }
+                    let names = if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        text.split(',').map(str::to_owned).collect()
+                    };
+                    crate::dataplane::validate_protocols(&names, max)
+                        .map_err(|err| self.corrupt(err))?;
+                    Ok(names)
+                })
+                .transpose()?;
             let id: [u8; 32] = id
                 .as_slice()
                 .try_into()
                 .map_err(|_| self.corrupt("stored network id is not 32 bytes"))?;
             out.push(StoredNetwork {
+                protocols,
                 network_id: NetworkId::from_bytes(id),
                 name: NetworkName::new(name)?,
                 secret: NetworkSecret::from_bytes(secret)?,
@@ -958,6 +1007,68 @@ mod broadcast_storage_tests {
     }
 
     #[test]
+    fn v7_migration_keeps_signed_state_and_protocol_overrides_are_local_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let store = StateStore::open(&path).unwrap();
+        let identity = store.load_or_create_device_identity().unwrap();
+        let name = NetworkName::new("protocol-migration").unwrap();
+        let secret = NetworkSecret::from_bytes([4; 32]).unwrap();
+        let id = NetworkKeys::derive(&name, &secret).network_id();
+        store.upsert_network(id, &name, &secret, true).unwrap();
+        store.set_broadcast(id, false).unwrap();
+        let record = SignedRecord::sign(&identity.signing_key(), id, 17, RecordBody::Release);
+        store.publish_own_record(&record).unwrap();
+        store
+            .conn
+            .execute_batch("ALTER TABLE networks DROP COLUMN protocols; PRAGMA user_version=7;")
+            .unwrap();
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .load_or_create_device_identity()
+                .unwrap()
+                .endpoint_id(),
+            identity.endpoint_id()
+        );
+        assert_eq!(store.signed_records(id).unwrap(), vec![record]);
+        let saved = store.list_networks().unwrap();
+        assert!(saved[0].protocols.is_none());
+        assert!(!saved[0].broadcast);
+        assert!(saved[0].auto_start);
+        assert_eq!(saved[0].secret, secret);
+        let chosen = vec!["awg".into(), "wg-quic".into()];
+        store.set_protocols(id, &chosen).unwrap();
+        assert!(
+            store
+                .set_protocols(id, &["awg".into(), "awg".into()])
+                .is_err()
+        );
+        assert!(
+            store
+                .set_protocols(NetworkId::from_bytes([1; 32]), &[])
+                .is_err()
+        );
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.list_networks().unwrap()[0].protocols, Some(chosen));
+        store.upsert_network(id, &name, &secret, true).unwrap();
+        store.set_protocols(id, &[]).unwrap();
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.list_networks().unwrap()[0].protocols, Some(vec![]));
+        store
+            .conn
+            .execute("UPDATE networks SET protocols = 'awg,awg'", [])
+            .unwrap();
+        assert!(matches!(
+            store.list_networks(),
+            Err(Error::StateCorrupted { .. })
+        ));
+    }
+
+    #[test]
     fn v3_migration_preserves_identity_and_networks_and_defaults_broadcast_on() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
@@ -977,6 +1088,7 @@ mod broadcast_storage_tests {
                 "ALTER TABLE networks DROP COLUMN broadcast; \
              ALTER TABLE networks DROP COLUMN exit_node; \
              ALTER TABLE networks DROP COLUMN exit_via; \
+             ALTER TABLE networks DROP COLUMN protocols; \
              PRAGMA user_version=3;",
             )
             .unwrap();

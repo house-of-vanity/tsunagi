@@ -72,6 +72,11 @@ pub(crate) enum NetCommand {
         enabled: bool,
         reply: oneshot::Sender<()>,
     },
+    SetProtocols {
+        interface: Option<Arc<crate::overlay::Interface>>,
+        protocols: Vec<String>,
+        reply: oneshot::Sender<()>,
+    },
     /// Offer this agent as an exit node in this network, or stop.
     SetExitOffer {
         enabled: bool,
@@ -122,6 +127,7 @@ impl std::fmt::Debug for NetCommand {
             NetCommand::Status { .. } => f.write_str("Status"),
             NetCommand::Recheck => f.write_str("Recheck"),
             NetCommand::SetBroadcast { enabled, .. } => write!(f, "SetBroadcast({enabled})"),
+            NetCommand::SetProtocols { protocols, .. } => write!(f, "SetProtocols({protocols:?})"),
             NetCommand::SetExitOffer { enabled, .. } => write!(f, "SetExitOffer({enabled})"),
             NetCommand::SetExitVia { via, .. } => write!(f, "SetExitVia({})", via.is_some()),
             NetCommand::Reannounce => f.write_str("Reannounce"),
@@ -171,6 +177,7 @@ pub(crate) struct RuntimeParams {
     pub(crate) discovery_interval: Duration,
     pub(crate) discovery_policy: DiscoveryPolicy,
     pub(crate) plugins: Vec<SharedPlugin>,
+    pub(crate) available_plugins: Vec<SharedPlugin>,
     /// Who holds which overlay address, shared with every other network.
     pub(crate) routes: Arc<crate::overlay::RoutingTable>,
     /// The one interface, when the agent has one.
@@ -192,6 +199,7 @@ pub(crate) struct RuntimeParams {
 
 /// Outcome of one attempt to open a data plane link.
 struct LinkOutcome {
+    generation: u64,
     peer: EndpointId,
     protocol: String,
     result: Result<SharedLink, String>,
@@ -332,6 +340,9 @@ struct Runtime {
     announced_reach: HashSet<crate::proto::message::ReachableLink>,
     /// Links currently being opened, so we do not start two.
     opening: HashSet<(EndpointId, String)>,
+    link_tasks: HashMap<(EndpointId, String), tokio::task::AbortHandle>,
+    link_attempts: HashMap<(EndpointId, String), u64>,
+    next_link_attempt: u64,
     link_results_tx: mpsc::Sender<LinkOutcome>,
     link_results_rx: mpsc::Receiver<LinkOutcome>,
     /// Protocol dial failure count and backoff cooldown per peer and protocol.
@@ -425,6 +436,9 @@ impl Runtime {
             local_capabilities: Vec::new(),
             announced_reach: HashSet::new(),
             opening: HashSet::new(),
+            link_tasks: HashMap::new(),
+            link_attempts: HashMap::new(),
+            next_link_attempt: 0,
             link_results_tx,
             link_results_rx,
             protocol_dial_states: HashMap::new(),
@@ -511,6 +525,10 @@ impl Runtime {
             link.close();
         }
         self.links.clear();
+        for (_, task) in self.link_tasks.drain() {
+            task.abort();
+        }
+        self.opening.clear();
         self.pending_health.clear();
         self.last_failed_protocol.clear();
         self.protocol_dial_states.clear();
@@ -553,6 +571,60 @@ impl Runtime {
             NetCommand::Status { reply } => {
                 let _ = reply.send(Box::new(self.status()));
             }
+            NetCommand::SetProtocols {
+                protocols,
+                interface,
+                reply,
+            } => {
+                self.params.interface = interface;
+                let current: Vec<_> = self
+                    .params
+                    .plugins
+                    .iter()
+                    .map(|p| p.protocol_id().to_owned())
+                    .collect();
+                if current != protocols {
+                    let peers: Vec<_> = self.sessions.keys().copied().collect();
+                    for peer in &peers {
+                        self.reset_peer_data(*peer, "local protocol selection changed");
+                    }
+                    for plugin in &self.params.plugins {
+                        if !protocols.iter().any(|name| name == plugin.protocol_id()) {
+                            plugin.on_network_deactivated(self.network_id);
+                        }
+                    }
+                    self.params.plugins = protocols
+                        .iter()
+                        .filter_map(|name| {
+                            self.params
+                                .available_plugins
+                                .iter()
+                                .find(|p| p.protocol_id() == name)
+                                .cloned()
+                        })
+                        .collect();
+                    for plugin in &self.params.plugins {
+                        if !current.iter().any(|name| name == plugin.protocol_id()) {
+                            plugin.on_network_activated(self.network_id);
+                        }
+                    }
+                    self.hub.set_priority(protocols);
+                    self.publish_allocations().await;
+                    for peer in peers {
+                        let caps = self
+                            .sessions
+                            .get(&peer)
+                            .map(|s| s.capabilities.clone())
+                            .unwrap_or_default();
+                        self.dispatch_capabilities(peer, &caps);
+                    }
+                    self.reannounce();
+                    self.ensure_links();
+                    self.update_paths();
+                    self.announce_reach(true);
+                }
+                let _ = reply.send(());
+            }
             NetCommand::SetBroadcast { enabled, reply } => {
                 self.params.broadcast = enabled;
                 self.update_broadcast();
@@ -584,7 +656,22 @@ impl Runtime {
                 let _ = reply.send(outcome);
             }
             NetCommand::Recheck => self.discovery_round().await,
-            NetCommand::Reannounce => self.reannounce(),
+            NetCommand::Reannounce => {
+                // A newly enabled plugin may prepare its key asynchronously.
+                // Replay allocations and peer identities once it is ready.
+                self.publish_allocations().await;
+                let peers: Vec<_> = self
+                    .sessions
+                    .iter()
+                    .map(|(peer, s)| (*peer, s.capabilities.clone()))
+                    .collect();
+                for (peer, caps) in peers {
+                    self.dispatch_capabilities(peer, &caps);
+                }
+                self.reannounce();
+                self.ensure_links();
+                self.update_paths();
+            }
             NetCommand::Release { reply } => {
                 // A tombstone, so the address and the name this agent held
                 // are freed for somebody else instead of staying reserved
@@ -1578,13 +1665,16 @@ impl Runtime {
             if self.links.contains_key(&key) || self.opening.contains(&key) {
                 continue;
             }
-            self.opening.insert(key);
+            self.opening.insert(key.clone());
 
             let results = self.link_results_tx.clone();
             let transport = Arc::clone(&transport);
             let network = self.network_id;
             let shutdown = self.shutdown.clone();
-            tokio::spawn(async move {
+            self.next_link_attempt = self.next_link_attempt.wrapping_add(1);
+            let generation = self.next_link_attempt;
+            self.link_attempts.insert(key.clone(), generation);
+            let task = tokio::spawn(async move {
                 let result = tokio::select! {
                     biased;
                     _ = shutdown.wait() => Err("network deactivated".to_string()),
@@ -1594,12 +1684,14 @@ impl Runtime {
                 };
                 let _ = results
                     .send(LinkOutcome {
+                        generation,
                         peer,
                         protocol,
                         result,
                     })
                     .await;
             });
+            self.link_tasks.insert(key, task.abort_handle());
         }
     }
 
@@ -1834,7 +1926,15 @@ impl Runtime {
 
     fn handle_link_result(&mut self, outcome: LinkOutcome) {
         let key = (outcome.peer, outcome.protocol.clone());
+        if self.link_attempts.get(&key) != Some(&outcome.generation) {
+            if let Ok(link) = outcome.result {
+                link.close();
+            }
+            return;
+        }
+        self.link_attempts.remove(&key);
         self.opening.remove(&key);
+        self.link_tasks.remove(&key);
         match outcome.result {
             Ok(link) => {
                 self.record_protocol_success(outcome.peer, &outcome.protocol);
@@ -1903,12 +2003,17 @@ impl Runtime {
             link.close();
             return;
         }
-        if !self
-            .params
-            .plugins
-            .iter()
-            .any(|plugin| plugin.protocol_id() == protocol)
-        {
+        if !self.params.plugins.iter().any(|plugin| {
+            plugin.protocol_id() == protocol
+                && self.sessions.get(&peer).is_some_and(|s| {
+                    s.capabilities.iter().any(|c| {
+                        c.enabled
+                            && c.protocol == protocol
+                            && c.version == plugin.protocol_version()
+                    })
+                })
+        }) {
+            link.close();
             return;
         }
 
@@ -1966,14 +2071,25 @@ impl Runtime {
 
     /// Drops every link to a peer.
     fn drop_links_for(&mut self, peer: EndpointId) {
-        // The peer itself is going, not just a path to it, so the
-        // protocol's link goes with it.
+        self.reset_peer_data(peer, "peer session ended");
         self.hub.remove_peer(peer);
         self.reachable.remove(&peer);
-        self.protocol_dial_states.retain(|(p, _), _| *p != peer);
-        self.last_failed_protocol.remove(&peer);
-        self.pending_health.retain(|(p, _), _| *p != peer);
-        let keys: Vec<(EndpointId, String)> = self
+    }
+
+    /// Retire only the data plane; authenticated membership and topology remain.
+    fn reset_peer_data(&mut self, peer: EndpointId, reason: &str) {
+        self.link_attempts.retain(|(id, _), _| *id != peer);
+        self.opening.retain(|(id, _)| *id != peer);
+        self.link_tasks.retain(|(id, _), task| {
+            if *id == peer {
+                task.abort();
+                false
+            } else {
+                true
+            }
+        });
+        self.hub.clear_peer_links(peer);
+        let keys: Vec<_> = self
             .links
             .keys()
             .filter(|(id, _)| *id == peer)
@@ -1987,8 +2103,14 @@ impl Runtime {
                 network: self.network_id,
                 peer,
                 protocol: key.1,
-                reason: "peer session ended".into(),
+                reason: reason.into(),
             });
+        }
+        self.protocol_dial_states.retain(|(id, _), _| *id != peer);
+        self.last_failed_protocol.remove(&peer);
+        self.pending_health.retain(|(id, _), _| *id != peer);
+        for plugin in &self.params.plugins {
+            plugin.on_peer_gone(self.network_id, peer);
         }
     }
 
@@ -2182,9 +2304,6 @@ impl Runtime {
                 self.watch_exit_via();
                 self.update_paths();
                 self.announce_reach(false);
-                for plugin in &self.params.plugins {
-                    plugin.on_peer_gone(self.network_id, peer);
-                }
                 // Retry promptly, then back off if it keeps failing.
                 let policy = &self.params.reconnect;
                 let state = self
@@ -2277,6 +2396,18 @@ impl Runtime {
             }
             ControlMessage::Announce(announcement) => {
                 let capabilities = announcement.capabilities.clone();
+                let changed = self.sessions.get(&peer).is_some_and(|session| {
+                    let selection = |caps: &[PluginCapability]| {
+                        caps.iter()
+                            .filter(|c| c.enabled)
+                            .map(|c| (c.protocol.clone(), c.version))
+                            .collect::<Vec<_>>()
+                    };
+                    selection(&session.capabilities) != selection(&capabilities)
+                });
+                if changed {
+                    self.reset_peer_data(peer, "peer protocol selection changed");
+                }
                 if let Some(session) = self.sessions.get_mut(&peer) {
                     session.hostname = Some(announcement.hostname.clone());
                     session.broadcast = announcement.broadcast;
@@ -2289,6 +2420,7 @@ impl Runtime {
                 self.dispatch_capabilities(peer, &capabilities);
                 self.ensure_links();
                 self.update_paths();
+                self.announce_reach(false);
             }
             ControlMessage::Ping { seq, payload } => {
                 let pong = ControlMessage::Pong {
@@ -2522,6 +2654,12 @@ impl Runtime {
         members.dedup_by(|a, b| a.endpoint_id == b.endpoint_id);
 
         NetworkStatus {
+            protocols: self
+                .params
+                .plugins
+                .iter()
+                .map(|p| p.protocol_id().to_owned())
+                .collect(),
             auto_start: true,
             broadcast: self.params.broadcast,
             exit_offer: self.params.exit_offer,

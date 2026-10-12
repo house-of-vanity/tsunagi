@@ -21,6 +21,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A request from the UI to the agent.
 pub(crate) enum Command {
+    /// Replace the network's enabled protocols in preference order.
+    SetProtocols {
+        network_id: String,
+        protocols: Vec<String>,
+    },
     /// Stop serving a network, or start serving it again.
     SetActive { network_id: String, active: bool },
     /// Turn local broadcast participation on or off for a network.
@@ -106,7 +111,13 @@ impl AgentClient {
 
     /// Sends a command; a dropped worker simply means nothing happens.
     pub(crate) fn send(&self, command: Command) {
-        let _ = self.tx.send(command);
+        // Disable protocol editing until the refreshed snapshot arrives;
+        // otherwise a second checkbox click could replace the first edit
+        // using the same stale network selection.
+        lock(&self.shared).busy = true;
+        if self.tx.send(command).is_err() {
+            lock(&self.shared).busy = false;
+        }
     }
 
     /// A copy of the latest snapshot.
@@ -142,6 +153,8 @@ async fn worker(
                 let Some(command) = command else { return };
                 run(&resolve_socket(), command, &shared, &pending_copy, &ctx).await;
                 refresh(&shared, &ctx).await;
+                lock(&shared).busy = false;
+                ctx.request_repaint();
             }
         }
     }
@@ -179,6 +192,22 @@ async fn run(
     ctx.request_repaint();
 
     let outcome: Result<String, String> = match command {
+        Command::SetProtocols {
+            network_id,
+            protocols,
+        } => ipc::set_protocols(socket, &network_id, protocols)
+            .await
+            .map(|names| {
+                format!(
+                    "protocols: {}",
+                    if names.is_empty() {
+                        "none".into()
+                    } else {
+                        names.join(", ")
+                    }
+                )
+            })
+            .map_err(|err| err.to_string()),
         Command::SetActive { network_id, active } => ipc::set_active(socket, &network_id, active)
             .await
             .map(|report| {
@@ -260,7 +289,6 @@ async fn run(
 
     {
         let mut guard = lock(shared);
-        guard.busy = false;
         guard.last_action = if matches!(&outcome, Ok(message) if message.is_empty()) {
             None
         } else {

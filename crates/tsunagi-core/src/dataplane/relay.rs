@@ -492,11 +492,12 @@ impl RelayHub {
         }
     }
 
-    /// Revokes all links and topology involving a departed authenticated peer.
-    pub fn remove_peer(&self, peer: EndpointId) {
+    /// Retires data channels without removing an authenticated peer's topology.
+    pub fn clear_peer_links(&self, peer: EndpointId) {
         let mut state = self.state();
         if let Some(links) = state.raw.remove(peer.as_bytes()) {
             for raw in links {
+                raw.link.close();
                 raw.reader.abort();
             }
         }
@@ -511,6 +512,13 @@ impl RelayHub {
                 link.close();
             }
         }
+        state.publish();
+    }
+
+    /// Revokes all links and topology involving a departed authenticated peer.
+    pub fn remove_peer(&self, peer: EndpointId) {
+        self.clear_peer_links(peer);
+        let mut state = self.state();
         state.members.remove(peer.as_bytes());
         state.graph.remove(peer.as_bytes());
         for neighbors in state.graph.values_mut() {

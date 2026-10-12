@@ -328,6 +328,9 @@ pub struct AgentConfig {
     pub reconnect: ReconnectPolicy,
     /// IP plugins whose capabilities are announced and dispatched.
     pub plugins: Vec<SharedPlugin>,
+    /// Initial ordered selection for networks without a saved override.
+    /// `None` enables all registered plugins; an empty list is control-only.
+    pub default_protocols: Option<Vec<String>>,
     /// Custom packet transports registered per protocol.
     pub custom_transports:
         std::collections::HashMap<String, Arc<dyn crate::dataplane::PacketTransport>>,
@@ -376,6 +379,7 @@ impl AgentConfig {
             limits: Limits::default(),
             reconnect: ReconnectPolicy::default(),
             plugins: Vec::new(),
+            default_protocols: None,
             custom_transports: std::collections::HashMap::new(),
             tun_factory: None,
             interface_name: "tsun0".to_string(),

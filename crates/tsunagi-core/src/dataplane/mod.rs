@@ -40,6 +40,33 @@ pub use tunnel::{GenericTunnelPlugin, TunnelCodec};
 /// Maximum length of a plugin protocol identifier.
 pub const MAX_PROTOCOL_ID_LEN: usize = 32;
 
+/// Validates bounded local protocol preferences before storing or applying them.
+pub(crate) fn validate_protocols(protocols: &[String], max: usize) -> crate::error::Result<()> {
+    if protocols.len() > max {
+        return Err(crate::Error::InvalidProtocols(format!(
+            "at most {max} protocols are allowed"
+        )));
+    }
+    for (index, name) in protocols.iter().enumerate() {
+        if name.is_empty()
+            || name.len() > MAX_PROTOCOL_ID_LEN
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            return Err(crate::Error::InvalidProtocols(
+                "names must be 1–32 ASCII letters, digits, hyphens or underscores".into(),
+            ));
+        }
+        if protocols[..index].contains(name) {
+            return Err(crate::Error::InvalidProtocols(format!(
+                "`{name}` is listed more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// An announcement of one IP plugin's capability.
 ///
 /// `data` is opaque to the core. Nothing in it may be interpreted as a shell
