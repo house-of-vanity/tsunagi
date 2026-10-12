@@ -21,6 +21,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A request from the UI to the agent.
 pub(crate) enum Command {
+    /// Retire the exact offline-node claim selected in the devices window.
+    ForgetNode {
+        network_id: String,
+        peer: String,
+        expected_version: u64,
+    },
     /// Replace the network's enabled protocols in preference order.
     SetProtocols {
         network_id: String,
@@ -192,6 +198,19 @@ async fn run(
     ctx.request_repaint();
 
     let outcome: Result<String, String> = match command {
+        Command::ForgetNode {
+            network_id,
+            peer,
+            expected_version,
+        } => ipc::forget_node(socket, &network_id, &peer, expected_version)
+            .await
+            .map(|report| {
+                format!(
+                    "forgot node claim v{}; cleanup queued to {} peers",
+                    report.record_version, report.peers_told
+                )
+            })
+            .map_err(|err| err.to_string()),
         Command::SetProtocols {
             network_id,
             protocols,

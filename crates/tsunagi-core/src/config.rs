@@ -174,6 +174,8 @@ pub struct Limits {
     pub max_reason_len: usize,
     /// Largest number of signed records accepted in one snapshot.
     pub max_state_records: usize,
+    /// Maximum durable retirement markers retained per network.
+    pub max_retirements: usize,
     /// Deadline for the whole handshake.
     pub handshake_timeout: Duration,
     /// Deadline for one outbound dial attempt.
@@ -211,6 +213,7 @@ impl Default for Limits {
             max_echo_payload_len: 4 * 1024,
             max_reason_len: 256,
             max_state_records: crate::state::MAX_RECORDS_PER_MESSAGE,
+            max_retirements: 1024,
             handshake_timeout: Duration::from_secs(10),
             dial_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(30),

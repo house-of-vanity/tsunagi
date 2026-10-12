@@ -116,20 +116,21 @@ impl App {
                 .with_title(devices::title(network))
                 .with_app_id(crate::icon::APP_ID)
                 .with_icon(crate::icon::window())
-                .with_inner_size([940.0, 540.0])
-                .with_min_inner_size([480.0, 320.0]);
+                .with_inner_size([1440.0, 640.0])
+                .with_min_inner_size([800.0, 400.0]);
             let agent = &self.agent;
             let traffic = &self.traffic;
             // The window shares the single unit setting, so its toggle and the
             // main window's stay in step.
             let unit = &mut self.state.unit;
             let confirm = &mut self.state.exit_confirm;
+            let forget_confirm = &mut self.state.forget_confirm;
             let keep = ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
                 devices::show(
                     vctx,
                     agent,
                     unit,
-                    confirm,
+                    (confirm, forget_confirm),
                     network,
                     &report.endpoint_id,
                     traffic,

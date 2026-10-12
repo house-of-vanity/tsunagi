@@ -164,10 +164,9 @@ paused clock. The public Mainline/relay smoke test is ignored by default.
 
 ## Not covered, and not claimed to be
 
-Listed in [sync-model.md](sync-model.md#future-tests): snapshots, revocations,
-long partitions, hostname renames, recovery of a returning participant, NAT
-traversal, relay fallback, and multi-process or multi-host deployment. None of
-these are implemented, and none are marked as passing.
+Listed in [sync-model.md](sync-model.md#future-tests): compaction, long partitions,
+NAT traversal, relay fallback and multi-host deployment. These scenarios are
+not established by the default loopback suite.
 
 ## Debugging a test
 
@@ -198,3 +197,14 @@ SQLite tests migrate schema 7 to 8 without changing
 identity, secrets or signed records, preserve order and explicit empty choices,
 and reject malformed stored selections. These checks use memory TUNs and do
 not establish GUI rendering or behavior on an actual OS interface.
+
+`tests/forget_node.rs` uses real agents, handshakes and SQLite to check equal
+cleanup rights, network isolation, online/self/stale-version refusal, restart,
+recovery of a stale replica, reuse of a hostname and a returning identity's
+newer claim. Bounded batch delivery is checked with a two-message send queue
+and twelve retained markers. Retirement unit tests check signatures, proof tampering, invented
+future cutoffs, bounds, deterministic merge and resistance to stale snapshots.
+SQLite tests migrate schema 8 to 9 and inject counter-write failure to prove
+atomic rollback. The CLI test starts two real agent processes and exercises
+offline cleanup by network and hostname through the control socket.
+Tray rendering and physical screen sizing are not exercised automatically.

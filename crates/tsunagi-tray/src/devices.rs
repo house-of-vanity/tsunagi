@@ -27,6 +27,8 @@ pub(crate) fn title(network: &NetworkReport) -> String {
 
 /// One row of the device table, built from a tunnel and/or a signed member.
 struct Device<'a> {
+    /// Observed claim version, if this row came from signed membership.
+    record_version: Option<u64>,
     /// The agent's own answer to whether it can be reached by any path.
     online: bool,
     /// How packets reach it.
@@ -63,6 +65,15 @@ pub(crate) struct ExitConfirm {
     stop: bool,
     /// Asked in the main window, not in the devices window of the network.
     main: bool,
+}
+
+/// An exact offline claim selected for durable cleanup.
+pub(crate) struct ForgetConfirm {
+    network_id: String,
+    peer: String,
+    version: u64,
+    name: String,
+    address: Option<String>,
 }
 
 impl ExitConfirm {
@@ -121,11 +132,12 @@ pub(crate) fn show(
     ctx: &egui::Context,
     agent: &AgentClient,
     unit: &mut Unit,
-    confirm: &mut Option<ExitConfirm>,
+    confirmations: (&mut Option<ExitConfirm>, &mut Option<ForgetConfirm>),
     network: &NetworkReport,
     own_id: &str,
     traffic: &Traffic,
 ) {
+    let (confirm, forget_confirm) = confirmations;
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.heading(&network.name);
@@ -158,10 +170,68 @@ pub(crate) fn show(
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                device_table(ui, unit, network, &devices, traffic, confirm);
+                device_table(
+                    ui,
+                    unit,
+                    network,
+                    &devices,
+                    traffic,
+                    confirm,
+                    forget_confirm,
+                );
             });
     });
     confirm_exit(ctx, agent, confirm, Some(&network.network_id));
+    confirm_forget(ctx, agent, forget_confirm, &network.network_id);
+}
+
+fn confirm_forget(
+    ctx: &egui::Context,
+    agent: &AgentClient,
+    confirm: &mut Option<ForgetConfirm>,
+    network: &str,
+) {
+    let Some(pending) = confirm.as_ref().filter(|c| c.network_id == network) else {
+        return;
+    };
+    egui::Area::new(egui::Id::new("forget node backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.screen_rect();
+            ui.allocate_response(screen.size(), egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
+        });
+    let (mut accepted, mut cancelled) = (false, false);
+    egui::Window::new("Forget offline node")
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            ui.label(format!("Forget {}?", pending.name));
+            ui.monospace(&pending.peer);
+            if let Some(address) = &pending.address {
+                ui.label(format!("IP: {address}"));
+            }
+            ui.label("The network will forget this claim and free its name and IP. A returning device can publish a new claim; this does not ban it.");
+            ui.horizontal(|ui| {
+                accepted = ui.add_enabled(!agent.snapshot().busy, egui::Button::new("Forget")).clicked();
+                cancelled = ui.button("Cancel").clicked();
+            });
+        });
+    if accepted {
+        agent.send(Command::ForgetNode {
+            network_id: pending.network_id.clone(),
+            peer: pending.peer.clone(),
+            expected_version: pending.version,
+        });
+    }
+    if accepted || cancelled || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        *confirm = None;
+    }
 }
 
 /// The confirmation for an exit-node choice, drawn in the window it was
@@ -354,6 +424,7 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
             });
             let hostname = hostnames.get(id).copied();
             Device {
+                record_version: member.map(|m| m.record_version),
                 online,
                 path,
                 via_name,
@@ -493,6 +564,7 @@ fn device_table(
     devices: &[Device<'_>],
     traffic: &Traffic,
     confirm: &mut Option<ExitConfirm>,
+    forget_confirm: &mut Option<ForgetConfirm>,
 ) {
     let network_id = network.network_id.as_str();
     if devices.is_empty() {
@@ -542,7 +614,26 @@ fn device_table(
             ui.end_row();
 
             for device in devices {
-                cell(ui, 0, &mut widths, |ui| name_cell(ui, device));
+                cell(ui, 0, &mut widths, |ui| {
+                    ui.horizontal(|ui| {
+                        name_cell(ui, device);
+                        if !device.online
+                            && !device.in_use
+                            && let Some(version) = device.record_version
+                            && ui.add_enabled(network.active, egui::Button::new("Forget"))
+                                .on_hover_text("Forget this offline claim across the network; returning devices may rejoin")
+                                .clicked()
+                        {
+                            *forget_confirm = Some(ForgetConfirm {
+                                network_id: network.network_id.clone(),
+                                peer: device.id.into(),
+                                version,
+                                name: device.name(),
+                                address: device.address.clone(),
+                            });
+                        }
+                    });
+                });
                 cell(ui, 1, &mut widths, |ui| {
                     exit_cell(ui, device, network_id, confirm);
                 });
@@ -736,6 +827,7 @@ mod tests {
 
     fn member(id: &str, online: bool, path: DataPathReport) -> MemberReport {
         MemberReport {
+            record_version: 1,
             endpoint_id: id.into(),
             online,
             path,

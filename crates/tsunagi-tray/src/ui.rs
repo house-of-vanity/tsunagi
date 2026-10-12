@@ -45,6 +45,8 @@ pub(crate) struct UiState {
     pub(crate) about_open: bool,
     /// An exit-node choice waiting for the user to confirm it.
     pub(crate) exit_confirm: Option<devices::ExitConfirm>,
+    /// A selected offline claim waiting for cleanup confirmation.
+    pub(crate) forget_confirm: Option<devices::ForgetConfirm>,
 }
 
 impl Default for UiState {
@@ -56,6 +58,7 @@ impl Default for UiState {
             open_devices: BTreeSet::new(),
             about_open: false,
             exit_confirm: None,
+            forget_confirm: None,
         }
     }
 }

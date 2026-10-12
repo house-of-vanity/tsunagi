@@ -204,6 +204,13 @@ struct JoinArgs {
 
 #[derive(Debug, Subcommand)]
 enum NetworkAction {
+    /// Forgets an offline node's observed claim on every replica; newer claims may return.
+    ForgetNode {
+        /// Exact network name, full id or unique id prefix.
+        network: String,
+        /// Exact node hostname, full endpoint id, unique id prefix or overlay IPv4.
+        node: String,
+    },
     /// Shows or changes this network's local LAN broadcast participation.
     Broadcast {
         /// Exact network name, full id or unique id prefix.
@@ -1570,6 +1577,31 @@ struct AgentControl {
 }
 
 impl tsunagi::ipc::ReportSource for AgentControl {
+    fn forget_node(
+        &self,
+        network: String,
+        peer: String,
+        expected_version: u64,
+    ) -> tsunagi::BoxFuture<'_, Result<tsunagi::ipc::ForgottenNodeReport, String>> {
+        Box::pin(async move {
+            let network = network
+                .parse()
+                .map_err(|err| format!("invalid network id: {err}"))?;
+            let peer = peer
+                .parse()
+                .map_err(|err| format!("invalid endpoint id: {err}"))?;
+            let result = self
+                .agent
+                .forget_node(network, peer, expected_version)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(tsunagi::ipc::ForgottenNodeReport {
+                peer: result.target.to_string(),
+                record_version: result.record_version,
+                peers_told: result.peers_told as u32,
+            })
+        })
+    }
     fn report(&self) -> tsunagi::BoxFuture<'_, tsunagi::ipc::StatusReport> {
         Box::pin(async move {
             let dns = self.dns_state().await;
@@ -2035,6 +2067,46 @@ async fn protocols_command(args: ProtocolsArgs) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+async fn forget_node_command(
+    socket: &std::path::Path,
+    network: &str,
+    node: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = tsunagi::ipc::request_status(socket)
+        .await
+        .map_err(|err| format!("a reachable running agent is required to forget nodes: {err}"))?;
+    let entries: Vec<_> = report
+        .networks
+        .iter()
+        .map(|n| (n.network_id.clone(), n.name.clone()))
+        .collect();
+    let network = &report.networks[resolve_network_index(&entries, network)?];
+    if !network.active {
+        return Err(format!(
+            "start `{}` first: tsng network start {}",
+            network.name, network.network_id
+        )
+        .into());
+    }
+    let member = tsunagi::ipc::resolve_node(network, node)?;
+    let result = tsunagi::ipc::forget_node(
+        socket,
+        &network.network_id,
+        &member.endpoint_id,
+        member.record_version,
+    )
+    .await?;
+    println!(
+        "forgot {} ({}) claim v{} in `{}`; cleanup queued to {} peers. A newer signed claim can return.",
+        member.hostname.as_deref().unwrap_or("unnamed"),
+        result.peer,
+        result.record_version,
+        network.name,
+        result.peers_told
+    );
+    Ok(())
+}
+
 /// `tsng network`: what this device belongs to, and leaving it.
 async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Error>> {
     let paths = args.paths.resolve()?;
@@ -2042,6 +2114,9 @@ async fn network_command(args: NetworkArgs) -> Result<(), Box<dyn std::error::Er
     let socket = control_socket(&paths, args.control_socket.as_ref(), is_custom_state);
     let paths = agent_paths(paths, &socket, is_custom_state).await;
     match args.action {
+        Some(NetworkAction::ForgetNode { network, node }) => {
+            forget_node_command(&socket, &network, &node).await
+        }
         None => show_networks(&paths, &socket).await,
         Some(NetworkAction::Broadcast { network, choice }) => {
             broadcast_command(&paths, &socket, &network, choice).await
@@ -5259,6 +5334,7 @@ async fn build_report(
                     .members
                     .iter()
                     .map(|member| MemberReport {
+                        record_version: member.record_version,
                         endpoint_id: member.endpoint_id.to_string(),
                         overlay_address_v4: member.overlay_address_v4.map(|addr| addr.to_string()),
                         // What this agent is currently experiencing trying to
@@ -5688,6 +5764,7 @@ mod status_tests {
             }],
             members: vec![
                 MemberReport {
+                    record_version: 1,
                     endpoint_id: OWN.into(),
                     overlay_address_v4: Some("10.13.37.69".into()),
                     failed_dials: 0,
@@ -5695,6 +5772,7 @@ mod status_tests {
                     ..Default::default()
                 },
                 MemberReport {
+                    record_version: 1,
                     endpoint_id: ONLINE.into(),
                     overlay_address_v4: Some("10.13.37.237".into()),
                     failed_dials: 0,
@@ -5971,6 +6049,7 @@ mod status_tests {
     fn offline_members_are_listed_after_online_ones() {
         let mut network = network_after_a_peer_returned();
         network.members.push(MemberReport {
+            record_version: 1,
             endpoint_id: AWAY.into(),
             overlay_address_v4: Some("10.13.37.99".into()),
             failed_dials: 9,
@@ -6092,6 +6171,7 @@ mod status_tests {
     fn an_offline_member_keeps_the_last_name_it_announced() {
         let mut network = network_after_a_peer_returned();
         network.members.push(MemberReport {
+            record_version: 1,
             endpoint_id: AWAY.into(),
             overlay_address_v4: Some("10.13.37.99".into()),
             failed_dials: 0,
@@ -6113,6 +6193,7 @@ mod status_tests {
         // are attributed to it instead of floating free as a counter.
         let mut network = network_after_a_peer_returned();
         network.members.push(MemberReport {
+            record_version: 1,
             endpoint_id: AWAY.into(),
             overlay_address_v4: Some("10.13.37.99".into()),
             failed_dials: 9,
@@ -6137,6 +6218,7 @@ mod status_tests {
         // and said to be, rather than being shown as away or as a fault.
         let mut network = network_after_a_peer_returned();
         network.members.push(MemberReport {
+            record_version: 1,
             endpoint_id: AWAY.into(),
             overlay_address_v4: Some("10.13.37.99".into()),
             hostname: Some("laptop".into()),

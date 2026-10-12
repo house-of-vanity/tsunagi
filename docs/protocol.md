@@ -9,14 +9,18 @@ Two versions exist and are independent:
 
 - **Identity scheme**, `tsunagi-network-id-v1`. Frozen. Changing it creates a
   different network space for the same name and secret.
-- **Control protocol**, ALPN `tsunagi/ctrl/6`, `PROTOCOL_VERSION = 6`.
+- **Control protocol**, ALPN `tsunagi/ctrl/7`, `PROTOCOL_VERSION = 7`.
 
 Upgrading the crate or bumping the control protocol must never change an
 existing `NetworkId`.
 
-Control version 6 adds private transport negotiation for pairwise AWG and data
-delivery checks. Data ALPN remains `tsunagi/data/5`. All members must upgrade
-together; network ids and stored state are unchanged. See [amnezia.md](amnezia.md).
+Control version 7 adds signed offline-node retirement messages to version 6's
+private AWG transport negotiation and delivery checks. Data ALPN remains
+`tsunagi/data/5`. All members must upgrade together; network ids, handshake
+encoding and existing record signatures are unchanged. Local CLI/tray IPC is
+version 21, so restart the agent with matching clients. SQLite schema 9 adds
+retirement storage while preserving existing identities, settings and records.
+See [sync-model.md](sync-model.md#offline-node-cleanup) and [amnezia.md](amnezia.md).
 
 ## Canonical encoding
 
@@ -238,6 +242,7 @@ not affect other networks.
 | `Ping { seq, payload }` | small request used to verify the exchange |
 | `Pong { seq, payload }` | the echoed reply |
 | `State { records }` | a snapshot of signed records, merged into what the receiver holds |
+| `Retirements { markers }` | signed cleanup markers with the target's original signed claim as proof |
 | `Peers { peers }` | unverified member address hints, requiring their own handshake |
 | `Reachable { links }` | sender's current direct data links, by kind of transport |
 | `Bye { reason }` | graceful goodbye; not a revocation of anything |

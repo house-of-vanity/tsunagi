@@ -1,18 +1,9 @@
-# Planned state synchronisation
+# State synchronisation
 
-**The first slice of this model is now implemented**, in `crates/tsunagi-core/src/state/`, and is
-used for one thing: IPv4 overlay addresses. What follows describes the whole
-model; the section at the end says exactly which parts exist.
-
-The proof of concept still exchanges hostname and capability announcements
-over live sessions and keeps no replicated history for those, which is why
-WireGuard peer *membership* remains session-scoped even though a peer's
-*address* no longer is. This file records the intended direction so the module
-boundaries in [architecture.md](architecture.md) stay compatible with it, and so
-nobody mistakes the current announcements for synchronisation.
-
-There is no fake "ready CRDT" here and no snapshots that are not actually
-verified.
+Signed claims in `crates/tsunagi-core/src/state/` preserve IPv4 reservations and
+hostnames across an absence. Signed releases and offline-node cleanup markers
+free those reservations durably. Capabilities, links and authenticated sessions
+remain volatile; a stored claim never authenticates a live connection.
 
 ## The problem
 
@@ -75,6 +66,39 @@ Turning a computer off is not a revocation of its hostname and does not remove
 the participant. Revocations are not dropped merely because they are old, and
 no acknowledgement from offline peers is required to keep working.
 
+## Offline-node cleanup
+
+Any authenticated member can sign a `SignedRetirement` for another member's
+observed `Claim`. It includes the original signed claim as proof and uses the
+separate `tsunagi-node-retirement/v1` signing domain. Both signatures and both
+network scopes are checked. No owner, vote or quorum is involved, and no member
+can fabricate the target's release or invent a future version cutoff.
+
+The strongest observed target version wins; ties use a deterministic canonical
+byte order. Claims at or below that version do not occupy an address, hostname
+or visible member row. Original signed records remain stored, including their
+range, so cleanup does not renumber the network. Markers remain even after a
+newer claim returns: absence from a snapshot is never deletion and replaying an
+old snapshot cannot restore the retired claim.
+
+The local `Agent::forget_node` API checks the exact observed version again and
+refuses self, online nodes, the selected exit node and missing/changed claims.
+CLI and tray share this API. A returning live node can sign a newer claim and
+allocate against the current holders; it resets the old hostname priority, so
+it cannot reclaim a reused name merely by keeping its old timestamp. Cleanup
+is not a permanent identity ban or a change of secret.
+
+The marker and requester's own author counter commit in one SQLite transaction
+before publication. Receivers persist a verified marker before applying it.
+Invalid proofs are rejected individually. Periodic bounded marker batches
+rotate through each peer's send queue, including when a queue fills, so a
+replica that missed an update can catch up without the requester being online.
+
+One strongest marker per target is retained, with a default limit of 1024 per
+network and 1024 bytes per encoded marker. New targets beyond that limit are
+refused rather than evicting resurrection protection. Corrupt mandatory marker
+storage or a configured limit smaller than the stored set is an explicit error.
+
 ## Storage requirement this creates
 
 When signed records land, writing the event and bumping the author's own
@@ -104,9 +128,9 @@ Implemented, in `crates/tsunagi-core/src/state/`:
 * the merge rules above: higher version wins, an older version never rolls
   back a newer one, duplicates are idempotent, a same-version conflict is
   resolved identically on every replica and reported;
-* a release tombstone, which merges correctly and is not undone by a replica
-  that has not heard of it — though nothing emits one yet, so freeing an
-  address still means forgetting the network;
+* a release tombstone, emitted when leaving or replacing the device key and
+  not undone by a replica that has not heard of it;
+* durable hostnames and equal-rights offline-node retirement described above;
 * persistence in `state.sqlite`, with the record and the author's own version
   counter committed in **one transaction before the record is announced**;
 * distribution as a `State` control message, merged into what the receiver
@@ -114,21 +138,16 @@ Implemented, in `crates/tsunagi-core/src/state/`:
 * allocation of a free IPv4 address against what everybody else holds, which
   is what makes an address stable across an absence.
 
-Deliberately not implemented: compaction, revoking a whole author, record
-types beyond addressing, and any bound on how large a snapshot may grow
-beyond the per-message limit.
+Deliberately not implemented: compaction and permanent author revocation.
+Claims have a per-message bound; retirement history also has a per-network bound.
 
 ## Future tests
 
 These are **not implemented and must not be reported as passing**:
 
-- snapshot merge against the rules above, including conflicting same-version
-  records;
-- revocation propagation and resistance to resurrection after compaction;
+- resistance to resurrection after compaction (compaction is not implemented);
 - long network partitions and rejoin after an extended absence;
-- hostname rename with atomic revoke-and-announce;
-- recovery of a returning participant from a replica that is not the author;
 - NAT traversal and hole punching between real hosts;
 - relay fallback behaviour against a self-hosted relay;
-- multi-process and multi-host deployment, as opposed to several library
-  instances inside one test process.
+- multi-host deployment. CLI tests do run separate local agent processes;
+  library tests run several independent instances inside one process.

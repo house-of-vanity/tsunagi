@@ -26,7 +26,9 @@ use crate::net::{EndpointAdapter, PathAddr, snapshot_connection};
 use crate::proto::handshake::{self, HandshakeOutcome, Role};
 use crate::proto::message::{Announcement, ControlMessage, Envelope, encode, kind};
 use crate::state::allocator::allocate;
-use crate::state::{Ipv4Range, Merged, RecordBody, SignedRecord, StateSet};
+use crate::state::{
+    Ipv4Range, MAX_RETIREMENT_LEN, Merged, RecordBody, SignedRecord, SignedRetirement, StateSet,
+};
 use crate::storage::Storage;
 
 use super::events::Event;
@@ -48,6 +50,11 @@ pub(crate) struct InboundSession {
 
 /// Commands accepted by a network runtime.
 pub(crate) enum NetCommand {
+    ForgetNode {
+        peer: EndpointId,
+        expected_version: u64,
+        reply: oneshot::Sender<Result<super::ForgetNodeOutcome>>,
+    },
     Inbound(Box<InboundSession>),
     Send {
         peer: EndpointId,
@@ -118,6 +125,7 @@ pub(crate) enum NetCommand {
 impl std::fmt::Debug for NetCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NetCommand::ForgetNode { peer, .. } => write!(f, "ForgetNode({peer})"),
             NetCommand::Inbound(_) => f.write_str("Inbound"),
             NetCommand::InboundLink(link) => write!(f, "InboundLink({})", link.protocol),
             NetCommand::Send { peer, message, .. } => {
@@ -162,6 +170,7 @@ impl NetworkHandle {
 
 /// Everything a network runtime needs to run.
 pub(crate) struct RuntimeParams {
+    pub(crate) retirements: Vec<SignedRetirement>,
     pub(crate) broadcast: bool,
     /// This agent offers itself as an exit node here.
     pub(crate) exit_offer: bool,
@@ -366,6 +375,9 @@ struct Runtime {
     state: StateSet,
     /// Snapshots received while dispatching, handled on the next loop pass.
     pending_state: Vec<(EndpointId, Vec<SignedRecord>)>,
+    pending_retirements: Vec<(EndpointId, Vec<SignedRetirement>)>,
+    /// Next cleanup batch per live session; prevents queue pressure starving a suffix.
+    retirement_cursor: HashMap<EndpointId, usize>,
     /// The highest version this agent has ever published for this network.
     own_version: u64,
     /// Whether the exit node in use was reachable when last looked at, so
@@ -448,6 +460,8 @@ impl Runtime {
             reported_name_taken: None,
             state: StateSet::new(),
             pending_state: Vec::new(),
+            pending_retirements: Vec::new(),
+            retirement_cursor: HashMap::new(),
             own_version: 0,
             exit_via_was_online: false,
             announced_exit: false,
@@ -547,6 +561,14 @@ impl Runtime {
 
     async fn handle_command(&mut self, command: NetCommand) {
         match command {
+            NetCommand::ForgetNode {
+                peer,
+                expected_version,
+                reply,
+            } => {
+                let result = self.forget_node(peer, expected_version).await;
+                let _ = reply.send(result);
+            }
             NetCommand::Inbound(inbound) => {
                 self.install_session(*inbound).await;
             }
@@ -801,6 +823,7 @@ impl Runtime {
         // the check is a comparison when nothing has changed.
         self.ensure_own_claim().await;
         self.report_hostname_taken();
+        self.broadcast_retirements();
         // The same timer repairs the relay picture: reachability is soft
         // state, repeated while it holds and forgotten when it stops.
         self.update_paths();
@@ -814,7 +837,7 @@ impl Runtime {
         // still dialable when the endpoint's own discovery can resolve
         // one. This is what makes a network a mesh rather than a star
         // around whoever was named on a command line.
-        for record in self.state.records() {
+        for record in self.state.active_records() {
             if let Ok(author) = record.author_id()
                 && author != self.local_id
             {
@@ -831,6 +854,9 @@ impl Runtime {
             let Ok(endpoint_id) = EndpointId::from_bytes(&hint.endpoint_id) else {
                 continue;
             };
+            if self.state.is_retired(&endpoint_id) {
+                continue;
+            }
             let Some(addr) = decode_hint(endpoint_id, &hint.addr) else {
                 continue;
             };
@@ -1036,6 +1062,22 @@ impl Runtime {
     /// boundary, because a restored backup or a copied file could hold
     /// anything.
     async fn load_state(&mut self) {
+        for marker in std::mem::take(&mut self.params.retirements) {
+            // Storage verified these proofs and activation enforced capacity.
+            if let Err(err) = self.state.merge_retirement(
+                self.network_id,
+                marker,
+                self.params.limits.max_retirements,
+            ) {
+                self.emit(Event::PluginError {
+                    network: self.network_id,
+                    protocol: "state".into(),
+                    reason: err.to_string(),
+                });
+                self.shutdown.trigger();
+                return;
+            }
+        }
         let stored = self
             .params
             .storage
@@ -1051,7 +1093,8 @@ impl Runtime {
             .storage
             .own_record_version(self.network_id, self.local_id)
             .await
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(self.state.authored_version(&self.local_id));
         for (id, hostname) in self
             .params
             .storage
@@ -1163,6 +1206,7 @@ impl Runtime {
             let kept = self
                 .state
                 .get(&self.local_id)
+                .filter(|_| !self.state.is_retired(&self.local_id))
                 .filter(|record| record.body.hostname() == Some(name.as_str()))
                 .and_then(|record| record.body.hostname_since());
             kept.unwrap_or_else(unix_millis)
@@ -1195,12 +1239,169 @@ impl Runtime {
         if self
             .state
             .get(&self.local_id)
-            .is_some_and(|record| record.body == body)
+            .is_some_and(|record| record.body == body && !self.state.is_retired(&self.local_id))
         {
             return;
         }
 
         self.publish_record(body).await;
+    }
+
+    async fn forget_node(
+        &mut self,
+        peer: EndpointId,
+        expected_version: u64,
+    ) -> Result<super::ForgetNodeOutcome> {
+        if peer == self.local_id {
+            return Err(Error::ForgetNode(
+                "use network leave for this device".into(),
+            ));
+        }
+        if self.is_online(peer) {
+            return Err(Error::ForgetNode(
+                "the node is online; only offline history can be forgotten".into(),
+            ));
+        }
+        if self.params.exit_via == Some(peer) {
+            return Err(Error::ForgetNode(
+                "stop using this exit node before forgetting it".into(),
+            ));
+        }
+        let target = self
+            .state
+            .get(&peer)
+            .filter(|_| !self.state.is_retired(&peer))
+            .filter(|record| matches!(record.body, RecordBody::Claim { .. }))
+            .cloned()
+            .ok_or_else(|| Error::ForgetNode("no current signed claim for this node".into()))?;
+        if target.version != expected_version {
+            return Err(Error::ForgetNode(
+                "the node's claim changed; refresh and select it again".into(),
+            ));
+        }
+        let version = self
+            .own_version
+            .max(self.state.authored_version(&self.local_id))
+            .checked_add(1)
+            .filter(|v| *v <= i64::MAX as u64)
+            .ok_or_else(|| Error::ForgetNode("author counter exhausted".into()))?;
+        let marker =
+            SignedRetirement::sign(&self.params.device_secret, self.network_id, version, target);
+        let mut candidate = self.state.clone();
+        candidate
+            .merge_retirement(
+                self.network_id,
+                marker.clone(),
+                self.params.limits.max_retirements,
+            )
+            .map_err(|err| Error::ForgetNode(err.to_string()))?;
+        // Signed cleanup and our author counter commit together before visibility.
+        self.params
+            .storage
+            .publish_own_retirement(marker.clone())
+            .await?;
+        self.own_version = version;
+        self.state = candidate;
+        self.known_hostnames.remove(&peer);
+        self.dial_states.remove(&peer);
+        self.candidate_addrs.remove(&peer);
+        self.publish_allocations().await;
+        self.report_hostname_taken();
+        let message = ControlMessage::Retirements {
+            markers: vec![marker],
+        };
+        let peers: Vec<_> = self.sessions.keys().copied().collect();
+        let peers_told = peers
+            .into_iter()
+            .filter(|peer| self.send_to(*peer, message.clone()).is_ok())
+            .count();
+        Ok(super::ForgetNodeOutcome {
+            target: peer,
+            record_version: expected_version,
+            peers_told,
+        })
+    }
+
+    fn broadcast_retirements(&mut self) -> usize {
+        let markers = self.state.retirements();
+        if markers.is_empty() {
+            return 0;
+        }
+        // Each proof has an encoded bound; reserve envelope/list overhead and
+        // chunk every marker, so a low-id prefix cannot starve later cleanup.
+        let batch = (self.params.limits.max_frame_len.saturating_sub(128) / MAX_RETIREMENT_LEN)
+            .max(1)
+            .min(self.params.limits.max_state_records.max(1));
+        let mut delivered = HashSet::new();
+        let peers: Vec<_> = self.sessions.keys().copied().collect();
+        let chunks: Vec<_> = markers.chunks(batch).collect();
+        for peer in peers {
+            let start = self.retirement_cursor.get(&peer).copied().unwrap_or(0) % chunks.len();
+            for offset in 0..chunks.len() {
+                let index = (start + offset) % chunks.len();
+                let message = ControlMessage::Retirements {
+                    markers: chunks[index].to_vec(),
+                };
+                if self.send_to(peer, message).is_err() {
+                    self.retirement_cursor.insert(peer, index);
+                    break;
+                }
+                delivered.insert(peer);
+                self.retirement_cursor
+                    .insert(peer, (index + 1) % chunks.len());
+            }
+        }
+        delivered.len()
+    }
+
+    async fn receive_retirements(&mut self, peer: EndpointId, markers: Vec<SignedRetirement>) {
+        let mut changed = false;
+        for marker in markers {
+            let mut candidate = self.state.clone();
+            match candidate.merge_retirement(
+                self.network_id,
+                marker.clone(),
+                self.params.limits.max_retirements,
+            ) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(err) => {
+                    self.metrics.protocol_violations += 1;
+                    self.emit(Event::ProtocolViolation {
+                        network: Some(self.network_id),
+                        peer: Some(peer),
+                        reason: format!("unusable cleanup proof: {err}"),
+                    });
+                    continue;
+                }
+            }
+            let target = marker.target.author_id().ok();
+            if let Err(err) = self.params.storage.put_retirement(marker).await {
+                self.emit(Event::PluginError {
+                    network: self.network_id,
+                    protocol: "state".into(),
+                    reason: format!("cannot persist cleanup proof: {err}"),
+                });
+                continue;
+            }
+            self.state = candidate;
+            if let Some(target) = target
+                && self.state.is_retired(&target)
+                && !self.sessions.contains_key(&target)
+            {
+                self.known_hostnames.remove(&target);
+                self.dial_states.remove(&target);
+                self.candidate_addrs.remove(&target);
+            }
+            changed = true;
+        }
+        if changed {
+            // A live target answers cleanup with a fresh claim; its identity
+            // is still authenticated, and old hostname priority is not reused.
+            self.ensure_own_claim().await;
+            self.publish_allocations().await;
+            self.broadcast_retirements();
+        }
     }
 
     /// Signs, stores and announces one of this agent's own records.
@@ -1209,7 +1410,24 @@ impl Runtime {
     /// counter, so a crash can never let us reuse a version we already put on
     /// the wire.
     async fn publish_record(&mut self, body: RecordBody) {
-        let version = self.own_version.saturating_add(1);
+        let observed = self.state.authored_version(&self.local_id).max(
+            self.state
+                .retirement_of(&self.local_id)
+                .map_or(0, |m| m.target.version),
+        );
+        let Some(version) = self
+            .own_version
+            .max(observed)
+            .checked_add(1)
+            .filter(|v| *v <= i64::MAX as u64)
+        else {
+            self.emit(Event::PluginError {
+                network: self.network_id,
+                protocol: "state".into(),
+                reason: "author counter exhausted".into(),
+            });
+            return;
+        };
         let record = SignedRecord::sign(&self.params.device_secret, self.network_id, version, body);
 
         if let Err(err) = self.params.storage.publish_own_record(record.clone()).await {
@@ -1234,6 +1452,9 @@ impl Runtime {
 
     /// Handles snapshots collected while dispatching messages.
     async fn drain_pending_state(&mut self) {
+        for (peer, markers) in std::mem::take(&mut self.pending_retirements) {
+            self.receive_retirements(peer, markers).await;
+        }
         for (peer, records) in std::mem::take(&mut self.pending_state) {
             self.receive_state(peer, records).await;
         }
@@ -1242,6 +1463,7 @@ impl Runtime {
 
     /// Sends everything we know to every peer.
     fn broadcast_state(&mut self) {
+        self.broadcast_retirements();
         let mut records = self.state.records();
         records.truncate(self.params.limits.max_state_records);
         if records.is_empty() {
@@ -2071,6 +2293,7 @@ impl Runtime {
 
     /// Drops every link to a peer.
     fn drop_links_for(&mut self, peer: EndpointId) {
+        self.retirement_cursor.remove(&peer);
         self.reset_peer_data(peer, "peer session ended");
         self.hub.remove_peer(peer);
         self.reachable.remove(&peer);
@@ -2434,6 +2657,9 @@ impl Runtime {
             ControlMessage::State { records } => {
                 self.pending_state.push((peer, records.clone()));
             }
+            ControlMessage::Retirements { markers } => {
+                self.pending_retirements.push((peer, markers.clone()));
+            }
             // Members somebody else knows of. Candidates, nothing more:
             // each still has to pass the handshake, and each is tried the
             // same way as one from any other source.
@@ -2631,12 +2857,13 @@ impl Runtime {
         // listing it as one turns leaving into a peer that looks broken.
         let mut members: Vec<MemberStatus> = self
             .state
-            .records()
+            .active_records()
             .into_iter()
             .filter(|record| !matches!(record.body, RecordBody::Release))
             .filter_map(|record| {
                 let endpoint_id = record.author_id().ok()?;
                 Some(MemberStatus {
+                    record_version: record.version,
                     endpoint_id,
                     // Only uncontested claims are reported as held: two
                     // members may have claimed the same thing, and saying

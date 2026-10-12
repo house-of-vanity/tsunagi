@@ -171,6 +171,15 @@ pub fn default_control_socket_path() -> PathBuf {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Request {
+    /// Retire the selected offline member's observed claim.
+    ForgetNode {
+        /// Exact public network id.
+        network_id: String,
+        /// Exact device identity selected by the client.
+        peer: String,
+        /// Claim version displayed when the user selected the node.
+        expected_version: u64,
+    },
     /// Replace one network's ordered local data-plane selection.
     SetProtocols {
         /// Public network identifier.
@@ -262,6 +271,14 @@ pub enum Request {
 impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Request::ForgetNode {
+                network_id,
+                peer,
+                expected_version,
+            } => write!(
+                f,
+                "ForgetNode {{ {network_id}, peer: {peer}, version: {expected_version} }}"
+            ),
             Request::SetProtocols {
                 network_id,
                 protocols,
@@ -300,6 +317,8 @@ impl std::fmt::Debug for Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Response {
+    /// An observed offline claim was durably retired.
+    NodeForgotten(ForgottenNodeReport),
     /// Accepted ordered protocol selection.
     Protocols(Vec<String>),
     /// A status report.
@@ -326,6 +345,141 @@ pub enum Response {
     ExitNode(Option<String>),
     /// The request could not be served.
     Error(String),
+}
+
+/// The durable result of an offline-node cleanup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgottenNodeReport {
+    /// Selected device identity.
+    pub peer: String,
+    /// The retired claim version, not a future-version ban.
+    pub record_version: u64,
+    /// Peers to which cleanup was immediately queued.
+    pub peers_told: u32,
+}
+
+/// Resolves a node by exact hostname, full id, unique id prefix or overlay IPv4.
+/// Ambiguity is reported with names and full ids and never guessed.
+pub fn resolve_node<'a>(
+    network: &'a NetworkReport,
+    selector: &str,
+) -> std::result::Result<&'a MemberReport, String> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err("select a node by name, id or IPv4 address".into());
+    }
+    if let Some(member) = network.members.iter().find(|m| m.endpoint_id == selector) {
+        return Ok(member);
+    }
+    let prefix = selector.trim_end_matches('…');
+    let matches: Vec<_> = network
+        .members
+        .iter()
+        .filter(|m| {
+            m.hostname.as_deref() == Some(selector)
+                || m.overlay_address_v4.as_deref() == Some(selector)
+                || (!prefix.is_empty() && m.endpoint_id.starts_with(prefix))
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!(
+            "no signed node matches `{selector}` in `{}`",
+            network.name
+        )),
+        many => Err(format!(
+            "`{selector}` is ambiguous; use a full id or unique id prefix:\n{}",
+            many.iter()
+                .map(|m| format!(
+                    "  {}  {}  {}",
+                    m.hostname.as_deref().unwrap_or("unnamed"),
+                    m.endpoint_id,
+                    m.overlay_address_v4.as_deref().unwrap_or("no IPv4")
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
+    }
+}
+
+/// Retires an exact selected claim; an online or changed target is rejected.
+pub async fn forget_node(
+    socket: &Path,
+    network: &str,
+    peer: &str,
+    expected_version: u64,
+) -> Result<ForgottenNodeReport> {
+    let request = Request::ForgetNode {
+        network_id: network.into(),
+        peer: peer.into(),
+        expected_version,
+    };
+    match exchange(socket, &request, EXCHANGE_TIMEOUT).await? {
+        Response::NodeForgotten(report) => Ok(report),
+        Response::Error(reason) => Err(Error::ForgetNode(reason)),
+        other => Err(Error::Storage(format!("unexpected response: {other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod node_selector_tests {
+    use super::*;
+
+    #[test]
+    fn exact_names_addresses_and_unique_prefixes_select_the_same_signed_node() {
+        let node = MemberReport {
+            endpoint_id: "abcdef01".into(),
+            hostname: Some("laptop".into()),
+            overlay_address_v4: Some("10.2.0.3".into()),
+            record_version: 42,
+            ..Default::default()
+        };
+        let network = NetworkReport {
+            name: "home".into(),
+            members: vec![node.clone()],
+            ..Default::default()
+        };
+        for selector in ["laptop", "10.2.0.3", "abcdef01", "abc…"] {
+            assert_eq!(resolve_node(&network, selector), Ok(&node));
+        }
+        for selector in ["", "LAPTOP", "missing"] {
+            assert!(resolve_node(&network, selector).is_err());
+        }
+    }
+
+    #[test]
+    fn collisions_between_names_addresses_and_prefixes_require_an_explicit_identity() {
+        let first = MemberReport {
+            endpoint_id: "abcdef01".into(),
+            hostname: Some("duplicate".into()),
+            overlay_address_v4: Some("10.2.0.3".into()),
+            ..Default::default()
+        };
+        let second = MemberReport {
+            endpoint_id: "abcdef02".into(),
+            hostname: Some("duplicate".into()),
+            overlay_address_v4: Some("10.2.0.3".into()),
+            ..Default::default()
+        };
+        let third = MemberReport {
+            endpoint_id: "12345678".into(),
+            hostname: Some("abc".into()),
+            ..Default::default()
+        };
+        let network = NetworkReport {
+            name: "home".into(),
+            members: vec![first.clone(), second, third],
+            ..Default::default()
+        };
+        for selector in ["duplicate", "10.2.0.3", "abc"] {
+            let result = resolve_node(&network, selector);
+            assert!(result.is_err_and(|error| error.contains("ambiguous")
+                && error.contains("abcdef01")
+                && error.contains("abcdef02")
+                && error.contains("duplicate")));
+        }
+        assert_eq!(resolve_node(&network, "abcdef01"), Ok(&first));
+    }
 }
 
 /// What happened when a network was stopped or started.
@@ -580,6 +734,8 @@ pub struct HostnameConflictReport {
 /// One member of the network, from signed state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberReport {
+    /// Signed claim version used to reject stale cleanup requests.
+    pub record_version: u64,
     /// The member's device identity.
     pub endpoint_id: String,
     /// The IPv4 overlay address it claimed and signed for.
@@ -749,6 +905,15 @@ impl OverlayPeerReport {
 /// running and what they can report or change. That is what keeps this module
 /// free of any knowledge of them.
 pub trait ReportSource: Send + Sync + 'static {
+    /// Persists and announces a version-scoped node cleanup.
+    fn forget_node(
+        &self,
+        _network: String,
+        _peer: String,
+        _expected_version: u64,
+    ) -> BoxFuture<'_, std::result::Result<ForgottenNodeReport, String>> {
+        Box::pin(async { Err("this agent cannot forget node history".into()) })
+    }
     /// Saves and applies a local ordered protocol set for one network.
     fn set_protocols(
         &self,
@@ -886,7 +1051,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 20]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 21]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///
@@ -910,6 +1075,14 @@ where
             }
         };
     let response = match request {
+        Request::ForgetNode {
+            network_id,
+            peer,
+            expected_version,
+        } => match source.forget_node(network_id, peer, expected_version).await {
+            Ok(report) => Response::NodeForgotten(report),
+            Err(reason) => Response::Error(reason),
+        },
         Request::SetProtocols {
             network_id,
             protocols,

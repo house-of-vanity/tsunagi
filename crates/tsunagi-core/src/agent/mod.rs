@@ -72,6 +72,17 @@ pub struct ConfiguredNetwork {
     pub active: bool,
 }
 
+/// A durable version-scoped cleanup, not an identity ban.
+#[derive(Debug, Clone)]
+pub struct ForgetNodeOutcome {
+    /// Identity whose observed claim was retired.
+    pub target: EndpointId,
+    /// The retired claim version; future signed claims remain admissible.
+    pub record_version: u64,
+    /// Authenticated peers to which cleanup was queued immediately.
+    pub peers_told: usize,
+}
+
 /// A running agent.
 ///
 /// Cloning gives another handle to the same agent.
@@ -298,6 +309,27 @@ impl TransportContext for TransportCtx {
 }
 
 impl Agent {
+    /// Retires one offline member's observed claim without revoking membership.
+    /// Every member has this right. The version must still match the selection.
+    pub async fn forget_node(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+        expected_version: u64,
+    ) -> Result<ForgetNodeOutcome> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let (reply, receive) = oneshot::channel();
+        self.command(
+            network,
+            NetCommand::ForgetNode {
+                peer,
+                expected_version,
+                reply,
+            },
+        )
+        .await?;
+        receive.await.map_err(|_| Error::Stopped)?
+    }
     fn effective_protocols(&self, saved: Option<&Vec<String>>) -> Vec<String> {
         saved
             .or(self.inner.config.default_protocols.as_ref())
@@ -878,6 +910,12 @@ impl Agent {
             .await?
             .into_iter()
             .find(|stored| stored.network_id == network_id);
+        // Mandatory cleanup proofs must never be silently dropped on startup.
+        let retirements = self
+            .inner
+            .storage
+            .retirements(network_id, self.inner.limits.max_retirements)
+            .await?;
         let range = self.desired_range(network_id).await?;
         if let Some(range) = range {
             let conflicts = self.inner.routes.overlapping_networks(network_id, range);
@@ -930,6 +968,7 @@ impl Agent {
             .and_then(|stored| stored.exit_via)
             .and_then(|bytes| EndpointId::from_bytes(&bytes).ok());
         let handle = network::spawn(RuntimeParams {
+            retirements,
             broadcast,
             exit_offer,
             exit_via,

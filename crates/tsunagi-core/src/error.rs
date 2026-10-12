@@ -15,6 +15,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A node-history cleanup is unsafe, stale or cannot be performed.
+    #[error("cannot forget node: {0}")]
+    ForgetNode(String),
     /// An ordered local data-plane protocol selection is invalid.
     #[error("invalid protocol selection: {0}")]
     InvalidProtocols(String),

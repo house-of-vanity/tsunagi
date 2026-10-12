@@ -38,6 +38,14 @@ Read this before relying on anything here. The protocol is in
   arbitrarily many identities, flood the network with records and collide with
   other participants' names. This is why a majority is not a root of trust.
   Signatures protect authorship; they do not make a participant honest.
+- **Cleanup rights are equal.** Any member can retire an observed signed claim
+  of another device, freeing its hostname and IPv4 reservation. A valid original
+  claim bounds the cutoff; a member cannot invent a future cutoff or forge the
+  target's release. The local API refuses online nodes, but a remote signature
+  cannot prove that a target was offline. A live target may publish a newer
+  claim; a malicious member can repeatedly disrupt reservations. Cleanup is
+  not expulsion or secret revocation. See
+  [sync-model.md](sync-model.md#offline-node-cleanup).
 - **Weak secrets.** This targets high-entropy secrets. There is no PAKE, so a
   short human passphrase can be guessed offline by anyone who can reach the
   handshake. Use `NetworkSecret::generate()`.
@@ -55,8 +63,10 @@ Read this before relying on anything here. The protocol is in
   having iroh under it does not make it so.
 - **A cloned state directory is a cloned identity.** `state.sqlite` holds the
   device secret key and the network secrets. Copying it copies the participant.
-  Restoring an old backup rolls the agent's state back, which — once signed
-  records exist — can resurrect revoked information or replay stale versions.
+  Restoring an old backup rolls the agent's state back and can replay stale
+  versions until it meets a replica holding the newer signed state. Retained
+  cleanup markers prevent old claims from resurrecting after that merge; they
+  cannot help if every copy of a marker has been lost.
 - **A compromised host.** The secret is on disk to survive restarts. File
   permissions are owner-only where the platform supports it, and the state
   directory takes an ownership lock, but neither defends against a user who can

@@ -20,7 +20,7 @@ use crate::error::ProtocolError;
 /// The version in the ALPN is the wire-compatibility version of the control
 /// protocol. It is independent of the network identity scheme version, so
 /// bumping it must not change any existing [`crate::NetworkId`].
-pub const ALPN: &[u8] = b"tsunagi/ctrl/6";
+pub const ALPN: &[u8] = b"tsunagi/ctrl/7";
 
 /// ALPN of the tsunagi data plane.
 ///
@@ -43,7 +43,7 @@ pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
 pub const MAX_SIGNATURE_LEN: usize = 64;
 
 /// Control protocol version carried inside the handshake.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 pub use crate::dataplane::transport::{MAX_TRANSPORT_PAYLOAD, TransportPayload};
 
@@ -181,6 +181,11 @@ pub enum ControlMessage {
         /// Short free-text reason.
         reason: String,
     },
+    /// Signed cleanup markers, each proving the retired claim version.
+    Retirements {
+        /// Bounded by the per-message signed-state limit.
+        markers: Vec<crate::state::SignedRetirement>,
+    },
 }
 
 /// Somewhere a member has been seen.
@@ -273,6 +278,28 @@ pub fn validate_capability(
 /// network, the other networks or the agent.
 pub fn validate(message: &ControlMessage, limits: &Limits) -> Result<(), ProtocolError> {
     match message {
+        ControlMessage::Retirements { markers } => {
+            check_len("retirements", markers.len(), limits.max_state_records)?;
+            for marker in markers {
+                check_len(
+                    "retirement.signature",
+                    marker.signature.len(),
+                    MAX_SIGNATURE_LEN,
+                )?;
+                check_len(
+                    "retirement.target.signature",
+                    marker.target.signature.len(),
+                    MAX_SIGNATURE_LEN,
+                )?;
+                if let Some(name) = marker.target.body.hostname() {
+                    check_len(
+                        "retirement.target.hostname",
+                        name.len(),
+                        limits.max_hostname_len,
+                    )?;
+                }
+            }
+        }
         ControlMessage::Transport { protocol, payload } => {
             if protocol.is_empty() {
                 return Err(ProtocolError::Malformed("empty transport protocol"));
@@ -345,6 +372,7 @@ pub fn kind(message: &ControlMessage) -> &'static str {
         ControlMessage::Ping { .. } => "ping",
         ControlMessage::Pong { .. } => "pong",
         ControlMessage::State { .. } => "state",
+        ControlMessage::Retirements { .. } => "retirements",
         ControlMessage::Reachable { .. } => "reachable",
         ControlMessage::Peers { .. } => "peers",
         ControlMessage::Bye { .. } => "bye",

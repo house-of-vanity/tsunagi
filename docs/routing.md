@@ -124,5 +124,5 @@ counts sends without storing frames. Results are CPU forwarding cost, **not**
 end-to-end network latency or VPN throughput; encryption, fragmentation,
 sockets, congestion and scheduling contribute separately.
 
-Wire compatibility: control ALPN `tsunagi/ctrl/6`, data ALPN `tsunagi/data/5`.
+Wire compatibility: control ALPN `tsunagi/ctrl/7`, data ALPN `tsunagi/data/5`.
 Upgrade every participant together; saved identities and network state persist.

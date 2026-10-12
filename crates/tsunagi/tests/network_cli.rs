@@ -58,6 +58,15 @@ fn start_bare_range(port: u16, range: Option<&str>) -> Running {
 }
 
 fn start_bare_config(port: u16, range: Option<&str>, protocols: Option<&str>) -> Running {
+    start_bare_peers(port, range, protocols, &[])
+}
+
+fn start_bare_peers(
+    port: u16,
+    range: Option<&str>,
+    protocols: Option<&str>,
+    peers: &[String],
+) -> Running {
     let dir = TempDir::new().unwrap();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_tsng"));
     command
@@ -77,6 +86,9 @@ fn start_bare_config(port: u16, range: Option<&str>, protocols: Option<&str>) ->
     }
     if let Some(protocols) = protocols {
         command.args(["--protocol", protocols]);
+    }
+    for peer in peers {
+        command.args(["--peer", peer]);
     }
     let child = command.spawn().expect("the agent binary starts");
     let mut agent = Running { child, dir };
@@ -117,6 +129,113 @@ fn start(network: &str, port: u16) -> Running {
         String::from_utf8_lossy(&joined.stderr)
     );
     agent
+}
+
+#[test]
+fn cli_forgets_only_the_selected_offline_claim_over_real_control() {
+    let cleaner = start("forget-cli", 0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let socket = tsunagi::ipc::control_socket_path(&cleaner.dir.path().join("state"));
+    let read = || {
+        runtime
+            .block_on(tsunagi::ipc::request_status(&socket))
+            .unwrap()
+    };
+    let before = read();
+    let bootstrap = format!("{}@{}", before.endpoint_id, before.bound_sockets[0]);
+    let target = start_bare_peers(0, None, Some("none"), &[bootstrap]);
+    assert!(
+        target
+            .run(&["id", "hostname", "old-cli-node"])
+            .status
+            .success()
+    );
+    assert!(
+        target
+            .run(&[
+                "join",
+                "--network",
+                "forget-cli",
+                "--secret",
+                "a-secret-for-the-cli-test"
+            ])
+            .status
+            .success()
+    );
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let status = tsunagi::ipc::request_status(&socket).await.unwrap();
+                if status.networks[0]
+                    .members
+                    .iter()
+                    .any(|m| m.hostname.as_deref() == Some("old-cli-node") && m.online)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+    });
+    assert!(
+        !cleaner
+            .run(&["network", "forget-node", "forget-cli", "old-cli-node"])
+            .status
+            .success()
+    );
+    assert!(
+        !cleaner
+            .run(&["network", "forget-node", "forget-cli", &before.endpoint_id])
+            .status
+            .success()
+    );
+    assert!(
+        target
+            .run(&["network", "stop", "forget-cli"])
+            .status
+            .success()
+    );
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let status = tsunagi::ipc::request_status(&socket).await.unwrap();
+                if status.networks[0]
+                    .members
+                    .iter()
+                    .any(|m| m.hostname.as_deref() == Some("old-cli-node") && !m.online)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+    });
+    let forgotten = cleaner.run(&["network", "forget-node", "forget-cli", "old-cli-node"]);
+    assert!(
+        forgotten.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forgotten.stderr)
+    );
+    assert!(String::from_utf8_lossy(&forgotten.stdout).contains("newer signed claim can return"));
+    assert!(
+        !read().networks[0]
+            .members
+            .iter()
+            .any(|m| m.hostname.as_deref() == Some("old-cli-node"))
+    );
+    assert!(
+        !cleaner
+            .run(&["network", "forget-node", "forget-cli", "old-cli-node"])
+            .status
+            .success()
+    );
 }
 
 #[test]

@@ -129,6 +129,24 @@ a common protocol at the same wire version. `tsng up --protocol` supplies the
 initial defaults for networks without a saved choice; it does not restrict
 which built-in protocols can be enabled later.
 
+Remove an obsolete offline device from a network's shared history:
+
+```sh
+tsng network forget-node home old-laptop
+tsng network forget-node home 10.13.37.143
+```
+
+Networks accept exact names, full ids or unique id prefixes; nodes accept those
+id selectors, exact hostnames or overlay IPv4 addresses. Ambiguous selectors
+change nothing. Start the network first if it is stopped. In **Show devices**,
+click **Forget** beside an offline node and confirm its identity.
+
+Every member has the same cleanup right. The signed cleanup frees the observed
+claim's name and IPv4 reservation, survives restarts and reaches offline replicas
+when they reconnect. It does not ban the device: a newer signed claim can return.
+Online nodes and the currently selected exit node cannot be forgotten.
+[State and limits](docs/sync-model.md#offline-node-cleanup).
+
 ## Platforms
 
 | Platform                  | Build        | CLI `tsng` | Tray | Exit node: offer / use | Packages                            |

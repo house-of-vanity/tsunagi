@@ -18,10 +18,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
-use crate::state::{RecordBody, SignedRecord};
+use crate::state::{MAX_RETIREMENT_LEN, RecordBody, SignedRecord, SignedRetirement};
 
 /// Schema version written by this build.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Key of the stored hostname setting.
 const SETTING_HOSTNAME: &str = "hostname";
@@ -250,6 +250,19 @@ impl StateStore {
                 )
                 .map_err(|err| self.corrupt(format!("cannot migrate schema to 8: {err}")))?;
         }
+        if found < 9 {
+            self.conn
+                .execute_batch(
+                    "BEGIN;
+                CREATE TABLE IF NOT EXISTS retirements (
+                    network_id BLOB NOT NULL, target BLOB NOT NULL, data BLOB NOT NULL,
+                    PRIMARY KEY (network_id, target)
+                );
+                PRAGMA user_version = 9;
+                COMMIT;",
+                )
+                .map_err(|err| self.corrupt(format!("cannot migrate schema to 9: {err}")))?;
+        }
         Ok(())
     }
 
@@ -262,6 +275,7 @@ impl StateStore {
             "settings",
             "signed_records",
             "peer_hostnames",
+            "retirements",
         ] {
             let present: Option<String> = self
                 .conn
@@ -785,6 +799,112 @@ impl StateStore {
         Ok(version.unwrap_or(0).max(0) as u64)
     }
 
+    /// Loads durable cleanup markers without allocating oversized stored blobs.
+    pub fn retirements(&self, network: NetworkId, max: usize) -> Result<Vec<SignedRetirement>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT CASE WHEN length(data) <= ?2 THEN data ELSE NULL END
+            FROM retirements WHERE network_id = ?1 ORDER BY target",
+            )
+            .map_err(|err| self.corrupt(err))?;
+        let rows = stmt
+            .query_map(
+                params![network.as_bytes().as_slice(), MAX_RETIREMENT_LEN as i64],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .map_err(|err| self.corrupt(err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if out.len() >= max {
+                return Err(Error::Storage(
+                    "stored retirements exceed the configured limit".into(),
+                ));
+            }
+            let bytes = row
+                .map_err(|err| self.corrupt(err))?
+                .ok_or_else(|| self.corrupt("oversized retirement"))?;
+            let marker: SignedRetirement =
+                postcard::from_bytes(&bytes).map_err(|err| self.corrupt(err))?;
+            marker.verify(network).map_err(|err| self.corrupt(err))?;
+            out.push(marker);
+        }
+        Ok(out)
+    }
+
+    /// Persists a strongest verified marker received from an authenticated session.
+    pub fn put_retirement(&self, marker: &SignedRetirement) -> Result<()> {
+        let network = NetworkId::from_bytes(marker.network);
+        marker
+            .verify(network)
+            .map_err(|err| Error::Storage(err.to_string()))?;
+        let old: Option<Option<Vec<u8>>> = self.conn.query_row(
+            "SELECT CASE WHEN length(data) <= ?3 THEN data ELSE NULL END FROM retirements WHERE network_id = ?1 AND target = ?2",
+            params![marker.network.as_slice(), marker.target.author.as_slice(), MAX_RETIREMENT_LEN as i64], |row| row.get(0))
+            .optional().map_err(|err| self.corrupt(err))?;
+        if let Some(bytes) = old {
+            let bytes = bytes.ok_or_else(|| self.corrupt("oversized retirement"))?;
+            let old: SignedRetirement =
+                postcard::from_bytes(&bytes).map_err(|err| self.corrupt(err))?;
+            old.verify(network).map_err(|err| self.corrupt(err))?;
+            if !marker.supersedes(&old) {
+                return Ok(());
+            }
+        }
+        let bytes = postcard::to_stdvec(marker).map_err(|err| Error::Storage(err.to_string()))?;
+        if bytes.len() > MAX_RETIREMENT_LEN {
+            return Err(Error::Storage(
+                "retirement exceeds its encoded bound".into(),
+            ));
+        }
+        self.conn
+            .execute(
+                "INSERT INTO retirements (network_id, target, data) VALUES (?1, ?2, ?3)
+            ON CONFLICT(network_id, target) DO UPDATE SET data = excluded.data",
+                params![
+                    marker.network.as_slice(),
+                    marker.target.author.as_slice(),
+                    bytes
+                ],
+            )
+            .map_err(|err| Error::Storage(format!("cannot store retirement: {err}")))?;
+        Ok(())
+    }
+
+    /// Commits our signed cleanup marker and author counter in one transaction.
+    pub fn publish_own_retirement(&self, marker: &SignedRetirement) -> Result<()> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| Error::Storage(err.to_string()))?;
+        self.put_retirement(marker)?;
+        transaction
+            .execute(
+                "INSERT INTO own_record_version (network_id, author, version) VALUES (?1, ?2, ?3)
+            ON CONFLICT(network_id, author) DO UPDATE SET version = max(version, excluded.version)",
+                params![
+                    marker.network.as_slice(),
+                    marker.author.as_slice(),
+                    marker.version as i64
+                ],
+            )
+            .map_err(|err| Error::Storage(format!("cannot store retirement counter: {err}")))?;
+        transaction
+            .commit()
+            .map_err(|err| Error::Storage(format!("cannot commit retirement: {err}")))
+    }
+
+    /// Drops a forgotten network's local cleanup proofs.
+    pub fn forget_retirements(&self, network: NetworkId) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM retirements WHERE network_id = ?1",
+                params![network.as_bytes().as_slice()],
+            )
+            .map_err(|err| Error::Storage(err.to_string()))?;
+        Ok(())
+    }
+
     /// Forgets every record of a network.
     pub fn forget_signed_records(&self, network_id: NetworkId) -> Result<()> {
         self.conn
@@ -1004,6 +1124,96 @@ mod broadcast_storage_tests {
         );
         store.forget_peer_hostnames(id).unwrap();
         assert!(store.peer_hostnames(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retirement_migration_and_atomic_counter_commit_preserve_existing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let store = StateStore::open(&path).unwrap();
+        let identity = store.load_or_create_device_identity().unwrap();
+        let name = NetworkName::new("retirement-migration").unwrap();
+        let secret = NetworkSecret::from_bytes([6; 32]).unwrap();
+        let id = NetworkKeys::derive(&name, &secret).network_id();
+        store.upsert_network(id, &name, &secret, true).unwrap();
+        store.set_protocols(id, &["awg".into()]).unwrap();
+        let own = SignedRecord::sign(&identity.signing_key(), id, 8, RecordBody::Release);
+        store.publish_own_record(&own).unwrap();
+        store
+            .conn
+            .execute_batch("DROP TABLE retirements; PRAGMA user_version = 8;")
+            .unwrap();
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store.device_identity().unwrap().unwrap().endpoint_id(),
+            identity.endpoint_id()
+        );
+        assert_eq!(
+            store.list_networks().unwrap()[0].protocols,
+            Some(vec!["awg".into()])
+        );
+        assert_eq!(store.signed_records(id).unwrap(), vec![own]);
+        let target_key = iroh::SecretKey::generate();
+        let target = SignedRecord::sign(
+            &target_key,
+            id,
+            3,
+            RecordBody::Claim {
+                address: Some("10.13.37.2".parse().unwrap()),
+                range: Some(crate::state::DEFAULT_IPV4_RANGE),
+                hostname: Some("old-device".into()),
+                hostname_since: Some(123),
+            },
+        );
+        let marker = SignedRetirement::sign(&identity.signing_key(), id, 9, target);
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_retirement_counter BEFORE INSERT ON own_record_version
+            WHEN NEW.version = 9 BEGIN SELECT RAISE(ABORT, 'counter write refused'); END;",
+            )
+            .unwrap();
+        assert!(store.publish_own_retirement(&marker).is_err());
+        assert!(
+            store.retirements(id, 16).unwrap().is_empty(),
+            "marker must roll back with counter failure"
+        );
+        assert_eq!(
+            store
+                .own_record_version(id, identity.endpoint_id())
+                .unwrap(),
+            8
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_retirement_counter;")
+            .unwrap();
+        store.publish_own_retirement(&marker).unwrap();
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.retirements(id, 16).unwrap(), vec![marker.clone()]);
+        assert_eq!(
+            store
+                .own_record_version(id, identity.endpoint_id())
+                .unwrap(),
+            9
+        );
+        assert!(
+            store.retirements(id, 0).is_err(),
+            "capacity changes must not silently drop markers"
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE retirements SET data = ?1",
+                params![vec![0u8; MAX_RETIREMENT_LEN + 1]],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.retirements(id, 16),
+            Err(Error::StateCorrupted { .. })
+        ));
     }
 
     #[test]

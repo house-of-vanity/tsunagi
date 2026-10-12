@@ -28,15 +28,22 @@
 //! replica that has the record needs nothing else to interpret it, and
 //! recovery never depends on replaying a chain from the beginning.
 //!
+//! Any member may also sign a separate retirement of another author's proved
+//! claim version. It suppresses stale reservations without changing that
+//! author's record, and a newer claim remains valid.
+//!
 //! # What this slice does not do yet
 //!
-//! Compaction, revocation of a whole author, and snapshots covering more than
-//! one record type. See `docs/sync-model.md` for the shape those take.
+//! Compaction and permanent revocation of a whole author. See
+//! `docs/sync-model.md` for the implemented cleanup semantics.
 
 pub mod allocator;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+
+mod retirement;
+pub use retirement::{MAX_RETIREMENT_LEN, SignedRetirement};
 
 use iroh::{EndpointId, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
@@ -488,6 +495,7 @@ pub enum Merged {
 #[derive(Debug, Clone, Default)]
 pub struct StateSet {
     records: HashMap<EndpointId, SignedRecord>,
+    retirements: HashMap<EndpointId, SignedRetirement>,
 }
 
 impl StateSet {
@@ -500,6 +508,7 @@ impl StateSet {
     pub fn from_verified(records: impl IntoIterator<Item = (EndpointId, SignedRecord)>) -> Self {
         Self {
             records: records.into_iter().collect(),
+            retirements: HashMap::new(),
         }
     }
 
@@ -526,6 +535,52 @@ impl StateSet {
             .into_iter()
             .filter_map(|author| self.records.get(author).cloned())
             .collect()
+    }
+
+    /// Visible records, excluding versions retired by authenticated members.
+    pub fn active_records(&self) -> Vec<SignedRecord> {
+        self.records()
+            .into_iter()
+            .filter(|r| r.author_id().is_ok_and(|id| !self.is_retired(&id)))
+            .collect()
+    }
+
+    /// Whether the current known version is at or below a proved retirement.
+    pub fn is_retired(&self, author: &EndpointId) -> bool {
+        self.retirements
+            .get(author)
+            .is_some_and(|m| self.version_of(author) <= m.target.version)
+    }
+
+    /// Strongest retained cleanup proof for an identity.
+    pub fn retirement_of(&self, target: &EndpointId) -> Option<&SignedRetirement> {
+        self.retirements.get(target)
+    }
+
+    /// Durable markers in target-id order, including markers surpassed by a fresh claim.
+    pub fn retirements(&self) -> Vec<SignedRetirement> {
+        let mut markers: Vec<_> = self.retirements.values().cloned().collect();
+        markers.sort_by_key(|m| m.target.author);
+        markers
+    }
+
+    /// Accepts any member's signed cleanup after checking both signatures.
+    pub fn merge_retirement(
+        &mut self,
+        network: NetworkId,
+        marker: SignedRetirement,
+        max: usize,
+    ) -> Result<bool, StateError> {
+        let target = marker.verify(network)?;
+        if let Some(old) = self.retirements.get(&target) {
+            if !marker.supersedes(old) {
+                return Ok(false);
+            }
+        } else if self.retirements.len() >= max {
+            return Err(StateError::Malformed("retirement capacity reached"));
+        }
+        self.retirements.insert(target, marker);
+        Ok(true)
     }
 
     /// Merges one record, verifying it first.
@@ -591,6 +646,9 @@ impl StateSet {
     pub fn address_holders(&self) -> HashMap<Ipv4Addr, EndpointId> {
         let mut holders: HashMap<Ipv4Addr, EndpointId> = HashMap::new();
         for (author, record) in &self.records {
+            if self.is_retired(author) {
+                continue;
+            }
             let Some(address) = record.body.claimed_address() else {
                 continue;
             };
@@ -618,6 +676,9 @@ impl StateSet {
     pub fn hostname_holders(&self) -> HashMap<String, EndpointId> {
         let mut holders: HashMap<String, (u64, EndpointId)> = HashMap::new();
         for (author, record) in &self.records {
+            if self.is_retired(author) {
+                continue;
+            }
             let Some(hostname) = record.body.hostname() else {
                 continue;
             };
@@ -646,6 +707,9 @@ impl StateSet {
     /// The name an author claimed and the member that holds it instead, when
     /// somebody who claimed it earlier does.
     pub fn hostname_taken(&self, author: &EndpointId) -> Option<(&str, EndpointId)> {
+        if self.is_retired(author) {
+            return None;
+        }
         let hostname = self.records.get(author)?.body.hostname()?;
         let holder = *self.hostname_holders().get(hostname)?;
         (holder != *author).then_some((hostname, holder))
@@ -671,6 +735,12 @@ impl StateSet {
     pub fn agreed_range(&self) -> Option<Ipv4Range> {
         self.records
             .iter()
+            .chain(
+                self.retirements
+                    .iter()
+                    .filter(|(author, _)| !self.records.contains_key(*author))
+                    .map(|(author, marker)| (author, &marker.target)),
+            )
             .filter_map(|(author, record)| {
                 let range = record.body.range()?;
                 let derived = derived_ipv4_range(NetworkId::from_bytes(record.network));
@@ -683,6 +753,18 @@ impl StateSet {
     /// The highest version this author has published, as far as is known.
     pub fn version_of(&self, author: &EndpointId) -> u64 {
         self.records.get(author).map_or(0, |record| record.version)
+    }
+
+    /// Highest witnessed author counter across claims and authored cleanup.
+    /// This differs from the claim version used to decide retirement.
+    pub fn authored_version(&self, author: &EndpointId) -> u64 {
+        self.retirements
+            .values()
+            .filter(|m| m.author == *author.as_bytes())
+            .map(|m| m.version)
+            .chain(std::iter::once(self.version_of(author)))
+            .max()
+            .unwrap_or(0)
     }
 }
 

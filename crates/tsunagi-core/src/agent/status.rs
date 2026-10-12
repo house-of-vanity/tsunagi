@@ -108,6 +108,8 @@ pub struct HostnameConflict {
 /// connected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberStatus {
+    /// Current signed claim version, used to bind cleanup confirmation.
+    pub record_version: u64,
     /// The member's device identity.
     pub endpoint_id: EndpointId,
     /// The IPv4 overlay address it claimed and signed for.

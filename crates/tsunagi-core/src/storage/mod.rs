@@ -310,6 +310,7 @@ impl Storage {
         self.with_state(move |state| {
             state.remove_network(network_id)?;
             state.forget_signed_records(network_id)?;
+            state.forget_retirements(network_id)?;
             state.forget_peer_hostnames(network_id)
         })
         .await?;
@@ -366,6 +367,31 @@ impl Storage {
     /// Loads every signed record known for a network.
     pub async fn signed_records(&self, network_id: NetworkId) -> Result<Vec<SignedRecord>> {
         self.with_state(move |state| state.signed_records(network_id))
+            .await
+    }
+
+    /// Loads verified durable cleanup proofs off the executor.
+    pub async fn retirements(
+        &self,
+        network: NetworkId,
+        max: usize,
+    ) -> Result<Vec<crate::state::SignedRetirement>> {
+        self.with_state(move |state| state.retirements(network, max))
+            .await
+    }
+
+    /// Persists a received cleanup proof before applying it.
+    pub async fn put_retirement(&self, marker: crate::state::SignedRetirement) -> Result<()> {
+        self.with_state(move |state| state.put_retirement(&marker))
+            .await
+    }
+
+    /// Commits our cleanup and author counter together before announcement.
+    pub async fn publish_own_retirement(
+        &self,
+        marker: crate::state::SignedRetirement,
+    ) -> Result<()> {
+        self.with_state(move |state| state.publish_own_retirement(&marker))
             .await
     }
 
