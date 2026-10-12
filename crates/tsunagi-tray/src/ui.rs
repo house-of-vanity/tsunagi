@@ -390,7 +390,7 @@ fn draw_protocols(
                         }
                         if let Some(index) = selected.iter().position(|p| p == &protocol.name) {
                             if ui
-                                .add_enabled(index > 0, egui::Button::new("↑"))
+                                .add_enabled(index > 0, egui::Button::new(icon::ARROW_UP))
                                 .on_hover_text("prefer earlier")
                                 .clicked()
                             {
@@ -398,7 +398,10 @@ fn draw_protocols(
                                 changed = true;
                             }
                             if ui
-                                .add_enabled(index + 1 < selected.len(), egui::Button::new("↓"))
+                                .add_enabled(
+                                    index + 1 < selected.len(),
+                                    egui::Button::new(icon::ARROW_DOWN),
+                                )
                                 .on_hover_text("prefer later")
                                 .clicked()
                             {
