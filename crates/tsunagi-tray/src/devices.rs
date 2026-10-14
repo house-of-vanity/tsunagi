@@ -462,8 +462,20 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
     devices
 }
 
-/// The widest value each column is expected to hold, so the table starts out
-/// wide enough and does not reflow as numbers grow.
+const COLUMN_HEADERS: [&str; 10] = [
+    "device",
+    "exit",
+    "end-to-end",
+    "handshake / RTT",
+    "address",
+    "data path",
+    "pkts",
+    "bytes",
+    "rate",
+    "plot",
+];
+
+/// Initial column floors; actual headers, values and totals can grow them.
 const COLUMN_SAMPLES: [&str; 10] = [
     "device",
     "exit",
@@ -511,6 +523,7 @@ fn cell(ui: &mut egui::Ui, column: usize, widths: &[f32; 10], add: impl FnOnce(&
         |ui| {
             ui.set_min_width(floor);
             ui.set_max_width(floor);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             add(ui);
         },
     );
@@ -588,7 +601,20 @@ fn device_table(
     }
     let widths_id = egui::Id::new(("devices column widths", network_id));
     let mut widths = column_widths(ui, widths_id);
+    let previous_widths = widths;
     let font = egui::TextStyle::Body.resolve(ui.style());
+    let measure = |text: String| {
+        ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(text, font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    for (column, header) in COLUMN_HEADERS.into_iter().enumerate() {
+        widths[column] = widths[column].max(measure(header.to_owned()));
+    }
+    let (mut tx_packets, mut rx_packets, mut tx_bytes, mut rx_bytes) = (0u64, 0, 0, 0);
     for device in devices {
         let name = format!(
             "{} ({}){}",
@@ -596,21 +622,65 @@ fn device_table(
             short_id(device.id),
             if !device.online { " Forget" } else { "" }
         );
-        let natural = ui.fonts(|fonts| {
-            fonts
-                .layout_no_wrap(name, font.clone(), egui::Color32::WHITE)
-                .size()
-                .x
-        });
-        widths[0] = widths[0].max(natural + 24.0);
+        widths[0] = widths[0].max(measure(name) + 24.0);
         let (path, _) = data_path_text(device.path, device.via_name.as_deref(), device.online);
-        let path_width = ui.fonts(|fonts| {
-            fonts
-                .layout_no_wrap(path, font.clone(), egui::Color32::WHITE)
-                .size()
-                .x
-        });
-        widths[5] = widths[5].max(path_width);
+        for (column, text) in [
+            (2, displayed_protocol(device.tunnel_protocol).to_owned()),
+            (
+                3,
+                handshake_rtt_text(
+                    device.handshake_secs,
+                    device.control_rtt_ms,
+                    displayed_protocol(device.tunnel_protocol) != "—",
+                ),
+            ),
+            (4, device.address.clone().unwrap_or_default()),
+            (5, path),
+        ] {
+            widths[column] = widths[column].max(measure(text));
+        }
+        if let Some(peer) = device.overlay {
+            tx_packets += peer.tx_packets;
+            rx_packets += peer.rx_packets;
+            tx_bytes += peer.tx_bytes;
+            rx_bytes += peer.rx_bytes;
+            for (column, text) in [
+                (6, format!("{}/{}", peer.tx_packets, peer.rx_packets)),
+                (
+                    7,
+                    format!(
+                        "{} / {}",
+                        format::bytes(peer.tx_bytes as f64),
+                        format::bytes(peer.rx_bytes as f64)
+                    ),
+                ),
+                (
+                    8,
+                    format::series_rate(traffic.peer(network_id, &peer.public_key), unit),
+                ),
+            ] {
+                widths[column] = widths[column].max(measure(text));
+            }
+        }
+    }
+    for (column, text) in [
+        (6, format!("{tx_packets}/{rx_packets}")),
+        (
+            7,
+            format!(
+                "{} / {}",
+                format::bytes(tx_bytes as f64),
+                format::bytes(rx_bytes as f64)
+            ),
+        ),
+        (8, format::series_rate(traffic.network(network_id), unit)),
+    ] {
+        widths[column] = widths[column].max(measure(text));
+    }
+    if widths != previous_widths {
+        // Grid positions use the previous pass's widths. Let it settle
+        // before painting newly widened values over the next column.
+        ui.ctx().request_discard("device table columns widened");
     }
     ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
     let widths = stretch_columns(widths, ui.available_width());
@@ -620,21 +690,7 @@ fn device_table(
         .striped(true)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
-            for (column, header) in [
-                "device",
-                "exit",
-                "end-to-end",
-                "handshake / RTT",
-                "address",
-                "data path",
-                "pkts",
-                "bytes",
-                "rate",
-                "plot",
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            for (column, header) in COLUMN_HEADERS.into_iter().enumerate() {
                 cell(ui, column, &widths, |ui| {
                     let response = ui.weak(header);
                     match column {
@@ -744,13 +800,6 @@ fn device_table(
 
             // Everything this agent has moved through the overlay, including
             // devices that have since gone away.
-            let (mut tx_packets, mut rx_packets, mut tx_bytes, mut rx_bytes) = (0u64, 0, 0, 0);
-            for peer in devices.iter().filter_map(|d| d.overlay) {
-                tx_packets += peer.tx_packets;
-                rx_packets += peer.rx_packets;
-                tx_bytes += peer.tx_bytes;
-                rx_bytes += peer.rx_bytes;
-            }
             cell(ui, 0, &widths, |ui| {
                 ui.strong("total");
             });
@@ -1032,6 +1081,119 @@ mod tests {
             wide,
             "a resize does not accumulate padding"
         );
+    }
+
+    #[test]
+    fn counters_headers_and_handshake_stay_on_one_line_without_overlapping() {
+        use tsunagi::ipc::{OverlayReport, PeerReport};
+
+        fn collect_text<'a>(
+            shapes: &'a [egui::Shape],
+            texts: &mut Vec<&'a egui::epaint::TextShape>,
+        ) {
+            for shape in shapes {
+                match shape {
+                    egui::Shape::Text(shape) => texts.push(shape),
+                    egui::Shape::Vec(shapes) => collect_text(shapes, texts),
+                    _ => {}
+                }
+            }
+        }
+
+        let context = egui::Context::default();
+        for (width, packets, age) in [
+            (1600.0, 1569, 56),
+            (1600.0, 55_555, 172_800),
+            (1600.0, 137_245, 172_800),
+            (900.0, 9_876_543_210, 172_800),
+            (1600.0, 42, 56),
+        ] {
+            let network = NetworkReport {
+                network_id: "network".into(),
+                peers: ["peer", "other"]
+                    .into_iter()
+                    .map(|id| PeerReport {
+                        endpoint_id: id.into(),
+                        rtt_ms: Some(12_345),
+                        ..Default::default()
+                    })
+                    .collect(),
+                overlay: Some(OverlayReport {
+                    peers: ["peer", "other"]
+                        .into_iter()
+                        .map(|id| OverlayPeerReport {
+                            endpoint_id: id.into(),
+                            protocol: "wg-quic".into(),
+                            address: Some("10.13.37.100".into()),
+                            handshake_secs_ago: Some(age),
+                            tx_packets: packets,
+                            rx_packets: packets + 1,
+                            tx_bytes: 123_456_789,
+                            rx_bytes: 987_654_321,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let rows = devices(&network, "own");
+            for _ in 0..3 {
+                let output = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(2400.0, 640.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.allocate_ui(egui::vec2(width, 480.0), |ui| {
+                                device_table(
+                                    ui,
+                                    Unit::Packets,
+                                    &network,
+                                    &rows,
+                                    &Traffic::default(),
+                                    &mut None,
+                                    &mut None,
+                                );
+                            });
+                        });
+                    },
+                );
+                let shapes: Vec<_> = output.shapes.into_iter().map(|s| s.shape).collect();
+                let mut texts = Vec::new();
+                collect_text(&shapes, &mut texts);
+                for (label, next_column) in [
+                    ("handshake / RTT".to_string(), "address"),
+                    (handshake_rtt_text(Some(age), Some(12_345), true), "address"),
+                    (format!("{packets}/{}", packets + 1), "bytes"),
+                    (format!("{}/{}", packets * 2, (packets + 1) * 2), "bytes"),
+                ] {
+                    let right = texts
+                        .iter()
+                        .find(|shape| shape.galley.text() == next_column)
+                        .unwrap()
+                        .pos
+                        .x;
+                    let matching: Vec<_> = texts
+                        .iter()
+                        .filter(|shape| shape.galley.text() == label)
+                        .collect();
+                    assert!(!matching.is_empty(), "missing {label}");
+                    for shape in &matching {
+                        assert_eq!(shape.galley.rows.len(), 1, "wrapped {label}");
+                        assert!(
+                            shape.visual_bounding_rect().right() <= right,
+                            "overlapping {label}: {} > {right} at width {width}",
+                            shape.visual_bounding_rect().right()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
