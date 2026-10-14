@@ -43,12 +43,36 @@ be an exit node in one network and not in another.
   `tsunagi-exit:<interface>:<range>` and are removed when the offer ends, the
   network stops, and when the agent exits. Only networks that offer have
   rules, so the others' traffic is not forwarded.
-- **Client:** policy routing, with no change to the main table. Table `28787`
-  holds `default dev <interface>`, and three rules sit after Tailscale's:
-  `5280 uidrange <agent uid> lookup main` (the agent's own connections never
-  go through the tunnel, which would be a loop), `5290 lookup main
-  suppress_prefixlength 0` (LAN and other specific routes keep working) and
-  `5300 lookup 28787`.
+- **Client:** policy routing, with no change to the main table. Table `29811`
+  holds `default dev <interface>`. Rules `5205 fwmark 0x40000000/0x40000000
+  lookup main` and `5206 uidrange <agent uid> lookup main` keep the agent's
+  sockets and their replies outside the tunnel, before Tailscale's rules.
+  `5290 lookup main suppress_prefixlength 0` preserves LAN and other specific
+  routes, and `5300 lookup 29811` directs other traffic through the exit.
+  The exit table is `29811` (`0x7473`).
+- **Linux reverse-path filtering:** only the agent's dedicated UID is marked
+  in mangle `OUTPUT`. Its own bit, `0x40000000`, is saved to conntrack and
+  restored in `PREROUTING` before the host firewall checks reply routing.
+  Other mark bits, including Tailscale's `0xff0000` mask, are preserved. The
+  rules are tagged `tsunagi-exit-underlay:<interface>` and never accept packets
+  around the host firewall. IPv4 and IPv6 protection is installed before exit
+  routes; routes are removed before protection, including rollback on failure.
+  Locally owned TCP listeners and bound UDP sockets also protect the first
+  incoming packet, before any outgoing packet has created a connection mark.
+  Socket addresses and ports
+  come from local kernel socket tables and match an actual socket; remote
+  announcements never supply these firewall arguments.
+  The socket set is refreshed before private pair negotiation is sent and on
+  discovery ticks, so fresh AWG ports are included. An unchanged set causes no
+  firewall writes; a socket-refresh failure leaves active exit routes in place.
+  Linux needs both `iptables` and `ip6tables` when IPv6 is present.
+- **Kernel strict `rp_filter`:** if an interface uses strict mode (`1`), the
+  kernel must include marks in reverse lookups: set
+  `net.ipv4.conf.all.src_valid_mark=1`, or enable it on those interfaces.
+  The agent checks this before installing exit routes and reports an actionable
+  error if marks would be ignored. It never disables `rp_filter` or changes
+  host sysctls. Netfilter strict reverse checks also need their mark-aware
+  form, such as `rpfilter --validmark`, which NixOS already uses.
 - Packets for addresses outside every overlay range are sent to the exit node
   by the router; the exit node's replies are accepted from any source. A member
   that is not your exit node cannot do that.

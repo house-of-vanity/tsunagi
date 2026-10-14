@@ -25,18 +25,19 @@
 //!
 //! ```text
 //! table 0x7473:  default dev <if>
-//! 5280: from all uidrange <euid>-<euid> lookup main
+//! 5205: from all fwmark 0x40000000/0x40000000 lookup main
+//! 5206: from all uidrange <euid>-<euid> lookup main
 //! 5290: from all lookup main suppress_prefixlength 0
 //! 5300: from all lookup 0x7473
 //! ```
 //!
-//! The first keeps the agent's *own* sockets off the tunnel: its QUIC, relay,
+//! The first two keep the agent's *own* sockets and marked replies off the tunnel: its QUIC, relay,
 //! DHT and DNS traffic would otherwise be routed into the interface it is
-//! carrying, a loop. The second lets every specific route — the LAN, another
+//! carrying, a loop. The specific-route rule lets the LAN, another
 //! VPN, a tunnel to somewhere else — keep working, because only the default
-//! route is suppressed. The priorities sit after Tailscale's 5270.
+//! route is suppressed. Mark/UID bypass precedes Tailscale; application rules follow it.
 //!
-//! The first rule exempts a *user id*, so it is only right when the agent has
+//! The UID rule exempts a *user id*, so it is only right when the agent has
 //! one of its own, as the packaged service does. An agent started from a login
 //! session would take that user's own applications out of the tunnel with it,
 //! and the exit node would silently do nothing for them. That is refused, not
@@ -48,9 +49,10 @@ use crate::state::Ipv4Range;
 use super::RuleOutcome;
 use super::exit::{ExitHostPlan, ExitHostReport, ExitHostRules, exit_tag, exit_tag_prefix};
 use super::linux::{
-    LinuxHostRules, Ran, Run, comment_supported, failure, locked, run_iptables, same_rule,
-    split_rule_line,
+    LinuxHostRules, Ran, Run, comment_supported, failure, locked, run_firewall, run_iptables,
+    same_rule, split_rule_line,
 };
+use super::linux_exit_mark;
 
 /// The chains the offering rules live in: `(table, chain)`.
 const CHAINS: [(&str, &str); 2] = [("nat", "POSTROUTING"), ("filter", "FORWARD")];
@@ -377,6 +379,32 @@ fn read_sysctl(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+fn check_kernel_rpf(overlay: &str) -> Result<(), String> {
+    let directory = "/proc/sys/net/ipv4/conf";
+    let value = |name: &str, setting: &str| -> Result<u32, String> {
+        read_sysctl(&format!("{directory}/{name}/{setting}"))
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| format!("cannot check {name}/{setting} before installing exit routes"))
+    };
+    let mut interfaces = Vec::new();
+    for entry in std::fs::read_dir(directory).map_err(|err| err.to_string())? {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name != "all" && name != "default" && name != "lo" && name != overlay {
+            interfaces.push((
+                name.clone(),
+                value(&name, "rp_filter")?,
+                value(&name, "src_valid_mark")?,
+            ));
+        }
+    }
+    linux_exit_mark::check_kernel_rpf(
+        value("all", "rp_filter")?,
+        value("all", "src_valid_mark")?,
+        &interfaces,
+    )
+}
+
 /// The effective user id from the text of `/proc/self/status`.
 fn parse_euid(status: &str) -> Option<u32> {
     status
@@ -417,7 +445,7 @@ impl LinuxHostRules {
         let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
         if let Some(reason) = client_refusal(xdg.as_deref()) {
             // Whatever an earlier run left must not stay in force.
-            self.clear_client().await;
+            let _ = self.clear_client(interface).await;
             return RuleOutcome::Failed(reason);
         }
         let Some(euid) = std::fs::read_to_string("/proc/self/status")
@@ -426,24 +454,147 @@ impl LinuxHostRules {
         else {
             return RuleOutcome::Failed("cannot tell which user this agent runs as".to_string());
         };
+        let installed = self
+            .underlay_sockets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|(name, _, routed)| name == interface && *routed);
+        if installed {
+            // A failed socket refresh must never remove an active exit route.
+            return self
+                .refresh_sockets(interface)
+                .await
+                .unwrap_or(RuleOutcome::Applied);
+        }
+        if let Err(reason) = self.clear_client(interface).await {
+            return RuleOutcome::Failed(reason);
+        }
+        let name = interface.to_string();
+        let prepared = Self::blocking(move || {
+            check_kernel_rpf(&name)?;
+            linux_exit_mark::install(
+                &run_firewall,
+                &name,
+                euid,
+                std::path::Path::new("/proc/sys/net/ipv6").is_dir(),
+            )
+        })
+        .await;
+        match prepared {
+            Ok(Ok(sockets)) => {
+                *self
+                    .underlay_sockets
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some((interface.into(), sockets, false));
+            }
+            Ok(Err(reason)) | Err(reason) => return RuleOutcome::Failed(reason),
+        }
         let route = self.route.clone();
-        let interface = interface.to_string();
-        match Self::blocking(move || route.set_exit_client(&interface, euid)).await {
+        let name = interface.to_string();
+        let outcome = match Self::blocking(move || route.set_exit_client(&name, euid)).await {
             Ok(Ok(())) => RuleOutcome::Applied,
             Ok(Err(err)) => RuleOutcome::Failed(err.to_string()),
             Err(reason) => RuleOutcome::Failed(reason),
+        };
+        if let RuleOutcome::Failed(reason) = outcome {
+            let reason = match self.clear_client(interface).await {
+                Ok(()) => reason,
+                Err(cleanup) => format!("{reason}; cannot roll back exit rules: {cleanup}"),
+            };
+            RuleOutcome::Failed(reason)
+        } else {
+            if let Some((_, _, routed)) = self
+                .underlay_sockets
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_mut()
+            {
+                *routed = true;
+            }
+            outcome
         }
     }
 
-    async fn clear_client(&self) {
+    async fn clear_client(&self, interface: &str) -> Result<(), String> {
         let route = self.route.clone();
-        if let Ok(Err(err)) = Self::blocking(move || route.clear_exit_client()).await {
-            tracing::warn!(%err, "cannot remove the exit node routing rules");
+        Self::blocking(move || route.clear_exit_client())
+            .await?
+            .map_err(|err| err.to_string())?;
+        // Route removal must precede removing reply protection.
+        let name = interface.to_string();
+        Self::blocking(move || {
+            linux_exit_mark::clear(
+                &run_firewall,
+                &name,
+                std::path::Path::new("/proc/sys/net/ipv6").is_dir(),
+            )
+        })
+        .await??;
+        *self
+            .underlay_sockets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        Ok(())
+    }
+
+    async fn refresh_sockets(&self, interface: &str) -> Option<RuleOutcome> {
+        let previous = self
+            .underlay_sockets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if previous
+            .as_ref()
+            .is_none_or(|(name, _, routed)| name != interface || !routed)
+        {
+            return None;
+        }
+        let name = interface.to_string();
+        let work_name = name.clone();
+        let result = Self::blocking(move || {
+            let uid = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| parse_euid(&s))
+                .ok_or("cannot read agent UID")?;
+            check_kernel_rpf(&work_name)?;
+            let v6 = std::path::Path::new("/proc/sys/net/ipv6").is_dir();
+            let sockets = linux_exit_mark::local_sockets(uid, v6)?;
+            if previous
+                .as_ref()
+                .is_some_and(|(name, old, _)| name == &work_name && old == &sockets)
+            {
+                return Ok(None);
+            }
+            linux_exit_mark::refresh(&run_firewall, &work_name, v6, &sockets)?;
+            Ok(Some(sockets))
+        })
+        .await;
+        match result {
+            Ok(Ok(None)) => None,
+            Ok(Ok(Some(sockets))) => {
+                *self
+                    .underlay_sockets
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some((name, sockets, true));
+                Some(RuleOutcome::Applied)
+            }
+            Ok(Err(reason)) | Err(reason) => Some(RuleOutcome::Failed(reason)),
         }
     }
 }
 
 impl ExitHostRules for LinuxHostRules {
+    fn refresh<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, Option<RuleOutcome>> {
+        Box::pin(async move {
+            if plan.client {
+                self.refresh_sockets(&plan.interface).await
+            } else {
+                None
+            }
+        })
+    }
+
     fn apply<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, ExitHostReport> {
         Box::pin(async move {
             let interface = plan.interface.clone();
@@ -467,7 +618,9 @@ impl ExitHostRules for LinuxHostRules {
             let client = if plan.client {
                 Some(self.apply_client(&interface).await)
             } else {
-                self.clear_client().await;
+                if let Err(reason) = self.clear_client(&interface).await {
+                    tracing::warn!(%reason, "cannot remove exit-client rules");
+                }
                 None
             };
             ExitHostReport {
@@ -482,7 +635,9 @@ impl ExitHostRules for LinuxHostRules {
         Box::pin(async move {
             let name = interface.to_string();
             let _ = Self::blocking(move || clear_offer(&run_iptables, &name)).await;
-            self.clear_client().await;
+            if let Err(reason) = self.clear_client(interface).await {
+                tracing::warn!(%reason, "cannot remove exit-client rules");
+            }
         })
     }
 }

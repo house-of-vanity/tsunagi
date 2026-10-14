@@ -84,6 +84,11 @@ pub trait ExitHostRules: Send + Sync + std::fmt::Debug + 'static {
     /// startup to take away what a crashed run left.
     fn clear<'a>(&'a self, interface: &'a str) -> BoxFuture<'a, ()>;
 
+    /// Refreshes volatile local socket protection without replacing exit routes.
+    fn refresh<'a>(&'a self, _plan: &'a ExitHostPlan) -> BoxFuture<'a, Option<RuleOutcome>> {
+        Box::pin(async { None })
+    }
+
     /// Whether using an exit node on this host needs the underlay addresses
     /// the agent talks to, because the host cannot exempt the agent's own
     /// traffic from the default route by user id (Windows). The default is no.

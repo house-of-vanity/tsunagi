@@ -48,6 +48,7 @@ struct Device<'a> {
     tunnel_protocol: &'a str,
     address: Option<String>,
     handshake_secs: Option<u64>,
+    control_rtt_ms: Option<u64>,
     overlay: Option<&'a OverlayPeerReport>,
     /// It is connected and offers to be an exit node.
     exit_node: bool,
@@ -120,8 +121,7 @@ fn name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
         if let Some((name, holder)) = &device.name_taken {
             ui.label(egui::RichText::new(egui_phosphor::regular::WARNING).color(AMBER))
                 .on_hover_text(format!(
-                    "`{name}` was claimed first by {holder}. This device works by address, \
-                     but nobody finds it by that name."
+                    "Name `{name}` belongs to {holder}. Use this device's address."
                 ));
         }
     });
@@ -437,6 +437,11 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
                     .and_then(|p| p.address.clone())
                     .or_else(|| member.and_then(|m| m.overlay_address_v4.clone())),
                 handshake_secs: overlay.and_then(|p| p.handshake_secs_ago),
+                control_rtt_ms: network
+                    .peers
+                    .iter()
+                    .find(|p| p.endpoint_id == id)
+                    .and_then(|p| p.rtt_ms),
                 overlay,
                 exit_node: online
                     && network
@@ -458,16 +463,17 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
 
 /// The widest value each column is expected to hold, so the table starts out
 /// wide enough and does not reflow as numbers grow.
-const COLUMN_SAMPLES: [&str; 9] = [
-    "",
+const COLUMN_SAMPLES: [&str; 10] = [
+    "device",
     "exit",
-    "wg-quic · waiting for handshake",
+    "end-to-end",
+    "999d / 9999 ms",
     "255.255.255.255",
     "direct over tcp-tls",
     "99999/99999",
     "1023.9 MB / 1023.9 MB",
     "1023.9 kB/s",
-    "",
+    "plot",
 ];
 
 /// Column widths that only ever grow, kept across frames.
@@ -476,11 +482,11 @@ const COLUMN_SAMPLES: [&str; 9] = [
 /// gets shorter — `14.4 MB/s` giving way to `382 pkt/s` — would pull the
 /// column in and push every cell after it. Remembering the widest seen keeps
 /// the table where it is.
-fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 9] {
-    let stored: Option<[f32; 9]> = ui.memory(|m| m.data.get_temp(id));
+fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 10] {
+    let stored: Option<[f32; 10]> = ui.memory(|m| m.data.get_temp(id));
     stored.unwrap_or_else(|| {
         let font = egui::TextStyle::Body.resolve(ui.style());
-        let mut widths = [0.0; 9];
+        let mut widths = [0.0; 10];
         for (width, sample) in widths.iter_mut().zip(COLUMN_SAMPLES) {
             if !sample.is_empty() {
                 *width = ui.fonts(|fonts| {
@@ -496,13 +502,24 @@ fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 9] {
 }
 
 /// One cell, at least as wide as its column has ever been.
-fn cell(ui: &mut egui::Ui, column: usize, widths: &mut [f32; 9], add: impl FnOnce(&mut egui::Ui)) {
+fn cell(ui: &mut egui::Ui, column: usize, widths: &[f32; 10], add: impl FnOnce(&mut egui::Ui)) {
     let floor = widths[column];
-    let response = ui.scope(|ui| {
-        ui.set_min_width(floor);
-        add(ui);
-    });
-    widths[column] = widths[column].max(response.response.rect.width());
+    ui.allocate_ui_with_layout(
+        egui::vec2(floor, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_width(floor);
+            ui.set_max_width(floor);
+            add(ui);
+        },
+    );
+}
+
+fn stretch_columns(mut widths: [f32; 10], available: f32) -> [f32; 10] {
+    let gaps = 10.0 * (widths.len() - 1) as f32;
+    widths[9] = widths[9].max(100.0);
+    widths[9] += (available - gaps - widths.iter().sum::<f32>()).max(0.0);
+    widths
 }
 
 /// The exit-node mark of a device: shown when it offers to be one, bright
@@ -528,10 +545,7 @@ fn exit_cell(
         };
         (color, "in use as your exit node — click to stop")
     } else {
-        (
-            ui.visuals().text_color(),
-            "offers to be an exit node — click to send all your internet traffic through it",
-        )
+        (ui.visuals().text_color(), "Use this exit node")
     };
     let response = ui
         .add(
@@ -573,8 +587,27 @@ fn device_table(
     }
     let widths_id = egui::Id::new(("devices column widths", network_id));
     let mut widths = column_widths(ui, widths_id);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    for device in devices {
+        let name = format!(
+            "{} ({}){}",
+            device.name(),
+            short_id(device.id),
+            if !device.online { " Forget" } else { "" }
+        );
+        let natural = ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(name, font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        });
+        widths[0] = widths[0].max(natural + 24.0);
+    }
+    ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
+    let widths = stretch_columns(widths, ui.available_width());
     egui::Grid::new("devices")
-        .num_columns(9)
+        .num_columns(10)
+        .min_col_width(0.0)
         .striped(true)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
@@ -582,6 +615,7 @@ fn device_table(
                 "device",
                 "exit",
                 "end-to-end",
+                "handshake / RTT",
                 "address",
                 "data path",
                 "pkts",
@@ -592,20 +626,17 @@ fn device_table(
             .into_iter()
             .enumerate()
             {
-                cell(ui, column, &mut widths, |ui| {
+                cell(ui, column, &widths, |ui| {
                     let response = ui.weak(header);
                     match column {
                         2 => {
-                            response.on_hover_text(
-                                "Protocol that encrypts traffic between this device and the \
-                                 destination. It is independent of the route carrying it.",
-                            );
+                            response.on_hover_text("End-to-end encryption.");
                         }
-                        4 => {
-                            response.on_hover_text(
-                                "Current route carrying the encrypted tunnel traffic. `direct \
-                                 over tcp-tls` means one Tsunagi hop with no mesh relay.",
-                            );
+                        3 => {
+                            response.on_hover_text("Handshake age / control-connection RTT.");
+                        }
+                        5 => {
+                            response.on_hover_text("Transport carrying the encrypted tunnel.");
                         }
                         _ => {}
                     }
@@ -614,14 +645,15 @@ fn device_table(
             ui.end_row();
 
             for device in devices {
-                cell(ui, 0, &mut widths, |ui| {
+                cell(ui, 0, &widths, |ui| {
                     ui.horizontal(|ui| {
                         name_cell(ui, device);
                         if !device.online
                             && !device.in_use
                             && let Some(version) = device.record_version
-                            && ui.add_enabled(network.active, egui::Button::new("Forget"))
-                                .on_hover_text("Forget this offline claim across the network; returning devices may rejoin")
+                            && ui
+                                .add_enabled(network.active, egui::Button::new("Forget"))
+                                .on_hover_text("Free this offline device's name and IPv4")
                                 .clicked()
                         {
                             *forget_confirm = Some(ForgetConfirm {
@@ -634,50 +666,68 @@ fn device_table(
                         }
                     });
                 });
-                cell(ui, 1, &mut widths, |ui| {
+                cell(ui, 1, &widths, |ui| {
                     exit_cell(ui, device, network_id, confirm);
                 });
-                cell(ui, 2, &mut widths, |ui| {
-                    tunnel_cell(ui, device);
+                cell(ui, 2, &widths, |ui| {
+                    ui.push_id((device.id, "end-to-end"), |ui| {
+                        tunnel_cell(ui, device);
+                    });
                 });
-                cell(ui, 3, &mut widths, |ui| match &device.address {
+                cell(ui, 3, &widths, |ui| {
+                    ui.label(handshake_rtt_text(
+                        device.handshake_secs,
+                        device.control_rtt_ms,
+                        displayed_protocol(device.tunnel_protocol) != "—",
+                    ))
+                    .on_hover_text(if device.tunnel_protocol == "tcp-tls" {
+                        "Session age / control RTT."
+                    } else {
+                        "Last handshake age / control RTT."
+                    });
+                });
+                cell(ui, 4, &widths, |ui| match &device.address {
                     Some(address) => format::copy_field(ui, address, address),
                     None => {
                         ui.weak("—");
                     }
                 });
-                cell(ui, 4, &mut widths, |ui| data_path_cell(ui, device));
+                cell(ui, 5, &widths, |ui| {
+                    ui.push_id((device.id, "data-path"), |ui| data_path_cell(ui, device));
+                });
 
                 match device.overlay.filter(|_| device.online) {
                     Some(peer) => {
                         let series = traffic.peer(network_id, &peer.public_key);
-                        cell(ui, 5, &mut widths, |ui| {
+                        cell(ui, 6, &widths, |ui| {
                             ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
                         });
-                        cell(ui, 6, &mut widths, |ui| {
+                        cell(ui, 7, &widths, |ui| {
                             ui.label(format!(
                                 "{} / {}",
                                 format::bytes(peer.tx_bytes as f64),
                                 format::bytes(peer.rx_bytes as f64)
                             ));
                         });
-                        cell(ui, 7, &mut widths, |ui| {
+                        cell(ui, 8, &widths, |ui| {
                             ui.add(
                                 egui::Label::new(format::series_rate(series, unit))
                                     .wrap_mode(egui::TextWrapMode::Extend),
                             );
                         });
-                        ui.allocate_ui(egui::vec2(100.0, 20.0), |ui| {
+                        ui.allocate_ui(egui::vec2(widths[9], 20.0), |ui| {
                             format::sparkline(ui, series, unit, 18.0);
                         });
                     }
                     None => {
-                        for column in 5..8 {
-                            cell(ui, column, &mut widths, |ui| {
+                        for column in 6..9 {
+                            cell(ui, column, &widths, |ui| {
                                 ui.weak("—");
                             });
                         }
-                        ui.weak("—");
+                        cell(ui, 9, &widths, |ui| {
+                            ui.weak("—");
+                        });
                     }
                 }
                 ui.end_row();
@@ -692,25 +742,25 @@ fn device_table(
                 tx_bytes += peer.tx_bytes;
                 rx_bytes += peer.rx_bytes;
             }
-            cell(ui, 0, &mut widths, |ui| {
+            cell(ui, 0, &widths, |ui| {
                 ui.strong("total");
             });
-            for column in 1..5 {
-                cell(ui, column, &mut widths, |ui| {
+            for column in 1..6 {
+                cell(ui, column, &widths, |ui| {
                     ui.label("");
                 });
             }
-            cell(ui, 5, &mut widths, |ui| {
+            cell(ui, 6, &widths, |ui| {
                 ui.strong(format!("{tx_packets}/{rx_packets}"));
             });
-            cell(ui, 6, &mut widths, |ui| {
+            cell(ui, 7, &widths, |ui| {
                 ui.strong(format!(
                     "{} / {}",
                     format::bytes(tx_bytes as f64),
                     format::bytes(rx_bytes as f64)
                 ));
             });
-            cell(ui, 7, &mut widths, |ui| {
+            cell(ui, 8, &widths, |ui| {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(format::series_rate(traffic.network(network_id), unit))
@@ -721,54 +771,45 @@ fn device_table(
             });
             ui.end_row();
         });
-    ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
 }
 
 /// A protocol name as it should appear in the table.
 fn displayed_protocol(protocol: &str) -> &str {
-    if protocol.is_empty() {
-        "wg-quic"
-    } else {
-        protocol
-    }
+    if protocol.is_empty() { "—" } else { protocol }
 }
 
 /// The end-to-end tunnel and its own health, without transport details.
-fn tunnel_text(protocol: &str, handshake_secs: Option<u64>) -> String {
-    let protocol = displayed_protocol(protocol);
-    if protocol == "—" {
-        return protocol.to_string();
-    }
-    match handshake_secs {
-        Some(secs) if protocol == "tcp-tls" => {
-            format!("{protocol} · up {}", format::age(secs))
-        }
-        Some(secs) => format!("{protocol} · handshake {} ago", format::age(secs)),
-        None => format!("{protocol} · waiting for handshake"),
+fn handshake_rtt_text(handshake: Option<u64>, rtt: Option<u64>, has_tunnel: bool) -> String {
+    let age = handshake.map_or_else(
+        || {
+            if has_tunnel {
+                "waiting".into()
+            } else {
+                "—".into()
+            }
+        },
+        format::age,
+    );
+    let rtt = rtt.map_or_else(|| "—".into(), |value| format!("{value} ms"));
+    format!("{age} / {rtt}")
+}
+
+fn tunnel_hint(protocol: &str) -> String {
+    let name = displayed_protocol(protocol);
+    if name == "tcp-tls" {
+        format!("{name}: Noise end-to-end encryption")
+    } else {
+        format!("{name}: WireGuard end-to-end encryption")
     }
 }
 
 fn tunnel_cell(ui: &mut egui::Ui, device: &Device<'_>) {
     let protocol = displayed_protocol(device.tunnel_protocol);
-    let text = tunnel_text(protocol, device.handshake_secs);
     if protocol == "—" {
-        ui.weak(text);
+        ui.weak(protocol);
         return;
     }
-    let hint = match device.path {
-        Some(DataPathReport::Direct { transport }) => format!(
-            "The end-to-end {protocol} tunnel is currently carried over a direct {transport} \
-             transport."
-        ),
-        Some(DataPathReport::Relayed { hops, .. }) => format!(
-            "The end-to-end {protocol} tunnel is currently carried through other devices over \
-             {hops} transport hops."
-        ),
-        Some(DataPathReport::None) | None => {
-            format!("The end-to-end {protocol} tunnel does not have a data path carrying it yet.")
-        }
-    };
-    ui.label(text).on_hover_text(hint);
+    ui.label(protocol).on_hover_text(tunnel_hint(protocol));
 }
 
 /// Current route text and whether that route is the preferred direct form.
@@ -802,16 +843,10 @@ fn data_path_cell(ui: &mut egui::Ui, device: &Device<'_>) {
         ui.label(egui::RichText::new(text).color(AMBER))
     };
     response.on_hover_text(match device.path {
-        Some(DataPathReport::Direct { .. }) => {
-            "One Tsunagi hop with no mesh relay. The end-to-end tunnel may use a different \
-             protocol from this transport."
-        }
-        Some(DataPathReport::Relayed { .. }) => {
-            "No direct transport yet: traffic goes through another device, and moves to a \
-             direct path by itself as soon as one comes up."
-        }
-        _ if device.online => "Connected, but no data path carries packets yet.",
-        _ => "This device is not reachable now.",
+        Some(DataPathReport::Direct { .. }) => "Direct transport; no mesh relay.",
+        Some(DataPathReport::Relayed { .. }) => "Traffic forwarded through another device.",
+        _ if device.online => "Control connected; data transport unavailable.",
+        _ => "Unreachable.",
     });
 }
 
@@ -895,7 +930,8 @@ mod tests {
 
     #[test]
     fn tunnel_and_direct_transport_are_named_as_different_layers() {
-        assert_eq!(tunnel_text("wg", Some(1)), "wg · handshake 1s ago");
+        assert_eq!(displayed_protocol("wg"), "wg");
+        assert_eq!(tunnel_hint("wg"), "wg: WireGuard end-to-end encryption");
         assert_eq!(
             data_path_text(
                 Some(&DataPathReport::Direct {
@@ -906,15 +942,15 @@ mod tests {
             ),
             ("direct over tcp-tls".into(), true)
         );
-        assert_eq!(tunnel_text("tcp-tls", Some(42)), "tcp-tls · up 42s");
+        assert_eq!(
+            tunnel_hint("tcp-tls"),
+            "tcp-tls: Noise end-to-end encryption"
+        );
     }
 
     #[test]
     fn incomplete_and_longer_paths_stay_explicit() {
-        assert_eq!(
-            tunnel_text("wg-quic", None),
-            "wg-quic · waiting for handshake"
-        );
+        assert_eq!(handshake_rtt_text(None, Some(25), true), "waiting / 25 ms");
         assert_eq!(
             data_path_text(
                 Some(&DataPathReport::Relayed {
@@ -931,5 +967,102 @@ mod tests {
             ("no data path yet".into(), false)
         );
         assert_eq!(data_path_text(None, None, false), ("offline".into(), false));
+    }
+
+    #[test]
+    fn handshake_rtt_has_no_invented_values_and_uses_control_measurements() {
+        use tsunagi::ipc::{OverlayReport, PeerReport};
+        let network = NetworkReport {
+            peers: vec![PeerReport {
+                endpoint_id: "peer".into(),
+                rtt_ms: Some(27),
+                ..Default::default()
+            }],
+            overlay: Some(OverlayReport {
+                peers: vec![OverlayPeerReport {
+                    endpoint_id: "peer".into(),
+                    protocol: "wg".into(),
+                    handshake_secs_ago: Some(5),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rows = devices(&network, "own");
+        assert_eq!(
+            handshake_rtt_text(rows[0].handshake_secs, rows[0].control_rtt_ms, true),
+            "5s / 27 ms"
+        );
+        assert_eq!(handshake_rtt_text(None, None, false), "— / —");
+        assert_eq!(rows[0].tunnel_protocol, "wg");
+        assert!(!tunnel_hint(rows[0].tunnel_protocol).contains("wg-quic"));
+    }
+
+    #[test]
+    fn resized_table_fills_the_window_without_growing_fixed_columns() {
+        let minimum = [100.0; 10];
+        let wide = stretch_columns(minimum, 1440.0);
+        assert!((wide.iter().sum::<f32>() + 90.0 - 1440.0).abs() < 0.1);
+        assert_eq!(&wide[..9], &minimum[..9]);
+        let narrow = stretch_columns(minimum, 800.0);
+        assert_eq!(
+            narrow, minimum,
+            "narrow windows scroll rather than clipping columns"
+        );
+        assert_eq!(
+            stretch_columns(minimum, 1440.0),
+            wide,
+            "a resize does not accumulate padding"
+        );
+    }
+
+    #[test]
+    fn rendered_table_uses_window_width_without_an_expanding_device_cell() {
+        let context = egui::Context::default();
+        let network = NetworkReport {
+            members: vec![MemberReport {
+                endpoint_id: "0123456789abcdef".into(),
+                hostname: Some("laptop".into()),
+                online: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rows = devices(&network, "own");
+        for width in [1440.0, 1200.0, 1440.0] {
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 640.0),
+                    )),
+                    ..Default::default()
+                };
+                let _output = context.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let right = ui.max_rect().right();
+                        egui::ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                device_table(
+                                    ui,
+                                    Unit::Bytes,
+                                    &network,
+                                    &rows,
+                                    &Traffic::default(),
+                                    &mut None,
+                                    &mut None,
+                                );
+                            });
+                        assert!(
+                            (ui.min_rect().right() - right).abs() < 2.0,
+                            "table width after resize: {} vs {right}",
+                            ui.min_rect().right()
+                        );
+                    });
+                });
+            }
+        }
     }
 }

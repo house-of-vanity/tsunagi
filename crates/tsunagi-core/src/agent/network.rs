@@ -578,6 +578,13 @@ impl Runtime {
                 message,
                 reply,
             } => {
+                if matches!(&message, ControlMessage::Transport { .. })
+                    && let Some(interface) = self.params.interface.clone()
+                {
+                    // Locally bound pair sockets must be protected before their
+                    // private offer/accept invites the first inbound datagram.
+                    interface.sync_exit_rules().await;
+                }
                 let _ = reply.send(self.send_to(peer, message));
             }
             NetCommand::Broadcast { message, reply } => {
@@ -871,6 +878,9 @@ impl Runtime {
         // Last, so it carries what this round learned.
         self.introduce_peers();
         self.refresh_underlay().await;
+        if let Some(interface) = self.params.interface.clone() {
+            interface.sync_exit_rules().await;
+        }
     }
 
     /// Hands the interface the underlay destinations this network depends

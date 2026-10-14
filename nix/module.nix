@@ -102,6 +102,7 @@ in
     # Exit nodes: the agent looks for iptables only in fixed FHS directories.
     systemd.tmpfiles.rules = [
       "L+ /usr/bin/iptables - - - - ${pkgs.iptables}/bin/iptables"
+      "L+ /usr/bin/ip6tables - - - - ${pkgs.iptables}/bin/ip6tables"
     ];
 
     # Names of mesh members are served locally and handed to the system resolver.

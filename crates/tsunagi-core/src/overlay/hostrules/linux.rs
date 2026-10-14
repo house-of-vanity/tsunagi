@@ -33,12 +33,13 @@ const CHAIN: &str = "INPUT";
 
 /// Fixed places `iptables` is installed. Never `PATH`: the agent is
 /// privileged and a directory a user controls must not decide what it runs.
-const IPTABLES_DIRECTORIES: [&str; 5] = [
+const IPTABLES_DIRECTORIES: [&str; 6] = [
     "/usr/sbin/iptables",
     "/sbin/iptables",
     "/usr/bin/iptables",
     "/bin/iptables",
     "/usr/local/sbin/iptables",
+    "/run/current-system/sw/bin/iptables",
 ];
 
 /// The first candidate that exists.
@@ -328,7 +329,23 @@ fn clear_firewall(run: Run<'_>, interface: &str) {
 
 /// Runs the real `iptables`.
 pub(super) fn run_iptables(args: &[String]) -> Ran {
-    let Some(program) = pick_iptables(|path| std::path::Path::new(path).is_file()) else {
+    run_firewall(false, args)
+}
+
+pub(super) fn run_firewall(ipv6: bool, args: &[String]) -> Ran {
+    let v6_paths: Vec<_> = IPTABLES_DIRECTORIES
+        .iter()
+        .map(|p| p.replace("iptables", "ip6tables"))
+        .collect();
+    let v6_program = v6_paths
+        .iter()
+        .find(|path| std::path::Path::new(path).is_file());
+    let program = if ipv6 {
+        v6_program.map(String::as_str)
+    } else {
+        pick_iptables(|path| std::path::Path::new(path).is_file())
+    };
+    let Some(program) = program else {
         return Ran::Missing;
     };
     match std::process::Command::new(program).args(args).output() {
@@ -350,11 +367,17 @@ pub(super) fn run_iptables(args: &[String]) -> Ran {
 #[derive(Debug)]
 pub struct LinuxHostRules {
     pub(super) route: RouteHandle,
+    /// Interface, sorted socket snapshot and whether exit routes committed.
+    pub(super) underlay_sockets:
+        std::sync::Mutex<Option<(String, Vec<super::linux_exit_mark::Listener>, bool)>>,
 }
 
 impl LinuxHostRules {
     pub(crate) fn new(route: RouteHandle) -> Self {
-        Self { route }
+        Self {
+            route,
+            underlay_sockets: std::sync::Mutex::new(None),
+        }
     }
 
     async fn set_route(&self, interface: String, source: Ipv4Addr) -> RuleOutcome {

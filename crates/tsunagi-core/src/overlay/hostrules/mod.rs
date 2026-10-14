@@ -55,6 +55,10 @@ pub use exit::{
 mod linux;
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 mod linux_exit;
+#[cfg(all(test, feature = "tun-device", target_os = "linux"))]
+mod linux_exit_kernel;
+#[cfg(all(feature = "tun-device", target_os = "linux"))]
+pub(in crate::overlay) mod linux_exit_mark;
 #[cfg(all(feature = "tun-device", target_os = "linux"))]
 pub use linux::LinuxHostRules;
 

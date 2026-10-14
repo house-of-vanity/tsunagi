@@ -207,4 +207,24 @@ future cutoffs, bounds, deterministic merge and resistance to stale snapshots.
 SQLite tests migrate schema 8 to 9 and inject counter-write failure to prove
 atomic rollback. The CLI test starts two real agent processes and exercises
 offline cleanup by network and hostname through the control socket.
-Tray rendering and physical screen sizing are not exercised automatically.
+Native tray rendering and physical screen sizing are not exercised automatically.
+
+Linux exit-client unit tests cover preservation of foreign mark bits, matching
+only the agent's UID and locally owned TCP/UDP sockets, exact tagged cleanup,
+partial IPv6 failure and mark-aware strict kernel RPF validation. The ignored
+`overlay::hostrules::linux_exit_kernel::strict_firewall_preserves_underlay_and_application_exit_routing`
+test creates two disposable network namespaces. It reproduces the UID-only
+failure with real sockets, then runs TCP/UDP IPv4/IPv6 and first inbound TCP/UDP
+packets, including a UDP port bound after activation, through real mark/conntrack
+rules with both strict kernel and
+Netfilter reverse-path checks. It verifies application exit routing, IPv6
+blocking, repeated apply and cleanup with foreign rules at Tailscale's priority
+retained. It requires root, iproute2,
+iptables/ip6tables and Python; it does not run in the default suite or claim
+to test the entire mesh inside these namespaces.
+
+Devices-window tests render the egui grid at multiple widths with its real
+scroll area. They check stretching and shrinking without an expanding first
+column, separate handshake/control RTT values, unknown measurements and short
+end-to-end hints that do not substitute the carrier protocol. This does not
+establish native desktop rendering on every platform.

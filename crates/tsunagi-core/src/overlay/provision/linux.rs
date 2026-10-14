@@ -55,6 +55,7 @@ use crate::BoxFuture;
 use crate::overlay::OverlayError;
 
 use super::super::config::Cidr;
+use super::super::hostrules::linux_exit_mark::{UNDERLAY_MARK, UNDERLAY_MASK};
 use super::super::tun::{TunDevice, TunRequest};
 use super::privilege::{NetAdmin, Privilege, probe_net_admin};
 use super::{
@@ -641,8 +642,10 @@ async fn del_broadcast_route(name: &str) -> Result<(), OverlayError> {
 const EXIT_TABLE: u32 = 0x7473;
 /// The main table.
 const MAIN_TABLE: u32 = 254;
-/// Where the exit rules sit, after Tailscale's 5270.
-const EXIT_BYPASS_PRIORITY: u32 = 5280;
+/// Protect marked underlay and initial socket routing before Tailscale's rules.
+const EXIT_MARK_PRIORITY: u32 = 5205;
+const EXIT_BYPASS_PRIORITY: u32 = 5206;
+const LEGACY_EXIT_BYPASS_PRIORITY: u32 = 5280;
 const EXIT_SPECIFIC_PRIORITY: u32 = 5290;
 const EXIT_DEFAULT_PRIORITY: u32 = 5300;
 
@@ -666,14 +669,23 @@ fn rule_priority(rule: &RuleMessage) -> Option<u32> {
         })
 }
 
-/// Whether a rule is one of the three this agent adds for an exit node.
+/// Whether a rule is one this agent adds for an exit node, including old UID priority.
 ///
 /// Recognised by shape as well as priority: those numbers are not reserved,
 /// and a rule somebody else put at one of them must not be removed.
 fn is_exit_rule(rule: &RuleMessage) -> bool {
     let table = rule_table(rule);
     match rule_priority(rule) {
-        Some(EXIT_BYPASS_PRIORITY) => {
+        Some(EXIT_MARK_PRIORITY) => {
+            table == MAIN_TABLE
+                && rule
+                    .attributes
+                    .contains(&RuleAttribute::FwMark(UNDERLAY_MARK))
+                && rule
+                    .attributes
+                    .contains(&RuleAttribute::FwMask(UNDERLAY_MASK))
+        }
+        Some(EXIT_BYPASS_PRIORITY | LEGACY_EXIT_BYPASS_PRIORITY) => {
             table == MAIN_TABLE
                 && rule
                     .attributes
@@ -789,7 +801,8 @@ async fn remove_exit_client(handle: &rtnetlink::Handle) -> Result<(), OverlayErr
 ///
 /// ```text
 /// ip route replace default dev <if> table 0x7473
-/// ip rule add priority 5280 uidrange <uid>-<uid> lookup main
+/// ip rule add priority 5205 fwmark 0x40000000/0x40000000 lookup main
+/// ip rule add priority 5206 uidrange <uid>-<uid> lookup main
 /// ip rule add priority 5290 lookup main suppress_prefixlength 0
 /// ip rule add priority 5300 lookup 0x7473
 /// ```
@@ -818,6 +831,8 @@ async fn set_exit_client(name: &str, uid: u32) -> Result<(), OverlayError> {
             .execute()
             .await
             .map_err(|err| fail("default route", err))?;
+
+        add_mark_bypass(&handle, false).await?;
 
         let mut bypass = handle
             .rule()
@@ -891,6 +906,7 @@ async fn set_exit_block_v6(handle: &rtnetlink::Handle, uid: u32) -> Result<(), O
         };
     }
 
+    add_mark_bypass(handle, true).await?;
     let mut bypass = handle
         .rule()
         .add()
@@ -936,6 +952,27 @@ async fn set_exit_block_v6(handle: &rtnetlink::Handle, uid: u32) -> Result<(), O
         .execute()
         .await
         .map_err(|err| fail("rule for the default route", err))
+}
+
+async fn add_mark_bypass(handle: &rtnetlink::Handle, v6: bool) -> Result<(), OverlayError> {
+    let mut rule = handle
+        .rule()
+        .add()
+        .table_id(MAIN_TABLE)
+        .action(RuleAction::ToTable)
+        .priority(EXIT_MARK_PRIORITY)
+        .fw_mark(UNDERLAY_MARK);
+    rule.message_mut().header.family = if v6 {
+        rtnetlink::packet_route::AddressFamily::Inet6
+    } else {
+        rtnetlink::packet_route::AddressFamily::Inet
+    };
+    rule.message_mut()
+        .attributes
+        .push(RuleAttribute::FwMask(UNDERLAY_MASK));
+    rule.execute().await.map_err(|err| {
+        OverlayError::Unavailable(format!("cannot protect marked underlay traffic: {err}"))
+    })
 }
 
 async fn configure_link(configure: &Configure) -> Result<(), OverlayError> {
@@ -1108,6 +1145,28 @@ mod tests {
         assert!(!is_exit_rule(&rule(5300, 52, vec![])));
         assert!(!is_exit_rule(&rule(5270, 52, vec![])));
         assert!(!is_exit_rule(&rule(5280, 100, vec![uid])));
+    }
+
+    #[test]
+    fn underlay_bypass_recognises_only_our_exact_bit_and_mask() {
+        let rule = |table, mark, mask| {
+            let mut message = RuleMessage::default();
+            message.attributes.extend([
+                RuleAttribute::Table(table),
+                RuleAttribute::Priority(EXIT_MARK_PRIORITY),
+                RuleAttribute::FwMark(mark),
+                RuleAttribute::FwMask(mask),
+            ]);
+            message
+        };
+        assert!(is_exit_rule(&rule(
+            MAIN_TABLE,
+            UNDERLAY_MARK,
+            UNDERLAY_MASK
+        )));
+        assert!(!is_exit_rule(&rule(MAIN_TABLE, 0x80000, 0xff0000)));
+        assert!(!is_exit_rule(&rule(MAIN_TABLE, UNDERLAY_MARK, u32::MAX)));
+        assert!(!is_exit_rule(&rule(52, UNDERLAY_MARK, UNDERLAY_MASK)));
     }
 
     #[test]

@@ -397,6 +397,14 @@ impl Interface {
             return;
         }
         if planned.as_ref() == Some(&wanted) && ok {
+            if let Some(outcome) = exit.refresh(&wanted).await {
+                if let RuleOutcome::Failed(reason) = &outcome {
+                    tracing::warn!(interface = %self.name, %reason, "cannot refresh exit-client socket protection");
+                }
+                if let Some(report) = self.exit_state().report.as_mut() {
+                    report.client = Some(outcome);
+                }
+            }
             return;
         }
         let report = exit.apply(&wanted).await;
