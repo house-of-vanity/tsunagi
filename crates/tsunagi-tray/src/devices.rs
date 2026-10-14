@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use eframe::egui;
+use egui_phosphor::regular as icon;
 
 use tsunagi::ipc::{DataPathReport, NetworkReport, OverlayPeerReport};
 
@@ -469,7 +470,7 @@ const COLUMN_SAMPLES: [&str; 10] = [
     "end-to-end",
     "999d / 9999 ms",
     "255.255.255.255",
-    "direct over tcp-tls",
+    "data path",
     "99999/99999",
     "1023.9 MB / 1023.9 MB",
     "1023.9 kB/s",
@@ -602,6 +603,14 @@ fn device_table(
                 .x
         });
         widths[0] = widths[0].max(natural + 24.0);
+        let (path, _) = data_path_text(device.path, device.via_name.as_deref(), device.online);
+        let path_width = ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(path, font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        });
+        widths[5] = widths[5].max(path_width);
     }
     ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
     let widths = stretch_columns(widths, ui.available_width());
@@ -812,7 +821,8 @@ fn tunnel_cell(ui: &mut egui::Ui, device: &Device<'_>) {
     ui.label(protocol).on_hover_text(tunnel_hint(protocol));
 }
 
-/// Current route text and whether that route is the preferred direct form.
+/// Compact route label and whether that route is the preferred direct form.
+/// The icon font is embedded by egui-phosphor and installed in `App::new`.
 fn data_path_text(
     path: Option<&DataPathReport>,
     via_name: Option<&str>,
@@ -822,9 +832,13 @@ fn data_path_text(
         return ("offline".into(), false);
     }
     match path {
-        Some(DataPathReport::Direct { transport }) => (format!("direct over {transport}"), true),
+        Some(DataPathReport::Direct { transport }) => (format!("{} {transport}", icon::LINK), true),
         Some(DataPathReport::Relayed { hops, .. }) => (
-            format!("via {} · {hops} hops", via_name.unwrap_or("another device")),
+            format!(
+                "{} {} · {hops} hops",
+                icon::SHARE_NETWORK,
+                via_name.unwrap_or("another device")
+            ),
             false,
         ),
         Some(DataPathReport::None) | None => ("no data path yet".into(), false),
@@ -838,9 +852,12 @@ fn data_path_text(
 fn data_path_cell(ui: &mut egui::Ui, device: &Device<'_>) {
     let (text, good) = data_path_text(device.path, device.via_name.as_deref(), device.online);
     let response = if good {
-        ui.label(text)
+        ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend))
     } else {
-        ui.label(egui::RichText::new(text).color(AMBER))
+        ui.add(
+            egui::Label::new(egui::RichText::new(text).color(AMBER))
+                .wrap_mode(egui::TextWrapMode::Extend),
+        )
     };
     response.on_hover_text(match device.path {
         Some(DataPathReport::Direct { .. }) => "Direct transport; no mesh relay.",
@@ -940,7 +957,7 @@ mod tests {
                 None,
                 true,
             ),
-            ("direct over tcp-tls".into(), true)
+            (format!("{} tcp-tls", icon::LINK), true)
         );
         assert_eq!(
             tunnel_hint("tcp-tls"),
@@ -960,7 +977,7 @@ mod tests {
                 Some("iris"),
                 true,
             ),
-            ("via iris · 2 hops".into(), false)
+            (format!("{} iris · 2 hops", icon::SHARE_NETWORK), false)
         );
         assert_eq!(
             data_path_text(Some(&DataPathReport::None), None, true),
@@ -1015,6 +1032,62 @@ mod tests {
             wide,
             "a resize does not accumulate padding"
         );
+    }
+
+    #[test]
+    fn a_long_relay_name_gets_its_full_column_width() {
+        let mut relay = member("near", true, DataPathReport::None);
+        relay.hostname = Some("a-relay-with-a-long-device-name".into());
+        let network = NetworkReport {
+            network_id: "network".into(),
+            members: vec![
+                relay,
+                member(
+                    "far",
+                    true,
+                    DataPathReport::Relayed {
+                        hops: 2,
+                        via: "near".into(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        let rows = devices(&network, "own");
+        let far = rows.iter().find(|device| device.id == "far").unwrap();
+        let (label, _) = data_path_text(far.path, far.via_name.as_deref(), far.online);
+        let context = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        context.set_fonts(fonts);
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                device_table(
+                    ui,
+                    Unit::Bytes,
+                    &network,
+                    &rows,
+                    &Traffic::default(),
+                    &mut None,
+                    &mut None,
+                );
+                let stored: [f32; 10] = ui
+                    .memory(|memory| {
+                        memory
+                            .data
+                            .get_temp(egui::Id::new(("devices column widths", "network")))
+                    })
+                    .unwrap();
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let needed = ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(label.clone(), font, egui::Color32::WHITE)
+                        .size()
+                        .x
+                });
+                assert!(stored[5] >= needed);
+            });
+        });
     }
 
     #[test]

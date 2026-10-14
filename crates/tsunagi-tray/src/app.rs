@@ -15,6 +15,12 @@ use crate::devices;
 use crate::stats::Traffic;
 use crate::ui::{self, UiState};
 
+fn app_fonts() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    fonts
+}
+
 /// The window's state.
 pub(crate) struct App {
     agent: AgentClient,
@@ -34,9 +40,7 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         // Add the Phosphor icon glyphs to the font set so the icon buttons
         // render instead of showing as tofu.
-        let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-        ctx.set_fonts(fonts);
+        ctx.set_fonts(app_fonts());
 
         let agent = AgentClient::spawn(&runtime, ctx);
         Ok(Self {
@@ -141,5 +145,22 @@ impl App {
                 self.state.open_devices.remove(&id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_icons_have_an_embedded_font_in_the_app() {
+        let fonts = app_fonts();
+        assert!(fonts.font_data.contains_key("phosphor"));
+        assert!(
+            fonts
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .is_some_and(|family| family.iter().any(|name| name == "phosphor"))
+        );
     }
 }
