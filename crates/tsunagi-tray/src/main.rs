@@ -17,9 +17,11 @@ mod exit;
 mod format;
 mod icon;
 mod stats;
+mod table;
 mod tray;
 mod ui;
 mod vip;
+mod vip_status;
 mod watch;
 
 use eframe::egui;

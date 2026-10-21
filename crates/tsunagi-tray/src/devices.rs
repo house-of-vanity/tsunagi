@@ -110,22 +110,20 @@ fn short_id(id: &str) -> String {
 /// The device cell: the hostname and, in brackets, the start of the id.
 /// Clicking either copies its own full value.
 fn name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        match (device.hostname, &device.copy) {
-            (Some(hostname), Some(copy)) => {
-                format::copy_field(ui, hostname, copy);
-                format::copy_field(ui, &format!("({})", short_id(device.id)), device.id);
-            }
-            _ => format::copy_field(ui, &short_id(device.id), device.id),
+    ui.spacing_mut().item_spacing.x = 4.0;
+    match (device.hostname, &device.copy) {
+        (Some(hostname), Some(copy)) => {
+            format::copy_field(ui, hostname, copy);
+            format::copy_field(ui, &format!("({})", short_id(device.id)), device.id);
         }
-        if let Some((name, holder)) = &device.name_taken {
-            ui.label(egui::RichText::new(egui_phosphor::regular::WARNING).color(AMBER))
-                .on_hover_text(format!(
-                    "Name `{name}` belongs to {holder}. Use this device's address."
-                ));
-        }
-    });
+        _ => format::copy_field(ui, &short_id(device.id), device.id),
+    }
+    if let Some((name, holder)) = &device.name_taken {
+        ui.label(egui::RichText::new(egui_phosphor::regular::WARNING).color(AMBER))
+            .on_hover_text(format!(
+                "Name `{name}` belongs to {holder}. Use this device's address."
+            ));
+    }
 }
 
 /// Draws the window body into its viewport.
@@ -491,14 +489,14 @@ const COLUMN_SAMPLES: [&str; 10] = [
 
 /// Column widths that only ever grow, kept across frames.
 ///
-/// A grid sizes each column to its widest cell *this frame*, so a value that
+/// Live values can change width between frames. A value that
 /// gets shorter — `14.4 MB/s` giving way to `382 pkt/s` — would pull the
 /// column in and push every cell after it. Remembering the widest seen keeps
 /// the table where it is.
 fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 10] {
     let stored: Option<[f32; 10]> = ui.memory(|m| m.data.get_temp(id));
     stored.unwrap_or_else(|| {
-        let font = egui::TextStyle::Body.resolve(ui.style());
+        let font = egui::FontSelection::Default.resolve(ui.style());
         let mut widths = [0.0; 10];
         for (width, sample) in widths.iter_mut().zip(COLUMN_SAMPLES) {
             if !sample.is_empty() {
@@ -512,21 +510,6 @@ fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 10] {
         }
         widths
     })
-}
-
-/// One cell, at least as wide as its column has ever been.
-fn cell(ui: &mut egui::Ui, column: usize, widths: &[f32; 10], add: impl FnOnce(&mut egui::Ui)) {
-    let floor = widths[column];
-    ui.allocate_ui_with_layout(
-        egui::vec2(floor, 0.0),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            ui.set_min_width(floor);
-            ui.set_max_width(floor);
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            add(ui);
-        },
-    );
 }
 
 fn stretch_columns(mut widths: [f32; 10], available: f32) -> [f32; 10] {
@@ -602,7 +585,7 @@ fn device_table(
     let widths_id = egui::Id::new(("devices column widths", network_id));
     let mut widths = column_widths(ui, widths_id);
     let previous_widths = widths;
-    let font = egui::TextStyle::Body.resolve(ui.style());
+    let font = egui::FontSelection::Default.resolve(ui.style());
     let measure = |text: String| {
         ui.fonts(|fonts| {
             fonts
@@ -678,157 +661,119 @@ fn device_table(
         widths[column] = widths[column].max(measure(text));
     }
     if widths != previous_widths {
-        // Grid positions use the previous pass's widths. Let it settle
-        // before painting newly widened values over the next column.
-        ui.ctx().request_discard("device table columns widened");
+        ui.ctx().request_repaint();
     }
     ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
     let widths = stretch_columns(widths, ui.available_width());
-    egui::Grid::new("devices")
-        .num_columns(10)
-        .min_col_width(0.0)
-        .striped(true)
-        .spacing([10.0, 4.0])
-        .show(ui, |ui| {
-            for (column, header) in COLUMN_HEADERS.into_iter().enumerate() {
-                cell(ui, column, &widths, |ui| {
-                    let response = ui.weak(header);
-                    match column {
-                        2 => {
-                            response.on_hover_text("End-to-end encryption.");
-                        }
-                        3 => {
-                            response.on_hover_text("Handshake age / control-connection RTT.");
-                        }
-                        5 => {
-                            response.on_hover_text("Transport carrying the encrypted tunnel.");
-                        }
-                        _ => {}
-                    }
-                });
+    crate::table::row(ui, "device headers", &widths, false, |column, ui| {
+        let response = ui.weak(COLUMN_HEADERS[column]);
+        match column {
+            2 => {
+                response.on_hover_text("End-to-end encryption.");
             }
-            ui.end_row();
-
-            for device in devices {
-                cell(ui, 0, &widths, |ui| {
-                    ui.horizontal(|ui| {
-                        name_cell(ui, device);
-                        if !device.online
-                            && !device.in_use
-                            && let Some(version) = device.record_version
-                            && ui
-                                .add_enabled(network.active, egui::Button::new("Forget"))
-                                .on_hover_text("Free this offline device's name and IPv4")
-                                .clicked()
-                        {
-                            *forget_confirm = Some(ForgetConfirm {
-                                network_id: network.network_id.clone(),
-                                peer: device.id.into(),
-                                version,
-                                name: device.name(),
-                                address: device.address.clone(),
-                            });
-                        }
-                    });
-                });
-                cell(ui, 1, &widths, |ui| {
-                    exit_cell(ui, device, network_id, confirm);
-                });
-                cell(ui, 2, &widths, |ui| {
-                    ui.push_id((device.id, "end-to-end"), |ui| {
-                        tunnel_cell(ui, device);
-                    });
-                });
-                cell(ui, 3, &widths, |ui| {
+            3 => {
+                response.on_hover_text("Handshake age / control-connection RTT.");
+            }
+            5 => {
+                response.on_hover_text("Transport carrying the encrypted tunnel.");
+            }
+            _ => {}
+        }
+    });
+    for (index, device) in devices.iter().enumerate() {
+        crate::table::row(
+            ui,
+            device.id,
+            &widths,
+            index % 2 == 0,
+            |column, ui| match column {
+                0 => {
+                    name_cell(ui, device);
+                    if !device.online
+                        && !device.in_use
+                        && let Some(version) = device.record_version
+                        && ui
+                            .add_enabled(network.active, egui::Button::new("Forget"))
+                            .on_hover_text("Free this offline device's name and IPv4")
+                            .clicked()
+                    {
+                        *forget_confirm = Some(ForgetConfirm {
+                            network_id: network.network_id.clone(),
+                            peer: device.id.into(),
+                            version,
+                            name: device.name(),
+                            address: device.address.clone(),
+                        });
+                    }
+                }
+                1 => exit_cell(ui, device, network_id, confirm),
+                2 => tunnel_cell(ui, device),
+                3 => {
                     ui.label(handshake_rtt_text(
                         device.handshake_secs,
                         device.control_rtt_ms,
                         displayed_protocol(device.tunnel_protocol) != "—",
                     ))
-                    .on_hover_text(if device.tunnel_protocol == "tcp-tls" {
-                        "Session age / control RTT."
-                    } else {
-                        "Last handshake age / control RTT."
-                    });
-                });
-                cell(ui, 4, &widths, |ui| match &device.address {
+                    .on_hover_text("Last handshake / control RTT.");
+                }
+                4 => match &device.address {
                     Some(address) => format::copy_field(ui, address, address),
                     None => {
                         ui.weak("—");
                     }
-                });
-                cell(ui, 5, &widths, |ui| {
-                    ui.push_id((device.id, "data-path"), |ui| data_path_cell(ui, device));
-                });
-
-                match device.overlay.filter(|_| device.online) {
-                    Some(peer) => {
+                },
+                5 => data_path_cell(ui, device),
+                _ => {
+                    if let Some(peer) = device.overlay.filter(|_| device.online) {
                         let series = traffic.peer(network_id, &peer.public_key);
-                        cell(ui, 6, &widths, |ui| {
-                            ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
-                        });
-                        cell(ui, 7, &widths, |ui| {
-                            ui.label(format!(
-                                "{} / {}",
-                                format::bytes(peer.tx_bytes as f64),
-                                format::bytes(peer.rx_bytes as f64)
-                            ));
-                        });
-                        cell(ui, 8, &widths, |ui| {
-                            ui.add(
-                                egui::Label::new(format::series_rate(series, unit))
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                            );
-                        });
-                        ui.allocate_ui(egui::vec2(widths[9], 20.0), |ui| {
-                            format::sparkline(ui, series, unit, 18.0);
-                        });
-                    }
-                    None => {
-                        for column in 6..9 {
-                            cell(ui, column, &widths, |ui| {
-                                ui.weak("—");
-                            });
+                        match column {
+                            6 => {
+                                ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
+                            }
+                            7 => {
+                                ui.label(format!(
+                                    "{} / {}",
+                                    format::bytes(peer.tx_bytes as f64),
+                                    format::bytes(peer.rx_bytes as f64)
+                                ));
+                            }
+                            8 => {
+                                ui.label(format::series_rate(series, unit));
+                            }
+                            _ => format::sparkline(ui, series, unit, 24.0),
                         }
-                        cell(ui, 9, &widths, |ui| {
-                            ui.weak("—");
-                        });
+                    } else {
+                        ui.weak("—");
                     }
                 }
-                ui.end_row();
-            }
-
-            // Everything this agent has moved through the overlay, including
-            // devices that have since gone away.
-            cell(ui, 0, &widths, |ui| {
+            },
+        );
+    }
+    crate::table::row(
+        ui,
+        "device totals",
+        &widths,
+        false,
+        |column, ui| match column {
+            0 => {
                 ui.strong("total");
-            });
-            for column in 1..6 {
-                cell(ui, column, &widths, |ui| {
-                    ui.label("");
-                });
             }
-            cell(ui, 6, &widths, |ui| {
+            6 => {
                 ui.strong(format!("{tx_packets}/{rx_packets}"));
-            });
-            cell(ui, 7, &widths, |ui| {
+            }
+            7 => {
                 ui.strong(format!(
                     "{} / {}",
                     format::bytes(tx_bytes as f64),
                     format::bytes(rx_bytes as f64)
                 ));
-            });
-            cell(ui, 8, &widths, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format::series_rate(traffic.network(network_id), unit))
-                            .strong(),
-                    )
-                    .wrap_mode(egui::TextWrapMode::Extend),
-                );
-            });
-            ui.end_row();
-        });
+            }
+            8 => {
+                ui.strong(format::series_rate(traffic.network(network_id), unit));
+            }
+            _ => {}
+        },
+    );
 }
 
 /// A protocol name as it should appear in the table.
@@ -1197,6 +1142,108 @@ mod tests {
     }
 
     #[test]
+    fn online_and_offline_rows_keep_text_buttons_and_graphs_in_their_own_bounds() {
+        use tsunagi::ipc::OverlayReport;
+        let mut network = NetworkReport {
+            network_id: "row regression".into(),
+            active: true,
+            ..Default::default()
+        };
+        for index in 0..14 {
+            let id = format!("node-{index:02}");
+            let mut member = member(
+                &id,
+                index < 10,
+                DataPathReport::Direct {
+                    transport: "wg-quic".into(),
+                },
+            );
+            member.hostname = Some(format!("node-with-a-long-name-{index:02}"));
+            network.members.push(member);
+        }
+        network.overlay = Some(OverlayReport {
+            peers: network.members[..10]
+                .iter()
+                .map(|member| OverlayPeerReport {
+                    endpoint_id: member.endpoint_id.clone(),
+                    protocol: "wg-quic".into(),
+                    tx_packets: 9_876_543_210,
+                    rx_packets: 12_345_678_901,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let rows = devices(&network, "own");
+        for font_size in [14.0, 22.0] {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|style| {
+                style.override_font_id = Some(egui::FontId::proportional(font_size))
+            });
+            for width in [900.0, 2100.0] {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 1600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            egui::ScrollArea::both().show(ui, |ui| {
+                                device_table(
+                                    ui,
+                                    Unit::Bytes,
+                                    &network,
+                                    &rows,
+                                    &Traffic::default(),
+                                    &mut None,
+                                    &mut None,
+                                )
+                            });
+                        });
+                    },
+                );
+                let mut row_bounds = Vec::new();
+                for member in &network.members {
+                    let shape = output.shapes.iter().find(|s| matches!(&s.shape, egui::Shape::Text(text) if Some(text.galley.text()) == member.hostname.as_deref())).unwrap();
+                    let egui::Shape::Text(text) = &shape.shape else {
+                        unreachable!()
+                    };
+                    assert_eq!(text.galley.rows.len(), 1);
+                    assert!(shape.clip_rect.top() <= text.visual_bounding_rect().top());
+                    assert!(shape.clip_rect.bottom() >= text.visual_bounding_rect().bottom());
+                    row_bounds.push(shape.clip_rect);
+                }
+                for pair in row_bounds.windows(2) {
+                    assert!(
+                        pair[0].bottom() < pair[1].top(),
+                        "rows overlap at font size {font_size}"
+                    );
+                }
+                let buttons: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter(
+                        |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "Forget"),
+                    )
+                    .collect();
+                assert_eq!(buttons.len(), 4, "offline cleanup remains visible");
+                for button in buttons {
+                    let egui::Shape::Text(text) = &button.shape else {
+                        unreachable!()
+                    };
+                    assert!(
+                        button.clip_rect.contains_rect(text.visual_bounding_rect()),
+                        "Forget button clipped at {font_size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_long_relay_name_gets_its_full_column_width() {
         let mut relay = member("near", true, DataPathReport::None);
         relay.hostname = Some("a-relay-with-a-long-device-name".into());
@@ -1240,7 +1287,7 @@ mod tests {
                             .get_temp(egui::Id::new(("devices column widths", "network")))
                     })
                     .unwrap();
-                let font = egui::TextStyle::Body.resolve(ui.style());
+                let font = egui::FontSelection::Default.resolve(ui.style());
                 let needed = ui.fonts(|fonts| {
                     fonts
                         .layout_no_wrap(label.clone(), font, egui::Color32::WHITE)

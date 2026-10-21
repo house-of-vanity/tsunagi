@@ -43,7 +43,23 @@ listeners, backend nodes/ports, check settings and flow timeouts. All edits,
 including deletion, remain drafts until **Save**. Status updates do not
 replace a dirty draft. A save conflict retains the draft; **Discard / reload**
 loads the latest configuration. Closing a dirty window offers explicit discard
-or continued editing. Addresses and ids are available in a collapsed detail.
+or continued editing.
+
+The **Overview** tab shows a total VIP traffic plot and one backend table per
+listener, with health, RTT, open flows, totals, TX/RX rates and individual
+traffic plots. Plots switch between bytes and packets. Observations describe
+traffic seen by this device, not a network-wide aggregate.
+
+An interactive diagram connects the service name through each listener to its
+node and target port. Drag to pan, Ctrl+scroll/pinch to zoom, and use **Fit**
+to restore the view. Click a backend in the diagram or table to highlight it
+and see its identity, address and measurement age. Green branches with moving
+dots indicate counter growth during the latest status sample; a blue ring
+marks the backend selected for new connections. Existing flows can therefore
+keep a different branch active. Idle open flows alone do not light up a branch;
+activity expires after five seconds without a fresh sample. Graph interaction
+never edits or saves configuration. The **Configuration** tab retains the
+explicit Save workflow. Addresses and ids are available in a collapsed detail.
 
 ## Delivery and recovery
 

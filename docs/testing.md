@@ -243,3 +243,12 @@ binary, configure independent listeners, disable checks, reject an invalid
 change atomically and observe DNS creation/deletion. GUI tests cover draft
 isolation and form rendering. These do not establish live host TUN behavior or
 native desktop behavior on Linux, macOS or Windows. See [VIP semantics](vip.md).
+
+Tray layout tests render bounded table rows with long names, online/offline
+members, Forget buttons, large counters and enlarged fonts. They assert text
+stays within its own row and that narrow windows scroll without expanding the
+viewport. VIP overview tests render live tables and egui scenes at multiple
+widths, click a diagram backend, and distinguish the new-flow selection from
+traffic on an existing binding. Sampling checks cover idle open flows, stale
+observations, counter resets, recreated listeners and removal of cached
+histories. These are headless egui checks, not native desktop screenshots.

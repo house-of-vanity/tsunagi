@@ -1,10 +1,9 @@
 //! Per-network VIP editor. Drafts never issue commands until Save is pressed.
 use crate::agent::{AgentClient, Command, Snapshot};
-use crate::stats::{Series, Unit};
+use crate::vip_status;
 use eframe::egui;
-use std::collections::BTreeMap;
 use tsunagi::ipc::NetworkReport;
-use tsunagi::vip::{Backend, Listener, Protocol, VipConfig, VipStatus};
+use tsunagi::vip::{Backend, Listener, Protocol, VipConfig};
 #[derive(Clone)]
 struct Draft {
     config: VipConfig,
@@ -32,7 +31,8 @@ pub(crate) struct Window {
     error: Option<String>,
     close_question: bool,
     close_after_save: bool,
-    rates: BTreeMap<String, (Series, Series)>,
+    live: vip_status::View,
+    configure: bool,
     generation: u64,
     acknowledged_generation: Option<u64>,
 }
@@ -62,19 +62,7 @@ pub(crate) fn show(
     if state.generation != snapshot.generation {
         state.generation = snapshot.generation;
         if let Some(at) = snapshot.at {
-            for v in &n.vips {
-                let counters = v.listeners.iter().fold((0, 0, 0, 0), |a, l| {
-                    (
-                        a.0 + l.counters.tx_packets,
-                        a.1 + l.counters.tx_bytes,
-                        a.2 + l.counters.rx_packets,
-                        a.3 + l.counters.rx_bytes,
-                    )
-                });
-                let (tx, rx) = state.rates.entry(v.config.id.clone()).or_default();
-                tx.sample(at, counters.0, counters.1);
-                rx.sample(at, counters.2, counters.3);
-            }
+            state.live.observe(n, at);
         }
     }
     if let Some(result) = &snapshot.vip_result
@@ -151,6 +139,7 @@ pub(crate) fn show(
                     state.error = Some("Save or discard the current draft first.".into());
                 } else {
                     state.draft = Some(Draft::new(VipConfig::new(""), None));
+                    state.configure = true;
                     state.error = None;
                 }
             }
@@ -231,28 +220,36 @@ pub(crate) fn show(
             }
         });
         ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.config.name)
-                            .id(egui::Id::new(("vip-name", &draft.config.id))),
-                    );
-                    ui.weak(format!(".{}", n.name));
-                });
-                if draft.revision.is_some() {
-                    ui.checkbox(&mut draft.delete, "Delete this VIP when saved");
-                }
-                if !draft.delete {
-                    edit_listeners(ui, &mut draft.config, n);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut state.configure, false, "Overview");
+            ui.selectable_value(&mut state.configure, true, "Configuration");
+        });
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if state.configure {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Name");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut draft.config.name)
+                                    .id(egui::Id::new(("vip-name", &draft.config.id))),
+                            );
+                            ui.weak(format!(".{}", n.name));
+                        });
+                        if draft.revision.is_some() {
+                            ui.checkbox(&mut draft.delete, "Delete this VIP when saved");
+                        }
+                        if !draft.delete {
+                            edit_listeners(ui, &mut draft.config, n);
+                        }
+                    });
+                } else if let Some(current) = current {
+                    vip_status::show(ui, current, n, &mut state.live);
+                } else {
+                    ui.weak("Save this VIP to see its live status.");
                 }
             });
-            if let Some(current) = current {
-                ui.separator();
-                status(ui, current, n, state.rates.get(&current.config.id));
-            }
-        });
     });
     if discard_new {
         state.draft = None;
@@ -287,68 +284,11 @@ fn edit_listeners(ui: &mut egui::Ui, config: &mut VipConfig, n: &NetworkReport) 
         config.listeners.push(Listener::new(Protocol::Tcp, 443));
     }
 }
-fn status(ui: &mut egui::Ui, v: &VipStatus, n: &NetworkReport, rates: Option<&(Series, Series)>) {
-    ui.heading("Status · this device");
-    if let Some(error) = &v.error {
-        ui.colored_label(egui::Color32::LIGHT_RED, error);
-    }
-    if let Some((tx, rx)) = rates {
-        ui.label(format!(
-            "TX {:.1} KiB/s · RX {:.1} KiB/s",
-            tx.rate(Unit::Bytes) / 1024.,
-            rx.rate(Unit::Bytes) / 1024.
-        ));
-    }
-    for l in &v.listeners {
-        ui.strong(format!("{}/{}", l.protocol, l.port));
-        let selected = l
-            .selected
-            .as_ref()
-            .map(|b| format!("{}:{}", peer_name(n, &b.peer), b.port))
-            .unwrap_or_else(|| "none".into());
-        ui.label(format!("Next new flow: {selected}"));
-        ui.label(format!(
-            "TX {} bytes / {} packets · RX {} bytes / {} packets · drops {} · UDP failovers {}",
-            l.counters.tx_bytes,
-            l.counters.tx_packets,
-            l.counters.rx_bytes,
-            l.counters.rx_packets,
-            l.counters.dropped,
-            l.counters.failovers
-        ));
-        for b in &l.backends {
-            let rtt = b
-                .rtt_us
-                .map(|v| format!("{:.2} ms", v as f64 / 1000.))
-                .unwrap_or_else(|| "unknown".into());
-            let age = b
-                .measurement_age_ms
-                .map(|v| format!("{:.1}s", v as f64 / 1000.))
-                .unwrap_or_else(|| "unknown".into());
-            ui.label(format!(
-                "{}:{} · {} · RTT {} (age {}) · {} active · TX/RX {}/{} bytes",
-                peer_name(n, &b.backend.peer),
-                b.backend.port,
-                b.state,
-                rtt,
-                age,
-                b.active_flows,
-                b.counters.tx_bytes,
-                b.counters.rx_bytes
-            ));
-        }
-    }
-    ui.collapsing("Internal address and identity", |ui| {
-        ui.monospace(&v.config.id);
-        if let Some(address) = v.address {
-            ui.monospace(address.to_string());
-        }
-    });
-}
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use tsunagi::vip::VipStatus;
     #[test]
     fn editing_the_actual_form_sends_nothing_until_save_is_clicked() {
         let (agent, mut commands) = AgentClient::test_client();
@@ -357,6 +297,7 @@ mod tests {
         config.listeners.push(Listener::new(Protocol::Tcp, 443));
         let mut state = Window {
             draft: Some(Draft::new(config.clone(), Some("revision".into()))),
+            configure: true,
             ..Default::default()
         };
         let network = NetworkReport {

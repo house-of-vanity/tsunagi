@@ -96,7 +96,7 @@ impl App {
                 .with_title(format!("tsunagi · VIP · {}", network.name))
                 .with_app_id(crate::icon::APP_ID)
                 .with_icon(crate::icon::window())
-                .with_inner_size([1000., 720.])
+                .with_inner_size([1280., 860.])
                 .with_min_inner_size([650., 400.]);
             let keep = ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of(("vip", &id)),
