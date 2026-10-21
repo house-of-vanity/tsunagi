@@ -207,6 +207,11 @@ Just trying it: `nix run github:house-of-vanity/tsunagi#tsunagi-cli -- --help`.
 `packages.<system>.tsunagi` (with the tray) and `tsunagi-cli` are also exported,
 along with `overlays.default`.
 
+For development from a checkout, `nix develop` also exposes the tray's native
+runtime libraries, including AppIndicator and graphics/windowing libraries.
+Cargo-built binaries such as `target/debug/tsunagi-tray` can run directly inside
+this shell, without installing the packaged wrapper.
+
 ## Build from source
 
 Rust 1.91 or newer.

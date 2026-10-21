@@ -26,14 +26,26 @@
 
       nixosModules.default = import ./nix/module.nix self;
 
-      devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.tsunagi ];
-          packages = [
-            pkgs.rustfmt
-            pkgs.clippy
-          ];
-        };
-      });
+      devShells = forAllSystems (
+        pkgs:
+        let
+          trayPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.tsunagi;
+        in
+        {
+          default = pkgs.mkShell {
+            inputsFrom = [ trayPackage ];
+            packages = [
+              pkgs.rustfmt
+              pkgs.clippy
+            ]
+            ++ trayPackage.trayRuntimeLibs;
+            # Cargo binaries have no installed wrapper. Expose runtime-loaded
+            # libraries here too, while preserving the caller's library path.
+            shellHook = ''
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath trayPackage.trayRuntimeLibs}:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            '';
+          };
+        }
+      );
     };
 }

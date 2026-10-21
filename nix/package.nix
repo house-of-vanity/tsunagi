@@ -52,7 +52,10 @@ rustPlatform.buildRustPackage {
   # The suite opens real sockets and interfaces; it runs in CI instead.
   doCheck = false;
 
-  nativeBuildInputs = [ pkg-config ] ++ lib.optionals withTray [
+  nativeBuildInputs = [
+    pkg-config
+  ]
+  ++ lib.optionals withTray [
     copyDesktopItems
     wrapGAppsHook3
   ];
@@ -63,6 +66,10 @@ rustPlatform.buildRustPackage {
   ];
 
   dontWrapGApps = true;
+
+  # The development shell runs unwrapped Cargo binaries and needs the same
+  # dynamically loaded libraries as the installed tray wrapper.
+  passthru = { inherit trayRuntimeLibs; };
 
   postInstall = ''
     install -Dm644 dist/linux/50-tsunagi-resolved.rules \
