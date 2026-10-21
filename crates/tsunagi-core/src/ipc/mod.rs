@@ -171,6 +171,17 @@ pub fn default_control_socket_path() -> PathBuf {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Request {
+    /// Save a complete version-checked service draft or its deletion.
+    SaveVip {
+        /// Exact network id.
+        network_id: String,
+        /// Entire desired configuration.
+        config: crate::vip::VipConfig,
+        /// Revision originally displayed; absent for creation.
+        expected: Option<String>,
+        /// Remove the service permanently.
+        delete: bool,
+    },
     /// Retire the selected offline member's observed claim.
     ForgetNode {
         /// Exact public network id.
@@ -271,6 +282,9 @@ pub enum Request {
 impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Request::SaveVip {
+                network_id, config, ..
+            } => write!(f, "SaveVip {{ {network_id}, {} }}", config.id),
             Request::ForgetNode {
                 network_id,
                 peer,
@@ -317,6 +331,8 @@ impl std::fmt::Debug for Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Response {
+    /// Accepted configuration with fresh local routing observations.
+    Vips(Vec<crate::vip::VipStatus>),
     /// An observed offline claim was durably retired.
     NodeForgotten(ForgottenNodeReport),
     /// Accepted ordered protocol selection.
@@ -356,6 +372,57 @@ pub struct ForgottenNodeReport {
     pub record_version: u64,
     /// Peers to which cleanup was immediately queued.
     pub peers_told: u32,
+}
+
+/// Saves a whole VIP draft through the running agent.
+pub async fn save_vip(
+    socket: &Path,
+    network_id: &str,
+    config: crate::vip::VipConfig,
+    expected: Option<String>,
+    delete: bool,
+) -> Result<Vec<crate::vip::VipStatus>> {
+    match exchange(
+        socket,
+        &Request::SaveVip {
+            network_id: network_id.into(),
+            config,
+            expected,
+            delete,
+        },
+        EXCHANGE_TIMEOUT,
+    )
+    .await?
+    {
+        Response::Vips(vips) => Ok(vips),
+        Response::Error(reason) => Err(Error::Rejected { reason }),
+        _ => Err(Error::Rejected {
+            reason: "unexpected VIP response".into(),
+        }),
+    }
+}
+/// Resolves a service by exact name, full id or unique id prefix.
+pub fn resolve_vip<'a>(
+    network: &'a NetworkReport,
+    selector: &str,
+) -> std::result::Result<&'a crate::vip::VipStatus, String> {
+    let matches: Vec<_> = network
+        .vips
+        .iter()
+        .filter(|v| v.config.name == selector || v.config.id.starts_with(selector))
+        .collect();
+    match matches.as_slice() {
+        [vip] => Ok(vip),
+        [] => Err(format!("no VIP matches `{selector}`")),
+        _ => Err(format!(
+            "ambiguous VIP `{selector}`: {}",
+            matches
+                .iter()
+                .map(|v| format!("{} ({})", v.config.name, v.config.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// Resolves a node by exact hostname, full id, unique id prefix or overlay IPv4.
@@ -642,6 +709,9 @@ pub struct ProtocolReport {
 /// One network.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkReport {
+    /// Shared VIPs and this client's routing observations.
+    #[serde(default)]
+    pub vips: Vec<crate::vip::VipStatus>,
     /// Enabled local data-plane protocols, in preference order.
     pub protocols: Vec<String>,
     /// Whether the network starts or resumes automatically when its range is free.
@@ -905,6 +975,16 @@ impl OverlayPeerReport {
 /// running and what they can report or change. That is what keeps this module
 /// free of any knowledge of them.
 pub trait ReportSource: Send + Sync + 'static {
+    /// Atomically saves a complete VIP draft using its original revision.
+    fn save_vip(
+        &self,
+        _network: String,
+        _config: crate::vip::VipConfig,
+        _expected: Option<String>,
+        _delete: bool,
+    ) -> BoxFuture<'_, std::result::Result<Vec<crate::vip::VipStatus>, String>> {
+        Box::pin(async { Err("this agent cannot manage VIPs".into()) })
+    }
     /// Persists and announces a version-scoped node cleanup.
     fn forget_node(
         &self,
@@ -1051,7 +1131,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 21]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 22]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///
@@ -1075,6 +1155,15 @@ where
             }
         };
     let response = match request {
+        Request::SaveVip {
+            network_id,
+            config,
+            expected,
+            delete,
+        } => match source.save_vip(network_id, config, expected, delete).await {
+            Ok(vips) => Response::Vips(vips),
+            Err(reason) => Response::Error(reason),
+        },
         Request::ForgetNode {
             network_id,
             peer,

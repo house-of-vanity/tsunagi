@@ -21,6 +21,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// A request from the UI to the agent.
 pub(crate) enum Command {
+    SaveVip {
+        token: String,
+        network_id: String,
+        config: tsunagi::vip::VipConfig,
+        expected: Option<String>,
+        delete: bool,
+    },
     /// Retire the exact offline-node claim selected in the devices window.
     ForgetNode {
         network_id: String,
@@ -55,8 +62,14 @@ pub(crate) enum Command {
 }
 
 /// The latest the worker knows, read by the UI each frame.
+#[derive(Clone)]
+pub(crate) struct VipSaveResult {
+    pub token: String,
+    pub result: Result<Vec<tsunagi::vip::VipStatus>, String>,
+}
 #[derive(Clone, Default)]
 pub(crate) struct Snapshot {
+    pub vip_result: Option<VipSaveResult>,
     /// The last status, or the reason it could not be read (agent down, no
     /// permission on the socket, …).
     pub status: Option<Result<StatusReport, String>>,
@@ -84,6 +97,18 @@ pub(crate) struct AgentClient {
 }
 
 impl AgentClient {
+    #[cfg(test)]
+    pub(crate) fn test_client() -> (Self, mpsc::UnboundedReceiver<Command>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                shared: Arc::new(Mutex::new(Snapshot::default())),
+                pending_copy: Arc::new(Mutex::new(None)),
+            },
+            rx,
+        )
+    }
     /// Starts the worker on `runtime`, reporting to `ctx` (for repaints).
     pub(crate) fn spawn(runtime: &tokio::runtime::Handle, ctx: egui::Context) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -198,6 +223,22 @@ async fn run(
     ctx.request_repaint();
 
     let outcome: Result<String, String> = match command {
+        Command::SaveVip {
+            token,
+            network_id,
+            config,
+            expected,
+            delete,
+        } => {
+            let result = ipc::save_vip(socket, &network_id, config, expected, delete)
+                .await
+                .map_err(|e| e.to_string());
+            lock(shared).vip_result = Some(VipSaveResult {
+                token,
+                result: result.clone(),
+            });
+            result.map(|_| "VIP configuration saved".into())
+        }
         Command::ForgetNode {
             network_id,
             peer,

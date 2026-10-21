@@ -19,6 +19,7 @@ mod icon;
 mod stats;
 mod tray;
 mod ui;
+mod vip;
 mod watch;
 
 use eframe::egui;

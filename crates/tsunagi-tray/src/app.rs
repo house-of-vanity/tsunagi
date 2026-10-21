@@ -64,6 +64,7 @@ impl eframe::App for App {
 
         ui::draw(ctx, &self.agent, &mut self.state, &snapshot, &self.traffic);
         self.show_devices_windows(ctx, &snapshot);
+        self.show_vip_windows(ctx, &snapshot);
         self.show_about_window(ctx, &snapshot);
 
         // A secret the worker fetched for the clipboard: copy it here, on the
@@ -78,6 +79,51 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn show_vip_windows(&mut self, ctx: &egui::Context, snapshot: &crate::agent::Snapshot) {
+        let Some(Ok(report)) = &snapshot.status else {
+            return;
+        };
+        let ids: Vec<_> = self.state.vip_windows.keys().cloned().collect();
+        for id in ids {
+            let Some(network) = report.networks.iter().find(|n| n.network_id == id) else {
+                self.state.vip_windows.remove(&id);
+                continue;
+            };
+            let Some(state) = self.state.vip_windows.get_mut(&id) else {
+                continue;
+            };
+            let builder = egui::ViewportBuilder::default()
+                .with_title(format!("tsunagi · VIP · {}", network.name))
+                .with_app_id(crate::icon::APP_ID)
+                .with_icon(crate::icon::window())
+                .with_inner_size([1000., 720.])
+                .with_min_inner_size([650., 400.]);
+            let keep = ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("vip", &id)),
+                builder,
+                |vctx, _| {
+                    let close = crate::vip::show(vctx, &self.agent, state, network, snapshot);
+                    if close {
+                        return false;
+                    }
+                    if vctx.input(|i| i.viewport().close_requested()) {
+                        if state.dirty() {
+                            state.request_close();
+                            vctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    }
+                },
+            );
+            if !keep {
+                self.state.vip_windows.remove(&id);
+            }
+        }
+    }
     /// Renders the About window while it is open.
     fn show_about_window(&mut self, ctx: &egui::Context, snapshot: &crate::agent::Snapshot) {
         if !self.state.about_open {

@@ -94,6 +94,19 @@ stopping a suspended network cancels its automatic resume.
 
 Machines are called `tsunagi-<id>` until you rename them: `tsng id hostname laptop`.
 
+### Virtual services
+
+```sh
+tsng vip create home api
+tsng vip port add home api tcp/443 --backend server1:6443 --backend server2:7443
+tsng vip status home api --watch
+```
+
+Use `api.home:443`. Each client selects the available backend with the lowest
+measured data-plane RTT. A VIP can have multiple independent TCP and UDP ports.
+Every member may edit it; the tray's **VIP** button opens a draft editor with
+explicit Save. [Commands, health, metrics and limits](docs/vip.md).
+
 ### Exit nodes
 
 ```sh
@@ -227,6 +240,7 @@ The [threat model](docs/threat-model.md) says what this does and doesn't protect
 [Pairwise Amnezia transport](docs/amnezia.md) ·
 [Routing](docs/routing.md) ·
 [Exit nodes](docs/exit-node.md) ·
+[Virtual services](docs/vip.md) ·
 [Threat model](docs/threat-model.md) ·
 [Contributing](AGENTS.md)
 

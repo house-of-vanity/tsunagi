@@ -228,3 +228,18 @@ scroll area. They check stretching and shrinking without an expanding first
 column, separate handshake/control RTT values, unknown measurements and short
 end-to-end hints that do not substitute the carrier protocol. This does not
 establish native desktop rendering on every platform.
+
+
+VIP tests cover signed multi-writer backend merging, stale draft rejection,
+permanent deletion and replay, separate active/deleted capacity, and mandatory
+SQLite migration/counter rollback. Real agent instances verify equal editing
+rights, network isolation, restart and recovery without the creator. Packet
+checks exercise RTT selection, port translation, UDP failover, a local backend,
+fragment reassembly/checksums and ICMP quoted-header/PMTU translation. TCP check
+recovery uses real loopback listening sockets. The WireGuard suite moves VIP
+TCP/UDP packets through real encrypted tunnels, rejects forged VIP sources and
+checks UDP failover after the selected agent stops. CLI/DNS tests run the real
+binary, configure independent listeners, disable checks, reject an invalid
+change atomically and observe DNS creation/deletion. GUI tests cover draft
+isolation and form rendering. These do not establish live host TUN behavior or
+native desktop behavior on Linux, macOS or Windows. See [VIP semantics](vip.md).

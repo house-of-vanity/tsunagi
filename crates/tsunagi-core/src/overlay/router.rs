@@ -89,6 +89,7 @@ pub enum RouteError {
 /// Address ownership across every network this agent is in.
 #[derive(Debug, Default)]
 pub struct RoutingTable {
+    pub(crate) vips: Arc<crate::vip::VipRouter>,
     broadcast: ArcSwap<BroadcastTable>,
     networks: RwLock<HashMap<NetworkId, NetworkRoutes>>,
 }
@@ -146,6 +147,7 @@ impl RoutingTable {
 
     /// Forgets a network.
     pub fn remove_network(&self, network: NetworkId) {
+        self.vips.remove_network(network);
         let mut networks = self.write();
         networks.remove(&network);
         self.broadcast

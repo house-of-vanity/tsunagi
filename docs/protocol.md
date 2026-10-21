@@ -9,24 +9,26 @@ Two versions exist and are independent:
 
 - **Identity scheme**, `tsunagi-network-id-v1`. Frozen. Changing it creates a
   different network space for the same name and secret.
-- **Control protocol**, ALPN `tsunagi/ctrl/7`, `PROTOCOL_VERSION = 7`.
+- **Control protocol**, ALPN `tsunagi/ctrl/8`, `PROTOCOL_VERSION = 8`.
 
 Upgrading the crate or bumping the control protocol must never change an
 existing `NetworkId`.
 
-Control version 7 adds signed offline-node retirement messages to version 6's
-private AWG transport negotiation and delivery checks. Data ALPN remains
-`tsunagi/data/5`. All members must upgrade together; network ids, handshake
-encoding and existing record signatures are unchanged. Local CLI/tray IPC is
-version 21, so restart the agent with matching clients. SQLite schema 9 adds
-retirement storage while preserving existing identities, settings and records.
-See [sync-model.md](sync-model.md#offline-node-cleanup) and [amnezia.md](amnezia.md).
+Control version 8 adds signed, multi-writer VIP field snapshots to version 7's
+node retirements. Data ALPN remains `tsunagi/data/5`. All members must upgrade
+together. Network ids, derivation labels, handshake encoding and existing record
+signatures are unchanged. Local CLI/tray IPC is version 22; restart the agent
+with matching clients. SQLite schema 10 adds `vip_fields`, preserving identity,
+network configuration, signed node records and retirement proofs.
+See [virtual services](vip.md), [state sync](sync-model.md) and [AWG](amnezia.md).
 
 ## Canonical encoding
 
-Everything that is hashed or MAC'd uses length-prefixed fields, written here as
-`LP(x) = u32_be(len(x)) || x`. String concatenation is never used, so no two
-different field splits can produce the same bytes.
+Network identity derivation and the membership transcript use length-prefixed
+fields, written here as `LP(x) = u32_be(len(x)) || x`. String concatenation is
+never used, so different field splits cannot produce the same bytes. VIP field
+signatures use their separate domain and canonical postcard encoding described
+in [virtual services](vip.md#shared-state-and-addresses).
 
 ## Network space identity
 

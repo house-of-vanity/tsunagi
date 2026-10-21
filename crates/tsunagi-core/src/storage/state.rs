@@ -21,7 +21,7 @@ use crate::identity::{DeviceIdentity, NetworkId, NetworkName, NetworkSecret};
 use crate::state::{MAX_RETIREMENT_LEN, RecordBody, SignedRecord, SignedRetirement};
 
 /// Schema version written by this build.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Key of the stored hostname setting.
 const SETTING_HOSTNAME: &str = "hostname";
@@ -263,6 +263,12 @@ impl StateStore {
                 )
                 .map_err(|err| self.corrupt(format!("cannot migrate schema to 9: {err}")))?;
         }
+        if found < 10 {
+            self.conn.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS vip_fields (
+                network_id BLOB NOT NULL, vip TEXT NOT NULL, field TEXT NOT NULL, data BLOB NOT NULL,
+                PRIMARY KEY(network_id, vip, field)); PRAGMA user_version = 10; COMMIT;")
+                .map_err(|err| self.corrupt(format!("cannot migrate VIP state: {err}")))?;
+        }
         Ok(())
     }
 
@@ -276,6 +282,7 @@ impl StateStore {
             "signed_records",
             "peer_hostnames",
             "retirements",
+            "vip_fields",
         ] {
             let present: Option<String> = self
                 .conn
@@ -894,8 +901,77 @@ impl StateStore {
             .map_err(|err| Error::Storage(format!("cannot commit retirement: {err}")))
     }
 
+    /// Reads bounded mandatory VIP state; corrupt records fail activation.
+    pub fn vip_fields(&self, network: NetworkId, max: usize) -> Result<Vec<crate::vip::VipEntry>> {
+        let mut stmt = self.conn.prepare("SELECT CASE WHEN length(data) <= 1024 THEN data ELSE NULL END FROM vip_fields WHERE network_id=?1 ORDER BY vip, field")
+            .map_err(|e| self.corrupt(e.to_string()))?;
+        let mut rows = stmt
+            .query(params![network.as_bytes().as_slice()])
+            .map_err(|e| self.corrupt(e.to_string()))?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| self.corrupt(e.to_string()))? {
+            if entries.len() >= max {
+                return Err(self.corrupt("stored VIP state exceeds configured limits"));
+            }
+            let bytes: Option<Vec<u8>> = row.get(0).map_err(|e| self.corrupt(e.to_string()))?;
+            let bytes = bytes.ok_or_else(|| self.corrupt("oversized VIP field"))?;
+            let entry: crate::vip::VipEntry =
+                postcard::from_bytes(&bytes).map_err(|e| self.corrupt(e.to_string()))?;
+            entry
+                .verify(network)
+                .map_err(|e| self.corrupt(e.to_string()))?;
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    /// Commits a validated VIP snapshot and optional author counter atomically.
+    pub fn put_vip_fields(
+        &self,
+        network: NetworkId,
+        entries: &[crate::vip::VipEntry],
+        own: Option<([u8; 32], u64)>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if let Some(first) = entries.first() {
+            if entries.iter().any(|e| e.vip != first.vip) {
+                return Err(Error::Storage(
+                    "VIP snapshot mixes service identities".into(),
+                ));
+            }
+            tx.execute(
+                "DELETE FROM vip_fields WHERE network_id=?1 AND vip=?2",
+                params![network.as_bytes().as_slice(), first.vip],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+        for e in entries {
+            e.verify(network)?;
+            let bytes = postcard::to_stdvec(e).map_err(|e| Error::Storage(e.to_string()))?;
+            if bytes.len() > 1024 {
+                return Err(Error::Storage("oversized VIP field".into()));
+            }
+            tx.execute("INSERT INTO vip_fields(network_id,vip,field,data) VALUES(?1,?2,?3,?4) ON CONFLICT(network_id,vip,field) DO UPDATE SET data=excluded.data",
+                params![network.as_bytes().as_slice(),e.vip,e.key,bytes]).map_err(|e|Error::Storage(e.to_string()))?;
+        }
+        if let Some((author, version)) = own {
+            tx.execute("INSERT INTO own_record_version(network_id,author,version) VALUES(?1,?2,?3) ON CONFLICT(network_id,author) DO UPDATE SET version=max(version,excluded.version)",
+                params![network.as_bytes().as_slice(),author.as_slice(),version as i64]).map_err(|e|Error::Storage(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| Error::Storage(e.to_string()))
+    }
+
     /// Drops a forgotten network's local cleanup proofs.
     pub fn forget_retirements(&self, network: NetworkId) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM vip_fields WHERE network_id = ?1",
+                params![network.as_bytes().as_slice()],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
         self.conn
             .execute(
                 "DELETE FROM retirements WHERE network_id = ?1",
@@ -1331,5 +1407,61 @@ mod broadcast_storage_tests {
             store.list_networks().unwrap()[0].broadcast,
             "forgotten network gets defaults"
         );
+    }
+}
+
+#[cfg(test)]
+mod vip_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    #[test]
+    fn vip_migration_and_counter_failure_preserve_identity_and_rollback_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let store = StateStore::open(&path).unwrap();
+        let identity = store.load_or_create_device_identity().unwrap();
+        store
+            .conn
+            .execute_batch("DROP TABLE vip_fields; PRAGMA user_version=9;")
+            .unwrap();
+        drop(store);
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store.device_identity().unwrap().unwrap().endpoint_id(),
+            identity.endpoint_id()
+        );
+        let net = NetworkId::from_bytes([7; 32]);
+        let key = identity.signing_key();
+        let config = crate::vip::VipConfig::new("api");
+        let fields = crate::vip::VipSet::default()
+            .edit(net, &key, 7, &config, None, &crate::Limits::default())
+            .unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_vip_counter BEFORE INSERT ON own_record_version BEGIN SELECT RAISE(ABORT,'counter unavailable'); END;").unwrap();
+        assert!(
+            store
+                .put_vip_fields(net, &fields, Some((*key.public().as_bytes(), 7)))
+                .is_err()
+        );
+        assert!(store.vip_fields(net, 192).unwrap().is_empty());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_vip_counter;")
+            .unwrap();
+        store
+            .put_vip_fields(net, &fields, Some((*key.public().as_bytes(), 7)))
+            .unwrap();
+        assert_eq!(store.vip_fields(net, 192).unwrap(), fields);
+        assert_eq!(store.own_record_version(net, key.public()).unwrap(), 7);
+        drop(store);
+        let reopened = StateStore::open(path).unwrap();
+        assert_eq!(reopened.vip_fields(net, 192).unwrap(), fields);
+        reopened
+            .conn
+            .execute("UPDATE vip_fields SET data=?1", params![vec![0xffu8; 1025]])
+            .unwrap();
+        assert!(matches!(
+            reopened.vip_fields(net, 192),
+            Err(Error::StateCorrupted { .. })
+        ));
     }
 }

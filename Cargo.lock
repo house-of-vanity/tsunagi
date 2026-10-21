@@ -6239,6 +6239,7 @@ dependencies = [
  "iroh",
  "netwatch",
  "nix 0.31.3",
+ "serde_json",
  "simple-dns",
  "tempfile",
  "tokio",

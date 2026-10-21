@@ -14,6 +14,7 @@ use std::time::Duration;
 #[cfg(windows)]
 mod winservice;
 
+mod vip_cli;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tsunagi::agent::Event;
 use tsunagi::config::{AgentConfig, StoragePaths, TransportPolicy};
@@ -52,6 +53,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Manage named shared TCP/UDP virtual services.
+    Vip(vip_cli::VipArgs),
     /// Shows this device's identity, and changes it.
     ///
     /// Every item follows the same shape: name it to see it, name it with a
@@ -927,6 +930,7 @@ async fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Join(args) => join_command(args).await,
         Command::Network(args) => network_command(args).await,
         Command::Dns(args) => dns_command(args).await,
+        Command::Vip(args) => vip_cli::run(args).await,
         Command::ExitNode(args) => exit_node_command(args).await,
         Command::Wipe(args) => wipe(args).await,
         // Taken in `main`, before there is a runtime: the service manager
@@ -1317,7 +1321,12 @@ fn spawn_dns(agent: Agent, port: u16) -> DnsService {
                     let members = network.members.iter().filter_map(|member| {
                         Some((member.hostname.clone()?, member.overlay_address_v4?))
                     });
-                    zones.push(Zone::new(zone, members));
+                    let services = network
+                        .vips
+                        .iter()
+                        .filter(|v| v.error.is_none())
+                        .filter_map(|v| Some((v.config.name.clone(), v.address?)));
+                    zones.push(Zone::new(zone, members.chain(services)));
                 }
                 let zones = Zones::new(zones);
                 let names = zones.names() as u32;
@@ -1577,6 +1586,23 @@ struct AgentControl {
 }
 
 impl tsunagi::ipc::ReportSource for AgentControl {
+    fn save_vip(
+        &self,
+        network: String,
+        config: tsunagi::vip::VipConfig,
+        expected: Option<String>,
+        delete: bool,
+    ) -> tsunagi::BoxFuture<'_, Result<Vec<tsunagi::vip::VipStatus>, String>> {
+        Box::pin(async move {
+            let network = network
+                .parse()
+                .map_err(|e| format!("invalid network id: {e}"))?;
+            self.agent
+                .save_vip(network, config, expected, delete)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
     fn forget_node(
         &self,
         network: String,
@@ -5307,6 +5333,7 @@ async fn build_report(
             };
 
             NetworkReport {
+                vips: network.vips.clone(),
                 protocols: network.protocols.clone(),
                 auto_start: network.auto_start,
                 exit: exit_report(network),
@@ -5740,6 +5767,7 @@ mod status_tests {
     /// The situation that prompted this: one peer left and came back.
     fn network_after_a_peer_returned() -> NetworkReport {
         NetworkReport {
+            vips: Vec::new(),
             protocols: vec!["wg-quic".into()],
             auto_start: true,
             exit: Default::default(),

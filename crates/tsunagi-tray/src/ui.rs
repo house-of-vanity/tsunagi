@@ -41,6 +41,7 @@ pub(crate) struct UiState {
     pub(crate) host_edit: Option<String>,
     /// Network ids whose devices window is open.
     pub(crate) open_devices: BTreeSet<String>,
+    pub(crate) vip_windows: std::collections::BTreeMap<String, crate::vip::Window>,
     /// Whether the About window is open.
     pub(crate) about_open: bool,
     /// An exit-node choice waiting for the user to confirm it.
@@ -56,6 +57,7 @@ impl Default for UiState {
             unit: Unit::Packets,
             host_edit: None,
             open_devices: BTreeSet::new(),
+            vip_windows: Default::default(),
             about_open: false,
             exit_confirm: None,
             forget_confirm: None,
@@ -211,6 +213,7 @@ fn draw_network(
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
             format::copy_field(ui, network.name.as_str(), &network.name);
+            if ui.button("VIP").clicked(){state.vip_windows.entry(network.network_id.clone()).or_default();}
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let leave =
                     egui::Button::new(egui::RichText::new("Leave").color(egui::Color32::WHITE))

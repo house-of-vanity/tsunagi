@@ -1770,3 +1770,188 @@ async fn lan_broadcast_fanout_is_scoped_opt_in_and_does_not_reflood() {
         agent.shutdown().await;
     }
 }
+
+fn vip_segment(
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    sport: u16,
+    dport: u16,
+    udp: bool,
+    flags: u8,
+) -> Bytes {
+    fn sum(bytes: &[u8]) -> u16 {
+        let mut s: u32 = bytes
+            .chunks(2)
+            .map(|b| u32::from(u16::from_be_bytes([b[0], *b.get(1).unwrap_or(&0)])))
+            .sum();
+        while s >> 16 != 0 {
+            s = (s & 0xffff) + (s >> 16);
+        }
+        !(s as u16)
+    }
+    let mut p = vec![0; if udp { 36 } else { 40 }];
+    p[0] = 0x45;
+    let len = p.len() as u16;
+    p[2..4].copy_from_slice(&len.to_be_bytes());
+    p[8] = 64;
+    p[9] = if udp { 17 } else { 6 };
+    p[12..16].copy_from_slice(&source.octets());
+    p[16..20].copy_from_slice(&destination.octets());
+    p[20..22].copy_from_slice(&sport.to_be_bytes());
+    p[22..24].copy_from_slice(&dport.to_be_bytes());
+    if udp {
+        p[24..26].copy_from_slice(&16u16.to_be_bytes());
+    } else {
+        p[32] = 0x50;
+        p[33] = flags;
+        p[24..28].copy_from_slice(&123u32.to_be_bytes());
+    }
+    let mut pseudo = p[12..20].to_vec();
+    pseudo.extend([0, p[9]]);
+    pseudo.extend(((p.len() - 20) as u16).to_be_bytes());
+    pseudo.extend(&p[20..]);
+    let c = sum(&pseudo);
+    let offset = if udp { 26 } else { 36 };
+    p[offset..offset + 2].copy_from_slice(&c.to_be_bytes());
+    let c = sum(&p[..20]);
+    p[10..12].copy_from_slice(&c.to_be_bytes());
+    Bytes::from(p)
+}
+#[tokio::test]
+async fn vip_tcp_and_udp_remap_ports_over_real_encryption_and_preserve_source_admission() {
+    use tsunagi::vip::{Backend, Listener, Protocol, VipConfig};
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("vip-encrypted");
+    let a = WgAgent::spawn(&discovery, "vipa").await;
+    let b = WgAgent::spawn(&discovery, "vipb").await;
+    let net = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(net, 1).await;
+    b.wait_for_tunnels(net, 1).await;
+    let aa = a.overlay(net).await;
+    let ab = b.overlay(net).await;
+    let ta = a.tun(net).await;
+    let tb = b.tun(net).await;
+    let mut cfg = VipConfig::new("service");
+    for (protocol, port, backend) in [(Protocol::Tcp, 443, 6443), (Protocol::Udp, 53, 5353)] {
+        let mut l = Listener::new(protocol, port);
+        l.port_check = false;
+        l.backends.push(Backend {
+            peer: b.endpoint_id().to_string(),
+            port: backend,
+        });
+        cfg.listeners.push(l);
+    }
+    a.agent
+        .save_vip(net, cfg.clone(), None, false)
+        .await
+        .unwrap();
+    let vip = wait_until("data-plane probes measure the backend RTT", || async {
+        let status = a.agent.network_status(net).await.ok()?;
+        let v = status.vips.iter().find(|v| v.config.id == cfg.id)?;
+        (v.listeners.iter().all(|l| l.selected.is_some()))
+            .then_some(v.address?)
+            .filter(|_| v.listeners.len() == 2)
+    })
+    .await;
+    for (udp, port, target) in [(false, 443, 6443), (true, 53, 5353)] {
+        ta.push_from_os(vip_segment(aa, vip, 40000, port, udp, 2));
+        let received = tokio::time::timeout(Duration::from_secs(5), tb.pop_to_os())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[12..16], &aa.octets());
+        assert_eq!(&received[16..20], &ab.octets());
+        assert_eq!(u16::from_be_bytes([received[22], received[23]]), target);
+        let translated = u16::from_be_bytes([received[20], received[21]]);
+        tb.push_from_os(vip_segment(ab, aa, target, translated, udp, 0x12));
+        let reply = tokio::time::timeout(Duration::from_secs(5), ta.pop_to_os())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply[12..16], &vip.octets());
+        assert_eq!(u16::from_be_bytes([reply[20], reply[21]]), port);
+        assert_eq!(u16::from_be_bytes([reply[22], reply[23]]), 40000);
+        // A backend cannot send a VIP source over its authenticated tunnel.
+        let forged = vip_segment(vip, aa, port, 40000, udp, 0x12);
+        tb.push_from_os(forged);
+    }
+    wait_until("forged VIP sources are rejected before NAT", || async {
+        (a.agent.overlay()?.counters.wrong_source >= 2).then_some(())
+    })
+    .await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn vip_udp_reaches_another_backend_after_the_selected_agent_stops() {
+    use tsunagi::vip::{Backend, Listener, Protocol, VipConfig};
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("vip-failover");
+    let a = WgAgent::spawn(&discovery, "vipfa").await;
+    let b = WgAgent::spawn(&discovery, "vipfb").await;
+    let c = WgAgent::spawn(&discovery, "vipfc").await;
+    let net = a.agent.join_network(&name, &secret).await.unwrap();
+    for node in [&b, &c] {
+        node.agent.join_network(&name, &secret).await.unwrap();
+    }
+    for node in [&a, &b, &c] {
+        node.wait_for_tunnels(net, 2).await;
+    }
+    let mut config = VipConfig::new("datagrams");
+    let mut listener = Listener::new(Protocol::Udp, 8888);
+    listener.backends = vec![
+        Backend {
+            peer: b.endpoint_id().to_string(),
+            port: 9000,
+        },
+        Backend {
+            peer: c.endpoint_id().to_string(),
+            port: 9001,
+        },
+    ];
+    config.listeners.push(listener);
+    a.agent
+        .save_vip(net, config.clone(), None, false)
+        .await
+        .unwrap();
+    let first = wait_until("both UDP backends have measured paths", || async {
+        let s = a.agent.network_status(net).await.ok()?;
+        let v = s.vips.iter().find(|v| v.config.id == config.id)?;
+        let l = v.listeners.first()?;
+        (l.backends.iter().all(|b| b.rtt_us.is_some())).then_some((v.address?, l.selected.clone()?))
+    })
+    .await;
+    let (dead, alive) = if first.1.peer == b.endpoint_id().to_string() {
+        (b, c)
+    } else {
+        (c, b)
+    };
+    let address = a.overlay(net).await;
+    let tun = a.tun(net).await;
+    let dest = dead.tun(net).await;
+    tun.push_from_os(vip_segment(address, first.0, 41000, 8888, true, 0));
+    tokio::time::timeout(Duration::from_secs(5), dest.pop_to_os())
+        .await
+        .unwrap()
+        .unwrap();
+    dead.shutdown().await;
+    wait_until("the remaining backend becomes the next choice", || async {
+        let s = a.agent.network_status(net).await.ok()?;
+        let v = s.vips.iter().find(|v| v.config.id == config.id)?;
+        (v.listeners.first()?.selected.as_ref()?.peer == alive.endpoint_id().to_string())
+            .then_some(())
+    })
+    .await;
+    tun.push_from_os(vip_segment(address, first.0, 41000, 8888, true, 0));
+    let packet = tokio::time::timeout(Duration::from_secs(5), alive.tun(net).await.pop_to_os())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&packet[16..20], &alive.overlay(net).await.octets());
+    let view = a.agent.network_status(net).await.unwrap();
+    assert_eq!(view.vips[0].listeners[0].counters.failovers, 1);
+    a.shutdown().await;
+    alive.shutdown().await;
+}

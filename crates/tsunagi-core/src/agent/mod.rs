@@ -309,6 +309,28 @@ impl TransportContext for TransportCtx {
 }
 
 impl Agent {
+    /// Atomically saves or removes a version-checked shared VIP draft.
+    /// Every authenticated network member may edit any service.
+    pub async fn save_vip(
+        &self,
+        network: NetworkId,
+        config: crate::vip::VipConfig,
+        expected: Option<String>,
+        delete: bool,
+    ) -> Result<Vec<crate::vip::VipStatus>> {
+        let (reply, receive) = oneshot::channel();
+        self.command(
+            network,
+            NetCommand::SaveVip {
+                config,
+                expected,
+                delete,
+                reply,
+            },
+        )
+        .await?;
+        receive.await.map_err(|_| Error::Stopped)?
+    }
     /// Retires one offline member's observed claim without revoking membership.
     /// Every member has this right. The version must still match the selection.
     pub async fn forget_node(
@@ -916,6 +938,34 @@ impl Agent {
             .storage
             .retirements(network_id, self.inner.limits.max_retirements)
             .await?;
+        let vip_entries = self
+            .inner
+            .storage
+            .vip_fields(
+                network_id,
+                self.inner
+                    .limits
+                    .max_vips
+                    .saturating_mul(self.inner.limits.max_vip_fields)
+                    .saturating_add(self.inner.limits.max_vip_tombstones),
+            )
+            .await?;
+        let mut vips = crate::vip::VipSet::default();
+        for id in vip_entries
+            .iter()
+            .map(|e| e.vip.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            vips.merge(
+                network_id,
+                vip_entries
+                    .iter()
+                    .filter(|e| e.vip == id)
+                    .cloned()
+                    .collect(),
+                &self.inner.limits,
+            )?;
+        }
         let range = self.desired_range(network_id).await?;
         if let Some(range) = range {
             let conflicts = self.inner.routes.overlapping_networks(network_id, range);
@@ -968,6 +1018,7 @@ impl Agent {
             .and_then(|stored| stored.exit_via)
             .and_then(|bytes| EndpointId::from_bytes(&bytes).ok());
         let handle = network::spawn(RuntimeParams {
+            vips,
             retirements,
             broadcast,
             exit_offer,
@@ -1215,7 +1266,43 @@ impl Agent {
             let keys = NetworkKeys::derive(&stored.name, &stored.secret);
             let range = self.desired_range(stored.network_id).await?;
             let range_conflicts = self.range_conflicts(stored.network_id, range).await?;
+            let fields = self
+                .inner
+                .storage
+                .vip_fields(
+                    stored.network_id,
+                    self.inner
+                        .limits
+                        .max_vips
+                        .saturating_mul(self.inner.limits.max_vip_fields)
+                        .saturating_add(self.inner.limits.max_vip_tombstones),
+                )
+                .await?;
+            let mut service_state = crate::vip::VipSet::default();
+            for id in fields
+                .iter()
+                .map(|e| e.vip.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                service_state.merge(
+                    stored.network_id,
+                    fields.iter().filter(|e| e.vip == id).cloned().collect(),
+                    &self.inner.limits,
+                )?;
+            }
+            let vips = service_state
+                .configs()
+                .into_iter()
+                .map(|config| crate::vip::VipStatus {
+                    revision: service_state.revision(&config.id),
+                    config,
+                    address: None,
+                    error: Some("network is inactive".into()),
+                    listeners: vec![],
+                })
+                .collect();
             networks.push(NetworkStatus {
+                vips,
                 protocols: self.effective_protocols(stored.protocols.as_ref()),
                 auto_start: stored.auto_start,
                 broadcast: stored.broadcast,

@@ -50,6 +50,12 @@ pub(crate) struct InboundSession {
 
 /// Commands accepted by a network runtime.
 pub(crate) enum NetCommand {
+    SaveVip {
+        config: crate::vip::VipConfig,
+        expected: Option<String>,
+        delete: bool,
+        reply: oneshot::Sender<Result<Vec<crate::vip::VipStatus>>>,
+    },
     ForgetNode {
         peer: EndpointId,
         expected_version: u64,
@@ -125,6 +131,7 @@ pub(crate) enum NetCommand {
 impl std::fmt::Debug for NetCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NetCommand::SaveVip { .. } => f.write_str("SaveVip"),
             NetCommand::ForgetNode { peer, .. } => write!(f, "ForgetNode({peer})"),
             NetCommand::Inbound(_) => f.write_str("Inbound"),
             NetCommand::InboundLink(link) => write!(f, "InboundLink({})", link.protocol),
@@ -170,6 +177,7 @@ impl NetworkHandle {
 
 /// Everything a network runtime needs to run.
 pub(crate) struct RuntimeParams {
+    pub(crate) vips: crate::vip::VipSet,
     pub(crate) retirements: Vec<SignedRetirement>,
     pub(crate) broadcast: bool,
     /// This agent offers itself as an exit node here.
@@ -376,6 +384,8 @@ struct Runtime {
     /// Snapshots received while dispatching, handled on the next loop pass.
     pending_state: Vec<(EndpointId, Vec<SignedRecord>)>,
     pending_retirements: Vec<(EndpointId, Vec<SignedRetirement>)>,
+    pending_vips: Vec<Vec<crate::vip::VipEntry>>,
+    vip_cursor: HashMap<EndpointId, usize>,
     /// Next cleanup batch per live session; prevents queue pressure starving a suffix.
     retirement_cursor: HashMap<EndpointId, usize>,
     /// The highest version this agent has ever published for this network.
@@ -461,6 +471,8 @@ impl Runtime {
             state: StateSet::new(),
             pending_state: Vec::new(),
             pending_retirements: Vec::new(),
+            pending_vips: Vec::new(),
+            vip_cursor: HashMap::new(),
             retirement_cursor: HashMap::new(),
             own_version: 0,
             exit_via_was_online: false,
@@ -561,6 +573,15 @@ impl Runtime {
 
     async fn handle_command(&mut self, command: NetCommand) {
         match command {
+            NetCommand::SaveVip {
+                config,
+                expected,
+                delete,
+                reply,
+            } => {
+                let result = self.save_vip(config, expected, delete).await;
+                let _ = reply.send(result);
+            }
             NetCommand::ForgetNode {
                 peer,
                 expected_version,
@@ -830,6 +851,7 @@ impl Runtime {
         // the check is a comparison when nothing has changed.
         self.ensure_own_claim().await;
         self.report_hostname_taken();
+        self.broadcast_vips();
         self.broadcast_retirements();
         // The same timer repairs the relay picture: reachability is soft
         // state, repeated while it holds and forgotten when it stops.
@@ -1104,7 +1126,8 @@ impl Runtime {
             .own_record_version(self.network_id, self.local_id)
             .await
             .unwrap_or(0)
-            .max(self.state.authored_version(&self.local_id));
+            .max(self.state.authored_version(&self.local_id))
+            .max(self.params.vips.authored_version(self.local_id));
         for (id, hostname) in self
             .params
             .storage
@@ -1178,11 +1201,26 @@ impl Runtime {
                 match self.state.address_of(&self.local_id) {
                     Some(mine) if range.contains(mine) => Some(mine),
                     _ => {
-                        let taken: std::collections::HashSet<std::net::Ipv4Addr> = holders
+                        let mut taken: std::collections::HashSet<std::net::Ipv4Addr> = holders
                             .iter()
                             .filter(|(_, holder)| **holder != self.local_id)
                             .map(|(address, _)| *address)
                             .collect();
+                        for vip in self.params.vips.views(
+                            Some(range),
+                            taken.clone(),
+                            &std::collections::BTreeSet::new(),
+                            &self.params.limits,
+                        ) {
+                            if let Some(address) = vip.address {
+                                taken.insert(address);
+                            }
+                        }
+                        for vip in self.params.routes.vips.statuses(self.network_id) {
+                            if let Some(address) = vip.address {
+                                taken.insert(address);
+                            }
+                        }
                         match allocate(
                             self.network_id,
                             self.local_id,
@@ -1460,8 +1498,188 @@ impl Runtime {
         self.broadcast_state();
     }
 
+    fn update_vips(&self) {
+        let taken = self.state.address_holders().into_keys().collect();
+        let names = self
+            .state
+            .active_records()
+            .into_iter()
+            .filter_map(|r| {
+                r.author_id()
+                    .ok()
+                    .and_then(|p| self.state.hostname_of(&p).map(str::to_owned))
+            })
+            .collect();
+        let views =
+            self.params
+                .vips
+                .views(self.effective_range(), taken, &names, &self.params.limits);
+        let peers = self
+            .state
+            .address_holders()
+            .into_iter()
+            .map(|(a, p)| (p, a, self.hub.reachable(p)))
+            .collect();
+        self.params.routes.vips.configure(
+            self.network_id,
+            self.local_id,
+            self.state.address_of(&self.local_id),
+            views,
+            peers,
+            &self.params.limits,
+        );
+    }
+    async fn save_vip(
+        &mut self,
+        config: crate::vip::VipConfig,
+        expected: Option<String>,
+        delete: bool,
+    ) -> Result<Vec<crate::vip::VipStatus>> {
+        if self.released || self.shutdown.is_triggered() {
+            return Err(Error::Stopped);
+        }
+        let version = self
+            .own_version
+            .checked_add(1)
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or_else(|| crate::vip::invalid("author counter exhausted"))?;
+        let entries = if delete {
+            self.params.vips.delete(
+                self.network_id,
+                &self.params.device_secret,
+                version,
+                &config.id,
+                expected.as_deref().unwrap_or(""),
+            )?
+        } else {
+            self.params.vips.edit(
+                self.network_id,
+                &self.params.device_secret,
+                version,
+                &config,
+                expected.as_deref(),
+                &self.params.limits,
+            )?
+        };
+        let mut candidate = self.params.vips.clone();
+        candidate.merge(self.network_id, entries, &self.params.limits)?;
+        if !delete {
+            let duplicate = candidate
+                .configs()
+                .iter()
+                .any(|v| v.id != config.id && v.name == config.name)
+                || self.state.active_records().iter().any(|r| {
+                    r.author_id().ok().and_then(|p| self.state.hostname_of(&p))
+                        == Some(config.name.as_str())
+                });
+            if duplicate {
+                return Err(crate::vip::invalid(
+                    "VIP name is already used by a node or another VIP",
+                ));
+            }
+        }
+        let snapshot = candidate.entries(&config.id);
+        self.validate_vip_frame(&snapshot)?;
+        self.params
+            .storage
+            .put_vip_fields(
+                self.network_id,
+                snapshot.clone(),
+                Some((*self.local_id.as_bytes(), version)),
+            )
+            .await?;
+        self.own_version = version;
+        self.params.vips = candidate;
+        self.update_vips();
+        let peers: Vec<_> = self.sessions.keys().copied().collect();
+        for peer in peers {
+            let _ = self.send_to(
+                peer,
+                ControlMessage::Vips {
+                    entries: snapshot.clone(),
+                },
+            );
+        }
+        Ok(self.params.routes.vips.statuses(self.network_id))
+    }
+    async fn receive_vips(&mut self, entries: Vec<crate::vip::VipEntry>) -> Result<()> {
+        let Some(id) = entries.first().map(|e| e.vip.clone()) else {
+            return Ok(());
+        };
+        if entries.iter().any(|e| e.vip != id) {
+            return Err(crate::vip::invalid("VIP snapshot mixes service identities"));
+        }
+        let own_seen = entries
+            .iter()
+            .filter(|e| e.author == *self.local_id.as_bytes())
+            .map(|e| e.version)
+            .max()
+            .unwrap_or(0);
+        let mut candidate = self.params.vips.clone();
+        let changed = candidate.merge(self.network_id, entries, &self.params.limits)?;
+        if !changed && own_seen <= self.own_version {
+            return Ok(());
+        }
+        let counter =
+            (own_seen > self.own_version).then_some((*self.local_id.as_bytes(), own_seen));
+        let snapshot = candidate.entries(&id);
+        self.validate_vip_frame(&snapshot)?;
+        self.params
+            .storage
+            .put_vip_fields(self.network_id, snapshot, counter)
+            .await?;
+        self.own_version = self.own_version.max(own_seen);
+        self.params.vips = candidate;
+        self.update_vips();
+        self.broadcast_vips();
+        Ok(())
+    }
+    fn validate_vip_frame(&self, entries: &[crate::vip::VipEntry]) -> Result<()> {
+        let frame = Envelope {
+            network_id: *self.network_id.as_bytes(),
+            message: ControlMessage::Vips {
+                entries: entries.to_vec(),
+            },
+        };
+        let bytes = encode(&frame).map_err(|e| crate::vip::invalid(e.to_string()))?;
+        if bytes.len() > self.params.limits.max_frame_len {
+            return Err(crate::vip::invalid(
+                "VIP snapshot exceeds the control frame limit",
+            ));
+        }
+        Ok(())
+    }
+    fn broadcast_vips(&mut self) {
+        let ids = self.params.vips.ids();
+        if ids.is_empty() {
+            return;
+        }
+        let peers: Vec<_> = self.sessions.keys().copied().collect();
+        for peer in peers {
+            let start = self.vip_cursor.get(&peer).copied().unwrap_or(0) % ids.len();
+            for step in 0..ids.len() {
+                let index = (start + step) % ids.len();
+                let entries = self.params.vips.entries(&ids[index]);
+                if self
+                    .send_to(peer, ControlMessage::Vips { entries })
+                    .is_err()
+                {
+                    self.vip_cursor.insert(peer, index);
+                    break;
+                }
+                self.vip_cursor.insert(peer, (index + 1) % ids.len());
+            }
+        }
+    }
+
     /// Handles snapshots collected while dispatching messages.
     async fn drain_pending_state(&mut self) {
+        for entries in std::mem::take(&mut self.pending_vips) {
+            if let Err(err) = self.receive_vips(entries).await {
+                self.metrics.protocol_violations += 1;
+                tracing::warn!(%err,"rejecting VIP snapshot");
+            }
+        }
         for (peer, markers) in std::mem::take(&mut self.pending_retirements) {
             self.receive_retirements(peer, markers).await;
         }
@@ -1473,6 +1691,7 @@ impl Runtime {
 
     /// Sends everything we know to every peer.
     fn broadcast_state(&mut self) {
+        self.broadcast_vips();
         self.broadcast_retirements();
         let mut records = self.state.records();
         records.truncate(self.params.limits.max_state_records);
@@ -1671,6 +1890,7 @@ impl Runtime {
             self.params.range_changed.send_replace(());
             return;
         }
+        self.update_vips();
         for plugin in &self.params.plugins {
             plugin.on_address_allocation(self.network_id, range, &allocations);
         }
@@ -2154,6 +2374,7 @@ impl Runtime {
                 });
             }
         }
+        self.update_vips();
     }
 
     fn handle_link_result(&mut self, outcome: LinkOutcome) {
@@ -2304,6 +2525,7 @@ impl Runtime {
     /// Drops every link to a peer.
     fn drop_links_for(&mut self, peer: EndpointId) {
         self.retirement_cursor.remove(&peer);
+        self.vip_cursor.remove(&peer);
         self.reset_peer_data(peer, "peer session ended");
         self.hub.remove_peer(peer);
         self.reachable.remove(&peer);
@@ -2664,6 +2886,7 @@ impl Runtime {
                     tracing::debug!(%err, "could not queue pong");
                 }
             }
+            ControlMessage::Vips { entries } => self.pending_vips.push(entries.clone()),
             ControlMessage::State { records } => {
                 self.pending_state.push((peer, records.clone()));
             }
@@ -2891,6 +3114,7 @@ impl Runtime {
         members.dedup_by(|a, b| a.endpoint_id == b.endpoint_id);
 
         NetworkStatus {
+            vips: self.params.routes.vips.statuses(self.network_id),
             protocols: self
                 .params
                 .plugins

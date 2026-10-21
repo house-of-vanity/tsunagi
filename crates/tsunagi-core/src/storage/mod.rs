@@ -370,6 +370,25 @@ impl Storage {
             .await
     }
 
+    /// Loads mandatory signed VIP fields with a strict capacity bound.
+    pub async fn vip_fields(
+        &self,
+        network: NetworkId,
+        max: usize,
+    ) -> Result<Vec<crate::vip::VipEntry>> {
+        self.with_state(move |state| state.vip_fields(network, max))
+            .await
+    }
+    /// Stores a complete merged service snapshot and optional own counter.
+    pub async fn put_vip_fields(
+        &self,
+        network: NetworkId,
+        entries: Vec<crate::vip::VipEntry>,
+        own: Option<([u8; 32], u64)>,
+    ) -> Result<()> {
+        self.with_state(move |state| state.put_vip_fields(network, &entries, own))
+            .await
+    }
     /// Loads verified durable cleanup proofs off the executor.
     pub async fn retirements(
         &self,

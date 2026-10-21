@@ -38,6 +38,8 @@
 //! `docs/sync-model.md` for the implemented cleanup semantics.
 
 pub mod allocator;
+/// Signed shared virtual service state and its merge rules.
+pub mod vip;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;

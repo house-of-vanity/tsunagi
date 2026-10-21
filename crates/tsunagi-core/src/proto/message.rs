@@ -20,7 +20,7 @@ use crate::error::ProtocolError;
 /// The version in the ALPN is the wire-compatibility version of the control
 /// protocol. It is independent of the network identity scheme version, so
 /// bumping it must not change any existing [`crate::NetworkId`].
-pub const ALPN: &[u8] = b"tsunagi/ctrl/7";
+pub const ALPN: &[u8] = b"tsunagi/ctrl/8";
 
 /// ALPN of the tsunagi data plane.
 ///
@@ -43,7 +43,7 @@ pub const MAX_DATA_PROTOCOL_LEN: usize = 32;
 pub const MAX_SIGNATURE_LEN: usize = 64;
 
 /// Control protocol version carried inside the handshake.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 pub use crate::dataplane::transport::{MAX_TRANSPORT_PAYLOAD, TransportPayload};
 
@@ -181,6 +181,11 @@ pub enum ControlMessage {
         /// Short free-text reason.
         reason: String,
     },
+    /// One complete signed VIP field snapshot, merged atomically.
+    Vips {
+        /// Signed registers bounded by the per-VIP field limit.
+        entries: Vec<crate::vip::VipEntry>,
+    },
     /// Signed cleanup markers, each proving the retired claim version.
     Retirements {
         /// Bounded by the per-message signed-state limit.
@@ -278,6 +283,15 @@ pub fn validate_capability(
 /// network, the other networks or the agent.
 pub fn validate(message: &ControlMessage, limits: &Limits) -> Result<(), ProtocolError> {
     match message {
+        ControlMessage::Vips { entries } => {
+            check_len("vip.fields", entries.len(), limits.max_vip_fields)?;
+            for e in entries {
+                check_len("vip.id", e.vip.len(), 32)?;
+                check_len("vip.key", e.key.len(), 160)?;
+                check_len("vip.value", e.value.as_ref().map_or(0, Vec::len), 256)?;
+                check_len("vip.signature", e.signature.len(), 64)?;
+            }
+        }
         ControlMessage::Retirements { markers } => {
             check_len("retirements", markers.len(), limits.max_state_records)?;
             for marker in markers {
@@ -373,6 +387,7 @@ pub fn kind(message: &ControlMessage) -> &'static str {
         ControlMessage::Pong { .. } => "pong",
         ControlMessage::State { .. } => "state",
         ControlMessage::Retirements { .. } => "retirements",
+        ControlMessage::Vips { .. } => "vips",
         ControlMessage::Reachable { .. } => "reachable",
         ControlMessage::Peers { .. } => "peers",
         ControlMessage::Bye { .. } => "bye",

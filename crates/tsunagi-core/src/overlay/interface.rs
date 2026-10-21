@@ -145,18 +145,19 @@ impl Tally {
 }
 
 /// The overlay interface.
-#[derive(Debug)]
 pub struct Interface {
     device: Arc<dyn TunDevice>,
     factory: Arc<dyn TunFactory>,
     name: String,
     mtu: u32,
     routes: Arc<RoutingTable>,
+    carrier: Arc<dyn PacketCarrier>,
     tally: Arc<Tally>,
     /// What was last applied to the host, so an unchanged table is not
     /// re-applied on every pass.
     applied: std::sync::Mutex<Vec<Cidr>>,
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    vip_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     sync_lock: Arc<tokio::sync::Mutex<()>>,
     /// The host rules for this interface, when the factory manages the host.
     host_rules: Option<Arc<dyn BroadcastHostRules>>,
@@ -200,6 +201,14 @@ impl ExitState {
     }
 }
 
+impl std::fmt::Debug for Interface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Interface")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Interface {
     /// Creates the interface and starts moving packets.
     pub async fn start(
@@ -221,7 +230,29 @@ impl Interface {
         let name = device.name().to_string();
         let tally = Arc::new(Tally::default());
 
+        let vip_task = {
+            let routes = Arc::clone(&routes);
+            let carrier = Arc::clone(&carrier);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut checks = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _=interval.tick()=>{
+                            let (probes,jobs)=routes.vips.tick(routes.vips.check_capacity().saturating_sub(checks.len()));
+                            for (route,packet) in probes {carrier.carry(route,packet);}
+                            for job in jobs {checks.spawn(job.run());}
+                        },
+                        Some(result)=checks.join_next(),if !checks.is_empty()=>{
+                            if let Ok((job,ok))=result {routes.vips.checked(job,ok);}
+                        }
+                    }
+                }
+            })
+        };
         let task = {
+            let carrier = Arc::clone(&carrier);
             let device = Arc::clone(&device);
             let routes = Arc::clone(&routes);
             let tally = Arc::clone(&tally);
@@ -231,6 +262,26 @@ impl Interface {
                         tally.malformed.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
+                    match routes.vips.outgoing(packet.clone()) {
+                        crate::vip::router::Decision::Send(route, packet) => {
+                            for part in crate::vip::packet::fragments(packet, mtu) {
+                                if carrier.carry(route, part) {
+                                    tally.sent.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    tally.undeliverable.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            continue;
+                        }
+                        crate::vip::router::Decision::Local(packet) => {
+                            for part in crate::vip::packet::fragments(packet, mtu) {
+                                let _ = device.send(part).await;
+                            }
+                            continue;
+                        }
+                        crate::vip::router::Decision::Drop => continue,
+                        crate::vip::router::Decision::Pass => {}
+                    }
                     let destination = header.destination();
                     if let (IpAddr::V4(source), IpAddr::V4(destination)) =
                         (header.source(), destination)
@@ -279,9 +330,11 @@ impl Interface {
             name,
             mtu,
             routes,
+            carrier,
             tally,
             applied: std::sync::Mutex::new(Vec::new()),
             task: std::sync::Mutex::new(Some(task)),
+            vip_task: std::sync::Mutex::new(Some(vip_task)),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             host_rules,
             rules_report: std::sync::Mutex::new(None),
@@ -716,6 +769,15 @@ impl Interface {
             task.abort();
             let _ = task.await;
         }
+        let vip_task = self
+            .vip_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(task) = vip_task {
+            task.abort();
+            let _ = task.await;
+        }
         self.factory.destroy(self.device.name()).await;
     }
 
@@ -770,6 +832,24 @@ impl Interface {
                 return Err(Rejected::WrongDestination);
             }
         };
+        // Source ownership was checked before any VIP reverse translation.
+        let packet = match self.routes.vips.incoming(network, peer, packet.clone()) {
+            crate::vip::router::Decision::Send(route, packet) => {
+                // Probe replies use the ordinary peer carrier, never the TUN.
+                self.carrier.carry(route, packet);
+                return Ok(());
+            }
+            crate::vip::router::Decision::Local(packet) => {
+                for part in crate::vip::packet::fragments(packet, self.mtu) {
+                    if self.device.send(part).await.is_ok() {
+                        self.tally.received.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return Ok(());
+            }
+            crate::vip::router::Decision::Drop => return Ok(()),
+            crate::vip::router::Decision::Pass => packet,
+        };
         // Remote broadcasts terminate here. Only local TUN ingress can fan out.
         if self.device.send(packet).await.is_ok() {
             if broadcast {
@@ -794,6 +874,14 @@ impl Interface {
 
 impl Drop for Interface {
     fn drop(&mut self) {
+        if let Some(task) = self
+            .vip_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            task.abort();
+        }
         if let Ok(mut guard) = self.task.lock()
             && let Some(task) = guard.take()
         {

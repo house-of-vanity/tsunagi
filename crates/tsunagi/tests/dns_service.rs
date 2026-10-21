@@ -345,3 +345,95 @@ fn opposing_dns_flags_are_rejected() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("cannot be used with"));
 }
+
+#[test]
+fn vip_cli_creates_multiple_ports_updates_dns_and_rejects_partial_invalid_changes() {
+    let agent = start("vip-test", 15367);
+    let created = agent.run(&["vip", "create", "vip-test", "api", "--json"]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let vip: tsunagi::vip::VipStatus = serde_json::from_slice(&created.stdout).unwrap();
+    assert!(vip.config.listeners.is_empty());
+    let reply = wait_for_answer("127.0.0.1:15367".parse().unwrap(), "api.vip-test");
+    assert!(has_answer(&reply));
+    let socket = tsunagi::ipc::control_socket_path(&agent.dir.path().join("state"));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let status = runtime
+        .block_on(tsunagi::ipc::request_status(socket))
+        .unwrap();
+    let backend = format!("{}:6443", status.endpoint_id);
+    let added = agent.run(&[
+        "vip",
+        "port",
+        "add",
+        "vip-test",
+        "api",
+        "tcp/443",
+        "--backend",
+        &backend,
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(
+        agent
+            .run(&["vip", "port", "add", "vip-test", "api", "udp/53"])
+            .status
+            .success()
+    );
+    assert!(
+        !agent
+            .run(&["vip", "port", "add", "vip-test", "api", "tcp/443"])
+            .status
+            .success()
+    );
+    assert!(
+        agent
+            .run(&[
+                "vip",
+                "port",
+                "set",
+                "vip-test",
+                "api",
+                "tcp/443",
+                "--port-check",
+                "off"
+            ])
+            .status
+            .success()
+    );
+    let shown = agent.run(&["vip", "show", "vip-test", "api", "--json"]);
+    assert!(shown.status.success());
+    let shown: tsunagi::vip::VipStatus = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown.config.listeners.len(), 2);
+    assert!(
+        !shown
+            .config
+            .listeners
+            .iter()
+            .find(|l| l.protocol == tsunagi::vip::Protocol::Tcp)
+            .unwrap()
+            .port_check
+    );
+    assert_eq!(shown.config.listeners[0].backends[0].port, 6443);
+    let removed = agent.run(&["vip", "remove", "vip-test", "api"]);
+    assert!(removed.status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(reply) = query("127.0.0.1:15367".parse().unwrap(), "api.vip-test", TYPE::A)
+            && !has_answer(&reply)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}

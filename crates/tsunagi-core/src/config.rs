@@ -158,6 +158,22 @@ pub enum TransportPolicy {
 /// object where that is possible (notably [`Limits::max_frame_len`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
+    /// Maximum active VIP identities per network.
+    pub max_vips: usize,
+    /// Maximum permanent VIP deletion tombstones per network.
+    pub max_vip_tombstones: usize,
+    /// Maximum concurrent active TCP port checks across the agent.
+    pub max_vip_checks: usize,
+    /// Maximum signed fields per VIP, including removed fields.
+    pub max_vip_fields: usize,
+    /// Maximum listeners per VIP.
+    pub max_vip_listeners: usize,
+    /// Maximum backend endpoints per listener.
+    pub max_vip_backends: usize,
+    /// Maximum simultaneous local VIP flow bindings.
+    pub max_vip_flows: usize,
+    /// Maximum incomplete IPv4 datagrams per network in VIP reassembly.
+    pub max_vip_fragments: usize,
     /// Largest accepted control frame payload, in bytes.
     pub max_frame_len: usize,
     /// Largest accepted hostname, in bytes.
@@ -205,6 +221,14 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_vips: 64,
+            max_vip_tombstones: 1024,
+            max_vip_checks: 32,
+            max_vip_fields: 192,
+            max_vip_listeners: 16,
+            max_vip_backends: 32,
+            max_vip_flows: 4096,
+            max_vip_fragments: 64,
             max_frame_len: 64 * 1024,
             max_hostname_len: 255,
             max_capabilities: 16,

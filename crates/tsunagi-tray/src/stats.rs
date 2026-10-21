@@ -34,7 +34,7 @@ pub(crate) struct Series {
 }
 
 impl Series {
-    fn sample(&mut self, now: Instant, packets: u64, bytes: u64) {
+    pub(crate) fn sample(&mut self, now: Instant, packets: u64, bytes: u64) {
         if let Some((then, prev_packets, prev_bytes)) = self.last {
             let dt = now.saturating_duration_since(then).as_secs_f32();
             if dt > 0.0 {
