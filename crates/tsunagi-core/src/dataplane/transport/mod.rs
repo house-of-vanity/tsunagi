@@ -33,6 +33,9 @@ mod fragments;
 pub(crate) mod health;
 pub mod iroh_link;
 
+pub mod carrier;
+pub use carrier::{DataCarrier, SharedCarrier};
+
 use std::sync::Arc;
 
 use bytes::Bytes;

@@ -37,6 +37,7 @@ fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::R
                         .peers
                         .iter()
                         .map(|peer| tsunagi::ipc::PeerReport {
+                            data_error: None,
                             endpoint_id: peer.endpoint_id.to_string(),
                             hostname: peer.hostname.clone(),
                             transport: format!("{:?}", peer.transport),
@@ -107,7 +108,10 @@ async fn a_client_sees_the_agent_and_its_overlay() {
     let agent = Agent::spawn(
         config_with(dir_a.path(), &discovery)
             .with_interface(Arc::new(tuns), "tca0", 1280)
-            .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+            .with_tunnel(plugin.clone() as Arc<dyn IpPlugin>)
+            .with_carrier(Arc::new(
+                tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+            )),
     )
     .await
     .unwrap();
@@ -122,7 +126,10 @@ async fn a_client_sees_the_agent_and_its_overlay() {
     let agent_b = Agent::spawn(
         config_with(dir_b.path(), &discovery)
             .with_interface(Arc::new(MemoryTunFactory::new()), "tcb0", 1280)
-            .with_plugin(plugin_b.clone() as Arc<dyn IpPlugin>),
+            .with_tunnel(plugin_b.clone() as Arc<dyn IpPlugin>)
+            .with_carrier(Arc::new(
+                tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+            )),
     )
     .await
     .unwrap();

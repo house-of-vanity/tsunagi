@@ -135,6 +135,10 @@ impl Inner {
             .await
             {
                 Ok(interface) => {
+                    self.adapter.exclude_interface(interface.name());
+                    for carrier in &self.config.carriers {
+                        carrier.on_interface_ready(interface.name());
+                    }
                     let _ = self.interface.set(Arc::new(interface));
                 }
                 Err(err) => {
@@ -188,14 +192,13 @@ impl PacketCarrier for Carrier {
         let Some(inner) = self.0.upgrade() else {
             return false;
         };
-        // Offered to each protocol in turn. With one configured this is a
-        // single call; the shape is what allows several to be live at once,
-        // each carrying the peers it has a link to.
+        // Every routed IP packet enters the same internal cipher, whatever
+        // physical carrier currently supplies the logical peer link.
         inner
             .config
-            .plugins
-            .iter()
-            .any(|plugin| plugin.carry(route.network, route.peer, packet.clone()))
+            .tunnel
+            .as_ref()
+            .is_some_and(|tunnel| tunnel.carry(route.network, route.peer, packet))
     }
 }
 
@@ -213,21 +216,6 @@ impl PacketSink for Sink {
             let Some(inner) = self.0.upgrade() else {
                 return;
             };
-            if let Some(payload) = crate::dataplane::transport::health::ip_payload(&packet) {
-                if let Some(header) = crate::overlay::IpHeader::parse(&packet)
-                    && let (std::net::IpAddr::V4(source), std::net::IpAddr::V4(destination)) =
-                        (header.source(), header.destination())
-                    && inner.routes.may_send_from(network, peer, source)
-                    && inner.routes.is_local_destination(network, destination)
-                    && let Some(handle) = inner.networks.read().await.get(&network)
-                {
-                    let _ = handle.commands.try_send(NetCommand::HealthProbe {
-                        peer,
-                        packet: bytes::Bytes::copy_from_slice(payload),
-                    });
-                }
-                return;
-            }
             let Some(interface) = inner.interface.get() else {
                 return;
             };
@@ -301,7 +289,7 @@ impl TransportContext for TransportCtx {
             }
             inner
                 .config
-                .plugins
+                .carriers
                 .iter()
                 .any(|plugin| plugin.protocol_id() == protocol)
         })
@@ -359,20 +347,23 @@ impl Agent {
             .unwrap_or_else(|| {
                 self.inner
                     .config
-                    .plugins
+                    .carriers
                     .iter()
                     .map(|p| p.protocol_id().to_owned())
                     .collect()
             })
     }
 
-    fn selected_plugins(&self, protocols: &[String]) -> Vec<crate::dataplane::SharedPlugin> {
+    fn selected_carriers(
+        &self,
+        protocols: &[String],
+    ) -> Vec<crate::dataplane::transport::SharedCarrier> {
         protocols
             .iter()
             .filter_map(|name| {
                 self.inner
                     .config
-                    .plugins
+                    .carriers
                     .iter()
                     .find(|p| p.protocol_id() == name)
                     .cloned()
@@ -388,7 +379,7 @@ impl Agent {
             if !self
                 .inner
                 .config
-                .plugins
+                .carriers
                 .iter()
                 .any(|p| p.protocol_id() == name)
             {
@@ -429,7 +420,7 @@ impl Agent {
         if let Some(protocols) = &config.default_protocols {
             crate::dataplane::validate_protocols(protocols, config.limits.max_capabilities)?;
             for name in protocols {
-                if !config.plugins.iter().any(|p| p.protocol_id() == name) {
+                if !config.carriers.iter().any(|p| p.protocol_id() == name) {
                     return Err(Error::InvalidProtocols(format!(
                         "this agent has no `{name}` plugin"
                     )));
@@ -508,7 +499,7 @@ impl Agent {
         // Plugins get a handle to ask for re-announcements and report errors.
         // A bounded queue keeps a noisy plugin from growing memory without
         // bound; overflow drops the request rather than stalling the plugin.
-        if !inner.config.plugins.is_empty() {
+        if !inner.config.carriers.is_empty() || inner.config.tunnel.is_some() {
             let (plugin_tx, plugin_rx) = mpsc::channel(64);
             let sink = inner
                 .config
@@ -516,8 +507,8 @@ impl Agent {
                 .as_ref()
                 .map(|_| Arc::new(Sink(Arc::downgrade(&inner))) as Arc<dyn PacketSink>);
             let context = PluginContext::new(plugin_tx, inner.identity.endpoint_id(), sink);
-            for plugin in &inner.config.plugins {
-                plugin.attach(context.clone());
+            if let Some(tunnel) = &inner.config.tunnel {
+                tunnel.attach(context);
             }
             let task = tokio::spawn(plugin_request_loop(Arc::downgrade(&inner), plugin_rx));
             if let Ok(mut guard) = inner.plugin_task.lock() {
@@ -1008,7 +999,7 @@ impl Agent {
         let broadcast = stored.as_ref().is_none_or(|stored| stored.broadcast);
         let protocols =
             self.effective_protocols(stored.as_ref().and_then(|s| s.protocols.as_ref()));
-        let plugins = self.selected_plugins(&protocols);
+        let plugins = self.selected_carriers(&protocols);
         if !plugins.is_empty() {
             self.inner.ensure_interface().await;
         }
@@ -1032,8 +1023,9 @@ impl Agent {
             discovery,
             discovery_interval: self.inner.config.discovery_interval,
             discovery_policy: self.inner.config.discovery_policy.clone(),
-            available_plugins: self.inner.config.plugins.clone(),
-            plugins: plugins.clone(),
+            available_carriers: self.inner.config.carriers.clone(),
+            tunnel: self.inner.config.tunnel.clone(),
+            carriers: plugins.clone(),
             routes: Arc::clone(&self.inner.routes),
             interface: self.inner.interface.get().cloned(),
             hostname: self.inner.read_hostname(),
@@ -1049,6 +1041,9 @@ impl Agent {
 
         for plugin in &plugins {
             plugin.on_network_activated(network_id);
+        }
+        if let Some(tunnel) = &self.inner.config.tunnel {
+            tunnel.on_network_activated(network_id);
         }
 
         let _ = self.inner.events.send(Event::NetworkActivated {
@@ -1094,8 +1089,11 @@ impl Agent {
                 .ok_or(Error::NetworkNotActive(network_id))?
         };
         handle.stop().await;
-        for plugin in &self.inner.config.plugins {
+        for plugin in &self.inner.config.carriers {
             plugin.on_network_deactivated(network_id);
+        }
+        if let Some(tunnel) = &self.inner.config.tunnel {
+            tunnel.on_network_deactivated(network_id);
         }
         // The network's addresses come off the interface; the interface
         // itself stays, because the agent owns it and other networks may
@@ -1129,8 +1127,11 @@ impl Agent {
             self.stop_network_locked(network_id).await?;
         }
         self.inner.storage.remove_network(network_id).await?;
-        for plugin in &self.inner.config.plugins {
+        for plugin in &self.inner.config.carriers {
             plugin.on_network_forgotten(network_id);
+        }
+        if let Some(tunnel) = &self.inner.config.tunnel {
+            tunnel.on_network_forgotten(network_id).await;
         }
         self.resume_networks_locked().await
     }
@@ -1423,7 +1424,7 @@ impl Agent {
 
         // Plugins remove whatever system objects they created. A plugin that
         // misbehaves here must not hold up the agent, so this is bounded.
-        for plugin in &self.inner.config.plugins {
+        for plugin in &self.inner.config.carriers {
             if tokio::time::timeout(PLUGIN_SHUTDOWN_GRACE, plugin.shutdown())
                 .await
                 .is_err()
@@ -1433,6 +1434,14 @@ impl Agent {
                     "plugin did not shut down in time"
                 );
             }
+        }
+
+        if let Some(tunnel) = &self.inner.config.tunnel
+            && tokio::time::timeout(PLUGIN_SHUTDOWN_GRACE, tunnel.shutdown())
+                .await
+                .is_err()
+        {
+            tracing::warn!("data encryption engine did not shut down in time");
         }
 
         // Release the directory so another instance can claim it right away.

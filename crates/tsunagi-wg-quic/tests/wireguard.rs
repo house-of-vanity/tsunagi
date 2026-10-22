@@ -121,7 +121,10 @@ impl WgAgent {
         let agent = Agent::spawn(
             config_with(dir.path(), discovery)
                 .with_interface(Arc::new(tuns.clone()), tag, 1280)
-                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+                .with_tunnel(plugin.clone() as Arc<dyn IpPlugin>)
+                .with_carrier(Arc::new(
+                    tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+                )),
         )
         .await
         .unwrap();
@@ -193,7 +196,10 @@ impl WgAgent {
             config_with(root, discovery)
                 .with_overlay_ipv4_range(range)
                 .with_interface(Arc::new(tuns.clone()), tag, 1280)
-                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+                .with_tunnel(plugin.clone() as Arc<dyn IpPlugin>)
+                .with_carrier(Arc::new(
+                    tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+                )),
         )
         .await
         .unwrap();
@@ -225,7 +231,10 @@ impl WgAgent {
                 .with_overlay_ipv4_range(Some(tsunagi::state::DEFAULT_IPV4_RANGE))
                 .with_interface(Arc::new(tuns.clone()), tag, 1280)
                 .with_unreachable_data_peers(blocked)
-                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+                .with_tunnel(plugin.clone() as Arc<dyn IpPlugin>)
+                .with_carrier(Arc::new(
+                    tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+                )),
         )
         .await
         .unwrap();
@@ -254,7 +263,10 @@ impl WgAgent {
             config_with(dir.path(), discovery)
                 .with_overlay_ipv4_range(Some(tsunagi::state::DEFAULT_IPV4_RANGE))
                 .with_interface(Arc::new(PretendHostTuns(tuns.clone())), tag, 1280)
-                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+                .with_tunnel(plugin.clone() as Arc<dyn IpPlugin>)
+                .with_carrier(Arc::new(
+                    tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+                )),
         )
         .await
         .unwrap();
@@ -458,9 +470,51 @@ async fn two_agents_carry_real_ip_packets_through_a_wireguard_tunnel() {
     let view = a.plugin.overview(network_id).unwrap();
     let tunnel = view.peers[0].tunnel.as_ref().unwrap();
     assert!(tunnel.health.is_up());
-    assert!(tunnel.stats.tx_packets >= 1);
-    assert!(tunnel.stats.rx_packets >= 1);
+    wait_until(
+        "plaintext counters exclude carrier probes and encryption overhead",
+        || async {
+            let view = a.plugin.overview(network_id)?;
+            let stats = view.peers[0].tunnel.as_ref()?.stats;
+            (stats.tx_packets == 1
+                && stats.rx_packets == 1
+                && stats.tx_bytes == (20 + payload.len()) as u64
+                && stats.rx_bytes == (20 + b"and back".len()) as u64)
+                .then_some(())
+        },
+    )
+    .await;
     assert_eq!(tunnel.stats.dropped_wrong_source, 0);
+
+    let before = a.plugin.overview(network_id).unwrap().peers[0]
+        .tunnel
+        .as_ref()
+        .unwrap()
+        .stats;
+    a.agent.set_protocols(network_id, Vec::new()).await.unwrap();
+    wait_until("no remaining physical path", || async {
+        matches!(
+            a.agent.network_status(network_id).await.ok()?.peers[0].data_path,
+            tsunagi::agent::DataPath::None
+        )
+        .then_some(())
+    })
+    .await;
+    assert!(!a.plugin.carry(
+        network_id,
+        b.agent.endpoint_id(),
+        ipv4_packet(addr_a, addr_b, b"refused by transport")
+    ));
+    let after = a.plugin.overview(network_id).unwrap().peers[0]
+        .tunnel
+        .as_ref()
+        .unwrap()
+        .stats;
+    assert_eq!(after.counter_epoch, before.counter_epoch);
+    assert_eq!(
+        after.tx_bytes, before.tx_bytes,
+        "a refused send is not transmitted traffic"
+    );
+    assert_eq!(after.tx_packets, before.tx_packets);
 
     a.shutdown().await;
     b.shutdown().await;
@@ -1151,10 +1205,12 @@ async fn the_core_carries_the_payload_without_interpreting_it() {
 
     let capability = wait_until("the peer's capability arrived", || async {
         let status: NetworkStatus = a.agent.network_status(network_id).await.ok()?;
-        status
-            .peers
-            .first()
-            .and_then(|peer| peer.capabilities.first().cloned())
+        status.peers.first().and_then(|peer| {
+            peer.capabilities
+                .iter()
+                .find(|cap| cap.protocol == WIREGUARD_PROTOCOL)
+                .cloned()
+        })
     })
     .await;
     assert_eq!(capability.protocol, WIREGUARD_PROTOCOL);
@@ -1197,7 +1253,10 @@ async fn an_announcement_for_another_network_never_reaches_a_tunnel() {
     let attacker_dir = TempDir::new().unwrap();
     let attacker = Agent::spawn(
         config_with(attacker_dir.path(), &discovery)
-            .with_plugin(forger.clone() as Arc<dyn IpPlugin>),
+            .with_tunnel(forger.clone() as Arc<dyn IpPlugin>)
+            .with_carrier(Arc::new(
+                tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+            )),
     )
     .await
     .unwrap();
@@ -1246,7 +1305,11 @@ async fn a_peer_at_another_protocol_version_gets_no_data_plane_and_keeps_the_con
     let ahead = Arc::new(FromTheFuture);
     let dir = TempDir::new().unwrap();
     let other = Agent::spawn(
-        config_with(dir.path(), &discovery).with_plugin(ahead.clone() as Arc<dyn IpPlugin>),
+        config_with(dir.path(), &discovery)
+            .with_tunnel(ahead.clone() as Arc<dyn IpPlugin>)
+            .with_carrier(Arc::new(
+                tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+            )),
     )
     .await
     .unwrap();
@@ -1273,10 +1336,16 @@ async fn a_peer_at_another_protocol_version_gets_no_data_plane_and_keeps_the_con
     );
     let status = here.agent.network_status(network_id).await.unwrap();
     assert_eq!(status.peers.len(), 1, "the session is up all the same");
+    assert_eq!(
+        status.peers[0].protocols,
+        ["wg-quic"],
+        "external capability remains independent"
+    );
     assert!(
-        status.peers[0].protocols.is_empty(),
-        "nothing was agreed with it: {:?}",
-        status.peers[0].protocols
+        status.peers[0]
+            .data_error
+            .as_deref()
+            .is_some_and(|reason| reason.contains("update both agents"))
     );
 
     // And the control plane carries a message to it regardless.
@@ -1317,7 +1386,11 @@ async fn agreement_turns_on_the_protocol_version_and_nothing_else() {
     });
     let dir = TempDir::new().unwrap();
     let other = Agent::spawn(
-        config_with(dir.path(), &discovery).with_plugin(stranger.clone() as Arc<dyn IpPlugin>),
+        config_with(dir.path(), &discovery)
+            .with_tunnel(stranger.clone() as Arc<dyn IpPlugin>)
+            .with_carrier(Arc::new(
+                tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+            )),
     )
     .await
     .unwrap();
@@ -1332,8 +1405,12 @@ async fn agreement_turns_on_the_protocol_version_and_nothing_else() {
         status
             .peers
             .first()?
-            .protocols
-            .contains(&WIREGUARD_PROTOCOL.to_string())
+            .capabilities
+            .iter()
+            .any(|cap| {
+                cap.protocol == WIREGUARD_PROTOCOL
+                    && cap.version == tsunagi_wg_quic::ANNOUNCEMENT_VERSION
+            })
             .then_some(())
     })
     .await;

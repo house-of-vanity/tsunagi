@@ -162,7 +162,7 @@ Keep these separate. Crossing them is the main thing to review for.
 | `crates/tsunagi-core/src/overlay/`   | the one interface an agent owns: provisioning, the TUN, routing, source checks, broadcast host rules |
 | `crates/tsunagi-core/src/dataplane/` | the protocol contract and the authenticated packet transport |
 | `crates/tsunagi-core/src/dns/`       | the DNS view of a network: zone, server, resolver publication |
-| `crates/tsunagi-wg-quic/`       | the `wg-quic` protocol: its keys, its announcement, its tunnels |
+| `crates/tsunagi-wg-quic/`       | the single internal WireGuard cipher, keys and opaque announcement; historical crate name |
 | `crates/tsunagi/` | the command line agent, built as `tsng`; the only place that owns a runtime, a logger and signals |
 | `tests/`            | integration tests; `tests/common/` is the shared harness |
 

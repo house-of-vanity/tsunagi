@@ -464,6 +464,17 @@ impl TcpTlsTransport {
         }
     }
 
+    /// Replaces a bounded candidate set learned through an authenticated session.
+    pub fn replace_peer_addrs(&self, peer: EndpointId, addresses: Vec<SocketAddr>) {
+        if let Ok(mut peers) = self.peer_addresses.write() {
+            if addresses.is_empty() {
+                peers.remove(&peer);
+            } else {
+                peers.insert(peer, addresses.into_iter().take(32).collect());
+            }
+        }
+    }
+
     /// Runs the accept loop for inbound TCP TLS connections.
     pub async fn accept_loop<F>(&self, on_inbound: F)
     where

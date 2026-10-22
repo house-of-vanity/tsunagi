@@ -1,28 +1,19 @@
-//! Boundary between the control plane core and future IP plugins.
+//! Boundaries between the agent, one IP encryption tunnel, and external carriers.
 //!
-//! The data plane is where actual IP connectivity is created. WireGuard is the
-//! first planned plugin; none is implemented here.
+//! The core moves bounded opaque capabilities without parsing cipher payloads.
+//! An [`IpPlugin`] sees routed IP packets and a logical [`PacketLink`] per peer;
+//! it never learns reachability or the network secret. The agent configures one
+//! such plugin. Built-in agents use the same internal WireGuard cipher for every
+//! peer, regardless of which external transports carry the encrypted bytes.
 //!
-//! Two rules shape this module:
-//!
-//! 1. **The core never parses plugin payloads.** A [`PluginCapability`] carries
-//!    a protocol id, a version, an enabled flag and a bounded opaque blob. The
-//!    core transports the blob and hands it to the matching plugin. It does not
-//!    know what a WireGuard configuration looks like.
-//! 2. **Plugin keys and lifecycle are separate from iroh identity and from the
-//!    network secret.** A plugin owns its own keys and its own system objects.
-//!
-//! An iroh address is *not* automatically a WireGuard address. A future plugin
-//! is expected to gather its own reachability information and ship it through
-//! the control plane as its announcement payload.
-//!
-//! A data plane failure never stops the daemon: errors returned here are
-//! recorded and surfaced, the control plane keeps running.
+//! [`transport::DataCarrier`] owns external capability negotiation and lifecycle.
+//! It sees reachability but never plaintext overlay packets. A relay forwards
+//! the encrypted inner bytes without entering an IP plugin or the TUN.
+//! Data-plane failure never stops control sessions or discovery.
 
 pub mod relay;
 pub mod routing;
 pub mod transport;
-pub mod tunnel;
 
 use std::sync::Arc;
 
@@ -35,7 +26,6 @@ use crate::identity::NetworkId;
 pub use transport::{
     MultiPacketTransport, PacketLink, PacketTransport, SharedLink, TransportError,
 };
-pub use tunnel::{GenericTunnelPlugin, TunnelCodec};
 
 /// Maximum length of a plugin protocol identifier.
 pub const MAX_PROTOCOL_ID_LEN: usize = 32;
@@ -438,7 +428,9 @@ pub trait IpPlugin: Send + Sync + std::fmt::Debug + 'static {
     /// Always preceded by [`IpPlugin::on_network_deactivated`], so this is
     /// only about what outlives a session. Defaulted to nothing, for a
     /// plugin that stores nothing.
-    fn on_network_forgotten(&self, _network: NetworkId) {}
+    fn on_network_forgotten(&self, _network: NetworkId) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
 
     /// Called once when the agent shuts down.
     ///

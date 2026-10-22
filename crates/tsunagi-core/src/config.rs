@@ -353,10 +353,12 @@ pub struct AgentConfig {
     pub limits: Limits,
     /// Reconnect backoff policy.
     pub reconnect: ReconnectPolicy,
-    /// IP plugins whose capabilities are announced and dispatched.
-    pub plugins: Vec<SharedPlugin>,
+    /// External data carriers whose capabilities are announced and dispatched.
+    pub carriers: Vec<crate::dataplane::transport::SharedCarrier>,
+    /// The single internal end-to-end engine, independent of carrier selection.
+    pub tunnel: Option<SharedPlugin>,
     /// Initial ordered selection for networks without a saved override.
-    /// `None` enables all registered plugins; an empty list is control-only.
+    /// `None` enables all registered carriers; an empty list is control-only.
     pub default_protocols: Option<Vec<String>>,
     /// Custom packet transports registered per protocol.
     pub custom_transports:
@@ -405,7 +407,8 @@ impl AgentConfig {
             discovery_interval: Duration::from_secs(5),
             limits: Limits::default(),
             reconnect: ReconnectPolicy::default(),
-            plugins: Vec::new(),
+            carriers: Vec::new(),
+            tunnel: None,
             default_protocols: None,
             custom_transports: std::collections::HashMap::new(),
             tun_factory: None,
@@ -489,9 +492,15 @@ impl AgentConfig {
         self
     }
 
-    /// Registers an IP plugin.
-    pub fn with_plugin(mut self, plugin: SharedPlugin) -> Self {
-        self.plugins.push(plugin);
+    /// Registers an external data carrier.
+    pub fn with_carrier(mut self, plugin: crate::dataplane::transport::SharedCarrier) -> Self {
+        self.carriers.push(plugin);
+        self
+    }
+
+    /// Installs the internal encryption engine. It is never a selectable carrier.
+    pub fn with_tunnel(mut self, tunnel: SharedPlugin) -> Self {
+        self.tunnel = Some(tunnel);
         self
     }
 
@@ -545,9 +554,9 @@ impl std::fmt::Debug for AgentConfig {
             .field("limits", &self.limits)
             .field("reconnect", &self.reconnect)
             .field(
-                "plugins",
+                "carriers",
                 &self
-                    .plugins
+                    .carriers
                     .iter()
                     .map(|p| p.protocol_id().to_string())
                     .collect::<Vec<_>>(),

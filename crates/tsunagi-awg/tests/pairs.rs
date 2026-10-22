@@ -1,5 +1,7 @@
 //! Real membership, UDP sockets, pair negotiation and nested WireGuard encryption.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[path = "common/tcp.rs"]
+mod tcp;
 use bytes::Bytes;
 use std::{
     net::Ipv4Addr,
@@ -24,8 +26,7 @@ use tsunagi_wg_quic::WireguardConfig;
 
 struct Node {
     agent: Agent,
-    plugin: Arc<AwgPlugin>,
-    quic: Option<Arc<tsunagi_wg_quic::WireguardPlugin>>,
+    plugin: Arc<tsunagi_wg_quic::WireguardPlugin>,
     transport: Arc<AwgTransport>,
     tuns: MemoryTunFactory,
     loss: Arc<AtomicBool>,
@@ -65,11 +66,10 @@ impl Node {
                 .load_or_create_device_identity()
                 .unwrap();
         let transport = AwgTransport::new(identity.endpoint_id(), Ipv4Addr::LOCALHOST);
-        let plugin = AwgPlugin::open(
+        let plugin = tsunagi_wg_quic::WireguardPlugin::open(
             WireguardConfig::new(root.join("awg"))
                 .with_mtu(mtu)
                 .with_reconcile(Duration::from_millis(20), Duration::from_millis(250)),
-            transport.clone(),
         )
         .await
         .unwrap();
@@ -81,19 +81,13 @@ impl Node {
         let tuns = MemoryTunFactory::new();
         let mut config = config_with(root, discovery)
             .with_interface(Arc::new(tuns.clone()), interface, mtu)
-            .with_plugin(plugin.clone() as Arc<dyn IpPlugin>)
+            .with_tunnel(plugin.clone() as Arc<dyn IpPlugin>)
+            .with_carrier(AwgPlugin::new(transport.clone()))
             .with_custom_transport(AWG_PROTOCOL, faults);
-        let mut quic_plugin = None;
         if fallback {
-            let quic = tsunagi_wg_quic::WireguardPlugin::open(
-                WireguardConfig::new(root.join("wg-quic"))
-                    .with_mtu(mtu)
-                    .with_reconcile(Duration::from_millis(20), Duration::from_millis(250)),
-            )
-            .await
-            .unwrap();
-            config = config.with_plugin(quic.clone());
-            quic_plugin = Some(quic);
+            config = config.with_carrier(Arc::new(
+                tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+            ));
         }
         config.default_protocols = default_protocols;
         let agent = Agent::spawn(config).await.unwrap();
@@ -109,7 +103,6 @@ impl Node {
         Self {
             agent,
             plugin,
-            quic: quic_plugin,
             transport,
             tuns,
             loss,
@@ -252,7 +245,7 @@ async fn a_control_only_agent_enables_real_data_without_restart_and_cancels_stal
 }
 
 #[tokio::test]
-async fn runtime_protocol_selection_replaces_real_tunnels_and_survives_restart() {
+async fn runtime_protocol_selection_preserves_real_tunnels_and_survives_restart() {
     let discovery = SharedMemoryDiscovery::new();
     let roots = [TempDir::new().unwrap(), TempDir::new().unwrap()];
     let a = Node::open_with_fallback(roots[0].path(), &discovery, "runtime-a", true).await;
@@ -263,6 +256,12 @@ async fn runtime_protocol_selection_replaces_real_tunnels_and_survives_restart()
     a.ready(id, 1).await;
     b.ready(id, 1).await;
     exchange(&a, &b, id).await;
+    let original_key = a.plugin.overview(id).unwrap().public_key;
+    let original_stats = a.plugin.overview(id).unwrap().peers[0]
+        .tunnel
+        .as_ref()
+        .unwrap()
+        .stats;
 
     let (other_name, other_secret, other_id) = loop {
         let (name, secret) = network("unchanged-runtime-network");
@@ -338,13 +337,25 @@ async fn runtime_protocol_selection_replaces_real_tunnels_and_survives_restart()
         .then_some(())
     })
     .await;
-    // Get addresses from the system allocation: the disabled AWG plugin no
-    // longer has a live view of this network.
+    assert_eq!(a.plugin.overview(id).unwrap().public_key, original_key);
+    let stats = a.plugin.overview(id).unwrap().peers[0]
+        .tunnel
+        .as_ref()
+        .unwrap()
+        .stats;
+    assert_eq!(stats.counter_epoch, original_stats.counter_epoch);
+    assert!(stats.tx_bytes >= original_stats.tx_bytes);
+    assert!(stats.rx_bytes >= original_stats.rx_bytes);
+    assert!(a.plugin.overview(id).unwrap().peers.iter().any(|peer| {
+        peer.tunnel
+            .as_ref()
+            .is_some_and(|tunnel| tunnel.health.is_up())
+    }));
+    // The same internal plugin supplies addresses and counters on the new carrier.
     for (source, dest) in [(&a, &b), (&b, &a)] {
         wait_until("QUIC end-to-end handshake", || async {
             source
-                .quic
-                .as_ref()?
+                .plugin
                 .overview(id)?
                 .peers
                 .iter()
@@ -352,15 +363,7 @@ async fn runtime_protocol_selection_replaces_real_tunnels_and_survives_restart()
                 .then_some(())
         })
         .await;
-        let addr = |n: &Node| {
-            n.quic
-                .as_ref()
-                .unwrap()
-                .overview(id)
-                .unwrap()
-                .overlay_address_v4
-                .unwrap()
-        };
+        let addr = |n: &Node| n.plugin.overview(id).unwrap().overlay_address_v4.unwrap();
         let bytes = packet(addr(source), addr(dest), 1280);
         source.tun().push_from_os(bytes.clone());
         assert_eq!(
@@ -604,18 +607,13 @@ async fn persistent_runtime_loss_retires_the_pair_and_negotiates_fresh_parameter
     } else {
         &b
     };
-    let received = initiator.plugin.overview(id).unwrap().peers[0]
-        .tunnel
-        .as_ref()
-        .unwrap()
-        .stats
-        .rx_packets;
     let attempt = initiator.transport.overview(id)[0].attempt;
+    let received = initiator.transport.overview(id)[0].delivery_checks;
     wait_until(
-        "fresh pair delivery checks answered after installation",
+        "fresh physical delivery checks answered after installation",
         || async {
-            let view = initiator.plugin.overview(id)?;
-            (view.peers.first()?.tunnel.as_ref()?.stats.rx_packets >= received + 3).then_some(())
+            (initiator.transport.overview(id).first()?.delivery_checks >= received + 3)
+                .then_some(())
         },
     )
     .await;
@@ -749,11 +747,11 @@ async fn encrypted_health_checks_fit_a_smaller_peers_configured_interface_mtu() 
         bytes
     );
     wait_until(
-        "encrypted delivery checks answered with a small MTU",
+        "physical delivery checks do not depend on overlay MTU",
         || async {
-            let view = a.plugin.overview(id)?;
-            let peer = view.peers.first()?.tunnel.as_ref()?;
-            (peer.stats.rx_packets >= 3).then_some(())
+            (a.transport.overview(id).first()?.delivery_checks >= 4
+                && b.transport.overview(id).first()?.delivery_checks >= 4)
+                .then_some(())
         },
     )
     .await;
@@ -768,6 +766,182 @@ async fn encrypted_health_checks_fit_a_smaller_peers_configured_interface_mtu() 
             0
         );
     }
+    a.agent.shutdown().await;
+    b.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn disjoint_external_policies_relay_the_same_internal_tunnel_and_keep_it_when_routes_change()
+{
+    let discovery = SharedMemoryDiscovery::new();
+    let roots = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let a = Node::open_selected(
+        roots[0].path(),
+        &discovery,
+        "only-awg",
+        true,
+        1280,
+        Some(vec!["awg".into()]),
+    )
+    .await;
+    let b = Node::open_with_fallback(roots[1].path(), &discovery, "mixed-relay", true).await;
+    let c = Node::open_selected(
+        roots[2].path(),
+        &discovery,
+        "only-quic",
+        true,
+        1280,
+        Some(vec!["wg-quic".into()]),
+    )
+    .await;
+    let (name, secret) = network("independent-internal-encryption");
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    c.agent.join_network(&name, &secret).await.unwrap();
+    for node in [&a, &b, &c] {
+        wait_for_peers(&node.agent, id, 2).await;
+    }
+    wait_until("AWG-only to QUIC-only through an authenticated mixed relay", || async {
+        let status = a.agent.network_status(id).await.ok()?;
+        let peer = status.peers.iter().find(|p| p.endpoint_id == c.agent.endpoint_id())?;
+        (matches!(peer.data_path, tsunagi::agent::DataPath::Relayed { via, .. } if via == b.agent.endpoint_id()) && a.plugin.overview(id)?.established_peers() == 2 && c.plugin.overview(id)?.established_peers() == 2).then_some(())
+    }).await;
+    exchange(&a, &c, id).await;
+    exchange(&c, &a, id).await;
+    let mut tcp = tcp::TcpPair::connect(a.tun(), a.addr(id), c.tun(), c.addr(id)).await;
+    tcp.exchange(b"SSH-like TCP stream over the initial relay")
+        .await;
+    let key = a.plugin.overview(id).unwrap().public_key;
+    let before = a
+        .plugin
+        .overview(id)
+        .unwrap()
+        .peers
+        .iter()
+        .find(|p| p.endpoint_id == c.agent.endpoint_id())
+        .unwrap()
+        .tunnel
+        .as_ref()
+        .unwrap()
+        .stats
+        .tx_packets;
+    // A's additional permission creates a direct QUIC route without replacing its IP tunnel.
+    a.agent
+        .set_protocols(id, vec!["wg-quic".into(), "awg".into()])
+        .await
+        .unwrap();
+    wait_until("direct carrier replaces the relay", || async {
+        let status = a.agent.network_status(id).await.ok()?;
+        matches!(
+            status
+                .peers
+                .iter()
+                .find(|p| p.endpoint_id == c.agent.endpoint_id())?
+                .data_path,
+            tsunagi::agent::DataPath::Direct { .. }
+        )
+        .then_some(())
+    })
+    .await;
+    tcp.exchange(b"same TCP socket after changing the carrier and next hop")
+        .await;
+    assert_eq!(a.plugin.overview(id).unwrap().public_key, key);
+    assert!(
+        a.plugin
+            .overview(id)
+            .unwrap()
+            .peers
+            .iter()
+            .find(|p| p.endpoint_id == c.agent.endpoint_id())
+            .unwrap()
+            .tunnel
+            .as_ref()
+            .unwrap()
+            .stats
+            .tx_packets
+            > before
+    );
+    a.agent.set_protocols(id, Vec::new()).await.unwrap();
+    // Poll the actual TCP stack while the route is absent: its first transmission is lost.
+    let pending = b"TCP retransmission survives the temporary absence of every data carrier";
+    tcp.queue_while_unreachable(pending);
+    a.agent.set_protocols(id, vec!["awg".into()]).await.unwrap();
+    wait_until("forbidden QUIC removed and relay restored", || async {
+        let status = a.agent.network_status(id).await.ok()?;
+        matches!(
+            status
+                .peers
+                .iter()
+                .find(|p| p.endpoint_id == c.agent.endpoint_id())?
+                .data_path,
+            tsunagi::agent::DataPath::Relayed { .. }
+        )
+        .then_some(())
+    })
+    .await;
+    assert_eq!(a.plugin.overview(id).unwrap().public_key, key);
+    tcp.receive_queued(pending).await;
+    tcp.exchange(b"same TCP connection after returning to AWG and the relay")
+        .await;
+    drop(tcp);
+    // Transit ciphertext must never be delivered to the middle agent's IP interface.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), b.tun().pop_to_os())
+            .await
+            .is_err()
+    );
+    for node in [&a, &b, &c] {
+        node.agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn no_common_carrier_is_an_actionable_policy_error_without_disabling_control() {
+    let discovery = SharedMemoryDiscovery::new();
+    let roots = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+    let a = Node::open_selected(
+        roots[0].path(),
+        &discovery,
+        "awg-policy",
+        true,
+        1280,
+        Some(vec!["awg".into()]),
+    )
+    .await;
+    let b = Node::open_selected(
+        roots[1].path(),
+        &discovery,
+        "quic-policy",
+        true,
+        1280,
+        Some(vec!["wg-quic".into()]),
+    )
+    .await;
+    let (name, secret) = network("no-common-carrier");
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    wait_until("explain independent external policies", || async {
+        let status = a.agent.network_status(id).await.ok()?;
+        let peer = status.peers.first()?;
+        peer.data_error
+            .as_ref()?
+            .contains("no common external transport")
+            .then_some(())
+    })
+    .await;
+    assert_eq!(
+        a.agent
+            .network_status(id)
+            .await
+            .unwrap()
+            .metrics
+            .data_links_established,
+        0
+    );
     a.agent.shutdown().await;
     b.agent.shutdown().await;
 }

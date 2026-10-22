@@ -106,6 +106,49 @@ impl WgKeyStore {
         }
     }
 
+    /// Imports missing network keys from an older carrier-specific store, atomically.
+    /// The source is read-only and existing canonical keys always win.
+    pub fn import_legacy(&self, path: &Path) -> Result<(), PluginError> {
+        if !path.exists() || path == self.path {
+            return Ok(());
+        }
+        let fail = |err: rusqlite::Error| {
+            PluginError::Other(format!("cannot import legacy data keys: {err}"))
+        };
+        let source = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(fail)?;
+        let integrity: String = source
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(fail)?;
+        let schema: i64 = source
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(fail)?;
+        if integrity != "ok" || schema != SCHEMA_VERSION {
+            return Err(PluginError::Other(
+                "legacy data key store is damaged or has an unsupported schema".into(),
+            ));
+        }
+        let mut statement = source.prepare("SELECT network_id, secret, created_at, length(network_id), length(secret) FROM network_keys").map_err(fail)?;
+        let mut rows = statement.query([]).map_err(fail)?;
+        let mut target = self.lock();
+        let transaction = target.transaction().map_err(fail)?;
+        while let Some(row) = rows.next().map_err(fail)? {
+            let id_len: i64 = row.get(3).map_err(fail)?;
+            let key_len: i64 = row.get(4).map_err(fail)?;
+            if id_len != 32 || key_len != KEY_LEN as i64 {
+                return Err(PluginError::Other(
+                    "legacy data key has an invalid length".into(),
+                ));
+            }
+            let id: Vec<u8> = row.get(0).map_err(fail)?;
+            let key = zeroize::Zeroizing::new(row.get::<_, Vec<u8>>(1).map_err(fail)?);
+            let created: i64 = row.get(2).map_err(fail)?;
+            transaction.execute("INSERT OR IGNORE INTO network_keys(network_id, secret, created_at) VALUES (?1, ?2, ?3)", params![id, key.as_slice(), created]).map_err(fail)?;
+        }
+        transaction.commit().map_err(fail)?;
+        Ok(())
+    }
+
     /// Returns this agent's key for a network, creating it on first use.
     pub fn load_or_create(&self, network: NetworkId) -> Result<WgSecretKey, PluginError> {
         let conn = self.lock();
@@ -218,5 +261,71 @@ mod tests {
             result.is_err(),
             "a damaged key store must not silently mint a new identity (was {original})"
         );
+    }
+
+    #[tokio::test]
+    async fn forgetting_an_imported_key_cannot_resurrect_it_on_restart() {
+        use crate::{WireguardConfig, WireguardPlugin};
+        use tsunagi::dataplane::IpPlugin;
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = network("forgotten-import");
+        let legacy_path = dir.path().join("old.sqlite");
+        let original = WgKeyStore::open(&legacy_path)
+            .unwrap()
+            .load_or_create(id)
+            .unwrap()
+            .public();
+        let mut config = WireguardConfig::new(dir.path().join("canonical"));
+        config.legacy_key_stores.push(legacy_path);
+        let plugin = WireguardPlugin::open(config.clone()).await.unwrap();
+        plugin.on_network_forgotten(id).await;
+        plugin.shutdown().await;
+        let restarted = WireguardPlugin::open(config.clone()).await.unwrap();
+        let key = WgKeyStore::open(config.key_store_path())
+            .unwrap()
+            .load_or_create(id)
+            .unwrap()
+            .public();
+        assert_ne!(key, original);
+        restarted.shutdown().await;
+    }
+
+    #[test]
+    fn legacy_import_preserves_keys_and_never_overwrites_the_canonical_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let legacy = WgKeyStore::open(dir.path().join("legacy.sqlite")).unwrap();
+        let canonical = WgKeyStore::open(dir.path().join("canonical.sqlite")).unwrap();
+        let imported = network("imported");
+        let existing = network("existing");
+        let imported_key = legacy.load_or_create(imported).unwrap().public();
+        legacy.load_or_create(existing).unwrap();
+        let existing_key = canonical.load_or_create(existing).unwrap().public();
+        canonical.import_legacy(legacy.path()).unwrap();
+        canonical.import_legacy(legacy.path()).unwrap();
+        assert_eq!(
+            canonical.load_or_create(imported).unwrap().public(),
+            imported_key
+        );
+        assert_eq!(
+            canonical.load_or_create(existing).unwrap().public(),
+            existing_key
+        );
+        assert_eq!(
+            legacy.load_or_create(imported).unwrap().public(),
+            imported_key
+        );
+    }
+
+    #[test]
+    fn a_damaged_legacy_store_aborts_import_without_regenerating_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        std::fs::write(&path, b"damaged SQLite").unwrap();
+        let canonical = WgKeyStore::open(dir.path().join("canonical.sqlite")).unwrap();
+        assert!(canonical.import_legacy(&path).is_err());
+        canonical
+            .import_legacy(&dir.path().join("absent.sqlite"))
+            .unwrap();
+        assert!(!dir.path().join("absent.sqlite").exists());
     }
 }

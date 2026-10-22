@@ -101,7 +101,10 @@ impl Node {
                     tag,
                     1280,
                 )
-                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+                .with_tunnel(plugin.clone() as Arc<dyn IpPlugin>)
+                .with_carrier(Arc::new(
+                    tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+                )),
         )
         .await
         .unwrap();

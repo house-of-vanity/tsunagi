@@ -158,6 +158,8 @@ pub struct PeerStatus {
     pub protocols: Vec<String>,
     /// Capabilities the peer announced. Payloads stay opaque.
     pub capabilities: Vec<PluginCapability>,
+    /// Why no data route is available, when known.
+    pub data_error: Option<String>,
     /// How long the session has been up.
     pub connected_for: Duration,
     /// Verified paths of the underlying connection.

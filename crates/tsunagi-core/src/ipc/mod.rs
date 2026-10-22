@@ -828,6 +828,8 @@ pub struct MemberReport {
 /// One control plane peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReport {
+    /// Actionable carrier failure or policy mismatch; absent for a usable route.
+    pub data_error: Option<String>,
     /// The peer's endpoint id.
     pub endpoint_id: String,
     /// Hostname it announced, if any.
@@ -917,10 +919,12 @@ pub struct HostRulesReport {
 /// One overlay peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverlayPeerReport {
+    /// Opaque counter lifetime. A new tunnel or agent restart starts a new epoch.
+    pub counter_epoch: u64,
     /// The peer's control plane identity, so a tunnel can be matched to the
     /// session and the member it belongs to.
     pub endpoint_id: String,
-    /// Protocol carrying overlay traffic for this peer (e.g. "tcp-tls", "wg-quic").
+    /// Reserved legacy field; the internal encryption protocol is not user selectable.
     pub protocol: String,
     /// The peer's WireGuard public key (if applicable).
     pub public_key: String,
@@ -1131,7 +1135,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 22]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 23]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///

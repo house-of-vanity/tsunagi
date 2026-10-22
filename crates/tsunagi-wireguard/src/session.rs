@@ -6,7 +6,7 @@ use bytes::Bytes;
 use iroh::EndpointId;
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -21,6 +21,7 @@ const WINDOW: Duration = Duration::from_secs(20);
 
 pub(crate) struct PairLink {
     network: NetworkId,
+    protocol: &'static str,
     peer: EndpointId,
     pub(crate) attempt: [u8; 16],
     tx: mpsc::Sender<Bytes>,
@@ -29,6 +30,7 @@ pub(crate) struct PairLink {
     closed: AtomicBool,
     remote: Mutex<Option<SocketAddr>>,
     reason: Mutex<Option<String>>,
+    checks: Arc<AtomicU64>,
 }
 impl std::fmt::Debug for PairLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -39,6 +41,9 @@ impl std::fmt::Debug for PairLink {
     }
 }
 impl PairLink {
+    pub(crate) fn delivery_checks(&self) -> u64 {
+        self.checks.load(Ordering::Relaxed)
+    }
     pub(crate) fn has_authenticated_path(&self) -> bool {
         match self.remote.lock() {
             Ok(remote) => remote.is_some(),
@@ -103,8 +108,8 @@ impl PacketLink for PairLink {
     fn path_description(&self) -> String {
         match self.remote.lock() {
             Ok(addr) => match *addr {
-                Some(addr) => format!("awg UDP via {addr}"),
-                None => "awg UDP, establishing".into(),
+                Some(addr) => format!("{} UDP via {addr}", self.protocol),
+                None => format!("{} UDP, establishing", self.protocol),
             },
             Err(_) => "awg UDP".into(),
         }
@@ -117,19 +122,21 @@ impl Drop for PairLink {
 }
 
 pub(crate) fn start(
-    network: NetworkId,
-    peer: EndpointId,
+    pair: (NetworkId, EndpointId),
     socket: UdpSocket,
     tunn: Tunn,
     profile: PairProfile,
     candidates: Vec<SocketAddr>,
+    protocol: &'static str,
     parent: watch::Receiver<bool>,
 ) -> Arc<PairLink> {
+    let (network, peer) = pair;
     let (tx, rx) = mpsc::channel(QUEUE);
     let (in_tx, in_rx) = mpsc::channel(QUEUE);
     let (stop, _) = watch::channel(false);
     let link = Arc::new(PairLink {
         network,
+        protocol,
         peer,
         attempt: profile.id(),
         tx,
@@ -138,8 +145,10 @@ pub(crate) fn start(
         closed: AtomicBool::new(false),
         remote: Mutex::new(None),
         reason: Mutex::new(None),
+        checks: Arc::new(AtomicU64::new(0)),
     });
     let weak = Arc::downgrade(&link);
+    let checks = link.checks.clone();
     tokio::spawn(async move {
         let mut engine = Engine {
             stop: stop.subscribe(),
@@ -157,6 +166,7 @@ pub(crate) fn start(
             assemblies: HashMap::new(),
             started: Instant::now(),
             last_authenticated: Instant::now(),
+            checks,
         };
         engine.run(parent, &weak).await;
         if let Some(link) = weak.upgrade() {
@@ -188,6 +198,7 @@ struct Engine {
     assemblies: HashMap<u64, Assembly>,
     started: Instant,
     last_authenticated: Instant,
+    checks: Arc<AtomicU64>,
 }
 enum ResultOwned {
     Wire(Vec<u8>),
@@ -352,6 +363,7 @@ impl Engine {
                         {
                             self.pending.remove(index);
                             self.samples.push_back(true);
+                            self.checks.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     Some(3) => self.fragment(seq, payload),

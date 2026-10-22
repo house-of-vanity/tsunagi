@@ -6,10 +6,10 @@
 //! key: a network total, and each peer within it. Both packets and bytes are
 //! tracked so the UI can switch between them.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use tsunagi::ipc::StatusReport;
+use tsunagi::ipc::{OverlayPeerReport, StatusReport};
 
 /// How many rate samples to keep for a sparkline.
 const HISTORY: usize = 60;
@@ -26,7 +26,7 @@ pub(crate) enum Unit {
 /// One series' rolling packet and byte rates.
 #[derive(Default)]
 pub(crate) struct Series {
-    last: Option<(Instant, u64, u64)>,
+    last: Option<(Instant, Counters)>,
     packets_rate: f32,
     bytes_rate: f32,
     packets_history: VecDeque<f32>,
@@ -34,17 +34,52 @@ pub(crate) struct Series {
 }
 
 impl Series {
+    /// Samples a single cumulative counter pair (VIP histories own their lifetime).
     pub(crate) fn sample(&mut self, now: Instant, packets: u64, bytes: u64) {
-        if let Some((then, prev_packets, prev_bytes)) = self.last {
+        self.sample_peer(
+            now,
+            Counters {
+                epoch: 0,
+                tx_packets: packets,
+                tx_bytes: bytes,
+                rx_packets: 0,
+                rx_bytes: 0,
+            },
+        );
+    }
+
+    fn sample_peer(&mut self, now: Instant, counters: Counters) {
+        if let Some((then, previous)) = self.last {
             let dt = now.saturating_duration_since(then).as_secs_f32();
-            if dt > 0.0 {
-                self.packets_rate = packets.saturating_sub(prev_packets) as f32 / dt;
-                self.bytes_rate = bytes.saturating_sub(prev_bytes) as f32 / dt;
-                push(&mut self.packets_history, self.packets_rate);
-                push(&mut self.bytes_history, self.bytes_rate);
+            // Ignore duplicate/out-of-order observations without changing the baseline.
+            if dt <= 0.0 {
+                return;
+            }
+            if counters.epoch == previous.epoch
+                && counters.tx_packets >= previous.tx_packets
+                && counters.rx_packets >= previous.rx_packets
+                && counters.tx_bytes >= previous.tx_bytes
+                && counters.rx_bytes >= previous.rx_bytes
+            {
+                self.record(
+                    (counters.tx_packets - previous.tx_packets) as f32 / dt
+                        + (counters.rx_packets - previous.rx_packets) as f32 / dt,
+                    (counters.tx_bytes - previous.tx_bytes) as f32 / dt
+                        + (counters.rx_bytes - previous.rx_bytes) as f32 / dt,
+                );
+            } else {
+                // A counter reset is a new baseline, never traffic.
+                *self = Self::default();
             }
         }
-        self.last = Some((now, packets, bytes));
+        self.last = Some((now, counters));
+    }
+
+    fn record(&mut self, packets: f32, bytes: f32) {
+        self.packets_rate = packets;
+        self.bytes_rate = bytes;
+        push(&mut self.packets_history, packets);
+        push(&mut self.bytes_history, bytes);
     }
 
     /// The current rate in the chosen unit.
@@ -71,6 +106,27 @@ fn push(history: &mut VecDeque<f32>, value: f32) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Counters {
+    epoch: u64,
+    tx_packets: u64,
+    rx_packets: u64,
+    tx_bytes: u64,
+    rx_bytes: u64,
+}
+
+impl From<&OverlayPeerReport> for Counters {
+    fn from(peer: &OverlayPeerReport) -> Self {
+        Self {
+            epoch: peer.counter_epoch,
+            tx_packets: peer.tx_packets,
+            rx_packets: peer.rx_packets,
+            tx_bytes: peer.tx_bytes,
+            rx_bytes: peer.rx_bytes,
+        }
+    }
+}
+
 /// All traffic series, keyed by a stable string.
 #[derive(Default)]
 pub(crate) struct Traffic {
@@ -80,26 +136,32 @@ pub(crate) struct Traffic {
 impl Traffic {
     /// Folds a fresh snapshot into the rates. Call once per new generation.
     pub(crate) fn observe(&mut self, report: &StatusReport, now: Instant) {
+        let mut active = HashSet::new();
         for network in &report.networks {
             let Some(overlay) = &network.overlay else {
                 continue;
             };
-            let (mut net_packets, mut net_bytes) = (0u64, 0u64);
+            let (mut packets_rate, mut bytes_rate) = (0.0, 0.0);
             for peer in &overlay.peers {
-                let packets = peer.tx_packets.saturating_add(peer.rx_packets);
-                let bytes = peer.tx_bytes.saturating_add(peer.rx_bytes);
-                net_packets = net_packets.saturating_add(packets);
-                net_bytes = net_bytes.saturating_add(bytes);
-                self.series
-                    .entry(peer_key(&network.network_id, &peer.public_key))
-                    .or_default()
-                    .sample(now, packets, bytes);
+                let key = peer_key(&network.network_id, &peer.public_key);
+                // Duplicate rows are not additional traffic.
+                if !active.insert(key.clone()) {
+                    continue;
+                }
+                let series = self.series.entry(key).or_default();
+                series.sample_peer(now, peer.into());
+                packets_rate += series.rate(Unit::Packets);
+                bytes_rate += series.rate(Unit::Bytes);
             }
+            // Sum rates, not cumulative counters of a changing set of peers.
+            let key = net_key(&network.network_id);
+            active.insert(key.clone());
             self.series
-                .entry(net_key(&network.network_id))
+                .entry(key)
                 .or_default()
-                .sample(now, net_packets, net_bytes);
+                .record(packets_rate, bytes_rate);
         }
+        self.series.retain(|key, _| active.contains(key));
     }
 
     /// The network-total series, if sampled.
@@ -119,4 +181,113 @@ fn net_key(network_id: &str) -> String {
 
 fn peer_key(network_id: &str, public_key: &str) -> String {
     format!("peer:{network_id}:{public_key}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tsunagi::ipc::{NetworkReport, OverlayPeerReport, OverlayReport};
+
+    fn peer(key: &str, bytes: u64) -> OverlayPeerReport {
+        OverlayPeerReport {
+            public_key: key.into(),
+            tx_bytes: bytes,
+            ..Default::default()
+        }
+    }
+
+    fn report(peers: Vec<OverlayPeerReport>) -> StatusReport {
+        StatusReport {
+            networks: vec![NetworkReport {
+                network_id: "network".into(),
+                overlay: Some(OverlayReport {
+                    peers,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn joining_peer_does_not_add_its_past_traffic_to_the_network_rate() {
+        let mut traffic = Traffic::default();
+        let now = Instant::now();
+        traffic.observe(&report(vec![peer("a", 100)]), now);
+        traffic.observe(
+            &report(vec![peer("a", 120), peer("b", 100_000_000_000)]),
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            traffic.network("network").map(|s| s.rate(Unit::Bytes)),
+            Some(20.0)
+        );
+        traffic.observe(
+            &report(vec![peer("a", 150), peer("b", 100_000_000_040)]),
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(
+            traffic.network("network").map(|s| s.rate(Unit::Bytes)),
+            Some(70.0)
+        );
+    }
+
+    #[test]
+    fn departed_peers_and_removed_networks_do_not_keep_stale_rates() {
+        let mut traffic = Traffic::default();
+        let now = Instant::now();
+        traffic.observe(&report(vec![peer("a", 100)]), now);
+        traffic.observe(&report(vec![peer("a", 140)]), now + Duration::from_secs(1));
+        traffic.observe(&report(vec![]), now + Duration::from_secs(2));
+        assert!(traffic.peer("network", "a").is_none());
+        assert_eq!(
+            traffic.network("network").map(|s| s.rate(Unit::Bytes)),
+            Some(0.0)
+        );
+        traffic.observe(&StatusReport::default(), now + Duration::from_secs(3));
+        assert!(traffic.network("network").is_none());
+    }
+
+    #[test]
+    fn restarted_counters_are_a_new_baseline_even_if_they_already_exceed_the_old_value() {
+        let mut traffic = Traffic::default();
+        let now = Instant::now();
+        let mut old = peer("a", 100);
+        old.counter_epoch = 1;
+        traffic.observe(&report(vec![old]), now);
+        let mut restarted = peer("a", 100_000_000_000);
+        restarted.counter_epoch = 2;
+        traffic.observe(
+            &report(vec![restarted.clone()]),
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            traffic.peer("network", "a").map(|s| s.rate(Unit::Bytes)),
+            Some(0.0)
+        );
+        restarted.tx_bytes += 80;
+        traffic.observe(&report(vec![restarted]), now + Duration::from_secs(2));
+        assert_eq!(
+            traffic.network("network").map(|s| s.rate(Unit::Bytes)),
+            Some(80.0)
+        );
+    }
+
+    #[test]
+    fn reset_in_one_direction_cannot_be_hidden_by_growth_in_the_other() {
+        let mut traffic = Traffic::default();
+        let now = Instant::now();
+        let mut old = peer("a", 100);
+        old.rx_bytes = 1000;
+        traffic.observe(&report(vec![old]), now);
+        let mut reset = peer("a", 50);
+        reset.rx_bytes = 10_000;
+        traffic.observe(&report(vec![reset]), now + Duration::from_secs(1));
+        assert_eq!(
+            traffic.network("network").map(|s| s.rate(Unit::Bytes)),
+            Some(0.0)
+        );
+    }
 }

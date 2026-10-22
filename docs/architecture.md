@@ -11,14 +11,15 @@ messages. On top of it, this crate's protocol handles membership
 authentication, participant announcements, capability exchange and — later —
 state synchronisation and delivery of IP-plugin data.
 
-**Data plane.** Separate plugins create IP connectivity. WireGuard is the first
-one and is implemented in userspace — see [wireguard.md](wireguard.md). Plugin
+**Data plane.** One internal WireGuard plugin creates IP connectivity in userspace — see [wireguard.md](wireguard.md). Plugin
 keys, configuration and lifecycle are separate from iroh identity and from the
 network secret. The core moves an opaque, bounded payload and never parses it.
 
 **The transport in between.** Plugins do not open connections. They are handed
 a `PacketLink` — an authenticated, unreliable datagram channel to one peer for
-one protocol — and never learn how it is carried.
+the internal cipher — and never learns how it is carried. External `DataCarrier`
+adapters own their reachability capabilities and physical link lifecycle; they
+never receive plaintext overlay IP packets.
 
 The separation between the two planes is **logical, not physical**. The control plane uses
 iroh; the data plane can use iroh on its own ALPN and connection, or independent
@@ -73,8 +74,10 @@ And in crates of their own:
 
 | crate | responsibility |
 |---|---|
-| `tsunagi-awg` | ephemeral pairwise Amnezia masking, private negotiation and independently encrypted UDP carriers; reuses the end-to-end WireGuard engine |
-| `tsunagi-wg-quic` | the `wg-quic` protocol: its keys, its announcement, its tunnels |
+| `tsunagi-wireguard` | independent ordinary WG and masked UDP hop engines, private pair negotiation and local candidates |
+| `tsunagi-tcp-tls` | TLS hop encryption and bounded reachability announcements; no inner IP cipher |
+| `tsunagi-awg` | ephemeral pairwise Amnezia masking, private negotiation and independently encrypted UDP carriers; shares the independent UDP hop engine with `wg` |
+| `tsunagi-wg-quic` | the single internal WireGuard cipher, keys and opaque announcement (historical crate name) |
 | `tsunagi` | the command line agent, built as the `tsng` executable: the only place that owns a runtime, a logger and signals |
 
 The core library is the package `tsunagi-core`; its library target is still called `tsunagi`, so code says `use tsunagi::…`.
@@ -85,7 +88,7 @@ they compare the *wire* version, which moves only when the bytes do, so two
 peers on different releases keep working.
 
 Abstractions exist only where something is really substituted or really needs
-isolating for tests: `NetworkDiscovery`, `IpPlugin`, `PacketTransport` /
+isolating for tests: `NetworkDiscovery`, one `IpPlugin`, external `DataCarrier`, `PacketTransport` /
 `PacketLink` (so a protocol's carrier can change), `TunFactory` (which is what
 lets the whole data plane be tested without privileges), `InterfaceProvisioner`
 and `DnsPublisher` (which are where the platforms differ). Everything else is a
@@ -161,8 +164,10 @@ Values that cannot honestly be attributed to one network stay at the endpoint
 level. A value iroh does not report is `None`.
 
 An iroh address is an address for iroh. It is not assumed usable by any other
-protocol; a future WireGuard plugin gathers its own reachability data and ships
-it through the control plane as an opaque announcement.
+protocol; each external carrier gathers its own reachability data and ships it through
+the control plane as an opaque announcement or private pair negotiation.
+Local iroh candidates and introductions exclude the agent's own overlay, so
+transport traffic cannot recursively tunnel through itself.
 
 ### Relays
 

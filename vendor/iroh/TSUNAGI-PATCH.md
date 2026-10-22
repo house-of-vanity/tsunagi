@@ -41,3 +41,20 @@ failures, exercise success draining, and bound length and capacity under 10,000
 distinct candidates. They fail with the original unconditional enqueue.
 These are queue algorithm tests; the normal integration suite continues to use
 real iroh endpoints, membership handshakes, SQLite and encryption.
+
+## Excluding overlay candidates
+
+`Builder::addr_filter` filters discovery publication only. That is insufficient
+for an overlay: iroh still put the overlay interface address in the local
+candidate watch used for path creation, allowing its own transport packets to
+re-enter the overlay. Production logs contained verified data paths via
+`10.13.37.*` overlay addresses while their underlay links cycled.
+
+The separate optional `Builder::direct_addr_filter` applies an `AddrFilter`
+before storing local direct addresses. Default behavior is unchanged. Tsunagi
+uses its existing local-interface exclusion for both this filter and publication,
+including the actual kernel-assigned interface name after creation. Control authentication and
+wire formats are unchanged. The rootless real-endpoint regression is
+`crates/tsunagi-core/tests/iroh_candidates.rs`; overlay subnet filtering for
+introductions is also covered in the core. This prevents the recursive path;
+it does not prove the historical cause of any particular high byte counter.

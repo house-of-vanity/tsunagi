@@ -1,26 +1,14 @@
-//! The `tcp-tls` IP plugin implementation.
-
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-
-use bytes::Bytes;
-use iroh::EndpointId;
-use serde::{Deserialize, Serialize};
-use x25519_dalek::{PublicKey, StaticSecret};
-
-use tsunagi::dataplane::tunnel::{GenericTunnelPlugin, TunnelCodec};
-use tsunagi::dataplane::{PluginError, ProtocolOption};
-use tsunagi::identity::NetworkId;
-
-use crate::crypto::PeerCipher;
+//! TLS carrier options and bounded reachability announcements. No IP cipher lives here.
 use crate::transport::TcpTlsTransport;
-
-/// The wire protocol identifier for `tcp-tls`.
+use iroh::EndpointId;
+use serde::Deserialize;
+use std::sync::Arc;
+use tsunagi::NetworkId;
+use tsunagi::dataplane::{PluginError, ProtocolOption};
+/// External TLS carrier identifier.
 pub const TCP_TLS_PROTOCOL: &str = "tcp-tls";
-
-/// Wire version for `tcp-tls`.
-pub const TCP_TLS_VERSION: u16 = 1;
-
+/// Carrier announcement wire version.
+pub const TCP_TLS_VERSION: u16 = 2;
 /// Configuration for the `tcp-tls` protocol plugin.
 #[derive(Debug, Clone, Default)]
 pub struct TcpTlsConfig {
@@ -49,23 +37,22 @@ impl TcpTlsConfig {
     }
 }
 
-/// Announcement payload exchanged between peers for `tcp-tls`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TcpTlsAnnouncement {
-    /// X25519 public key for E2EE noise encryption.
-    pub noise_public: [u8; 32],
-    /// TCP port the peer is listening on.
-    pub port: u16,
-    /// Candidate IP addresses where this peer can be reached on `port`.
-    #[serde(default)]
-    pub addrs: Vec<std::net::IpAddr>,
-}
-
 /// Discovers local network interface IPs to announce to peers.
 pub fn local_ip_candidates() -> Vec<std::net::IpAddr> {
+    local_ip_candidates_excluding(None)
+}
+
+fn local_ip_candidates_excluding(excluded_interface: Option<&str>) -> Vec<std::net::IpAddr> {
     let mut candidates = Vec::new();
     for iface in netdev::get_interfaces() {
-        if !is_candidate_interface(&iface) {
+        if excluded_interface.is_some_and(|name| {
+            iface.name.eq_ignore_ascii_case(name)
+                || iface
+                    .friendly_name
+                    .as_deref()
+                    .is_some_and(|friendly| friendly.eq_ignore_ascii_case(name))
+        }) || !is_candidate_interface(&iface)
+        {
             continue;
         }
         for ip in &iface.ipv4 {
@@ -203,26 +190,7 @@ pub(crate) fn ip_priority(iface: &netdev::Interface, ip: std::net::IpAddr) -> u3
         }
     }
 }
-
-/// The codec implementing cryptographic transformation and announcements for `tcp-tls`.
-pub struct TcpTlsCodec {
-    local_id: EndpointId,
-    static_secret: StaticSecret,
-    public_key: PublicKey,
-    transport: Arc<TcpTlsTransport>,
-    ciphers: RwLock<HashMap<(NetworkId, EndpointId), Arc<PeerCipher>>>,
-}
-
-impl std::fmt::Debug for TcpTlsCodec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TcpTlsCodec")
-            .field("local_id", &self.local_id.fmt_short().to_string())
-            .field("port", &self.transport.bound_port())
-            .finish()
-    }
-}
-
-impl TcpTlsCodec {
+impl TcpTlsConfig {
     /// Supported options for `tcp-tls`.
     pub const OPTIONS: &'static [ProtocolOption] = &[
         ProtocolOption {
@@ -238,22 +206,6 @@ impl TcpTlsCodec {
             default: Some(crate::cert::DEFAULT_SNI),
         },
     ];
-
-    /// Creates a new `TcpTlsCodec`.
-    pub fn new(local_id: EndpointId, transport: Arc<TcpTlsTransport>) -> Self {
-        let mut secret_bytes = [0u8; 32];
-        rand::fill(&mut secret_bytes);
-        let static_secret = StaticSecret::from(secret_bytes);
-        let public_key = PublicKey::from(&static_secret);
-
-        Self {
-            local_id,
-            static_secret,
-            public_key,
-            transport,
-            ciphers: RwLock::new(HashMap::new()),
-        }
-    }
 
     /// Configures settings from parsed `-o` options.
     pub fn configure(
@@ -281,250 +233,169 @@ impl TcpTlsCodec {
         Ok(config)
     }
 }
-
-impl TunnelCodec for TcpTlsCodec {
+/// TLS carrier announcements and lifecycle, independent of IP encryption.
+#[derive(Debug)]
+pub struct TcpTlsCarrier {
+    transport: Arc<TcpTlsTransport>,
+    excluded_interface: std::sync::Mutex<Option<String>>,
+    peers: std::sync::Mutex<
+        std::collections::HashMap<(NetworkId, EndpointId), Vec<std::net::SocketAddr>>,
+    >,
+}
+impl TcpTlsCarrier {
+    /// Shares the transport's listener; creates no end-to-end cipher.
+    pub fn new(transport: Arc<TcpTlsTransport>) -> Arc<Self> {
+        Arc::new(Self {
+            transport,
+            excluded_interface: std::sync::Mutex::new(None),
+            peers: Default::default(),
+        })
+    }
+    /// Registers a carrier while excluding the agent's own, possibly custom-named interface.
+    pub fn with_interface(transport: Arc<TcpTlsTransport>, interface: String) -> Arc<Self> {
+        Arc::new(Self {
+            transport,
+            excluded_interface: std::sync::Mutex::new(Some(interface)),
+            peers: Default::default(),
+        })
+    }
+    fn update_peer(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+        addrs: Option<Vec<std::net::SocketAddr>>,
+    ) {
+        let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
+        match addrs {
+            Some(addrs) => {
+                peers.insert((network, peer), addrs);
+            }
+            None => {
+                peers.remove(&(network, peer));
+            }
+        }
+        let mut combined = peers
+            .iter()
+            .filter(|((_, id), _)| *id == peer)
+            .flat_map(|(_, addrs)| addrs.iter().copied())
+            .collect::<Vec<_>>();
+        combined.sort_unstable();
+        combined.dedup();
+        combined.truncate(32);
+        self.transport.replace_peer_addrs(peer, combined);
+    }
+}
+impl tsunagi::dataplane::transport::DataCarrier for TcpTlsCarrier {
     fn protocol_id(&self) -> &str {
         TCP_TLS_PROTOCOL
     }
-
     fn protocol_version(&self) -> u16 {
-        TCP_TLS_VERSION
+        2
     }
-
-    fn options(&self) -> &'static [ProtocolOption] {
-        Self::OPTIONS
+    fn on_interface_ready(&self, name: &str) {
+        *self
+            .excluded_interface
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(name.into());
     }
-
-    fn local_capability_data(&self, _network: NetworkId) -> Result<Vec<u8>, PluginError> {
-        let announcement = TcpTlsAnnouncement {
-            noise_public: *self.public_key.as_bytes(),
-            port: self.transport.bound_port(),
-            addrs: local_ip_candidates(),
-        };
-        postcard::to_allocvec(&announcement)
-            .map_err(|err| PluginError::Other(format!("encode announcement failed: {err}")))
+    fn local_capability(
+        &self,
+        _: NetworkId,
+    ) -> Result<Option<tsunagi::dataplane::PluginCapability>, PluginError> {
+        let data = postcard::to_allocvec(&(
+            self.transport.bound_port(),
+            local_ip_candidates_excluding(
+                self.excluded_interface
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_deref(),
+            )
+            .into_iter()
+            .take(32)
+            .collect::<Vec<_>>(),
+        ))
+        .map_err(|_| PluginError::Other("cannot encode TLS addresses".into()))?;
+        Ok(Some(tsunagi::dataplane::PluginCapability {
+            protocol: TCP_TLS_PROTOCOL.into(),
+            version: 2,
+            enabled: true,
+            data,
+        }))
     }
-
-    fn on_peer_capability_data(
+    fn on_peer_capability(
         &self,
         network: NetworkId,
         peer: EndpointId,
-        data: &[u8],
+        cap: &tsunagi::dataplane::PluginCapability,
     ) -> Result<(), PluginError> {
-        let announcement: TcpTlsAnnouncement = postcard::from_bytes(data)
-            .map_err(|err| PluginError::Rejected(format!("invalid announcement: {err}")))?;
-
-        for ip in &announcement.addrs {
-            if is_candidate_ip(*ip) {
-                self.transport
-                    .set_peer_addr(peer, std::net::SocketAddr::new(*ip, announcement.port));
-            }
+        if !cap.enabled || cap.protocol != TCP_TLS_PROTOCOL || cap.version != 2 {
+            return Err(PluginError::Rejected("unsupported TLS carrier".into()));
         }
-
-        let peer_noise_pubkey = PublicKey::from(announcement.noise_public);
-        let cipher = Arc::new(PeerCipher::new(
-            self.local_id,
+        // Decode a fixed bounded array through the existing common announcement limit.
+        #[derive(Deserialize)]
+        struct Addresses(
+            u16,
+            #[serde(deserialize_with = "bounded_ips")] Vec<std::net::IpAddr>,
+        );
+        let Addresses(port, ips) = postcard::from_bytes(&cap.data)
+            .map_err(|_| PluginError::Rejected("invalid TLS carrier addresses".into()))?;
+        if port == 0 {
+            return Err(PluginError::Rejected("invalid TLS carrier port".into()));
+        }
+        self.update_peer(
+            network,
             peer,
-            &self.static_secret,
-            &peer_noise_pubkey,
-        ));
-
-        let mut guard = match self.ciphers.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        guard.insert((network, peer), cipher);
+            Some(
+                ips.into_iter()
+                    .filter(|ip| is_candidate_ip(*ip))
+                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                    .collect(),
+            ),
+        );
         Ok(())
     }
-
-    fn on_peer_down(&self, network: NetworkId, peer: EndpointId) {
-        let mut guard = match self.ciphers.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        guard.remove(&(network, peer));
+    fn on_peer_gone(&self, network: NetworkId, peer: EndpointId) {
+        self.update_peer(network, peer, None);
     }
-
-    fn encrypt(
-        &self,
-        network: NetworkId,
-        peer: EndpointId,
-        packet: &[u8],
-    ) -> Result<Bytes, PluginError> {
-        let cipher = {
-            let guard = match self.ciphers.read() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            guard.get(&(network, peer)).cloned()
-        };
-
-        let Some(cipher) = cipher else {
-            return Err(PluginError::Unavailable("no cipher for peer".into()));
-        };
-
-        cipher.encrypt(packet)
-    }
-
-    fn decrypt(
-        &self,
-        network: NetworkId,
-        peer: EndpointId,
-        payload: &[u8],
-    ) -> Result<Bytes, PluginError> {
-        let cipher = {
-            let guard = match self.ciphers.read() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            guard.get(&(network, peer)).cloned()
-        };
-
-        let Some(cipher) = cipher else {
-            return Err(PluginError::Unavailable("no cipher for peer".into()));
-        };
-
-        cipher.decrypt(payload)
+    fn on_network_deactivated(&self, network: NetworkId) {
+        let peers: Vec<_> = self
+            .peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .filter(|(id, _)| *id == network)
+            .map(|(_, peer)| *peer)
+            .collect();
+        for peer in peers {
+            self.update_peer(network, peer, None);
+        }
     }
 }
-
-/// The complete `tcp-tls` plugin.
-pub type TcpTlsPlugin = GenericTunnelPlugin<TcpTlsCodec>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    #[test]
-    fn test_is_candidate_interface_filters_overlay_and_bridges() {
-        let mut iface = netdev::Interface::dummy();
-        iface.flags = 1; // UP
-
-        // Standard Ethernet - should pass
-        iface.name = "eth0".to_string();
-        assert!(is_candidate_interface(&iface));
-
-        // Windows Ethernet with GUID name - should pass
-        iface.name = "{B6149D2C-1234-5678-9ABC-DEF012345678}".to_string();
-        iface.friendly_name = Some("Ethernet".to_string());
-        iface.description = Some("Intel(R) Ethernet Connection".to_string());
-        assert!(is_candidate_interface(&iface));
-
-        // Linux tsun0 overlay - must be filtered
-        iface.name = "tsun0".to_string();
-        iface.friendly_name = None;
-        iface.description = None;
-        assert!(!is_candidate_interface(&iface));
-
-        // Windows Wintun overlay (GUID name with tsun0 friendly name) - must be filtered!
-        iface.name = "{72D85D76-F1A5-42AC-BC49-2169527CDDDF}".to_string();
-        iface.friendly_name = Some("tsun0".to_string());
-        iface.description = Some("Wintun Userspace Tunnel".to_string());
-        assert!(!is_candidate_interface(&iface));
-
-        // Windows Wintun overlay with description containing Wintun - must be filtered!
-        iface.friendly_name = Some("Local Area Connection 2".to_string());
-        iface.description = Some("Wintun Userspace Tunnel".to_string());
-        assert!(!is_candidate_interface(&iface));
-
-        // Docker bridge - must be filtered
-        iface.name = "docker0".to_string();
-        iface.friendly_name = None;
-        iface.description = None;
-        assert!(!is_candidate_interface(&iface));
-
-        // Docker network bridge br-* - must be filtered
-        iface.name = "br-4f6d3a9b1c2e".to_string();
-        assert!(!is_candidate_interface(&iface));
-
-        // Virtual ethernet veth* - must be filtered
-        iface.name = "veth12345".to_string();
-        assert!(!is_candidate_interface(&iface));
-
-        // Libvirt NAT bridge virbr* - must be filtered
-        iface.name = "virbr0".to_string();
-        assert!(!is_candidate_interface(&iface));
-
-        // CNI bridge - must be filtered
-        iface.name = "cni0".to_string();
-        assert!(!is_candidate_interface(&iface));
-
-        // Hyper-V / WSL vEthernet switch on Windows - must be filtered
-        iface.name = "{A1B2C3D4-E5F6-7890-1234-567890ABCDEF}".to_string();
-        iface.friendly_name = Some("vEthernet (WSL)".to_string());
-        iface.description = Some("Hyper-V Virtual Ethernet Adapter".to_string());
-        assert!(!is_candidate_interface(&iface));
-
-        // Down interface - must be filtered
-        let mut down_iface = netdev::Interface::dummy();
-        down_iface.flags = 0; // Not UP
-        down_iface.name = "eth0".to_string();
-        assert!(!is_candidate_interface(&down_iface));
+fn bounded_ips<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<std::net::IpAddr>, D::Error> {
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<std::net::IpAddr>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("at most 32 IP candidates")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            if seq.size_hint().is_some_and(|n| n > 32) {
+                return Err(serde::de::Error::custom("too many IP candidates"));
+            }
+            let mut ips = Vec::new();
+            while let Some(ip) = seq.next_element()? {
+                if ips.len() == 32 {
+                    return Err(serde::de::Error::custom("too many IP candidates"));
+                }
+                ips.push(ip);
+            }
+            Ok(ips)
+        }
     }
-
-    #[test]
-    fn test_is_candidate_ip() {
-        // Valid LAN IP
-        assert!(is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
-            192, 168, 1, 117
-        ))));
-        // Valid Tailscale IP
-        assert!(is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
-            100, 77, 155, 120
-        ))));
-        // Valid Public IP
-        assert!(is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
-            1, 1, 1, 1
-        ))));
-        // Valid IPv6 GUA
-        assert!(is_candidate_ip(std::net::IpAddr::V6(Ipv6Addr::new(
-            0x2a01, 0x4b00, 0xb8e3, 0x4e00, 0, 0, 0, 1
-        ))));
-
-        // Loopback - must be rejected
-        assert!(!is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
-            127, 0, 0, 1
-        ))));
-        assert!(!is_candidate_ip(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST)));
-
-        // Unspecified - must be rejected
-        assert!(!is_candidate_ip(std::net::IpAddr::V4(
-            Ipv4Addr::UNSPECIFIED
-        )));
-        assert!(!is_candidate_ip(std::net::IpAddr::V6(
-            Ipv6Addr::UNSPECIFIED
-        )));
-
-        // Link-local - must be rejected
-        assert!(!is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::new(
-            169, 254, 1, 1
-        ))));
-        assert!(!is_candidate_ip(std::net::IpAddr::V6(Ipv6Addr::new(
-            0xfe80, 0, 0, 0, 0, 0x1ff, 0xfe00, 1
-        ))));
-
-        // Broadcast - must be rejected
-        assert!(!is_candidate_ip(std::net::IpAddr::V4(Ipv4Addr::BROADCAST)));
-    }
-
-    #[test]
-    fn test_ip_priority_ordering() {
-        let mut iface_lan = netdev::Interface::dummy();
-        iface_lan.flags = 1;
-        iface_lan.gateway = Some(netdev::net::device::NetworkDevice::new());
-
-        let mut iface_vpn = netdev::Interface::dummy();
-        iface_vpn.flags = 1;
-        iface_vpn.name = "tailscale0".to_string();
-
-        let lan_ip = std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 117));
-        let tailscale_ip = std::net::IpAddr::V4(Ipv4Addr::new(100, 77, 155, 120));
-
-        let p_lan = ip_priority(&iface_lan, lan_ip);
-        let p_ts = ip_priority(&iface_vpn, tailscale_ip);
-
-        // LAN IP with gateway should score higher than VPN IP without gateway
-        assert!(p_lan > p_ts);
-    }
+    deserializer.deserialize_seq(Visitor)
 }

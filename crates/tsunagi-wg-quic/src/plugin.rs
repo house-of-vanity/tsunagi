@@ -47,13 +47,9 @@ use crate::store::WgKeyStore;
 use tsunagi::state::Ipv4Range;
 use tsunagi::task::{TASK_GRACE, wind_down};
 
-/// The protocol identifier this plugin announces.
-/// The protocol id of this plugin.
-///
-/// `wg-quic`, because that is what it is: WireGuard's cryptography carried
-/// in QUIC datagrams. The name is on the wire, so it is a protocol name and
-/// not a description of the implementation.
-pub const WIREGUARD_PROTOCOL: &str = "wg-quic";
+/// Fixed internal encryption capability, independent of external carrier names.
+/// The historical crate/storage name does not select a physical transport.
+pub const WIREGUARD_PROTOCOL: &str = "wireguard-e2e";
 
 /// Smallest interface MTU the overlay accepts.
 ///
@@ -79,8 +75,8 @@ pub const WIREGUARD_OVERHEAD: u32 = 32;
 /// Configuration of the WireGuard plugin.
 #[derive(Debug, Clone)]
 pub struct WireguardConfig {
-    /// Diagnostic protocol id when this end-to-end engine is reused by another carrier.
-    pub protocol: &'static str,
+    /// Previous key stores to import before creating any network key.
+    pub legacy_key_stores: Vec<PathBuf>,
     /// Directory for the plugin's own key store. Separate from agent state.
     pub state_dir: PathBuf,
     /// WireGuard keepalive, which keeps tunnels and their links warm.
@@ -102,7 +98,7 @@ impl WireguardConfig {
     /// Creates a configuration rooted at `state_dir` with sensible defaults.
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
-            protocol: WIREGUARD_PROTOCOL,
+            legacy_key_stores: Vec::new(),
             state_dir: state_dir.into(),
             keepalive: Some(25),
             mtu: DEFAULT_MTU,
@@ -302,9 +298,16 @@ impl WireguardPlugin {
         }
 
         let path = config.key_store_path();
-        let store = tokio::task::spawn_blocking(move || WgKeyStore::open(path))
-            .await
-            .map_err(|err| PluginError::Other(format!("key store task failed: {err}")))??;
+        let legacy = config.legacy_key_stores.clone();
+        let store = tokio::task::spawn_blocking(move || {
+            let store = WgKeyStore::open(path)?;
+            for path in legacy {
+                store.import_legacy(&path)?;
+            }
+            Ok::<_, PluginError>(store)
+        })
+        .await
+        .map_err(|err| PluginError::Other(format!("key store task failed: {err}")))??;
 
         let worker = Arc::new(Worker {
             config,
@@ -397,7 +400,7 @@ impl Worker {
     fn report(&self, network: NetworkId, reason: impl std::fmt::Display) {
         tracing::warn!(network = %network.fmt_short(), %reason, "wireguard plugin error");
         if let Some(context) = self.context.get() {
-            context.report_error(network, self.config.protocol, reason.to_string());
+            context.report_error(network, WIREGUARD_PROTOCOL, reason.to_string());
         }
     }
 
@@ -650,7 +653,7 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
 
 impl IpPlugin for WireguardPlugin {
     fn protocol_id(&self) -> &str {
-        self.worker.config.protocol
+        WIREGUARD_PROTOCOL
     }
 
     fn protocol_version(&self) -> u16 {
@@ -689,7 +692,7 @@ impl IpPlugin for WireguardPlugin {
         // Identity only. Where to send packets is the transport's business.
         let announcement = WgAnnouncement::new(network, &state.key.public());
         Ok(Some(PluginCapability {
-            protocol: self.worker.config.protocol.to_string(),
+            protocol: WIREGUARD_PROTOCOL.to_string(),
             version: crate::announcement::ANNOUNCEMENT_VERSION,
             enabled: true,
             data: announcement.encode()?,
@@ -795,14 +798,26 @@ impl IpPlugin for WireguardPlugin {
         self.nudge(Command::Teardown(network));
     }
 
-    fn on_network_forgotten(&self, network: NetworkId) {
-        // The key is this protocol's identity in that network and nothing
-        // else's. Keeping it after leaving would keep a secret for a
-        // network this agent is no longer in — and hand back the same
-        // overlay address on a rejoin that everyone else has moved past.
-        if let Err(err) = self.worker.store.forget(network) {
-            tracing::warn!(%err, "cannot remove the WireGuard key of a network we left");
-        }
+    fn on_network_forgotten(&self, network: NetworkId) -> BoxFuture<'_, ()> {
+        let worker = Arc::clone(&self.worker);
+        Box::pin(async move {
+            // Remove old copies as well, otherwise the next startup's import
+            // would resurrect a key that the user explicitly forgot.
+            let result = tokio::task::spawn_blocking(move || {
+                for path in &worker.config.legacy_key_stores {
+                    if path.exists() {
+                        WgKeyStore::open(path)?.forget(network)?;
+                    }
+                }
+                worker.store.forget(network)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::warn!(%err, "cannot remove forgotten network data keys"),
+                Err(err) => tracing::warn!(%err, "data key cleanup task failed"),
+            }
+        })
     }
 
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {

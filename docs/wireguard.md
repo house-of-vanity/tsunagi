@@ -1,6 +1,6 @@
 # The WireGuard data plane
 
-WireGuard is the first IP plugin. It carries user traffic between
+WireGuard is the single internal IP cipher. It carries user traffic between
 participants while the control plane keeps doing its own job: deciding who is
 in the network and carrying each participant's opaque announcement.
 
@@ -46,20 +46,26 @@ peer by the agent and runs a WireGuard tunnel over it:
   source address checked       <--Tunn.decapsulate--  ciphertext <- transport
 ```
 
-Reachability — hole punching, relay fallback — belongs to the transport, which
-today is iroh. That is the whole reason the plugin's announcement says *who* it
-is and never *where* it is: there is no address for a peer to advertise, get
-wrong, or lie about.
+Reachability belongs to external carriers: ordinary WireGuard UDP (`wg`),
+Amnezia-masked UDP (`awg`), iroh QUIC (`wg-quic`), or TCP/TLS (`tcp-tls`). The
+user's ordered choice applies only to those physical data links. The internal
+capability `wireguard-e2e` v4 is fixed and hidden from the CLI/tray controls.
+All carriers move the same inner encrypted bytes, including through relays.
+The encryption plugin's announcement identifies a key, never an IP endpoint.
 
-**Two peers behind NAT work exactly as well as iroh does.** iroh hole punches a
-direct path when it can and falls back to a relay when it cannot; the tunnel
-rides on whichever it got. There is no separate STUN, no separate hole punching
-and no second set of NAT problems to solve for WireGuard.
+A relay removes its adjacent carrier's encryption to read routing metadata,
+then sends the inner ciphertext on another carrier. It cannot decrypt the
+endpoint IP packet. WireGuard session keys, counters and the interface survive
+carrier changes and direct/relay changes. TCP inside the overlay retransmits
+after transient loss; ordinary application and WireGuard timeouts still apply.
+The UDP modes have their own bounded STUN/pair discovery and can fail on NATs
+that iroh can traverse; selecting only AWG does not permit QUIC fallback.
 
 ## Checking it from outside
 
 `tsng status` asks a running agent over its local control socket and prints
-what it sees, including whether each tunnel has actually handshaken. See
+the external transport or relay route, data readiness and plaintext counters.
+An unavailable channel includes a reason such as no common permitted transport. See
 [../README.md](../README.md#checking-that-it-works).
 
 ## Deterministic overlay addressing
@@ -207,26 +213,40 @@ QUIC DATAGRAM frames themselves cannot fragment.
 Reassembly is bounded and expires incomplete packets; one lost fragment loses
 one packet, without blocking unrelated traffic. The logical data payload limit
 is 64 KiB, with the relay envelope subtracted before it reaches the plugin.
-The new framing uses data ALPN `tsunagi/data/5`; both ends and intermediate
+The new framing uses data ALPN `tsunagi/data/6`; both ends and intermediate
 peers need the updated binary. Network identities and saved state do not change.
 See [protocol.md](protocol.md#the-data-plane-protocol) for the wire format.
 
-## Lifecycle
+## Lifecycle and counters
 
-* A network is activated → the plugin loads or creates its key for that
-  network, derives the interface name, and creates the packet interface. If
-  that fails — no privileges, for instance — the key and the announcement still
-  work and the interface is retried on the next reconcile.
-* A peer announces its key → recorded.
-* A data link to that peer arrives → recorded.
-* Reconciliation starts a tunnel for every peer that has **both**, and removes
-  tunnels for peers that lost either.
-* A network is deactivated, or the agent shuts down → the interface and every
-  tunnel go away. The key stays, so coming back keeps the same overlay address.
+The agent owns one interface across every network. On network activation the
+internal plugin loads a network-specific key, announces it and reconciles
+peer tunnels. It owns no interface or host route. Local IP ingress resolves
+the destination owner and sends only through this one plugin. Source admission
+is enforced after decryption by the agent, not by trusting a remote address.
 
-There is no external configuration file and no command line tool, so unlike a
-kernel-WireGuard setup there is nothing outside this process for anybody to
-edit. Reconciliation is purely "do the running tunnels match what is known".
+A carrier policy change retires physical links while retaining the logical
+peer link and the internal tunnel. A peer's control membership ending removes
+its tunnel; network deactivation removes that network's channels. Its persistent
+key remains. The interface lives until agent shutdown, independently of carrier
+availability and individual network lifetimes.
+
+The historical `wg-quic/wireguard.sqlite` remains the canonical key store.
+Missing keys migrate from `wg` then `awg` without replacing canonical keys or
+modifying the source files. Corrupt legacy databases are hard errors. Old
+`-o keepalive=…`, `-o wg:keepalive=…` and `mtu` settings configure the shared
+internal channel; contradictory values are rejected. Interface MTU is selected
+once with `--mtu`, independent of carrier selection.
+
+User traffic counters count original IP bytes once when the encrypted frame is
+accepted by the logical transport, and once when decrypted on receipt. They do
+not promise remote delivery. They exclude carrier overhead, handshakes,
+keepalives, relay transit and carrier delivery probes. Packets queued before a
+handshake retain their exact original lengths. Each new tunnel gets an opaque
+counter epoch so tray deltas cannot cross a restart, including when its new
+counter already exceeds the old one. A carrier switch does not change that
+epoch. Network rates sum per-peer deltas; peers arriving with prior traffic
+never add that history to the current rate.
 
 ## Using it
 
@@ -238,71 +258,21 @@ tsng join --network lab --secret "$SECRET"
 
 See the two-machine walkthrough in [../README.md](../README.md#trying-it-on-two-machines).
 
-From the library:
+From the library, configure one `WireguardPlugin` with
+`AgentConfig::with_tunnel`, the agent's `with_interface`, and independent
+`with_carrier` adapters. UDP/TLS carriers also register their physical
+`PacketTransport` using `with_custom_transport`. Their own accept tasks pass
+real links to `Agent::install_inbound_link`. The `carriers.rs` integration test
+is a rootless example for ordinary WG and TLS; `tsunagi-awg/tests/pairs.rs`
+covers mixed transports and relay transitions.
 
-```rust,no_run
-use std::sync::Arc;
-use tsunagi::config::{AgentConfig, StoragePaths, TransportPolicy};
-use tsunagi::dataplane::IpPlugin;
-use tsunagi::dataplane::wireguard::{MemoryTunFactory, WireguardConfig, WireguardPlugin};
-use tsunagi::identity::{NetworkName, NetworkSecret};
-use tsunagi::{Agent, Result};
+## Limits
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let paths = StoragePaths::user_default()?;
-
-    // MemoryTunFactory needs no privileges; swap in ManagedTunFactory for a
-    // real interface.
-    let plugin = WireguardPlugin::open(
-        WireguardConfig::new(paths.state_dir.join("wireguard")),
-        Arc::new(MemoryTunFactory::new()),
-    )
-    .await
-    .expect("wireguard plugin");
-
-    let agent = Agent::spawn(
-        AgentConfig::new(paths)
-            .with_transport(TransportPolicy::N0Defaults)
-            .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
-    )
-    .await?;
-
-    let network = agent
-        .join_network(&NetworkName::new("lab")?, &NetworkSecret::generate())
-        .await?;
-
-    if let Some(view) = plugin.overview(network) {
-        println!("{} on {}", view.interface, view.overlay_address);
-    }
-    agent.shutdown().await;
-    Ok(())
-}
-```
-
-## Limits and future work
-
-* **Full mesh only.** Every member runs a tunnel to every other member.
-  Routing through an intermediate participant is not implemented.
-* **Nothing frees an address yet.** The release record exists and merges, but
-  no command emits one.
-* **A snapshot grows with the number of members ever seen**, and is capped per
-  message rather than compacted.
-* **No routes, DNS or firewall rules.** The plugin creates its interface and
-  nothing else. Anything beyond the overlay `/64` is the operator's business.
-* **Membership is session-scoped.** A peer leaves the overlay when its control
-  session ends; surviving a long absence is the same future work.
-* **Userspace costs CPU.** Kernel WireGuard is faster. A kernel backend could
-  return behind the same boundary, but it would give up transport-provided NAT
-  traversal unless paired with a local proxy.
-* **The interface is managed, not prepared.** On Linux the agent creates the
-  TUN interface and configures it over netlink, in process. See
-  *Provisioning* below.
-* **No provisioner exists for macOS or Windows yet.** There the agent attaches
-  to an interface prepared by hand and says so.
-* **The system interface path is not exercised by the default suite**, because
-  it needs privileges. Everything else about the data plane is.
-
+The default suite exercises real cryptography, sockets, handshakes, storage and
+IP routing using memory TUNs. It does not establish public NAT traversal, DPI
+effectiveness, actual host TUN performance, or native GUI behavior on every OS.
+Userspace encryption costs CPU. Reassembly and packet queues are bounded and
+may drop packets; host TCP handles retransmission within its own timeouts.
 
 ## Provisioning the interface
 
@@ -313,7 +283,7 @@ should carry and no others — observes what is actually on the host, and
 applies the difference. Running it twice changes nothing the second time.
 
 The decision of *what* to change is
-`dataplane::wireguard::provision::plan_changes`: pure, platform-independent
+`overlay::provision::plan_changes`: pure, platform-independent
 and unit-tested on every platform. Only the execution is behind
 `InterfaceProvisioner`, which has three implementations — netlink on Linux, a
 `MockProvisioner` over a pretend host for the tests, and one that refuses with
@@ -342,13 +312,12 @@ addresses with them.
 
 The two refusals are the interesting part:
 
-* **A link that is not a TUN is never touched.** The name is derived from the
-  network id, so colliding with a real device is unlikely rather than
-  impossible, and deleting somebody's bridge is not a recoverable mistake.
+* **A link that is not a TUN is never touched.** The interface name is supplied locally, so colliding with a real device is
+  possible, and deleting somebody's bridge is not a recoverable mistake.
 * **A TUN another process holds open is never deleted.** Carrier is the
   signal: a TUN has it exactly while something is attached. An attached one is
   a working overlay, almost certainly a second agent on this host, and it is
-  told to use a different `--wg-prefix` instead.
+  told to use a different `--interface` instead.
 
 ### Privilege
 
@@ -374,6 +343,6 @@ construction.
 ### What it cannot be told to do
 
 Nothing here takes a name, an address or a command from the network. The
-interface name is derived from the network id, the addresses come from the
-local plugin and the signed allocation records, and no external program is
+interface name comes from local configuration, the addresses come from the
+signed allocation records, and no external program is
 executed at any point — there is no `ip`, no shell and no `PATH` involved.

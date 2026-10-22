@@ -24,19 +24,6 @@ pub(crate) fn short(id: &str) -> String {
     }
 }
 
-/// A duration in seconds as a compact age (`5s`, `12m`, `3h 20m`, `2d 4h`).
-pub(crate) fn age(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3_600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h {}m", secs / 3_600, (secs % 3_600) / 60)
-    } else {
-        format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3_600)
-    }
-}
-
 /// A byte count in binary units.
 pub(crate) fn bytes(n: f64) -> String {
     const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];

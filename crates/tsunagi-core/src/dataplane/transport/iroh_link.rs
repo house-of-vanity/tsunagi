@@ -40,6 +40,49 @@ use crate::proto::{read_frame, write_frame};
 use super::fragments::{self, Reassembler};
 use super::{InboundLink, PacketLink, PacketTransport, SharedLink, TransportError};
 
+/// QUIC carrier capability. Encryption of end-to-end IP packets is independent.
+#[derive(Debug, Default)]
+pub struct IrohCarrier;
+
+impl super::DataCarrier for IrohCarrier {
+    fn protocol_id(&self) -> &str {
+        "wg-quic"
+    }
+    fn protocol_version(&self) -> u16 {
+        1
+    }
+    fn local_capability(
+        &self,
+        _: NetworkId,
+    ) -> Result<Option<crate::dataplane::PluginCapability>, crate::dataplane::PluginError> {
+        Ok(Some(crate::dataplane::PluginCapability {
+            protocol: self.protocol_id().into(),
+            version: self.protocol_version(),
+            enabled: true,
+            data: Vec::new(),
+        }))
+    }
+    fn on_peer_capability(
+        &self,
+        _: NetworkId,
+        _: EndpointId,
+        capability: &crate::dataplane::PluginCapability,
+    ) -> Result<(), crate::dataplane::PluginError> {
+        if capability.protocol != self.protocol_id()
+            || capability.version != self.protocol_version()
+            || !capability.enabled
+            || !capability.data.is_empty()
+        {
+            return Err(crate::dataplane::PluginError::Rejected(
+                "unsupported QUIC carrier capability".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn on_peer_gone(&self, _: NetworkId, _: EndpointId) {}
+    fn on_network_deactivated(&self, _: NetworkId) {}
+}
+
 /// What the iroh transport needs from the agent.
 ///
 /// Implemented by the agent, which is the only thing that knows which networks
@@ -190,6 +233,10 @@ impl PacketLink for IrohLink {
         self.conn.close_reason().is_some()
     }
 
+    fn failure_reason(&self) -> Option<String> {
+        self.conn.close_reason().map(|reason| reason.to_string())
+    }
+
     fn path_description(&self) -> String {
         // Report what iroh actually knows, never a guess.
         let snapshot = crate::net::snapshot_connection(&self.conn);
@@ -264,7 +311,8 @@ impl IrohTransport {
             ));
         }
 
-        let serves = self.lookup.serves(outcome.network_id, &open.protocol).await;
+        let serves = open.protocol == "wg-quic"
+            && self.lookup.serves(outcome.network_id, &open.protocol).await;
         if open.max_datagram == 0 || conn.max_datagram_size().is_none() {
             return Err(TransportError::Other(
                 "data channel has no datagram support".into(),
@@ -324,6 +372,12 @@ impl PacketTransport for IrohTransport {
                 return Err(TransportError::Other(
                     "data channel protocol id is out of bounds".into(),
                 ));
+            }
+            // This default must never impersonate a missing native carrier.
+            if protocol != "wg-quic" {
+                return Err(TransportError::Declined(format!(
+                    "no native `{protocol}` data transport registered"
+                )));
             }
             let keys = self
                 .lookup

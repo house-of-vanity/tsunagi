@@ -1,220 +1,94 @@
-#![allow(missing_docs)]
+//! Real control authentication and independently encrypted ordinary WG carriers.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-
 use bytes::Bytes;
-use tokio::sync::mpsc;
-use tsunagi::dataplane::transport::{InboundLink, PacketTransport};
-use tsunagi::identity::{DeviceIdentity, NetworkId};
-use tsunagi_wireguard::WireguardTransport;
+use std::{net::Ipv4Addr, time::Duration};
+use tempfile::TempDir;
+use tsunagi::{
+    Agent,
+    dataplane::transport::{PacketTransport, TransportError},
+    discovery::SharedMemoryDiscovery,
+    identity::DeviceIdentity,
+    testing::{config_with, network, wait_for_peers},
+};
+use tsunagi_wireguard::{UdpTransport, profile::PairProfile};
 
 #[tokio::test]
-async fn test_wireguard_transport_loopback() {
-    let identity_a = DeviceIdentity::generate();
-    let peer_a = identity_a.endpoint_id();
-
-    let identity_b = DeviceIdentity::generate();
-    let peer_b = identity_b.endpoint_id();
-
-    let network = NetworkId::from_bytes([42u8; 32]);
-
-    // Bind transport B on port 0 (ephemeral)
-    let transport_b = Arc::new(
-        WireguardTransport::bind(&identity_b, Some(0))
+async fn ordinary_wireguard_carries_opaque_frames_after_real_membership_authentication() {
+    let discovery = SharedMemoryDiscovery::new();
+    let mut nodes = Vec::new();
+    for _ in 0..2 {
+        let root = TempDir::new().unwrap();
+        let config = config_with(root.path(), &discovery);
+        let identity = tsunagi::storage::StateStore::open(config.paths.state_db())
+            .unwrap()
+            .load_or_create_device_identity()
+            .unwrap();
+        let transport = UdpTransport::wireguard(identity.endpoint_id(), Ipv4Addr::LOCALHOST, None);
+        let agent = Agent::spawn(config.with_custom_transport("wg", transport.clone()))
             .await
-            .expect("bind server should succeed"),
-    );
-    let port_b = transport_b.bound_port();
-    assert!(port_b > 0);
-
-    // Bind transport A on port 0 (ephemeral)
-    let transport_a = Arc::new(
-        WireguardTransport::bind(&identity_a, Some(0))
-            .await
-            .expect("bind client should succeed"),
-    );
-    let port_a = transport_a.bound_port();
-    assert!(port_a > 0);
-
-    // Register B's address and network on transport A
-    let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
-    transport_a.set_peer_addr(peer_b, addr_b);
-    transport_a.set_peer_network(peer_b, network);
-
-    // Register A's address and network on transport B
-    let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
-    transport_b.set_peer_addr(peer_a, addr_a);
-    transport_b.set_peer_network(peer_a, network);
-
-    // Spawn accept loop on A
-    let transport_a_clone = Arc::clone(&transport_a);
-    tokio::spawn(async move {
-        transport_a_clone.accept_loop(|_| {}).await;
-    });
-
-    // Spawn accept loop on B
-    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundLink>(1);
-    let transport_b_clone = Arc::clone(&transport_b);
-    tokio::spawn(async move {
-        transport_b_clone
-            .accept_loop(move |inbound| {
-                let _ = inbound_tx.try_send(inbound);
-            })
-            .await;
-    });
-
-    // Open link from A to B
-    let link_a = tokio::time::timeout(
-        Duration::from_secs(5),
-        transport_a.open(network, peer_b, "wg"),
-    )
-    .await
-    .expect("open should not timeout")
-    .expect("open should succeed");
-
-    // Send from A to B to trigger inbound link discovery on B
-    let data_a_to_b = Bytes::from_static(b"wireguard packet from A to B");
-    link_a.send(data_a_to_b.clone()).expect("send A->B");
-
-    // Receive inbound link on B
-    let inbound_b = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+            .unwrap();
+        nodes.push((root, agent, transport));
+    }
+    nodes.sort_by_key(|(_, agent, _)| *agent.endpoint_id().as_bytes());
+    let (name, secret) = network("outer-wireguard");
+    let id = nodes[0].1.join_network(&name, &secret).await.unwrap();
+    nodes[1].1.join_network(&name, &secret).await.unwrap();
+    for (index, (_, agent, transport)) in nodes.iter().enumerate() {
+        wait_for_peers(agent, id, 1).await;
+        transport.allow_peer(id, nodes[1 - index].1.endpoint_id());
+    }
+    let outgoing = nodes[0]
+        .2
+        .open(id, nodes[1].1.endpoint_id(), "wg")
         .await
-        .expect("accept should not timeout")
-        .expect("inbound link should arrive");
-
-    assert_eq!(inbound_b.network, network);
-    assert_eq!(inbound_b.peer, peer_a);
-    assert_eq!(inbound_b.protocol, "wg");
-    let link_b = inbound_b.link;
-
-    // Check packet received on B
-    let received_on_b = tokio::time::timeout(Duration::from_secs(2), link_b.recv())
+        .unwrap();
+    let incoming = tokio::time::timeout(Duration::from_secs(5), nodes[1].2.next_inbound())
         .await
-        .expect("recv B timeout")
-        .expect("recv B option");
-    assert_eq!(received_on_b, data_a_to_b);
-
-    // Send from B to A
-    let data_b_to_a = Bytes::from_static(b"wireguard packet from B to A");
-    link_b.send(data_b_to_a.clone()).expect("send B->A");
-    let received_on_a = tokio::time::timeout(Duration::from_secs(2), link_a.recv())
-        .await
-        .expect("recv A timeout")
-        .expect("recv A option");
-    assert_eq!(received_on_a, data_b_to_a);
-
-    // Path descriptions
-    assert!(link_a.path_description().contains("wireguard via"));
-    assert!(link_b.path_description().contains("wireguard via"));
-}
-
-#[tokio::test]
-async fn test_wireguard_transport_unreachable_probe_times_out() {
-    let identity_a = DeviceIdentity::generate();
-    let identity_b = DeviceIdentity::generate();
-    let peer_b = identity_b.endpoint_id();
-    let network = NetworkId::from_bytes([99u8; 32]);
-
-    let transport_a = Arc::new(
-        WireguardTransport::bind(&identity_a, Some(0))
-            .await
-            .expect("bind client should succeed"),
-    );
-
-    // Register a non-responsive address for peer B (TEST-NET-1 documentation IP which drops packets)
-    let unreachable_addr: SocketAddr = "192.0.2.1:51820".parse().unwrap();
-    transport_a.set_peer_addr(peer_b, unreachable_addr);
-    transport_a.set_peer_network(peer_b, network);
-
-    // Spawn accept loop on A
-    let transport_a_clone = Arc::clone(&transport_a);
-    tokio::spawn(async move {
-        transport_a_clone.accept_loop(|_| {}).await;
-    });
-
-    // Opening to unreachable candidate must fail with Unreachable rather than returning a dead direct link
-    let result = transport_a.open(network, peer_b, "wg").await;
-    match result {
-        Err(tsunagi::dataplane::transport::TransportError::Unreachable(msg)) => {
-            assert!(msg.contains("timed out"));
-        }
-        other => panic!("expected Unreachable error, got {other:?}"),
+        .unwrap()
+        .unwrap()
+        .link;
+    for (from, to) in [(&outgoing, &incoming), (&incoming, &outgoing)] {
+        let payload = Bytes::from(vec![0x37; 65_536]);
+        from.send(payload.clone()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), to.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            payload
+        );
+        assert!(from.path_description().starts_with("wg UDP via"));
+        assert!(matches!(
+            from.send(Bytes::from(vec![0; 65_537])),
+            Err(TransportError::TooLarge { .. })
+        ));
+    }
+    outgoing.close();
+    incoming.close();
+    for (_, agent, transport) in nodes {
+        transport.shutdown();
+        agent.shutdown().await;
     }
 }
 
 #[tokio::test]
-async fn test_wireguard_link_close_and_transport_close_link() {
-    let identity_a = DeviceIdentity::generate();
-    let peer_a = identity_a.endpoint_id();
-    let identity_b = DeviceIdentity::generate();
-    let peer_b = identity_b.endpoint_id();
-    let network = NetworkId::from_bytes([55u8; 32]);
+async fn an_unannounced_peer_cannot_open_or_negotiate_a_wireguard_carrier() {
+    let local = DeviceIdentity::generate().endpoint_id();
+    let peer = DeviceIdentity::generate().endpoint_id();
+    let transport = UdpTransport::wireguard(local, Ipv4Addr::LOCALHOST, None);
+    let id = tsunagi::NetworkId::from_bytes([7; 32]);
+    assert!(transport.open(id, peer, "wg").await.is_err());
+    assert!(transport.on_control(id, peer, "wg", &[0; 40]).is_err());
+    transport.shutdown();
+}
 
-    let transport_b = Arc::new(
-        WireguardTransport::bind(&identity_b, Some(0))
-            .await
-            .unwrap(),
-    );
-    let port_b = transport_b.bound_port();
-
-    let transport_a = Arc::new(
-        WireguardTransport::bind(&identity_a, Some(0))
-            .await
-            .unwrap(),
-    );
-    let port_a = transport_a.bound_port();
-
-    let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
-    transport_a.set_peer_addr(peer_b, addr_b);
-    transport_a.set_peer_network(peer_b, network);
-
-    let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
-    transport_b.set_peer_addr(peer_a, addr_a);
-    transport_b.set_peer_network(peer_a, network);
-
-    let transport_a_clone = Arc::clone(&transport_a);
-    tokio::spawn(async move {
-        transport_a_clone.accept_loop(|_| {}).await;
-    });
-
-    let transport_b_clone = Arc::clone(&transport_b);
-    tokio::spawn(async move {
-        transport_b_clone.accept_loop(|_| {}).await;
-    });
-
-    let link_a = transport_a
-        .open(network, peer_b, "wg")
-        .await
-        .expect("open link A");
-    assert!(!link_a.is_closed());
-
-    // Spawn a reader task waiting on recv()
-    let link_a_clone = Arc::clone(&link_a);
-    let recv_task = tokio::spawn(async move { link_a_clone.recv().await });
-
-    // Explicitly closing via transport.close_link()
-    transport_a.close_link(network, peer_b);
-    assert!(link_a.is_closed());
-
-    // Wait on closed() notification
-    tokio::time::timeout(Duration::from_secs(1), link_a.closed())
-        .await
-        .expect("link.closed() should resolve promptly");
-
-    // recv() must have returned None
-    let recv_res = tokio::time::timeout(Duration::from_secs(1), recv_task)
-        .await
-        .expect("recv task should complete")
-        .expect("task join");
-    assert_eq!(recv_res, None);
-
-    // Send after close must return Closed error
-    let send_res = link_a.send(Bytes::from_static(b"after close"));
-    assert!(matches!(
-        send_res,
-        Err(tsunagi::dataplane::transport::TransportError::Closed)
-    ));
+#[test]
+fn ordinary_profiles_preserve_the_wireguard_header_and_emit_no_masking_packets() {
+    let profile = PairProfile::wireguard();
+    let mut message = vec![0x42; 148];
+    message[..4].copy_from_slice(&[1, 0, 0, 0]);
+    assert_eq!(profile.encode(&message).unwrap().as_ref(), message);
+    assert_eq!(profile.decode(&message).unwrap(), message);
+    assert!(profile.signature_packets().is_empty());
+    assert!(!profile.is_masked());
 }

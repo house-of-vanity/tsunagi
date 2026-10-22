@@ -45,10 +45,9 @@ struct Device<'a> {
     copy: Option<String>,
     /// The full endpoint id, which clicking the short form copies.
     id: &'a str,
-    /// End-to-end tunnel protocol, independent of the path carrying it.
-    tunnel_protocol: &'a str,
+    /// Why the permitted external data channel is unavailable, when known.
+    data_error: Option<&'a str>,
     address: Option<String>,
-    handshake_secs: Option<u64>,
     control_rtt_ms: Option<u64>,
     overlay: Option<&'a OverlayPeerReport>,
     /// It is connected and offers to be an exit node.
@@ -431,11 +430,14 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
                 hostname,
                 copy: hostname.map(|h| format!("{h}.{}", network.name)),
                 id,
-                tunnel_protocol: overlay.map_or("—", |p| p.protocol.as_str()),
+                data_error: network
+                    .peers
+                    .iter()
+                    .find(|p| p.endpoint_id == id)
+                    .and_then(|p| p.data_error.as_deref()),
                 address: overlay
                     .and_then(|p| p.address.clone())
                     .or_else(|| member.and_then(|m| m.overlay_address_v4.clone())),
-                handshake_secs: overlay.and_then(|p| p.handshake_secs_ago),
                 control_rtt_ms: network
                     .peers
                     .iter()
@@ -463,8 +465,8 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
 const COLUMN_HEADERS: [&str; 10] = [
     "device",
     "exit",
-    "end-to-end",
-    "handshake / RTT",
+    "data",
+    "RTT",
     "address",
     "data path",
     "pkts",
@@ -477,8 +479,8 @@ const COLUMN_HEADERS: [&str; 10] = [
 const COLUMN_SAMPLES: [&str; 10] = [
     "device",
     "exit",
-    "end-to-end",
-    "999d / 9999 ms",
+    "data",
+    "9999 ms",
     "255.255.255.255",
     "data path",
     "99999/99999",
@@ -597,7 +599,8 @@ fn device_table(
     for (column, header) in COLUMN_HEADERS.into_iter().enumerate() {
         widths[column] = widths[column].max(measure(header.to_owned()));
     }
-    let (mut tx_packets, mut rx_packets, mut tx_bytes, mut rx_bytes) = (0u64, 0, 0, 0);
+    let (mut tx_packets, mut rx_packets, mut tx_bytes, mut rx_bytes): (u64, u64, u64, u64) =
+        (0, 0, 0, 0);
     for device in devices {
         let name = format!(
             "{} ({}){}",
@@ -608,25 +611,18 @@ fn device_table(
         widths[0] = widths[0].max(measure(name) + 24.0);
         let (path, _) = data_path_text(device.path, device.via_name.as_deref(), device.online);
         for (column, text) in [
-            (2, displayed_protocol(device.tunnel_protocol).to_owned()),
-            (
-                3,
-                handshake_rtt_text(
-                    device.handshake_secs,
-                    device.control_rtt_ms,
-                    displayed_protocol(device.tunnel_protocol) != "—",
-                ),
-            ),
+            (2, "waiting".to_owned()),
+            (3, rtt_text(device.control_rtt_ms)),
             (4, device.address.clone().unwrap_or_default()),
             (5, path),
         ] {
             widths[column] = widths[column].max(measure(text));
         }
         if let Some(peer) = device.overlay {
-            tx_packets += peer.tx_packets;
-            rx_packets += peer.rx_packets;
-            tx_bytes += peer.tx_bytes;
-            rx_bytes += peer.rx_bytes;
+            tx_packets = tx_packets.saturating_add(peer.tx_packets);
+            rx_packets = rx_packets.saturating_add(peer.rx_packets);
+            tx_bytes = tx_bytes.saturating_add(peer.tx_bytes);
+            rx_bytes = rx_bytes.saturating_add(peer.rx_bytes);
             for (column, text) in [
                 (6, format!("{}/{}", peer.tx_packets, peer.rx_packets)),
                 (
@@ -669,13 +665,16 @@ fn device_table(
         let response = ui.weak(COLUMN_HEADERS[column]);
         match column {
             2 => {
-                response.on_hover_text("End-to-end encryption.");
+                response.on_hover_text("Encrypted data channel readiness.");
             }
             3 => {
-                response.on_hover_text("Handshake age / control-connection RTT.");
+                response.on_hover_text("Control-connection round-trip time.");
+            }
+            7 => {
+                response.on_hover_text("Plaintext IP bytes accepted by the encrypted channel in this counter lifetime; excludes relay transit, transport overhead and delivery probes.");
             }
             5 => {
-                response.on_hover_text("Transport carrying the encrypted tunnel.");
+                response.on_hover_text("External data transport or relay route.");
             }
             _ => {}
         }
@@ -709,12 +708,8 @@ fn device_table(
                 1 => exit_cell(ui, device, network_id, confirm),
                 2 => tunnel_cell(ui, device),
                 3 => {
-                    ui.label(handshake_rtt_text(
-                        device.handshake_secs,
-                        device.control_rtt_ms,
-                        displayed_protocol(device.tunnel_protocol) != "—",
-                    ))
-                    .on_hover_text("Last handshake / control RTT.");
+                    ui.label(rtt_text(device.control_rtt_ms))
+                        .on_hover_text("Control-connection round-trip time.");
                 }
                 4 => match &device.address {
                     Some(address) => format::copy_field(ui, address, address),
@@ -776,43 +771,29 @@ fn device_table(
     );
 }
 
-/// A protocol name as it should appear in the table.
-fn displayed_protocol(protocol: &str) -> &str {
-    if protocol.is_empty() { "—" } else { protocol }
-}
-
-/// The end-to-end tunnel and its own health, without transport details.
-fn handshake_rtt_text(handshake: Option<u64>, rtt: Option<u64>, has_tunnel: bool) -> String {
-    let age = handshake.map_or_else(
-        || {
-            if has_tunnel {
-                "waiting".into()
-            } else {
-                "—".into()
-            }
-        },
-        format::age,
-    );
-    let rtt = rtt.map_or_else(|| "—".into(), |value| format!("{value} ms"));
-    format!("{age} / {rtt}")
-}
-
-fn tunnel_hint(protocol: &str) -> String {
-    let name = displayed_protocol(protocol);
-    if name == "tcp-tls" {
-        format!("{name}: Noise end-to-end encryption")
-    } else {
-        format!("{name}: WireGuard end-to-end encryption")
-    }
+/// Control RTT is independent of the hidden internal cipher's handshake age.
+fn rtt_text(rtt: Option<u64>) -> String {
+    rtt.map_or_else(|| "—".into(), |value| format!("{value} ms"))
 }
 
 fn tunnel_cell(ui: &mut egui::Ui, device: &Device<'_>) {
-    let protocol = displayed_protocol(device.tunnel_protocol);
-    if protocol == "—" {
-        ui.weak(protocol);
-        return;
-    }
-    ui.label(protocol).on_hover_text(tunnel_hint(protocol));
+    let ready = device.overlay.is_some_and(|peer| peer.is_up())
+        && !matches!(device.path, None | Some(DataPathReport::None));
+    let text = if !device.online {
+        "—"
+    } else if ready {
+        "ready"
+    } else {
+        "waiting"
+    };
+    let error = device.data_error.unwrap_or({
+        if ready {
+            "Encrypted data channel ready"
+        } else {
+            "Encrypted data channel is not ready"
+        }
+    });
+    ui.label(text).on_hover_text(error);
 }
 
 /// Compact route label and whether that route is the preferred direct form.
@@ -941,8 +922,6 @@ mod tests {
 
     #[test]
     fn tunnel_and_direct_transport_are_named_as_different_layers() {
-        assert_eq!(displayed_protocol("wg"), "wg");
-        assert_eq!(tunnel_hint("wg"), "wg: WireGuard end-to-end encryption");
         assert_eq!(
             data_path_text(
                 Some(&DataPathReport::Direct {
@@ -953,15 +932,11 @@ mod tests {
             ),
             (format!("{} tcp-tls", icon::LINK), true)
         );
-        assert_eq!(
-            tunnel_hint("tcp-tls"),
-            "tcp-tls: Noise end-to-end encryption"
-        );
     }
 
     #[test]
     fn incomplete_and_longer_paths_stay_explicit() {
-        assert_eq!(handshake_rtt_text(None, Some(25), true), "waiting / 25 ms");
+        assert_eq!(rtt_text(Some(25)), "25 ms");
         assert_eq!(
             data_path_text(
                 Some(&DataPathReport::Relayed {
@@ -981,10 +956,11 @@ mod tests {
     }
 
     #[test]
-    fn handshake_rtt_has_no_invented_values_and_uses_control_measurements() {
+    fn rtt_has_no_invented_values_and_ignores_the_internal_handshake_age() {
         use tsunagi::ipc::{OverlayReport, PeerReport};
         let network = NetworkReport {
             peers: vec![PeerReport {
+                data_error: None,
                 endpoint_id: "peer".into(),
                 rtt_ms: Some(27),
                 ..Default::default()
@@ -1001,13 +977,8 @@ mod tests {
             ..Default::default()
         };
         let rows = devices(&network, "own");
-        assert_eq!(
-            handshake_rtt_text(rows[0].handshake_secs, rows[0].control_rtt_ms, true),
-            "5s / 27 ms"
-        );
-        assert_eq!(handshake_rtt_text(None, None, false), "— / —");
-        assert_eq!(rows[0].tunnel_protocol, "wg");
-        assert!(!tunnel_hint(rows[0].tunnel_protocol).contains("wg-quic"));
+        assert_eq!(rtt_text(rows[0].control_rtt_ms), "27 ms");
+        assert_eq!(rtt_text(None), "—");
     }
 
     #[test]
@@ -1029,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn counters_headers_and_handshake_stay_on_one_line_without_overlapping() {
+    fn counters_headers_and_rtt_stay_on_one_line_without_overlapping() {
         use tsunagi::ipc::{OverlayReport, PeerReport};
 
         fn collect_text<'a>(
@@ -1058,6 +1029,7 @@ mod tests {
                 peers: ["peer", "other"]
                     .into_iter()
                     .map(|id| PeerReport {
+                        data_error: None,
                         endpoint_id: id.into(),
                         rtt_ms: Some(12_345),
                         ..Default::default()
@@ -1112,8 +1084,8 @@ mod tests {
                 let mut texts = Vec::new();
                 collect_text(&shapes, &mut texts);
                 for (label, next_column) in [
-                    ("handshake / RTT".to_string(), "address"),
-                    (handshake_rtt_text(Some(age), Some(12_345), true), "address"),
+                    ("RTT".to_string(), "address"),
+                    (rtt_text(Some(12_345)), "address"),
                     (format!("{packets}/{}", packets + 1), "bytes"),
                     (format!("{}/{}", packets * 2, (packets + 1) * 2), "bytes"),
                 ] {

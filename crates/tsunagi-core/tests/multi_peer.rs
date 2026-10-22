@@ -132,7 +132,7 @@ async fn opaque_plugin_capabilities_cross_the_control_plane() {
     let a = TestAgent::spawn_with(
         {
             let plugin = Arc::clone(&plugin_a);
-            move |cfg| cfg.with_plugin(plugin)
+            move |cfg| cfg.with_tunnel(plugin)
         },
         &discovery,
     )
@@ -141,7 +141,7 @@ async fn opaque_plugin_capabilities_cross_the_control_plane() {
     let b = TestAgent::spawn_with(
         {
             let plugin = Arc::clone(&plugin_b);
-            move |cfg| cfg.with_plugin(plugin)
+            move |cfg| cfg.with_tunnel(plugin)
         },
         &discovery,
     )

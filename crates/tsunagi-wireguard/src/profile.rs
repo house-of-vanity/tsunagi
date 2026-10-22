@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Serialize, Deserialize, zeroize::ZeroizeOnDrop)]
 pub struct PairProfile {
     id: [u8; 16],
+    masked: bool,
     prefix: u16,
     headers: [[u32; 2]; 4],
     header_key: [u8; 32],
@@ -31,6 +32,7 @@ impl PairProfile {
         });
         Self {
             id: rand::random(),
+            masked: true,
             prefix: rand::random_range(12..49),
             headers,
             header_key: rand::random(),
@@ -41,6 +43,16 @@ impl PairProfile {
             padding: rand::random_range(16..65),
             signature: rand::random_range(0..2),
         }
+    }
+    /// A fresh ordinary WireGuard profile, without masking or signature packets.
+    pub fn wireguard() -> Self {
+        let mut profile = Self::generate();
+        profile.masked = false;
+        profile
+    }
+    /// Whether this profile uses Amnezia masking.
+    pub fn is_masked(&self) -> bool {
+        self.masked
     }
     /// Public attempt identifier, useful for distinguishing retries without revealing secrets.
     pub fn id(&self) -> [u8; 16] {
@@ -109,6 +121,9 @@ impl PairProfile {
     }
     /// Masks one standard WireGuard message; invalid types and oversized packets are refused.
     pub fn encode(&self, raw: &[u8]) -> Option<Bytes> {
+        if !self.masked {
+            return (raw.len() <= 1200).then(|| Bytes::copy_from_slice(raw));
+        }
         let kind = match raw.get(..4)? {
             [1, 0, 0, 0] => AwgKind::Initiation,
             [2, 0, 0, 0] => AwgKind::Response,
@@ -132,6 +147,9 @@ impl PairProfile {
     }
     /// Unmasks a packet and restores standard headers before WireGuard validation.
     pub fn decode(&self, wire: &[u8]) -> Option<Vec<u8>> {
+        if !self.masked {
+            return (wire.len() <= 1200).then(|| wire.to_vec());
+        }
         if wire.len() > 1200 {
             return None;
         }
@@ -147,11 +165,18 @@ impl PairProfile {
         Some(message)
     }
     pub(crate) fn pad(&self, packet: Bytes) -> Bytes {
-        self.config().prepare_transport_plaintext(packet, 1200)
+        if self.masked {
+            self.config().prepare_transport_plaintext(packet, 1200)
+        } else {
+            packet
+        }
     }
     /// Generates structured signature packets with fresh fields, never static captures.
     /// These target the other Tsunagi peer, not DNS or SIP services.
     pub fn signature_packets(&self) -> Vec<Vec<u8>> {
+        if !self.masked {
+            return Vec::new();
+        }
         if self.signature == 0 {
             // A complete DNS query. Counts, label lengths and qtype remain valid.
             let label = format!("n{:016x}", rand::random::<u64>());
@@ -169,6 +194,9 @@ impl PairProfile {
         }
     }
     pub(crate) fn junk_packets(&self) -> Vec<Vec<u8>> {
+        if !self.masked {
+            return Vec::new();
+        }
         (0..self.junk_count)
             .map(|_| {
                 let mut packet = vec![0; rand::random_range(self.junk_min..=self.junk_max).into()];

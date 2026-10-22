@@ -17,13 +17,16 @@ tsng protocols home awg
 ```
 
 Changes are local to this device, persist across restarts, and retire existing
-data links and end-to-end channels for that network before renegotiation.
+physical data links for that network before renegotiation. The single internal
+WireGuard channel, its keys, session and counters survive.
 Authenticated control sessions, membership, addresses and other networks stay
 live. Removing every protocol (`none` in the CLI, all checkboxes off in the tray)
-leaves the network control-only. This is different from automatic carrier
-fallback, which preserves the selected end-to-end channel.
+leaves the network control-only. Re-enabling a carrier resumes the existing
+internal channel, subject to ordinary WireGuard and application timeouts. The
+choice applies to both incoming and outgoing local data links; a relay may use
+a different transport on its next hop. Control and discovery are independent.
 
-`awg` is Tsunagi AWG wire version 1. Its packet masking engine is adapted from
+`awg` is Tsunagi AWG wire version 2. Its packet masking engine is adapted from
 [RunaRoo/AmneziaWG-RS](https://github.com/RunaRoo/AmneziaWG-RS), with the pinned
 source and license recorded in
 [UPSTREAM.md](../crates/tsunagi-awg/UPSTREAM.md). It uses the existing boringtun
@@ -36,7 +39,7 @@ not implemented: this carrier connects authenticated Tsunagi members.
 There is one independent UDP socket and cancellable packet-engine task per
 `(network, peer)` pair. The smaller endpoint id initiates, following the same
 rule as other data carriers. Both sides must announce enabled AWG wire version
-1. An authenticated iroh control session is required throughout; AWG supplies
+2. An authenticated iroh control session is required throughout; AWG supplies
 no alternate discovery or membership mechanism.
 
 Every `open` generates new masking parameters, a header-protection key, an
@@ -100,25 +103,37 @@ candidates. IPv6-only paths, symmetric NAT and networks blocking arbitrary UDP
 may fail AWG and fall back; there is no AWG-over-QUIC substitution or AWG TURN
 relay hidden behind its name.
 
-Data delivery checks go through the actual end-to-end encrypted tunnel, once
-per second, independently of control-plane RTT. Requests and replies bind a
+Data delivery checks go through the specific authenticated physical carrier,
+once per second, independently of control-plane RTT or the shared internal
+tunnel. A successful relay path cannot mask a broken direct carrier. Requests and replies bind a
 fresh private marker/key to the sender's endpoint id. Unanswered requests expire
 after three seconds. After a 20-second warmup, at least 15 completed observations
 and at least 60% loss in the last 20 observations retire a carrier. Probes are
-consumed locally after source/destination admission and never enter the TUN.
+consumed at the carrier boundary and never enter the TUN or user IP counters.
 AWG additionally checks encrypted outer delivery throughout the pair lifetime.
 
 Setup failure or persistent runtime loss advances to the next mutually supported
 carrier in the initiator's order. Earlier expired cooldowns do not jump ahead of
 untried carriers. Retry cooldowns remain bounded; reaching AWG again negotiates
 new parameters. Control sessions and the logical end-to-end tunnel survive a
-carrier change. Status names the end-to-end protocol and the actual carrier
-separately, so `wg` over `awg` is a valid result.
+carrier change. Status and the tray show the actual external transport or relay
+route and data readiness. There is no user-selectable internal cipher.
 
-Control wire version 6 introduces the private transport message. All members
-must upgrade together; device identities, network ids, handshake transcript
-encoding, signed state and stored network configuration are unchanged. Data
-ALPN remains `tsunagi/data/5`; the relay envelope is unchanged.
+The internal capability is `wireguard-e2e` v4; external `wg` and `awg` use v2,
+`wg-quic` v1 and `tcp-tls` v2. All members must upgrade together. Control ALPN
+`tsunagi/ctrl/8`, discovery, membership and signed state are unchanged. The data
+ALPN is `tsunagi/data/6`; the relay envelope format is unchanged. Local IPC is v23,
+so agent, CLI and tray must match. Historical `wg-quic/wireguard.sqlite` is the
+canonical internal key store. Missing keys are imported transactionally from
+`wg` then `awg`, without replacing an existing canonical key or modifying a
+source database. Corrupt key stores fail rather than silently regenerating keys.
+Device identities, network ids, addresses and saved transport choices survive.
+
+Ordinary `wg` uses the same independent pair engine with standard WireGuard
+headers, no masking/junk, fresh hop keys and PSK, and a preferred local UDP port
+(default 51820; additional pairs use dynamic ports). The whole relay envelope is
+inside the hop encryption. It is separate from the internal WireGuard channel.
+Neither UDP mode is a client for an externally configured WireGuard server.
 
 ## Verification
 

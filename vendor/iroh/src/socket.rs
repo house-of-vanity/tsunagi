@@ -160,6 +160,7 @@ impl From<mpsc::error::SendError<RemoteStateMessage>> for RemoteStateActorStoppe
 /// Contains options for `Socket::listen`.
 #[derive(derive_more::Debug)]
 pub(crate) struct Options {
+    pub(crate) direct_addr_filter: Option<address_lookup::AddrFilter>,
     /// The configuration for the different transports.
     pub(crate) transports: Vec<TransportConfig>,
 
@@ -349,6 +350,7 @@ pub(crate) struct Socket {
     // - Networking Info
     /// Our discovered direct addresses.
     direct_addrs: DiscoveredDirectAddrs,
+    direct_addr_filter: Option<address_lookup::AddrFilter>,
     /// Our latest net-report
     net_report: Watchable<(Option<Report>, UpdateReason)>,
     /// If the last net_report report, reports IPv6 to be available.
@@ -508,7 +510,15 @@ impl Socket {
     ///
     /// If the direct addresses have changed from the previous set, they are published to
     /// the address lookup system.
-    fn store_direct_addresses(&self, addrs: BTreeSet<DirectAddr>) {
+    fn store_direct_addresses(&self, mut addrs: BTreeSet<DirectAddr>) {
+        if let Some(filter) = &self.direct_addr_filter {
+            let original = addrs
+                .iter()
+                .map(|addr| TransportAddr::Ip(addr.addr))
+                .collect::<Vec<_>>();
+            let retained = filter.apply(&original);
+            addrs.retain(|addr| retained.contains(&TransportAddr::Ip(addr.addr)));
+        }
         let updated = self.direct_addrs.update(addrs);
         if updated {
             self.publish_my_addr();
@@ -872,6 +882,7 @@ impl EndpointInner {
         let span = tracing::Span::current();
 
         let Options {
+            direct_addr_filter,
             secret_key,
             transports: transport_configs,
             address_lookup_user_data,
@@ -991,6 +1002,7 @@ impl EndpointInner {
             address_lookup_user_data: RwLock::new(address_lookup_user_data),
             configured_addrs: RwLock::new(configured_addrs),
             direct_addrs,
+            direct_addr_filter,
             net_report: Watchable::new((None, UpdateReason::None)),
             #[cfg(not(wasm_browser))]
             dns_resolver: dns_resolver.clone(),
@@ -2179,6 +2191,7 @@ mod tests {
             net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),
+            direct_addr_filter: None,
         }
     }
 
@@ -2595,6 +2608,7 @@ mod tests {
             net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),
+            direct_addr_filter: None,
         };
         let sock = EndpointInner::bind(opts).await?;
         Ok(sock)

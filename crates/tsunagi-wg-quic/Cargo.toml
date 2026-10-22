@@ -4,7 +4,7 @@ name = "tsunagi-wg-quic"
 # negotiates: a release here does not stop it talking to a peer on an older
 # build, because what peers compare is `ANNOUNCEMENT_VERSION`.
 version = "0.1.0"
-description = "The wg-quic protocol for tsunagi: WireGuard's cryptography carried in iroh's QUIC datagrams."
+description = "The single internal WireGuard tunnel for tsunagi, independent of external carriers."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -30,6 +30,8 @@ rand = "0.10"
 boringtun = { version = "0.7.1", default-features = false }
 
 [dev-dependencies]
+tsunagi-wireguard = { path = "../tsunagi-wireguard" }
+tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls" }
 tsunagi-core = { path = "../tsunagi-core", features = ["testing"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tempfile.workspace = true

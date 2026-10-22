@@ -22,6 +22,7 @@
 //! own reachability data.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::{
@@ -221,9 +222,18 @@ fn local_addr_string(addr: &iroh::endpoint::LocalTransportAddr) -> Option<String
 #[derive(Debug, Clone)]
 pub struct EndpointAdapter {
     endpoint: Endpoint,
+    owned_interface: Arc<std::sync::RwLock<String>>,
 }
 
 impl EndpointAdapter {
+    /// Excludes the real name after interface creation (macOS assigns utunN).
+    pub(crate) fn exclude_interface(&self, name: &str) {
+        *self
+            .owned_interface
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = name.to_lowercase();
+    }
+
     /// Binds an endpoint according to `config`, reusing the persistent device key.
     pub async fn bind(config: &AgentConfig, identity: &DeviceIdentity) -> Result<Self> {
         let mut builder = Endpoint::builder(presets::Minimal)
@@ -240,11 +250,15 @@ impl EndpointAdapter {
             TransportPolicy::N0Defaults => builder.preset(presets::N0),
         };
 
-        if matches!(
-            config.transport,
-            TransportPolicy::N0Defaults | TransportPolicy::DirectOnly
-        ) {
-            let filter = iroh::address_lookup::AddrFilter::new(|addrs| {
+        let owned_interface =
+            Arc::new(std::sync::RwLock::new(config.interface_name.to_lowercase()));
+        {
+            let interface_filter = Arc::clone(&owned_interface);
+            let filter = iroh::address_lookup::AddrFilter::new(move |addrs| {
+                let owned_interface = interface_filter
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
                 let mut overlay_ips = std::collections::HashSet::new();
                 for iface in netdev::get_interfaces() {
                     let name = iface.name.to_lowercase();
@@ -258,7 +272,9 @@ impl EndpointAdapter {
                         .as_deref()
                         .map(str::to_lowercase)
                         .unwrap_or_default();
-                    if name.starts_with("tsun")
+                    if name == owned_interface
+                        || friendly == owned_interface
+                        || name.starts_with("tsun")
                         || name.contains("tsunagi")
                         || name.contains("wintun")
                         || friendly.starts_with("tsun")
@@ -288,7 +304,9 @@ impl EndpointAdapter {
                     .collect();
                 std::borrow::Cow::Owned(filtered)
             });
-            builder = builder.addr_filter(filter);
+            builder = builder
+                .direct_addr_filter(filter.clone())
+                .addr_filter(filter);
         }
 
         #[cfg(feature = "testing")]
@@ -395,7 +413,10 @@ impl EndpointAdapter {
             }
         });
 
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            owned_interface,
+        })
     }
 
     /// The underlying iroh endpoint.

@@ -364,7 +364,7 @@ fn draw_protocols(
     } else {
         network.protocols.join(", ")
     };
-    egui::CollapsingHeader::new(format!("protocols  {summary}"))
+    egui::CollapsingHeader::new(format!("data transports  {summary}"))
         .id_salt(("protocols", &network.network_id))
         .show(ui, |ui| {
             ui.weak("Preference order; changes apply immediately and are saved.");

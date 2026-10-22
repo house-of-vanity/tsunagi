@@ -136,9 +136,14 @@ tsng protocols home none                # control plane only
 
 Exact network names, full ids and unique id prefixes work here. The choice is
 local to this device, saved per network and applied immediately; an offline
-change applies on the next start. In the tray, expand **protocols** on a network
-tile to toggle protocols or change their preference order. Both endpoints need
-a common protocol at the same wire version. `tsng up --protocol` supplies the
+change applies on the next start. In the tray, expand **data transports** on a network
+tile to toggle protocols or change their preference order. Adjacent peers need a common external transport at the same wire version.
+Selection applies to this device's incoming and outgoing data links; control and
+discovery are independent. A relay's next hop may use a different transport.
+Every pair uses one internal WireGuard cipher, hidden from these controls.
+Changing transport or moving direct → relay → direct preserves that channel,
+addresses and interface. An existing TCP connection can resume after temporary
+loss, subject to its own timeouts. `tsng up --protocol` supplies the
 initial defaults for networks without a saved choice; it does not restrict
 which built-in protocols can be enabled later.
 

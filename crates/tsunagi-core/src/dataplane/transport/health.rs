@@ -1,8 +1,6 @@
 //! Authenticated probes of the actual data link, independent of control RTT.
 //! Keys are negotiated privately for each physical link. No fixed wire magic.
 use super::{PacketLink, SharedLink, TransportError};
-use crate::dataplane::SharedPlugin;
-use crate::overlay::RoutingTable;
 use crate::{BoxFuture, NetworkId};
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
@@ -70,52 +68,8 @@ impl Samples {
             && self.recent.iter().filter(|ok| !**ok).count() * 100 >= self.recent.len() * 60
     }
 }
-// This prefix is inside end-to-end encryption. It never appears on the UDP wire.
-const IP_MAGIC: &[u8; 16] = b"tsunagi-health01";
-pub(crate) fn ip_payload(packet: &[u8]) -> Option<&[u8]> {
-    (packet.len() >= 36 && packet[0] == 0x45 && packet[9] == 253 && &packet[20..36] == IP_MAGIC)
-        .then(|| &packet[36..])
-}
-/// Inject probes through the same encrypted tunnel as application IP packets.
-/// This matters for pure WG: raw UDP probes could pass DPI while WG is blocked.
-pub(crate) struct ProbeRoute {
-    pub(crate) plugin: SharedPlugin,
-    pub(crate) routes: Arc<RoutingTable>,
-    pub(crate) network: NetworkId,
-    pub(crate) peer: EndpointId,
-    pub(crate) max_probe_size: usize,
-}
-impl ProbeRoute {
-    fn send(&self, payload: Bytes) -> bool {
-        let Some((source, destination)) = self.routes.probe_addresses(self.network, self.peer)
-        else {
-            return false;
-        };
-        let mut packet = vec![0; 36];
-        packet[0] = 0x45;
-        packet[8] = 64;
-        packet[9] = 253;
-        packet[12..16].copy_from_slice(&source.octets());
-        packet[16..20].copy_from_slice(&destination.octets());
-        packet[20..36].copy_from_slice(IP_MAGIC);
-        let length = (packet.len() + payload.len()) as u16;
-        packet[2..4].copy_from_slice(&length.to_be_bytes());
-        let sum = packet[..20]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|b| u32::from(u16::from_be_bytes(*b)))
-            .sum::<u32>();
-        let sum = (sum & 0xffff) + (sum >> 16);
-        packet[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
-        packet.extend_from_slice(&payload);
-        self.plugin
-            .carry(self.network, self.peer, Bytes::from(packet))
-    }
-}
 /// A monitored physical link. It forwards application bytes unchanged.
 pub(crate) struct HealthLink {
-    probes: mpsc::Sender<Bytes>,
     raw: SharedLink,
     settings: Mutex<Option<Settings>>,
     rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
@@ -136,17 +90,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 impl HealthLink {
-    pub(crate) fn new(
-        raw: SharedLink,
-        local: EndpointId,
-        settings: Option<Settings>,
-        route: Option<ProbeRoute>,
-    ) -> Arc<Self> {
+    pub(crate) fn new(raw: SharedLink, local: EndpointId, settings: Option<Settings>) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(64);
-        let (probe_tx, mut probe_rx) = mpsc::channel(64);
         let (stop, _) = watch::channel(false);
         let link = Arc::new(Self {
-            probes: probe_tx,
             raw: raw.clone(),
             settings: Mutex::new(settings),
             rx: tokio::sync::Mutex::new(rx),
@@ -174,28 +121,20 @@ impl HealthLink {
                             *lock(&link.reason)=Some("data delivery checks: at least 60% loss over the last 20 probes".into());break;
                         }
                         sequence=sequence.wrapping_add(1);
-                        let size=route.as_ref().map_or(raw.max_datagram_size(),|route|route.max_probe_size);
+                        let size=raw.max_datagram_size();
                         let packet=probe(&settings,local,1,sequence,size.min(1000));
-                        if let Some(route)=&route { if route.send(packet) {samples.sent(sequence,now);} }
-                        else { let _=raw.send(packet); samples.sent(sequence,now); }
+                        samples.sent(sequence,now);
+                        let _=raw.send(packet);
                     }
                     packet=raw.recv()=>{
                         let Some(packet)=packet else{break;};let Some(link)=weak.upgrade()else{break;};
                         let settings=lock(&link.settings).clone();
-                        if route.is_none() && let Some(settings)=settings && packet.starts_with(&settings.marker) {
+                        if let Some(settings)=settings && packet.starts_with(&settings.marker) {
                             if let Some((kind,seq))=verify(&settings,raw.peer(),&packet) {
                                 if kind==1 {let _=raw.send(probe(&settings,local,2,seq,packet.len()));}
                                 else if kind==2 {samples.acknowledge(seq);}
                             }
                         } else {let _=tx.try_send(packet);}
-                    }
-                    packet=probe_rx.recv(),if route.is_some()=>{
-                        let Some(packet)=packet else {break;};let Some(link)=weak.upgrade()else{break;};
-                        let Some(settings)=lock(&link.settings).clone()else{continue;};
-                        if let Some((kind,seq))=verify(&settings,raw.peer(),&packet) {
-                            if kind==1 { if let Some(route)=&route { route.send(probe(&settings,local,2,seq,packet.len().min(route.max_probe_size))); } }
-                            else if kind==2 {samples.acknowledge(seq);}
-                        }
                     }
 
                 }
@@ -206,9 +145,6 @@ impl HealthLink {
             }
         });
         link
-    }
-    pub(crate) fn receive_probe(&self, packet: Bytes) {
-        let _ = self.probes.try_send(packet);
     }
     pub(crate) fn configure(&self, settings: Settings) {
         *lock(&self.settings) = Some(settings);

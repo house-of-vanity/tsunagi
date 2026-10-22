@@ -1,10 +1,10 @@
 [package]
 name = "tsunagi-wireguard"
 version = "0.1.0"
-description = "Pure WireGuard direct UDP transport and protocol plugin for tsunagi mesh networks."
+description = "Independent authenticated WireGuard and Amnezia UDP carriers for tsunagi."
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "WTFPL AND Apache-2.0"
 repository.workspace = true
 
 [dependencies]
@@ -14,14 +14,10 @@ tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macro
 serde.workspace = true
 postcard.workspace = true
 bytes.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
-data-encoding.workspace = true
-hex.workspace = true
-rusqlite = { version = "0.40", features = ["bundled"] }
-subtle = "2.6"
 zeroize = { version = "1.9", features = ["derive"] }
 rand = "0.10"
+chacha20 = "0.9"
 boringtun = { version = "0.7.1", default-features = false }
 netdev = "0.46"
 

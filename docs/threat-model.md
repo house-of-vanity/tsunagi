@@ -130,7 +130,7 @@ AWG profiles, PSKs and outer keys are private to one authenticated pair attempt,
 not shared network state. Address candidates are unverified until authenticated
 outer WireGuard data arrives. Header protection and structured signature packets
 reduce fixed wire markers; they do not guarantee admission by DPI or hide traffic
-analysis. iroh control availability remains a prerequisite. Encrypted end-to-end
-delivery probes detect sustained carrier loss, never confer membership and pass
-the same signed source/destination admission as ordinary IP traffic. See
+analysis. iroh control availability remains a prerequisite. Authenticated physical-link
+delivery probes detect sustained loss on that carrier, independently of a
+working end-to-end relay path. They never confer membership or enter the TUN. See
 [amnezia.md](amnezia.md) for limits and tested scope.

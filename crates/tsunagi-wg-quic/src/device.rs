@@ -59,7 +59,7 @@ const SCRATCH: usize = 4096;
 /// All three operations share the same mutex as the cryptographic state.
 struct FlowTunnel {
     tunn: Tunn,
-    queued: VecDeque<FlowId>,
+    queued: VecDeque<(FlowId, usize)>,
 }
 
 fn is_data(result: &TunnResult<'_>) -> bool {
@@ -79,7 +79,7 @@ impl FlowTunnel {
         }
         // MAX_QUEUE_DEPTH in boringtun 0.7: the newest packet is dropped at 256.
         if self.queued.len() < 256 {
-            self.queued.push_back(flow);
+            self.queued.push_back((flow, packet.len()));
         }
         (result, 0)
     }
@@ -88,19 +88,22 @@ impl FlowTunnel {
         &mut self,
         packet: &[u8],
         scratch: &'a mut [u8],
-    ) -> (TunnResult<'a>, FlowId) {
+    ) -> (TunnResult<'a>, FlowId, Option<usize>) {
         let result = self.tunn.decapsulate(None, packet, scratch);
-        let mut flow = 0;
+        let (mut flow, mut plaintext_len) = (0, None);
         if packet.is_empty() {
             if is_data(&result) {
-                flow = self.queued.pop_front().unwrap_or(0);
+                if let Some((tag, len)) = self.queued.pop_front() {
+                    flow = tag;
+                    plaintext_len = Some(len);
+                }
             } else if let Some(pending) = self.queued.pop_front() {
                 // Without a session, draining pops the oldest IP packet and
                 // encapsulate queues it again at the back.
                 self.queued.push_back(pending);
             }
         }
-        (result, flow)
+        (result, flow, plaintext_len)
     }
 
     fn update_timers<'a>(&mut self, scratch: &'a mut [u8]) -> TunnResult<'a> {
@@ -118,6 +121,7 @@ impl FlowTunnel {
 /// Counters for one peer's tunnel.
 #[derive(Debug, Default)]
 struct PeerCounters {
+    epoch: u64,
     tx_packets: AtomicU64,
     tx_bytes: AtomicU64,
     rx_packets: AtomicU64,
@@ -132,6 +136,8 @@ struct PeerCounters {
 /// A snapshot of one peer's tunnel counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PeerStats {
+    /// Identifies this counter lifetime; unchanged by rekeying or route switches.
+    pub counter_epoch: u64,
     /// Plaintext packets encrypted and sent to this peer.
     pub tx_packets: u64,
     /// Plaintext bytes encrypted and sent to this peer.
@@ -209,6 +215,7 @@ impl Drop for Peer {
 impl Peer {
     fn stats(&self) -> PeerStats {
         PeerStats {
+            counter_epoch: self.counters.epoch,
             tx_packets: self.counters.tx_packets.load(Ordering::Relaxed),
             tx_bytes: self.counters.tx_bytes.load(Ordering::Relaxed),
             rx_packets: self.counters.rx_packets.load(Ordering::Relaxed),
@@ -328,26 +335,27 @@ impl WireguardDevice {
             };
             let (result, selected_flow) = tunn.encapsulate(packet, &mut scratch, flow);
             match result {
-                TunnResult::WriteToNetwork(out) => Some((out.len(), selected_flow)),
+                TunnResult::WriteToNetwork(out) => {
+                    Some((out.len(), selected_flow, out.starts_with(&[4, 0, 0, 0])))
+                }
                 // No session yet, so nothing to send. Counted as dropped
                 // rather than reported: the handshake is in flight and the
                 // next packet will go.
                 _ => None,
             }
         };
-        let Some((len, selected_flow)) = result else {
+        let Some((len, selected_flow, data)) = result else {
             peer.counters
                 .dropped_no_session
                 .fetch_add(1, Ordering::Relaxed);
             return false;
         };
 
-        send_to_peer_flow(&peer, &scratch[..len], selected_flow);
-        peer.counters.tx_packets.fetch_add(1, Ordering::Relaxed);
-        peer.counters
-            .tx_bytes
-            .fetch_add(packet.len() as u64, Ordering::Relaxed);
-        true
+        let sent = send_to_peer_flow(&peer, &scratch[..len], selected_flow);
+        if sent && data {
+            count_sent(&peer, packet.len());
+        }
+        sent
     }
 
     /// Adds or replaces a peer and starts its tunnel.
@@ -388,7 +396,10 @@ impl WireguardDevice {
                 queued: VecDeque::new(),
             }),
             link,
-            counters: Arc::new(PeerCounters::default()),
+            counters: Arc::new(PeerCounters {
+                epoch: rand::random(),
+                ..Default::default()
+            }),
             task: Mutex::new(None),
         });
 
@@ -501,9 +512,9 @@ fn send_to_peer(peer: &Peer, payload: &[u8]) {
     send_to_peer_flow(peer, payload, 0);
 }
 
-fn send_to_peer_flow(peer: &Peer, payload: &[u8], flow: FlowId) {
+fn send_to_peer_flow(peer: &Peer, payload: &[u8], flow: FlowId) -> bool {
     match peer.link.send_flow(Bytes::copy_from_slice(payload), flow) {
-        Ok(()) => {}
+        Ok(()) => return true,
         Err(TransportError::TooLarge { .. }) => {
             peer.counters
                 .dropped_oversize
@@ -514,6 +525,14 @@ fn send_to_peer_flow(peer: &Peer, payload: &[u8], flow: FlowId) {
             tracing::trace!(%err, "dropping a WireGuard packet the link refused");
         }
     }
+    false
+}
+
+fn count_sent(peer: &Peer, plaintext_len: usize) {
+    peer.counters.tx_packets.fetch_add(1, Ordering::Relaxed);
+    peer.counters
+        .tx_bytes
+        .fetch_add(plaintext_len as u64, Ordering::Relaxed);
 }
 
 async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
@@ -532,9 +551,12 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                let (result, flow) = tunn.decapsulate(input.unwrap_or(&[]), &mut scratch);
+                let (result, flow, plaintext_len) =
+                    tunn.decapsulate(input.unwrap_or(&[]), &mut scratch);
                 match result {
-                    TunnResult::WriteToNetwork(out) => Outcome::ToNetwork(out.len(), flow),
+                    TunnResult::WriteToNetwork(out) => {
+                        Outcome::ToNetwork(out.len(), flow, plaintext_len)
+                    }
                     // The source boringtun reports is not consulted here:
                     // whether the peer may use it is checked where the
                     // claims live.
@@ -549,8 +571,12 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
             };
 
             match outcome {
-                Outcome::ToNetwork(len, flow) => {
-                    send_to_peer_flow(&peer, &scratch[..len], flow);
+                Outcome::ToNetwork(len, flow, plaintext_len) => {
+                    if send_to_peer_flow(&peer, &scratch[..len], flow)
+                        && let Some(len) = plaintext_len
+                    {
+                        count_sent(&peer, len);
+                    }
                     // Keep draining with an empty datagram, as boringtun asks.
                     input = None;
                     continue;
@@ -584,7 +610,7 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
 }
 
 enum Outcome {
-    ToNetwork(usize, FlowId),
+    ToNetwork(usize, FlowId, Option<usize>),
     ToTunnel(usize),
     Done,
     Failed,
@@ -671,7 +697,12 @@ mod flow_tests {
         let keepalive = wire(a.decapsulate(&response, &mut scratch).0);
         let _ = b.decapsulate(&keepalive, &mut scratch);
         for expected in 100..356 {
-            let (result, flow) = a.decapsulate(&[], &mut scratch);
+            let (result, flow, len) = a.decapsulate(&[], &mut scratch);
+            assert_eq!(
+                len,
+                Some(packet.len()),
+                "queued counters retain the exact unpadded IP length"
+            );
             assert_eq!(flow, expected);
             let ciphertext = wire(result);
             match b.decapsulate(&ciphertext, &mut scratch).0 {

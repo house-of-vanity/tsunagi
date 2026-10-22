@@ -16,8 +16,8 @@ the default 1280-byte interface MTU also works on small QUIC paths.
 
 Each authenticated control session advertises that peer's own direct data
 links. There is one table for each network, whatever protocols run over it: a
-link is a way to reach a neighbour, and a protocol is an end-to-end tunnel to a
-peer. The envelope names the protocol, so the two are independent. A neighbour
+link is a way to reach a neighbour, while the single internal protocol is an
+end-to-end tunnel to a peer. The envelope names the protocol, so the two are independent. A neighbour
 reached over several kinds of transport (UDP, TCP, QUIC datagrams) is sent to
 over the best open one, in the order the protocols were configured, and over
 the next if that one fails or cannot carry the frame. Every authenticated
@@ -28,14 +28,16 @@ Link arrival, closure and changed announcements rebuild routes immediately.
 Unchanged announcements refresh their age without republishing the forwarding
 snapshot.
 
-Which protocol a pair of members runs their tunnel in is settled without
-asking: the member with the lower endpoint id decides, by the order it
-announces its protocols in, among those both have enabled at the same wire
-version. Both ends read the same answer from what they already hold. The
-tunnel is created as soon as the peer is reachable by any path, and it does not
-change when a direct link comes or goes underneath it: as soon as a direct
-link comes up it is shorter than the path through others, and traffic moves to
-it with nothing to redo. The user sees only a lower round-trip time.
+Every pair uses one internal WireGuard channel, matched by its fixed opaque
+capability and independent of the selected external protocols. The tunnel is
+created when a member and its key are known; its logical link survives temporary
+loss of all physical paths. Carrier selection changes, automatic fallback and
+shorter routes keep the same keys, interface and counters. The lower endpoint
+id still chooses the mutually enabled external carrier in its preference order.
+A relayed AWG first hop can lead to a QUIC next hop: the user's choice governs
+this device's adjacent links, while the inner ciphertext stays unchanged.
+An existing TCP connection continues after transient loss if its own timeout
+has not expired; a sufficiently long outage can still terminate it.
 
 Breadth-first search computes the shortest directed paths and every equal-cost
 first hop in sorted order. An actual direct link always wins. The first row is
@@ -124,5 +126,5 @@ counts sends without storing frames. Results are CPU forwarding cost, **not**
 end-to-end network latency or VPN throughput; encryption, fragmentation,
 sockets, congestion and scheduling contribute separately.
 
-Wire compatibility: control ALPN `tsunagi/ctrl/8`, data ALPN `tsunagi/data/5`.
+Wire compatibility: control ALPN `tsunagi/ctrl/8`, data ALPN `tsunagi/data/6`.
 Upgrade every participant together; saved identities and network state persist.

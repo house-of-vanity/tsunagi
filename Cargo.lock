@@ -602,6 +602,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "byteorder-lite"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1169,6 +1175,46 @@ checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "defmt"
+version = "0.3.101"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4deef977660e373c458df605a913d4ab121db0ccd18d1ad6976dff7d37cddb53"
+dependencies = [
+ "defmt 1.2.0",
+]
+
+[[package]]
+name = "defmt"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4a0795ac740cb54d7b3775c9c17345f6aaecf884c01733b39d6017738e0e3e1"
+dependencies = [
+ "bitflags 1.3.2",
+ "defmt-macros",
+]
+
+[[package]]
+name = "defmt-macros"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "840bb056bd99c495c9188198a258ab787c79f306d864db3e6e8451442d6d8366"
+dependencies = [
+ "defmt-parser",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
+name = "defmt-parser"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71958f69fb2de856c5dd51ac9377e986ca1aa5919f931bf5395a807277f889a0"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2367,6 +2413,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash32"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2402,6 +2457,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
  "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "heapless"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -3314,6 +3379,12 @@ checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "managed"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
 name = "matchers"
@@ -5517,6 +5588,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "smoltcp"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dad095989c1533c1c266d9b1e8d70a1329dd3723c3edac6d03bbd67e7bf6f4bb"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "cfg-if",
+ "defmt 0.3.101",
+ "heapless",
+ "managed",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6257,20 +6342,15 @@ dependencies = [
 name = "tsunagi-awg"
 version = "0.1.0"
 dependencies = [
- "boringtun",
  "bytes",
- "chacha20 0.9.1",
  "iroh",
- "postcard",
  "rand 0.10.3",
- "serde",
+ "smoltcp",
  "tempfile",
  "tokio",
- "tracing",
  "tsunagi-core",
  "tsunagi-wg-quic",
  "tsunagi-wireguard",
- "zeroize",
 ]
 
 [[package]]
@@ -6321,27 +6401,18 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "caps",
- "chacha20poly1305",
- "hex",
- "hkdf",
  "iroh",
  "netdev 0.46.3",
  "postcard",
- "rand 0.10.3",
  "rcgen",
  "rustls",
  "serde",
- "sha2",
- "subtle",
  "tempfile",
- "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "tsunagi-core",
- "x25519-dalek",
- "zeroize",
 ]
 
 [[package]]
@@ -6381,6 +6452,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tsunagi-core",
+ "tsunagi-tcp-tls",
+ "tsunagi-wireguard",
  "zeroize",
 ]
 
@@ -6390,17 +6463,13 @@ version = "0.1.0"
 dependencies = [
  "boringtun",
  "bytes",
- "data-encoding",
- "hex",
+ "chacha20 0.9.1",
  "iroh",
  "netdev 0.46.3",
  "postcard",
  "rand 0.10.3",
- "rusqlite",
  "serde",
- "subtle",
  "tempfile",
- "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",

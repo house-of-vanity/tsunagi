@@ -185,7 +185,8 @@ validation. Tests are offline; public STUN/DPI/NAT effectiveness needs separate
 real-network validation.
 
 Runtime protocol selection tests switch real AWG and iroh/QUIC carriers and
-end-to-end WireGuard tunnels from either endpoint-id role, carry full-size
+external policies from either endpoint-id role while preserving the one internal
+WireGuard tunnel, key, handshake and counter epoch, carry full-size
 packets, keep another active network's tunnels unchanged, disable and re-enable
 the data plane without losing control sessions, and preserve selection after
 restart. CLI tests use a real agent process and control socket to exercise
@@ -225,8 +226,8 @@ to test the entire mesh inside these namespaces.
 
 Devices-window tests render the egui grid at multiple widths with its real
 scroll area. They check stretching and shrinking without an expanding first
-column, separate handshake/control RTT values, unknown measurements and short
-end-to-end hints that do not substitute the carrier protocol. This does not
+column, control RTT without internal handshake/protocol clutter, unknown measurements
+and data readiness/error hints. This does not
 establish native desktop rendering on every platform.
 
 
@@ -252,3 +253,22 @@ widths, click a diagram backend, and distinguish the new-flow selection from
 traffic on an existing binding. Sampling checks cover idle open flows, stale
 observations, counter resets, recreated listeners and removal of cached
 histories. These are headless egui checks, not native desktop screenshots.
+
+`tsunagi-wg-quic/tests/carriers.rs` uses the same internal WireGuard plugin over
+real ordinary WG UDP and TCP/TLS, with loopback address selection and memory
+TUNs. Exact original IP byte/packet counts exclude health probes and encryption
+overhead. The AWG suite connects AWG-only and QUIC-only endpoints through a
+mixed relay. One real smoltcp TCP connection stays established through relay →
+direct QUIC → a dropped packet with all local carriers off → AWG relay; both
+middle TUNs and endpoint keys are checked. This exercises a real userspace TCP
+stack, not a host SSH server. Legacy key migration tests cover missing keys,
+canonical precedence, idempotence and damaged source files.
+
+Candidate tests exercise the vendored iroh local address filter on real bound
+endpoints and exclude overlay subnets from introductions. A renaming memory TUN checks
+that carriers receive the actual interface name, as required for macOS utun.
+A missing native WG transport is refused rather than silently carried by QUIC. Tray traffic tests
+cover a joining peer with 100 GB of prior counters, departed peers, removed
+networks and new counter epochs, including resets hidden by growth in the other
+direction. These distinguish rates from absolute volumes; they do not establish
+the cause of an earlier unrecorded high absolute counter on a real host.

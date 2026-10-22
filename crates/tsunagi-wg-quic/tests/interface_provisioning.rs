@@ -47,7 +47,10 @@ impl HostedAgent {
             config_with(dir.path(), discovery)
                 .with_overlay_ipv4_range(Some(DEFAULT_IPV4_RANGE))
                 .with_interface(factory, tag, 1280)
-                .with_plugin(plugin.clone() as Arc<dyn IpPlugin>),
+                .with_tunnel(plugin.clone() as Arc<dyn IpPlugin>)
+                .with_carrier(Arc::new(
+                    tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+                )),
         )
         .await
         .unwrap();

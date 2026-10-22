@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::{DiscoveryPolicy, Limits, ReconnectPolicy};
-use crate::dataplane::transport::health::{HealthLink, ProbeRoute, Settings as HealthSettings};
+use crate::dataplane::transport::health::{HealthLink, Settings as HealthSettings};
 use crate::dataplane::transport::{InboundLink, PacketLink, PacketTransport, SharedLink};
 use crate::dataplane::{PluginCapability, SharedPlugin};
 use crate::discovery::worker::DiscoveryWorker;
@@ -73,10 +73,6 @@ pub(crate) enum NetCommand {
     },
     /// A peer opened a data plane link towards us.
     InboundLink(Box<InboundLink>),
-    HealthProbe {
-        peer: EndpointId,
-        packet: bytes::Bytes,
-    },
     Status {
         reply: oneshot::Sender<Box<NetworkStatus>>,
     },
@@ -149,7 +145,6 @@ impl std::fmt::Debug for NetCommand {
             NetCommand::SetHostname(_) => f.write_str("SetHostname"),
             NetCommand::Release { .. } => f.write_str("Release"),
             NetCommand::PluginError { protocol, .. } => write!(f, "PluginError({protocol})"),
-            NetCommand::HealthProbe { peer, .. } => write!(f, "HealthProbe({})", peer.fmt_short()),
             NetCommand::ProtocolFailure { peer, protocol, .. } => {
                 write!(f, "ProtocolFailure({}, {protocol})", peer.fmt_short())
             }
@@ -193,8 +188,9 @@ pub(crate) struct RuntimeParams {
     pub(crate) discovery: Option<Arc<dyn NetworkDiscovery>>,
     pub(crate) discovery_interval: Duration,
     pub(crate) discovery_policy: DiscoveryPolicy,
-    pub(crate) plugins: Vec<SharedPlugin>,
-    pub(crate) available_plugins: Vec<SharedPlugin>,
+    pub(crate) carriers: Vec<crate::dataplane::transport::SharedCarrier>,
+    pub(crate) available_carriers: Vec<crate::dataplane::transport::SharedCarrier>,
+    pub(crate) tunnel: Option<SharedPlugin>,
     /// Who holds which overlay address, shared with every other network.
     pub(crate) routes: Arc<crate::overlay::RoutingTable>,
     /// The one interface, when the agent has one.
@@ -398,6 +394,8 @@ struct Runtime {
     /// The last hostname each peer announced, kept across restarts so a
     /// member that is away can still be called by name.
     known_hostnames: HashMap<EndpointId, String>,
+    data_errors: HashMap<EndpointId, String>,
+    tunnel_errors: HashMap<EndpointId, String>,
 }
 
 impl Runtime {
@@ -418,7 +416,7 @@ impl Runtime {
         // preferred when a neighbour can be reached over more than one.
         hub.set_priority(
             params
-                .plugins
+                .carriers
                 .iter()
                 .map(|plugin| plugin.protocol_id().to_string())
                 .collect(),
@@ -478,6 +476,8 @@ impl Runtime {
             exit_via_was_online: false,
             announced_exit: false,
             known_hostnames: HashMap::new(),
+            data_errors: HashMap::new(),
+            tunnel_errors: HashMap::new(),
         }
     }
 
@@ -629,7 +629,7 @@ impl Runtime {
                 self.params.interface = interface;
                 let current: Vec<_> = self
                     .params
-                    .plugins
+                    .carriers
                     .iter()
                     .map(|p| p.protocol_id().to_owned())
                     .collect();
@@ -638,22 +638,22 @@ impl Runtime {
                     for peer in &peers {
                         self.reset_peer_data(*peer, "local protocol selection changed");
                     }
-                    for plugin in &self.params.plugins {
+                    for plugin in &self.params.carriers {
                         if !protocols.iter().any(|name| name == plugin.protocol_id()) {
                             plugin.on_network_deactivated(self.network_id);
                         }
                     }
-                    self.params.plugins = protocols
+                    self.params.carriers = protocols
                         .iter()
                         .filter_map(|name| {
                             self.params
-                                .available_plugins
+                                .available_carriers
                                 .iter()
                                 .find(|p| p.protocol_id() == name)
                                 .cloned()
                         })
                         .collect();
-                    for plugin in &self.params.plugins {
+                    for plugin in &self.params.carriers {
                         if !current.iter().any(|name| name == plugin.protocol_id()) {
                             plugin.on_network_activated(self.network_id);
                         }
@@ -752,13 +752,6 @@ impl Runtime {
                     protocol,
                     reason,
                 });
-            }
-            NetCommand::HealthProbe { peer, packet } => {
-                for ((p, _), link) in &self.links {
-                    if *p == peer {
-                        link.receive_probe(packet.clone());
-                    }
-                }
             }
             NetCommand::ProtocolFailure {
                 peer,
@@ -932,7 +925,8 @@ impl Runtime {
             .await;
     }
 
-    fn add_candidate(&mut self, candidate: Candidate) {
+    fn add_candidate(&mut self, mut candidate: Candidate) {
+        candidate.addr = self.underlay_addr(candidate.addr);
         let peer = candidate.endpoint_id();
         if peer == self.local_id {
             return;
@@ -1891,8 +1885,8 @@ impl Runtime {
             return;
         }
         self.update_vips();
-        for plugin in &self.params.plugins {
-            plugin.on_address_allocation(self.network_id, range, &allocations);
+        if let Some(tunnel) = &self.params.tunnel {
+            tunnel.on_address_allocation(self.network_id, range, &allocations);
         }
         if self.published_range != Some(range) {
             self.published_range = Some(range);
@@ -1984,7 +1978,7 @@ impl Runtime {
     /// The protocols this agent speaks, with the version it speaks them at.
     fn served_protocols(&self) -> Vec<(String, u16)> {
         self.params
-            .plugins
+            .carriers
             .iter()
             .map(|plugin| (plugin.protocol_id().to_string(), plugin.protocol_version()))
             .collect()
@@ -2045,6 +2039,8 @@ impl Runtime {
             // reachable through somebody is decided below; the protocol's
             // link stays either way.
             self.hub.clear_direct(peer, &protocol);
+            self.data_errors
+                .insert(peer, format!("{protocol}: {reason}"));
             self.record_protocol_failure(peer, &protocol);
             self.emit(Event::DataLinkDown {
                 network: self.network_id,
@@ -2169,6 +2165,7 @@ impl Runtime {
                 }
             }
 
+            let addr = self.underlay_addr(addr);
             let fresh = !self.candidate_addrs.contains_key(&peer);
             self.candidate_addrs
                 .entry(peer)
@@ -2182,6 +2179,10 @@ impl Runtime {
             }
         }
         learned
+    }
+
+    fn underlay_addr(&self, addr: iroh::EndpointAddr) -> iroh::EndpointAddr {
+        without_overlay_addresses(addr, &self.params.routes.overlay_ranges())
     }
 
     /// Tells the peers it is talking to about the peers it knows.
@@ -2230,14 +2231,14 @@ impl Runtime {
             // other side's own discovery may be able to resolve it.
             hints.push(crate::proto::message::PeerHint {
                 endpoint: *peer.as_bytes(),
-                addrs: hint_addrs(addr),
+                addrs: hint_addrs(&self.underlay_addr(addr.clone())),
             });
         }
         // This agent, too: it is the one member the others cannot be told
         // about by anybody else.
         hints.push(crate::proto::message::PeerHint {
             endpoint: *self.local_id.as_bytes(),
-            addrs: hint_addrs(&self.params.adapter.addr()),
+            addrs: hint_addrs(&self.underlay_addr(self.params.adapter.addr())),
         });
         hints.truncate(self.params.limits.max_state_records);
         if hints.is_empty() {
@@ -2282,34 +2283,18 @@ impl Runtime {
         }
     }
 
-    /// The protocol this agent and a member run their tunnel in, if they have
-    /// one in common.
-    ///
-    /// Both ends must name the same one without asking each other, and what
-    /// each side was configured to prefer can differ. So the member with the
-    /// lower id decides, by the order it announces its protocols in, and the
-    /// other side reads that order from the announcement it already has.
+    /// Matches the single internal encryption capability, independently of carrier policy.
     fn tunnel_protocol(&self, session: &Session) -> Option<String> {
-        let usable = |ours: &[PluginCapability], theirs: &[PluginCapability], name: &str| {
-            ours.iter().any(|capability| {
-                capability.enabled
-                    && capability.protocol == name
-                    && theirs.iter().any(|other| {
-                        other.enabled
-                            && other.protocol == name
-                            && other.version == capability.version
-                    })
-            })
-        };
-        let (decides, other) = if self.local_id.as_bytes() < session.peer.as_bytes() {
-            (&self.local_capabilities, &session.capabilities)
-        } else {
-            (&session.capabilities, &self.local_capabilities)
-        };
-        decides
+        let tunnel = self.params.tunnel.as_ref()?;
+        session
+            .capabilities
             .iter()
-            .find(|capability| usable(decides, other, &capability.protocol))
-            .map(|capability| capability.protocol.clone())
+            .any(|cap| {
+                cap.enabled
+                    && cap.protocol == tunnel.protocol_id()
+                    && cap.version == tunnel.protocol_version()
+            })
+            .then(|| tunnel.protocol_id().to_owned())
     }
 
     /// Builds the graph off the packet path. Every remote row comes from that
@@ -2351,9 +2336,9 @@ impl Runtime {
             }
             let Some(plugin) = self
                 .params
-                .plugins
-                .iter()
-                .find(|plugin| plugin.protocol_id() == protocol)
+                .tunnel
+                .as_ref()
+                .filter(|plugin| plugin.protocol_id() == protocol)
                 .cloned()
             else {
                 continue;
@@ -2398,6 +2383,8 @@ impl Runtime {
                 self.announce_reach(false);
             }
             Err(reason) => {
+                self.data_errors
+                    .insert(outcome.peer, format!("{}: {reason}", outcome.protocol));
                 // A data plane that cannot be set up is reported, never fatal.
                 self.metrics.data_link_failures += 1;
                 self.record_protocol_failure(outcome.peer, &outcome.protocol);
@@ -2456,7 +2443,7 @@ impl Runtime {
             link.close();
             return;
         }
-        if !self.params.plugins.iter().any(|plugin| {
+        if !self.params.carriers.iter().any(|plugin| {
             plugin.protocol_id() == protocol
                 && self.sessions.get(&peer).is_some_and(|s| {
                     s.capabilities.iter().any(|c| {
@@ -2470,6 +2457,7 @@ impl Runtime {
             return;
         }
 
+        self.data_errors.remove(&peer);
         let key = (peer, protocol.clone());
         let settings = if self.local_id.as_bytes() < peer.as_bytes() {
             let settings = HealthSettings::fresh();
@@ -2486,21 +2474,7 @@ impl Runtime {
         } else {
             self.pending_health.remove(&key)
         };
-        let route = self
-            .sessions
-            .get(&peer)
-            .and_then(|s| self.tunnel_protocol(s))
-            .and_then(|name| self.params.plugins.iter().find(|p| p.protocol_id() == name))
-            .map(|plugin| ProbeRoute {
-                plugin: plugin.clone(),
-                routes: self.params.routes.clone(),
-                network: self.network_id,
-                peer,
-                max_probe_size: self.params.interface.as_ref().map_or(540, |interface| {
-                    (interface.mtu() as usize).saturating_sub(36)
-                }),
-            });
-        let link = HealthLink::new(link, self.local_id, settings, route);
+        let link = HealthLink::new(link, self.local_id, settings);
         let path = link.path_description();
         let max_datagram = link.max_datagram_size();
         if let Some(old) = self.links.insert(key, Arc::clone(&link)) {
@@ -2524,15 +2498,21 @@ impl Runtime {
 
     /// Drops every link to a peer.
     fn drop_links_for(&mut self, peer: EndpointId) {
+        self.tunnel_errors.remove(&peer);
         self.retirement_cursor.remove(&peer);
         self.vip_cursor.remove(&peer);
         self.reset_peer_data(peer, "peer session ended");
+        if let Some(tunnel) = &self.params.tunnel {
+            tunnel.on_peer_gone(self.network_id, peer);
+        }
+        self.hub.clear_peer_links(peer);
         self.hub.remove_peer(peer);
         self.reachable.remove(&peer);
     }
 
     /// Retire only the data plane; authenticated membership and topology remain.
     fn reset_peer_data(&mut self, peer: EndpointId, reason: &str) {
+        self.data_errors.remove(&peer);
         self.link_attempts.retain(|(id, _), _| *id != peer);
         self.opening.retain(|(id, _)| *id != peer);
         self.link_tasks.retain(|(id, _), task| {
@@ -2543,7 +2523,6 @@ impl Runtime {
                 true
             }
         });
-        self.hub.clear_peer_links(peer);
         let keys: Vec<_> = self
             .links
             .keys()
@@ -2554,6 +2533,7 @@ impl Runtime {
             if let Some(link) = self.links.remove(&key) {
                 link.close();
             }
+            self.hub.clear_direct(peer, &key.1);
             self.emit(Event::DataLinkDown {
                 network: self.network_id,
                 peer,
@@ -2564,7 +2544,7 @@ impl Runtime {
         self.protocol_dial_states.retain(|(id, _), _| *id != peer);
         self.last_failed_protocol.remove(&peer);
         self.pending_health.retain(|(id, _), _| *id != peer);
-        for plugin in &self.params.plugins {
+        for plugin in &self.params.carriers {
             plugin.on_peer_gone(self.network_id, peer);
         }
     }
@@ -2650,11 +2630,27 @@ impl Runtime {
     fn local_announcement(&mut self) -> Announcement {
         let mut capabilities = Vec::new();
         let mut errors = Vec::new();
-        for plugin in &self.params.plugins {
-            match plugin.local_capability(self.network_id) {
-                Ok(Some(capability)) => capabilities.push(capability),
+        let sources = self
+            .params
+            .carriers
+            .iter()
+            .map(|carrier| {
+                (
+                    carrier.protocol_id().to_owned(),
+                    carrier.local_capability(self.network_id),
+                )
+            })
+            .chain(self.params.tunnel.iter().map(|tunnel| {
+                (
+                    tunnel.protocol_id().to_owned(),
+                    tunnel.local_capability(self.network_id),
+                )
+            }));
+        for (protocol, result) in sources {
+            match result {
+                Ok(Some(cap)) => capabilities.push(cap),
                 Ok(None) => {}
-                Err(err) => errors.push((plugin.protocol_id().to_string(), err.to_string())),
+                Err(err) => errors.push((protocol, err.to_string())),
             }
         }
         for (protocol, reason) in errors {
@@ -2922,34 +2918,57 @@ impl Runtime {
 
     fn dispatch_capabilities(&mut self, peer: EndpointId, capabilities: &[PluginCapability]) {
         let mut errors = Vec::new();
-        for capability in capabilities {
-            for plugin in &self.params.plugins {
-                if plugin.protocol_id() != capability.protocol {
-                    continue;
-                }
-                if plugin.protocol_version() != capability.version {
-                    // Said once per peer and protocol. A version that will
-                    // not match this build will not match it on the next
-                    // announcement either, and repeating it every round
-                    // would bury everything else.
-                    let key = (peer, capability.protocol.clone());
-                    if self.reported_mismatch.insert(key) {
-                        errors.push((
-                            capability.protocol.clone(),
-                            format!(
-                                "peer speaks {} version {} and this build speaks {}, so there \
-                                 is no data plane with it; the control plane is unaffected",
-                                capability.protocol,
-                                capability.version,
-                                plugin.protocol_version()
-                            ),
-                        ));
+        for cap in capabilities {
+            let carriers = self
+                .params
+                .carriers
+                .iter()
+                .filter(|carrier| carrier.protocol_id() == cap.protocol)
+                .map(|carrier| {
+                    (
+                        carrier.protocol_version(),
+                        if carrier.protocol_version() == cap.version {
+                            carrier.on_peer_capability(self.network_id, peer, cap)
+                        } else {
+                            Ok(())
+                        },
+                    )
+                });
+            let tunnel = self
+                .params
+                .tunnel
+                .iter()
+                .filter(|tunnel| tunnel.protocol_id() == cap.protocol)
+                .map(|tunnel| {
+                    (
+                        tunnel.protocol_version(),
+                        if tunnel.protocol_version() == cap.version {
+                            tunnel.on_peer_capability(self.network_id, peer, cap)
+                        } else {
+                            Ok(())
+                        },
+                    )
+                });
+            for (version, result) in carriers.chain(tunnel) {
+                if version != cap.version {
+                    if self.reported_mismatch.insert((peer, cap.protocol.clone())) {
+                        errors.push((cap.protocol.clone(), format!("peer speaks {} version {} and this build speaks {version}; update both agents; control plane is unaffected", cap.protocol, cap.version)));
                     }
-                    continue;
-                }
-                // The core hands the opaque payload over without interpreting it.
-                if let Err(err) = plugin.on_peer_capability(self.network_id, peer, capability) {
-                    errors.push((plugin.protocol_id().to_string(), err.to_string()));
+                } else {
+                    let is_tunnel = self
+                        .params
+                        .tunnel
+                        .as_ref()
+                        .is_some_and(|t| t.protocol_id() == cap.protocol);
+                    if let Err(err) = result {
+                        if is_tunnel {
+                            self.tunnel_errors
+                                .insert(peer, format!("encrypted data channel: {err}"));
+                        }
+                        errors.push((cap.protocol.clone(), err.to_string()));
+                    } else if is_tunnel {
+                        self.tunnel_errors.remove(&peer);
+                    }
                 }
             }
         }
@@ -3028,6 +3047,58 @@ impl Runtime {
             })
     }
 
+    fn data_error(&self, session: &Session) -> Option<String> {
+        if self.params.carriers.is_empty() {
+            return Some("data transports disabled locally".into());
+        }
+        if self.params.tunnel.is_some() && self.tunnel_protocol(session).is_none() {
+            return Some(
+                "peer has no compatible encrypted data channel; update both agents".into(),
+            );
+        }
+        if let Some(reason) = self.tunnel_errors.get(&session.peer) {
+            return Some(reason.clone());
+        }
+        if !matches!(self.data_path(session.peer), DataPath::None) {
+            return None;
+        }
+        let served = self.served_protocols();
+        if !served.iter().any(|(name, version)| {
+            session
+                .capabilities
+                .iter()
+                .any(|cap| cap.enabled && cap.protocol == *name && cap.version == *version)
+        }) {
+            let local = served
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let remote = session
+                .capabilities
+                .iter()
+                .filter(|cap| {
+                    cap.enabled
+                        && self
+                            .params
+                            .tunnel
+                            .as_ref()
+                            .is_none_or(|t| t.protocol_id() != cap.protocol)
+                })
+                .map(|cap| cap.protocol.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Some(format!(
+                "no common external transport (local: {local}; peer: {})",
+                if remote.is_empty() { "none" } else { &remote }
+            ));
+        }
+        self.data_errors
+            .get(&session.peer)
+            .cloned()
+            .or_else(|| Some("establishing external data transport".into()))
+    }
+
     fn status(&self) -> NetworkStatus {
         let served = self.served_protocols();
         let mut peers: Vec<PeerStatus> = self
@@ -3055,6 +3126,7 @@ impl Runtime {
                         })
                         .map(|capability| capability.protocol.clone())
                         .collect(),
+                    data_error: self.data_error(session),
                     capabilities: session.capabilities.clone(),
                     connected_for: session.established.elapsed(),
                     paths: snapshot.paths,
@@ -3117,7 +3189,7 @@ impl Runtime {
             vips: self.params.routes.vips.statuses(self.network_id),
             protocols: self
                 .params
-                .plugins
+                .carriers
                 .iter()
                 .map(|p| p.protocol_id().to_owned())
                 .collect(),
@@ -3265,9 +3337,42 @@ fn merge_addr(existing: &mut iroh::EndpointAddr, incoming: &iroh::EndpointAddr) 
     }
 }
 
+/// Introductions and discovery candidates are underlay addresses. An overlay
+/// address here would send the tunnel's own transport recursively through itself.
+fn without_overlay_addresses(
+    mut addr: iroh::EndpointAddr,
+    ranges: &[Ipv4Range],
+) -> iroh::EndpointAddr {
+    addr.addrs.retain(|address| match address {
+        iroh::TransportAddr::Ip(socket) => match socket.ip() {
+            std::net::IpAddr::V4(ip) => !ranges.iter().any(|range| range.contains(ip)),
+            std::net::IpAddr::V6(_) => true,
+        },
+        _ => true,
+    });
+    addr
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn underlay_hints_exclude_overlay_subnets_but_preserve_lan_and_relay_candidates() {
+        let peer = crate::identity::DeviceIdentity::generate().endpoint_id();
+        let overlay = "10.13.37.99:1234".parse().unwrap();
+        let lan = "192.168.1.5:1234".parse().unwrap();
+        let relay: iroh::RelayUrl = "https://relay.example.com".parse().unwrap();
+        let addr = iroh::EndpointAddr::new(peer)
+            .with_ip_addr(overlay)
+            .with_ip_addr(lan)
+            .with_relay_url(relay.clone());
+        let filtered = without_overlay_addresses(addr, &[crate::state::DEFAULT_IPV4_RANGE]);
+        assert_eq!(filtered.ip_addrs().copied().collect::<Vec<_>>(), vec![lan]);
+        assert!(filtered.addrs.contains(&iroh::TransportAddr::Relay(relay)));
+        assert_eq!(filtered.id, peer);
+    }
 
     #[test]
     fn test_data_link_backoff_progression() {

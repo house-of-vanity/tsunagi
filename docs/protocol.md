@@ -15,9 +15,9 @@ Upgrading the crate or bumping the control protocol must never change an
 existing `NetworkId`.
 
 Control version 8 adds signed, multi-writer VIP field snapshots to version 7's
-node retirements. Data ALPN remains `tsunagi/data/5`. All members must upgrade
+node retirements. Data ALPN is `tsunagi/data/6` for the single internal WireGuard channel. All members must upgrade
 together. Network ids, derivation labels, handshake encoding and existing record
-signatures are unchanged. Local CLI/tray IPC is version 22; restart the agent
+signatures are unchanged. Local CLI/tray IPC is version 23; restart the agent
 with matching clients. SQLite schema 10 adds `vip_fields`, preserving identity,
 network configuration, signed node records and retirement proofs.
 See [virtual services](vip.md), [state sync](sync-model.md) and [AWG](amnezia.md).
@@ -145,7 +145,7 @@ event does not report a network id.
 ## The data plane protocol
 
 IP plugin packets never travel on a control connection. They use their own
-ALPN, `tsunagi/data/5`, on their own iroh connection:
+ALPN, `tsunagi/data/6`, on their own iroh connection:
 
 ```text
 initiator -> responder : (the same membership handshake as above)
@@ -192,7 +192,7 @@ and version 5 added the end-to-end protocol to it:
 | source peer | 32 | original endpoint public key |
 | destination peer | 32 | final endpoint public key |
 | flow id | 8 | big endian opaque stable hash supplied by the plugin |
-| protocol | 8 | big endian FNV-1a of the end-to-end protocol id (`wg`, `tcp-tls`, ...) |
+| protocol | 8 | big endian FNV-1a of the internal protocol id (`wireguard-e2e`) |
 | payload | remaining | end-to-end encrypted plugin bytes |
 
 The fixed header is 82 bytes. Zero/oversized hop limits, unknown versions,

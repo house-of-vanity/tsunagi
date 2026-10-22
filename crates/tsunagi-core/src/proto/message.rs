@@ -33,8 +33,10 @@ pub const ALPN: &[u8] = b"tsunagi/ctrl/8";
 /// transport fragmentation. Version 5 adds the end-to-end protocol to that
 /// envelope, so a tunnel no longer depends on the kind of link under it, and
 /// a first-claimed time to a signed hostname claim. All members must upgrade
-/// together. Persistent identities and network configuration do not change.
-pub const DATA_ALPN: &[u8] = b"tsunagi/data/5";
+/// together. Version 6 uses one fixed inner WireGuard channel and independent
+/// external carrier capabilities. Control authentication, persistent identities
+/// and network configuration do not change.
+pub const DATA_ALPN: &[u8] = b"tsunagi/data/6";
 
 /// Largest plugin protocol identifier accepted when opening a data channel.
 pub const MAX_DATA_PROTOCOL_LEN: usize = 32;

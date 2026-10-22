@@ -109,6 +109,7 @@ mod tests {
     fn network(exit: ExitReport) -> NetworkReport {
         NetworkReport {
             peers: vec![PeerReport {
+                data_error: None,
                 endpoint_id: "abcdef0123456789".into(),
                 hostname: Some("music".into()),
                 exit_node: true,

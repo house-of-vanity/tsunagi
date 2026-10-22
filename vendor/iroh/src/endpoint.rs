@@ -138,6 +138,7 @@ pub struct Builder {
     /// Default address filter applied to all address lookup services added via
     /// [`Builder::address_lookup`].
     addr_filter: Option<AddrFilter>,
+    direct_addr_filter: Option<AddrFilter>,
     proxy_url: Option<Url>,
     ca_tls_config: Option<CaTlsConfig>,
     #[cfg(not(wasm_browser))]
@@ -206,6 +207,7 @@ impl Builder {
             address_lookup: Default::default(),
             address_lookup_user_data: Default::default(),
             addr_filter: None,
+            direct_addr_filter: None,
             proxy_url: None,
             ca_tls_config: None,
             #[cfg(not(wasm_browser))]
@@ -271,6 +273,7 @@ impl Builder {
         });
 
         let sock_opts = socket::Options {
+            direct_addr_filter: self.direct_addr_filter,
             transports: self.transports,
             secret_key,
             address_lookup_user_data: self.address_lookup_user_data,
@@ -623,6 +626,13 @@ impl Builder {
     /// [`AddressLookupServices`]: crate::address_lookup::AddressLookupServices
     pub fn addr_filter(mut self, filter: AddrFilter) -> Self {
         self.addr_filter = Some(filter);
+        self
+    }
+
+    /// Filters local direct candidates before endpoint addresses and hole-punch hints
+    /// are published. Unlike `addr_filter`, this applies to every candidate source.
+    pub fn direct_addr_filter(mut self, filter: AddrFilter) -> Self {
+        self.direct_addr_filter = Some(filter);
         self
     }
 
