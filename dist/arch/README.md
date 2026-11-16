@@ -45,7 +45,7 @@ usermod -aG tsunagi "$USER"`. The group also lets its members configure
 systemd-resolved for the overlay zones through the polkit rule.
 
 The GUI package depends on `gtk3`, `libayatana-appindicator` (the tray icon),
-`xdotool` (its `libxdo`), and the usual windowing libraries.
+and the usual windowing libraries.
 
 ## Removal
 

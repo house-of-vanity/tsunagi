@@ -180,7 +180,8 @@ Online nodes and the currently selected exit node cannot be forgotten.
 ² Newer and less battle-tested than on Linux.
 ³ Builds from source, not covered by CI.</sup>
 
-The Linux CLI is a single static binary: it runs on any distribution.
+The Linux release CLI is a single static musl binary, independent of the
+distribution's libc. The tray uses dynamic desktop libraries.
 
 ## NixOS
 
@@ -225,6 +226,18 @@ Rust 1.91 or newer.
 cargo build --release --bin tsng               # the agent and CLI
 cargo build --release --bin tsunagi-tray       # the tray (Linux needs GTK 3 and libayatana-appindicator)
 ```
+
+These commands use the host target. On a glibc-based Linux distribution,
+`target/release/tsng` is dynamically linked. For the static x86_64 Linux CLI,
+release CI uses Zig 0.14.1 and `cargo-zigbuild` (with CMake, Clang and libclang
+installed):
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo zigbuild --release --locked --target x86_64-unknown-linux-musl --bin tsng
+```
+
+The static binary is `target/x86_64-unknown-linux-musl/release/tsng`.
 
 Windows needs [Wintun](https://www.wintun.net) next to `tsng.exe`.
 Per-platform notes: [Linux](dist/linux/README.md), [Arch](dist/arch/README.md),

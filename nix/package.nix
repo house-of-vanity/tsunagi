@@ -11,7 +11,6 @@
   libxkbcommon,
   vulkan-loader,
   wayland,
-  xdotool,
   libx11,
   libxcursor,
   libxi,
@@ -62,7 +61,6 @@ rustPlatform.buildRustPackage {
   buildInputs = lib.optionals withTray [
     gtk3
     libayatana-appindicator
-    xdotool
   ];
 
   dontWrapGApps = true;

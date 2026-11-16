@@ -46,7 +46,7 @@ if [ -n "$tray" ]; then
     # with it (both ship /usr/bin/tsng).
     extra_control=$'Conflicts: tsunagi\nReplaces: tsunagi\nProvides: tsunagi\n'
     # What the tray and its window load at run time.
-    extra_control+=$'Depends: libgtk-3-0 | libgtk-3-0t64, libayatana-appindicator3-1 | libappindicator3-1, libxdo3, libxkbcommon0, libwayland-client0, libx11-6, libgl1\n'
+    extra_control+=$'Depends: libgtk-3-0 | libgtk-3-0t64, libayatana-appindicator3-1 | libappindicator3-1, libxkbcommon0, libwayland-client0, libx11-6, libgl1\n'
     desc_gui=" It also installs the tray GUI (tsunagi-tray) and a desktop launcher so it can be started from the applications menu."
     install -D -m 0755 "$tray" "$root/usr/bin/tsunagi-tray"
     install -D -m 0644 "$here/../linux/tsunagi-tray.desktop" \

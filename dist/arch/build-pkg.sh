@@ -52,7 +52,7 @@ if [ -n "$tray" ]; then
     relations=$'conflict = tsunagi\nprovides = tsunagi\nreplaces = tsunagi\n'
     # What the tray and its window load at run time; none of it is linked in
     # statically, so pacman has to be told.
-    for dep in gtk3 libayatana-appindicator xdotool libxkbcommon wayland libx11 libglvnd; do
+    for dep in gtk3 libayatana-appindicator libxkbcommon wayland libx11 libglvnd; do
         relations+="depend = ${dep}"$'\n'
     done
     install -D -m 0755 "$tray" "$root/usr/bin/tsunagi-tray"
