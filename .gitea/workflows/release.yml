@@ -237,7 +237,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          pkgver="${version//-/_}"
+          pkgver="${version//-/}"
           bash dist/arch/build-pkg.sh \
             "target/${{ matrix.target }}/release/tsng" \
             "${{ matrix.pkg_arch }}" \
@@ -252,7 +252,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          pkgver="${version//-/_}"
+          pkgver="${version//-/}"
           tray="target/${{ matrix.gnu_target }}/release/tsunagi-tray"
           bash dist/deb/build-deb.sh \
             "target/${{ matrix.target }}/release/tsng" \

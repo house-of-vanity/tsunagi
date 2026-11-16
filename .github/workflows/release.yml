@@ -239,7 +239,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          pkgver="${version//-/_}"
+          pkgver="${version//-/}"
           bash dist/arch/build-pkg.sh \
             "target/${{ matrix.target }}/release/tsng" \
             "${{ matrix.pkg_arch }}" \
@@ -254,7 +254,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          pkgver="${version//-/_}"
+          pkgver="${version//-/}"
           tray="target/${{ matrix.gnu_target }}/release/tsunagi-tray"
           bash dist/deb/build-deb.sh \
             "target/${{ matrix.target }}/release/tsng" \
@@ -320,3 +320,25 @@ jobs:
               --verify-tag \
               "${prerelease[@]}"
           fi
+
+  notify-arch-repository:
+    name: Publish packages to the Arch repository
+    needs: publish
+    if: ${{ github.server_url == 'https://github.com' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Notify arch_repo of the completed release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.ARCH_REPO_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo '::error::Set the ARCH_REPO_TOKEN Actions secret with Contents: write access to house-of-vanity/arch_repo.'
+            exit 1
+          fi
+          jq -n --arg repository "$GITHUB_REPOSITORY" --arg tag "$RELEASE_TAG" \
+            '{event_type: "new_package", client_payload: {repository: $repository, tag: $tag}}' \
+            | gh api --method POST repos/house-of-vanity/arch_repo/dispatches --input -

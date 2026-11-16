@@ -24,10 +24,13 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
 
-# pacman pkgver may not contain '-', so a prerelease tag like 0.1.0-rc.9 becomes
-# 0.1.0_rc.9.
-pkgver="$(printf '%s' "$version" | tr '-' '_')"
+# Attach the prerelease suffix directly: vercmp orders 0.1.0rc.9 < 0.1.0,
+# whereas the old 0.1.0_rc.9 spelling sorts ABOVE the stable release. Epoch 1
+# ensures existing installations can upgrade from the old spelling as well.
+# The epoch is metadata only; it does not appear in package filenames.
+pkgver="$(printf '%s' "$version" | tr -d '-')"
 pkgrel=1
+epoch=1
 
 # Payload. Arch keeps units under /usr/lib/systemd/system and installs to
 # /usr/bin, so the service's ExecStart is rewritten to match.
@@ -67,7 +70,7 @@ size="$(du -sb "$root" | cut -f1)"
 
 cat > "$root/.PKGINFO" <<PKGINFO
 pkgname = ${pkgname}
-pkgver = ${pkgver}-${pkgrel}
+pkgver = ${epoch}:${pkgver}-${pkgrel}
 pkgdesc = ${pkgdesc}
 url = https://github.com/house-of-vanity/tsunagi
 builddate = $(date +%s)
