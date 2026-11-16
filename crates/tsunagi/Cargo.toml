@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi"
-version = "0.1.0"
+version = "1.0.0"
 description = "The tsunagi command line agent."
 edition.workspace = true
 rust-version.workspace = true
@@ -12,11 +12,11 @@ name = "tsng"
 path = "src/main.rs"
 
 [dependencies]
-tsunagi-core = { path = "../tsunagi-core", version = "0.1.0", features = ["tun-device", "dns-publish"] }
-tsunagi-wireguard = { path = "../tsunagi-wireguard", version = "0.1.0" }
-tsunagi-awg = { path = "../tsunagi-awg", version = "0.1.0" }
-tsunagi-wg-quic = { path = "../tsunagi-wg-quic", version = "0.1.0" }
-tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls", version = "0.1.0" }
+tsunagi-core = { path = "../tsunagi-core", version = "1.0.0", features = ["tun-device", "dns-publish"] }
+tsunagi-wireguard = { path = "../tsunagi-wireguard", version = "1.0.0" }
+tsunagi-awg = { path = "../tsunagi-awg", version = "1.0.0" }
+tsunagi-wg-quic = { path = "../tsunagi-wg-quic", version = "1.0.0" }
+tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls", version = "1.0.0" }
 iroh.workspace = true
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "signal"] }
 tracing.workspace = true

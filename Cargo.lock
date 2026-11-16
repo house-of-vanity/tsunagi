@@ -6296,7 +6296,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tsunagi"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -6320,7 +6320,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-awg"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "iroh",
@@ -6335,7 +6335,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -6377,7 +6377,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-tcp-tls"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "caps",
@@ -6397,7 +6397,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-tray"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "eframe",
  "egui-phosphor",
@@ -6412,7 +6412,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-wg-quic"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "boringtun",
  "bytes",
@@ -6439,7 +6439,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-wireguard"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "boringtun",
  "bytes",
