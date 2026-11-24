@@ -9,6 +9,7 @@ on:
       - 'crates/tsunagi-core/src/overlay/provision/windows.rs'
       - 'crates/tsunagi-core/src/overlay/provision/mod.rs'
       - 'crates/tsunagi-core/src/overlay/provision/factory.rs'
+      - 'crates/tsunagi-core/src/overlay/tun.rs'
       - 'crates/tsunagi-core/src/net.rs'
   workflow_dispatch:
 

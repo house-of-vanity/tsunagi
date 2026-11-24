@@ -364,7 +364,9 @@ mod tests {
         });
 
         assert!(!is_serving(&path).await, "nothing serves the pipe yet");
-        let control = ControlSocket::bind(&path, source).await.unwrap();
+        let control = ControlSocket::bind(&path, source, ControlSocketAccess::Private)
+            .await
+            .unwrap();
         assert!(is_serving(&path).await, "the agent serves it now");
 
         let answer = exchange(&path, &Request::Status, EXCHANGE_TIMEOUT)
@@ -439,10 +441,10 @@ mod tests {
             Box::pin(async { StatusReport::default() })
         });
 
-        let first = ControlSocket::bind(&path, Arc::clone(&source))
+        let first = ControlSocket::bind(&path, Arc::clone(&source), ControlSocketAccess::Private)
             .await
             .unwrap();
-        let second = ControlSocket::bind(&path, source).await;
+        let second = ControlSocket::bind(&path, source, ControlSocketAccess::Private).await;
         assert!(
             matches!(second, Err(Error::StateLocked { .. })),
             "{second:?}"
