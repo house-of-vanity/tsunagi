@@ -412,6 +412,99 @@ jobs:
             '{event_type: "new_package", client_payload: {repository: $repository, tag: $tag}}' \
             | gh api --method POST repos/house-of-vanity/arch_repo/dispatches --input -
 
+  update-homebrew:
+    name: Update the Homebrew tap
+    needs: publish
+    if: github.server_url == 'https://github.com' && github.repository == 'house-of-vanity/tsunagi'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check the release tag and tap credentials
+        id: stable
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Skipping Homebrew for non-stable tag $RELEASE_TAG"
+            exit 0
+          fi
+          if [[ -z "$TAP_TOKEN" ]]; then
+            echo '::error::Set HOMEBREW_TAP_TOKEN with Contents: write access to house-of-vanity/homebrew-tap.'
+            exit 1
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        if: steps.stable.outputs.publish == 'true'
+        with:
+          persist-credentials: false
+
+      - name: Verify the published macOS archive
+        if: steps.stable.outputs.publish == 'true'
+        id: archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          archive="tsunagi-macos-aarch64-${RELEASE_TAG#v}.tar.gz"
+          digest=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            | jq -er --arg archive "$archive" '
+                select(.draft == false and .prerelease == false)
+                | .assets[] | select(.name == $archive and .state == "uploaded")
+                | .digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))
+              ')
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$archive" --dir "$RUNNER_TEMP"
+          hash="${digest#sha256:}"
+          actual=$(sha256sum "$RUNNER_TEMP/$archive")
+          if [[ "${actual%% *}" != "$hash" ]]; then
+            echo "::error::SHA-256 mismatch for $archive."
+            exit 1
+          fi
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        if: steps.stable.outputs.publish == 'true'
+        with:
+          repository: house-of-vanity/homebrew-tap
+          ref: main
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update and push the formula and cask
+        if: steps.stable.outputs.publish == 'true'
+        env:
+          ARCHIVE_SHA256: ${{ steps.archive.outputs.hash }}
+        run: |
+          set -euo pipefail
+          # Retry from the latest tap state if another publisher pushes first.
+          for attempt in 1 2 3; do
+            git -C homebrew-tap fetch origin main
+            git -C homebrew-tap checkout --detach --force FETCH_HEAD
+            python3 .github/scripts/update_homebrew.py homebrew-tap "$RELEASE_TAG" "$ARCHIVE_SHA256"
+            cd homebrew-tap
+            ruby -c Formula/tsunagi.rb
+            ruby -c Casks/tsunagi-gui.rb
+            if git diff --quiet -- Formula/tsunagi.rb Casks/tsunagi-gui.rb; then
+              exit 0
+            fi
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add -- Formula/tsunagi.rb Casks/tsunagi-gui.rb
+            git commit -m "tsunagi ${RELEASE_TAG#v}"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push to the Homebrew tap failed on attempt $attempt of 3." >&2
+            cd ..
+          done
+          echo '::error::Could not push the updated formula and cask to the tap.'
+          exit 1
+
   publish-openartifact:
     name: Publish APT and pacman packages
     needs: publish

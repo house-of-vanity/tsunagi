@@ -41,6 +41,19 @@ The cask starts the service for you. The agent runs as root, and its control
 socket is open to the `admin` group, so the CLI and the tray work without
 `sudo` for an administrator.
 
+### Publishing Homebrew packages
+
+After a stable `vMAJOR.MINOR.PATCH` GitHub release uploads its assets, the
+`Update the Homebrew tap` job verifies the Apple Silicon archive against its
+GitHub release digest and updates the `tsunagi` formula and `tsunagi-gui` cask
+together on `house-of-vanity/homebrew-tap`'s `main` branch.
+
+Set the `HOMEBREW_TAP_TOKEN` Actions secret in `house-of-vanity/tsunagi` to a
+fine-grained token with **Contents: Read and write** on
+`house-of-vanity/homebrew-tap`. The token must be able to push to `main`.
+If publication fails, fix the reported error and rerun the Homebrew job on
+the existing release workflow run.
+
 ## Native deployment — root LaunchDaemon
 
 For an always-on agent that starts at boot, install the bundled
