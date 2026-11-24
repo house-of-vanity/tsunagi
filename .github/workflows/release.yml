@@ -455,9 +455,14 @@ jobs:
                   "$OA_SERVER/api/v1/repositories/hexor-apt/debs")
                 ;;
               *.pkg.tar.zst)
-                stem=${name%.pkg.tar.zst}
-                arch=${stem##*-}
-                url="$OA_SERVER/repos/hexor-pacman/os/$arch/$name"
+                # Release asset names omit the epoch. OpenArtifact matches the
+                # upload path against the full version recorded in .PKGINFO.
+                pkginfo=$(tar --zstd -xOf "$file" .PKGINFO)
+                pkg=$(sed -n 's/^pkgname = //p' <<< "$pkginfo")
+                version=$(sed -n 's/^pkgver = //p' <<< "$pkginfo")
+                arch=$(sed -n 's/^arch = //p' <<< "$pkginfo")
+                : "${pkg:?missing pkgname}" "${version:?missing pkgver}" "${arch:?missing arch}"
+                url="$OA_SERVER/repos/hexor-pacman/os/$arch/$pkg-$version-$arch.pkg.tar.zst"
                 status=$(curl -sS -o "$RUNNER_TEMP/oa-upload.json" -w '%{http_code}' \
                   "${auth[@]}" -T "$file" "$url")
                 ;;
