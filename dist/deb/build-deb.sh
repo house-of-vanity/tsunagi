@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assemble a dependency-free Debian package from prebuilt tsunagi binaries,
+# Assemble a Debian package from prebuilt tsunagi binaries,
 # using only dpkg-deb (no cargo-deb, no nfpm).
 #
 # Usage: build-deb.sh <binary> <deb_arch> <version> <output.deb> [tray_binary]
@@ -38,6 +38,7 @@ install -D -m 0644 "$here/../../README.md" "$root/usr/share/doc/tsunagi/README.m
 install -D -m 0644 "$here/../linux/README.md" "$root/usr/share/doc/tsunagi/INSTALL.md"
 
 pkgname=tsunagi
+depends="adduser"
 extra_control=""
 desc_gui=""
 if [ -n "$tray" ]; then
@@ -46,7 +47,8 @@ if [ -n "$tray" ]; then
     # with it (both ship /usr/bin/tsng).
     extra_control=$'Conflicts: tsunagi\nReplaces: tsunagi\nProvides: tsunagi\n'
     # What the tray and its window load at run time.
-    extra_control+=$'Depends: libgtk-3-0 | libgtk-3-0t64, libayatana-appindicator3-1 | libappindicator3-1, libxkbcommon0, libwayland-client0, libx11-6, libgl1\n'
+    glibc_min=$(bash "$here/../linux/required-glibc.sh" "$tray")
+    depends+=", libc6 (>= $glibc_min), libgtk-3-0 | libgtk-3-0t64, libayatana-appindicator3-1 | libappindicator3-1, libxkbcommon0, libwayland-client0, libx11-6, libgl1"
     desc_gui=" It also installs the tray GUI (tsunagi-tray) and a desktop launcher so it can be started from the applications menu."
     install -D -m 0755 "$tray" "$root/usr/bin/tsunagi-tray"
     install -D -m 0644 "$here/../linux/tsunagi-tray.desktop" \
@@ -64,6 +66,7 @@ Architecture: ${arch}
 Maintainer: AB <ab@hexor.cy>
 Section: net
 Priority: optional
+Depends: ${depends}
 Homepage: https://github.com/house-of-vanity/tsunagi
 ${extra_control}Description: Serverless private mesh networking agent
  tsunagi forms small private mesh IP networks between peers, with NAT
