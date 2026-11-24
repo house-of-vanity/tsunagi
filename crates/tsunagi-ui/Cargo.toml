@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-ui"
-version = "1.0.0"
+version = "1.0.1"
 description = "Shared egui widgets for the tray and Android clients."
 edition.workspace = true
 rust-version.workspace = true

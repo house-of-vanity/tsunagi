@@ -23,7 +23,7 @@ android {
         minSdk 26
         targetSdk 35
         versionCode providers.gradleProperty('tsunagiVersionCode').getOrElse('1').toInteger()
-        versionName providers.gradleProperty('tsunagiVersionName').getOrElse('1.0.0')
+        versionName providers.gradleProperty('tsunagiVersionName').getOrElse('1.0.1')
         ndk { abiFilters abi }
     }
 }

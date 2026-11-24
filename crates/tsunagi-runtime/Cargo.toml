@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-runtime"
-version = "1.0.0"
+version = "1.0.1"
 description = "Built-in mesh transports and status reporting for native tsunagi agents."
 edition.workspace = true
 rust-version.workspace = true
@@ -8,11 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tsunagi-core = { path = "../tsunagi-core", version = "1.0.0" }
-tsunagi-wg-quic = { path = "../tsunagi-wg-quic", version = "1.0.0" }
-tsunagi-wireguard = { path = "../tsunagi-wireguard", version = "1.0.0" }
-tsunagi-awg = { path = "../tsunagi-awg", version = "1.0.0" }
-tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls", version = "1.0.0" }
+tsunagi-core = { path = "../tsunagi-core", version = "1.0.1" }
+tsunagi-wg-quic = { path = "../tsunagi-wg-quic", version = "1.0.1" }
+tsunagi-wireguard = { path = "../tsunagi-wireguard", version = "1.0.1" }
+tsunagi-awg = { path = "../tsunagi-awg", version = "1.0.1" }
+tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls", version = "1.0.1" }
 tokio.workspace = true
 tracing.workspace = true
 
