@@ -20,46 +20,8 @@ env:
   CARGO_NET_RETRY: "10"
 
 jobs:
-  macos-runner:
-    name: Select macOS runner
-    if: github.server_url == 'https://github.com'
-    runs-on: ubuntu-latest
-    permissions: {}
-    outputs:
-      labels: ${{ steps.select.outputs.labels }}
-    steps:
-      - id: select
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.MACOS_RUNNER_STATUS_TOKEN }}
-          USE_HOSTED: ${{ vars.MACOS_USE_HOSTED }}
-        run: |
-          set -euo pipefail
-          labels='["self-hosted","macOS","ARM64"]'
-          if [[ "$USE_HOSTED" == "true" ]]; then
-            labels='["macos-latest"]'
-          elif [[ -n "$GH_TOKEN" ]]; then
-            # Listing repository runners requires Administration: read.
-            if ! available=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runners?per_page=100" \
-              --jq '.runners[] | select(.status == "online" and .busy == false) |
-                    select((["self-hosted","macos","arm64"] - [.labels[].name | ascii_downcase]) == []) | .id'); then
-              echo "::warning::Unable to check self-hosted runners; using GitHub-hosted macOS"
-              available=""
-            fi
-            if [[ -z "$available" ]]; then
-              labels='["macos-latest"]'
-            fi
-          else
-            echo "::notice::Using self-hosted macOS. Set MACOS_RUNNER_STATUS_TOKEN for automatic fallback."
-          fi
-          echo "Selected $labels"
-          echo "labels=$labels" >> "$GITHUB_OUTPUT"
-
   build:
     name: ${{ matrix.asset }}
-    needs: macos-runner
-    permissions:
-      contents: read
     if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -93,7 +55,7 @@ jobs:
             deb: true
             deb_arch: armhf
             pkg_arch: armv7h
-          - os: ${{ fromJSON(needs.macos-runner.outputs.labels) }}
+          - os: macos-latest
             target: aarch64-apple-darwin
             asset: tsunagi-macos-aarch64
             archive: tar.gz
@@ -106,8 +68,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
