@@ -208,6 +208,7 @@ struct State {
     /// Transport kinds, best first. A neighbour with several links is
     /// reached over the first of these it has.
     priority: Vec<String>,
+    preferred: HashMap<PeerId, String>,
     graph: HashMap<PeerId, Vec<PeerId>>,
     members: HashSet<PeerId>,
     raw: HashMap<PeerId, Vec<RawLink>>,
@@ -229,7 +230,14 @@ impl State {
             .get(peer)
             .map(|links| links.iter().collect())
             .unwrap_or_default();
-        links.sort_by_key(|raw| (self.rank(&raw.kind), raw.kind.clone()));
+        let preferred = self.preferred.get(peer);
+        links.sort_by_key(|raw| {
+            (
+                preferred != Some(&raw.kind),
+                self.rank(&raw.kind),
+                &raw.kind,
+            )
+        });
         links
     }
 
@@ -326,6 +334,7 @@ impl RelayHub {
                     tally: tally.clone(),
                 }),
                 priority: Vec::new(),
+                preferred: HashMap::new(),
                 graph: HashMap::new(),
                 members: HashSet::new(),
                 raw: HashMap::new(),
@@ -346,6 +355,23 @@ impl RelayHub {
         let mut state = self.state();
         if state.priority != kinds {
             state.priority = kinds;
+            state.publish();
+        }
+    }
+
+    /// Selects an already open carrier for this neighbour. The existing
+    /// immutable forwarding snapshot handles packet delivery and fallback.
+    pub(crate) fn prefer_direct(&self, peer: EndpointId, kind: &str) {
+        let mut state = self.state();
+        let id = peer.as_bytes();
+        if state.preferred.get(id).map(String::as_str) != Some(kind)
+            && state.raw.get(id).is_some_and(|links| {
+                links
+                    .iter()
+                    .any(|raw| raw.kind == kind && !raw.link.is_closed())
+            })
+        {
+            state.preferred.insert(*id, kind.to_owned());
             state.publish();
         }
     }
@@ -477,6 +503,9 @@ impl RelayHub {
     /// Removes one physical link without tearing down end-to-end protocol state.
     pub fn clear_direct(&self, peer: EndpointId, kind: &str) {
         let mut state = self.state();
+        if state.preferred.get(peer.as_bytes()).map(String::as_str) == Some(kind) {
+            state.preferred.remove(peer.as_bytes());
+        }
         let mut changed = false;
         if let Some(links) = state.raw.get_mut(peer.as_bytes()) {
             if let Some(position) = links.iter().position(|known| known.kind == kind) {
@@ -495,6 +524,7 @@ impl RelayHub {
     /// Retires data channels without removing an authenticated peer's topology.
     pub fn clear_peer_links(&self, peer: EndpointId) {
         let mut state = self.state();
+        state.preferred.remove(peer.as_bytes());
         if let Some(links) = state.raw.remove(peer.as_bytes()) {
             for raw in links {
                 raw.link.close();

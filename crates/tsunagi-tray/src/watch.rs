@@ -22,6 +22,8 @@ pub(crate) enum Health {
     Disconnected,
     /// Connected, nothing out of the ordinary.
     Connected,
+    /// The shared host interface could not apply its addresses or routes.
+    InterfaceError,
     /// At least one configured network is blocked by an overlapping active range.
     RangeConflict,
     /// This device's traffic leaves through an exit node, and that works.
@@ -35,6 +37,9 @@ impl Health {
         let Some(report) = report else {
             return Self::Disconnected;
         };
+        if report.overlay_config_error.is_some() {
+            return Self::InterfaceError;
+        }
         if report
             .networks
             .iter()
@@ -65,6 +70,7 @@ impl Health {
         match self {
             Self::Disconnected => "tsunagi: not connected",
             Self::Connected => "tsunagi: connected",
+            Self::InterfaceError => "tsunagi: overlay interface configuration failed",
             Self::RangeConflict => "tsunagi: network range conflict; open to switch networks",
             Self::ExitNode => "tsunagi: using an exit node",
         }
@@ -116,6 +122,15 @@ mod tests {
             networks,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_host_interface_error_is_visible_even_with_connected_peers() {
+        let mut status = report(vec![network(2, ExitReport::default())]);
+        status.overlay_config_error = Some("utun5: could not install subnet route".into());
+        assert_eq!(Health::of(Some(&status)), Health::InterfaceError);
+        status.overlay_config_error = None;
+        assert_eq!(Health::of(Some(&status)), Health::Connected);
     }
 
     #[test]

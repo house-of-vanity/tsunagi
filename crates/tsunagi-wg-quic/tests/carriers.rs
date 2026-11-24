@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tsunagi::dataplane::transport::{DataCarrier, PacketTransport, SharedLink, TransportError};
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::overlay::{MemoryTun, MemoryTunFactory};
@@ -64,11 +66,11 @@ impl Node {
         protocol: &str,
         ports: Arc<std::sync::Mutex<Vec<(EndpointId, u16)>>>,
     ) -> Self {
-        Self::configured(discovery, protocol, ports, true).await
+        Self::configured(discovery, &[protocol], ports, true).await
     }
     async fn configured(
         discovery: &SharedMemoryDiscovery,
-        protocol: &str,
+        protocols: &[&str],
         ports: Arc<std::sync::Mutex<Vec<(EndpointId, u16)>>>,
         register_transport: bool,
     ) -> Self {
@@ -89,6 +91,7 @@ impl Node {
         let config = config_with(root.path(), discovery)
             .with_interface(Arc::new(tuns.clone()), "carrier-test", 1280)
             .with_tunnel(tunnel.clone());
+        let protocol = protocols[0];
         let (agent, accept) = if protocol == "wg" {
             let transport =
                 UdpTransport::wireguard(identity.endpoint_id(), Ipv4Addr::LOCALHOST, None);
@@ -120,13 +123,15 @@ impl Node {
                 inner: transport.clone(),
                 ports,
             });
-            let agent = Agent::spawn(
-                config
-                    .with_carrier(carrier)
-                    .with_custom_transport(protocol, custom),
-            )
-            .await
-            .unwrap();
+            let mut config = config
+                .with_carrier(carrier)
+                .with_custom_transport(protocol, custom);
+            if protocols.contains(&"wg-quic") {
+                config = config.with_carrier(Arc::new(
+                    tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+                ));
+            }
+            let agent = Agent::spawn(config).await.unwrap();
             let incoming = agent.clone();
             let accept = tokio::spawn(async move {
                 transport
@@ -162,12 +167,135 @@ impl Node {
     }
 }
 
+// Real TLS bytes flow through this loopback proxy. Delay one direction so
+// authenticated probes can distinguish two otherwise healthy carriers.
+async fn delayed_tcp_listener(port: u16) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let mut streams = tokio::task::JoinSet::new();
+        while let Ok((client, _)) = listener.accept().await {
+            streams.spawn(async move {
+                let server = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+                let (mut from_client, mut to_client) = client.into_split();
+                let (mut from_server, mut to_server) = server.into_split();
+                let delayed = async {
+                    let mut buffer = [0; 8192];
+                    loop {
+                        let n = from_client.read(&mut buffer).await?;
+                        if n == 0 {
+                            return Ok::<(), std::io::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(85)).await;
+                        to_server.write_all(&buffer[..n]).await?;
+                    }
+                };
+                tokio::select! {
+                    res = delayed => res,
+                    res = tokio::io::copy(&mut from_server, &mut to_client) => res.map(|_| ()),
+                }
+            });
+        }
+    });
+    (local_port, task)
+}
+
+#[tokio::test]
+async fn data_flows_over_the_incumbent_while_a_faster_carrier_is_measured_and_promoted() {
+    use tsunagi::agent::{DataPath, Event};
+    let discovery = SharedMemoryDiscovery::new();
+    let ports = Arc::default();
+    let protocols = ["tcp-tls", "wg-quic"];
+    let a = Node::configured(&discovery, &protocols, Arc::clone(&ports), true).await;
+    let b = Node::configured(&discovery, &protocols, Arc::clone(&ports), true).await;
+    let mut proxies = Vec::new();
+    let registered = ports.lock().unwrap().clone();
+    for (peer, port) in registered {
+        let (proxy_port, task) = delayed_tcp_listener(port).await;
+        proxies.push(task);
+        ports
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|(id, _)| *id == peer)
+            .unwrap()
+            .1 = proxy_port;
+    }
+    let mut events = a.agent.subscribe();
+    let (name, secret) = network("measured-carrier");
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    let observations = |node: &Node| {
+        let overview = node.tunnel.overview(id)?;
+        let tunnel = overview.peers.first()?.tunnel.as_ref()?;
+        tunnel.health.is_up().then_some(tunnel.stats.counter_epoch)
+    };
+    let epochs = wait_until(
+        "both endpoints have a single established cipher",
+        || async { Some((observations(&a)?, observations(&b)?)) },
+    )
+    .await;
+    let selected = |protocol: &str, status: &tsunagi::NetworkStatus| {
+        matches!(status.peers.first().map(|p| &p.data_path),
+            Some(DataPath::Direct { transport }) if transport == protocol)
+    };
+    async fn deliver(source: &Node, destination: &Node, id: NetworkId, tag: u8) {
+        let mut packet = vec![0; 32];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&32_u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 253;
+        packet[12..16].copy_from_slice(&source.addr(id).octets());
+        packet[16..20].copy_from_slice(&destination.addr(id).octets());
+        packet[20] = tag;
+        let packet = Bytes::from(packet);
+        source.tun().push_from_os(packet.clone());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), destination.tun().pop_to_os())
+                .await
+                .unwrap()
+                .unwrap(),
+            packet
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        wait_until("slow TLS data-link probes are visible", || async {
+            let status = a.agent.network_status(id).await.ok()?;
+            (selected("tcp-tls", &status) && status.peers.first()?.data_rtt? >= Duration::from_millis(75)).then_some(())
+        }).await;
+        deliver(&a, &b, id, 1).await;
+        tsunagi::testing::wait_event(&mut events, |event| {
+            matches!(event, Event::DataLinkUp { network, protocol, .. } if *network == id && protocol == "wg-quic").then_some(())
+        }).await;
+        for (source, dest) in [(&a, &b), (&b, &a)] {
+            assert!(selected("tcp-tls", &source.agent.network_status(id).await.unwrap()));
+            deliver(source, dest, id, 2).await;
+        }
+        wait_until("both endpoints use the faster measured data link", || async {
+            let left = a.agent.network_status(id).await.ok()?;
+            let right = b.agent.network_status(id).await.ok()?;
+            (selected("wg-quic", &left) && selected("wg-quic", &right)).then_some(())
+        }).await;
+        for (source, dest) in [(&a, &b), (&b, &a)] {
+            deliver(source, dest, id, 3).await;
+        }
+        assert_eq!((observations(&a), observations(&b)), (Some(epochs.0), Some(epochs.1)));
+    }).await.expect("comparison must finish with traffic on the existing tunnel");
+    a.agent.shutdown().await;
+    b.agent.shutdown().await;
+    a.accept.abort();
+    b.accept.abort();
+    for proxy in proxies {
+        proxy.abort();
+    }
+}
+
 #[tokio::test]
 async fn missing_native_transport_cannot_silently_turn_wireguard_into_quic() {
     let discovery = SharedMemoryDiscovery::new();
     let ports = Arc::default();
-    let a = Node::configured(&discovery, "wg", Arc::clone(&ports), false).await;
-    let b = Node::configured(&discovery, "wg", ports, false).await;
+    let a = Node::configured(&discovery, &["wg"], Arc::clone(&ports), false).await;
+    let b = Node::configured(&discovery, &["wg"], ports, false).await;
     let (name, secret) = network("no-disguised-quic-fallback");
     let id = a.agent.join_network(&name, &secret).await.unwrap();
     b.agent.join_network(&name, &secret).await.unwrap();

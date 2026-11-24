@@ -18,9 +18,11 @@ Each authenticated control session advertises that peer's own direct data
 links. There is one table for each network, whatever protocols run over it: a
 link is a way to reach a neighbour, while the single internal protocol is an
 end-to-end tunnel to a peer. The envelope names the protocol, so the two are independent. A neighbour
-reached over several kinds of transport (UDP, TCP, QUIC datagrams) is sent to
-over the best open one, in the order the protocols were configured, and over
-the next if that one fails or cannot carry the frame. Every authenticated
+reached over several kinds of transport (UDP, TCP, QUIC datagrams) receives
+traffic over the selected link. Another open link can carry the frame if
+the selected link fails or its MTU is too small. The configured order
+selects the initial link. Peers with automatic carrier selection can then
+prefer a faster measured link for that neighbour. Every authenticated
 member enters the graph; a member in the middle needs no protocol in common
 with either end, only a link to each. A snapshot refreshes on the maintenance
 interval, expires after 90 seconds, and is withdrawn when the session ends.
@@ -33,7 +35,7 @@ capability and independent of the selected external protocols. The tunnel is
 created when a member and its key are known; its logical link survives temporary
 loss of all physical paths. Carrier selection changes, automatic fallback and
 shorter routes keep the same keys, interface and counters. The lower endpoint
-id still chooses the mutually enabled external carrier in its preference order.
+id chooses among the mutually enabled external carriers.
 A relayed AWG first hop can lead to a QUIC next hop: the user's choice governs
 this device's adjacent links, while the inner ciphertext stays unchanged.
 An existing TCP connection continues after transient loss if its own timeout
@@ -100,6 +102,20 @@ Logical peer links and end-to-end encryption state survive these changes.
 
 ## Carrier health and switching
 
+Two peers advertising `link-choice` v1 automatically compare carriers. The
+lower endpoint id opens one alternative while the established carrier keeps
+serving traffic. At most two comparisons start concurrently per network. Each
+peer pair rotates through its alternatives, with a two-minute interval after
+a trial. A failed active link still triggers immediate fallback.
+
+The measurements use authenticated round trips over the data carrier. After
+at least six seconds and five successful probes on each link, the alternative
+must have zero observed loss in its window and a median RTT improvement of
+at least 20% and 5 ms. Otherwise traffic stays on the incumbent. The agents
+coordinate retirement over their authenticated control session. An older peer
+continues using the configured order and failure recovery. One enabled carrier
+restricts the pair to that carrier.
+
 Carrier setup failures and persistent encrypted delivery loss advance the
 initiator's ordered fallback cycle. Logical end-to-end links survive while
 physical links are retired explicitly. The AWG carrier negotiates a fresh
@@ -127,4 +143,5 @@ end-to-end network latency or VPN throughput; encryption, fragmentation,
 sockets, congestion and scheduling contribute separately.
 
 Wire compatibility: control ALPN `tsunagi/ctrl/8`, data ALPN `tsunagi/data/6`.
-Upgrade every participant together; saved identities and network state persist.
+Version 1.0.2 interoperates with 1.0.1 peers using these wire versions.
+Saved identities and network state persist.

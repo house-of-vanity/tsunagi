@@ -42,6 +42,8 @@ fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::R
                             hostname: peer.hostname.clone(),
                             transport: format!("{:?}", peer.transport),
                             rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
+                            data_rtt_ms: peer.data_rtt.map(|rtt| rtt.as_millis() as u64),
+                            data_transport_detail: peer.data_transport_detail.clone(),
                             exit_node: peer.exit_node,
                             path: Default::default(),
                         })

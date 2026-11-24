@@ -35,7 +35,7 @@ pub(super) fn roster(
     let size = egui::vec2(width, ui.text_style_height(&egui::TextStyle::Body) + 8.0);
     ui.spacing_mut().item_spacing.y = 1.0;
     let (header, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    for (x, title) in offsets.into_iter().zip(["device", "IPv4", "RTT"]) {
+    for (x, title) in offsets.into_iter().zip(["device", "IPv4", "Data RTT"]) {
         ui.painter().text(
             header.left_center() + egui::vec2(x, 0.),
             egui::Align2::LEFT_CENTER,
@@ -73,7 +73,7 @@ pub(super) fn roster(
             );
         }
         let name = member.name();
-        let rtt = rtt_text(member.control_rtt_ms);
+        let rtt = rtt_text(member.data_rtt_ms);
         let labels = [
             name.as_str(),
             member.address.as_deref().unwrap_or("—"),
@@ -148,6 +148,16 @@ fn details(
         ui.label(path);
         tunnel_cell(ui, member);
     });
+    if member.online {
+        if let Some(path) = member.data_transport_detail {
+            ui.label(path);
+        }
+        ui.label(format!(
+            "Data RTT {} · Control RTT {}",
+            rtt_text(member.data_rtt_ms),
+            rtt_text(member.control_rtt_ms)
+        ));
+    }
     if let Some(error) = member.data_error {
         ui.colored_label(AMBER, error);
     }

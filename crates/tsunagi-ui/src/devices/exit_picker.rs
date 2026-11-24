@@ -18,7 +18,7 @@ pub fn choose_exit(ui: &mut Ui, network: &NetworkReport, own: &str) -> Option<Ex
     let muted = ui.visuals().weak_text_color();
     for (x, label) in [
         (columns.name, "Exit node"),
-        (columns.rtt, "RTT"),
+        (columns.rtt, "Data RTT"),
         (columns.path, "Path"),
     ] {
         ui.painter().text(
@@ -83,7 +83,7 @@ pub fn choose_exit(ui: &mut Ui, network: &NetworkReport, own: &str) -> Option<Ex
             peer: Some(candidate.id),
             name: &name,
             address: candidate.address.as_deref(),
-            rtt: candidate.control_rtt_ms,
+            rtt: candidate.data_rtt_ms,
             path,
             transport,
             selected: candidate.in_use,
@@ -224,7 +224,8 @@ mod tests {
             network.peers.push(PeerReport {
                 endpoint_id: id.into(),
                 hostname: Some(name.into()),
-                rtt_ms: Some(37),
+                data_rtt_ms: Some(37),
+                rtt_ms: Some(142),
                 path: DataPathReport::Direct {
                     transport: "wg".into(),
                 },

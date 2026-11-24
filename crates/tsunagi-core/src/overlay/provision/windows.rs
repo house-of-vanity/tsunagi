@@ -131,10 +131,14 @@ impl InterfaceProvisioner for WintunProvisioner {
             };
 
             for cidr in flush.iter().chain(changes.remove.iter()) {
-                // Best effort: an address that is already gone is the outcome
-                // wanted, and refusing to start over one is not worth it.
-                if let Err(err) = address_del(&plan.name, *cidr).await {
-                    tracing::debug!(interface = %plan.name, %cidr, %err, "could not remove address");
+                if let Err(err) = address_del(&plan.name, *cidr).await
+                    && observe(&plan.name)
+                        .await
+                        .addresses
+                        .iter()
+                        .any(|a| a.addr == cidr.addr)
+                {
+                    return Err(err);
                 }
             }
 
@@ -262,11 +266,12 @@ async fn configure(plan: &InterfacePlan, changes: &super::Changes) -> Result<(),
         set_mtu(&plan.name, mtu).await?;
     }
     for cidr in &changes.add {
-        if let Err(err) = address_add(&plan.name, *cidr).await {
-            let err_str = err.to_string();
-            if !err_str.contains("already exists") && !err_str.contains("0x80071392") {
-                return Err(err);
-            }
+        // An already-installed alias is idempotent, including on localized
+        // Windows. A duplicate on a different adapter cannot satisfy the plan.
+        if let Err(err) = address_add(&plan.name, *cidr).await
+            && !observe(&plan.name).await.addresses.contains(cidr)
+        {
+            return Err(err);
         }
     }
     if changes.bring_up {
@@ -300,6 +305,7 @@ fn address_add_args(name: &str, cidr: Cidr) -> Vec<String> {
             format!("address={addr}"),
             format!("mask={}", ipv4_mask(cidr.prefix_len)),
             "store=active".into(),
+            "skipassource=false".into(),
         ],
         IpAddr::V6(addr) => vec![
             "interface".into(),
@@ -466,6 +472,70 @@ mod tests {
         assert!(args.contains(&"name=tsun0".to_string()));
         assert!(args.contains(&"address=10.13.37.69".to_string()));
         assert!(args.contains(&"mask=255.255.255.0".to_string()));
+        assert!(args.contains(&"skipassource=false".to_string()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an elevated Windows host with Wintun"]
+    async fn two_windows_subnets_choose_their_own_source_and_survive_removal() {
+        let addresses = [
+            (
+                Ipv4Addr::new(198, 18, 251, 1),
+                Ipv4Addr::new(198, 18, 251, 2),
+            ),
+            (
+                Ipv4Addr::new(198, 19, 251, 1),
+                Ipv4Addr::new(198, 19, 251, 2),
+            ),
+        ];
+        for iface in netdev::get_interfaces() {
+            for prefix in iface.ipv4 {
+                assert!(
+                    addresses.iter().all(|(ip, destination)| {
+                        !prefix.contains(ip) && !prefix.contains(destination)
+                    }),
+                    "test subnets already in use"
+                );
+            }
+        }
+        let adapter = format!("tsun-test-{:08x}", rand::random::<u32>());
+        let provisioner = WintunProvisioner::new().unwrap();
+        let cidrs: Vec<_> = addresses
+            .iter()
+            .map(|(ip, _)| Cidr::new((*ip).into(), 30).unwrap())
+            .collect();
+        let mut device = None;
+        for wanted in [&cidrs[..1], &cidrs[..], &cidrs[1..], &cidrs[..]] {
+            let plan = InterfacePlan::new(&adapter, 1280, wanted.to_vec());
+            let result = provisioner.reconcile(&plan).await.unwrap();
+            if let Some(created) = result.device {
+                assert!(device.replace(created).is_none());
+            }
+            // Allow the Windows address to finish duplicate address detection.
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let ready = addresses
+                        .iter()
+                        .filter(|(ip, _)| wanted.iter().any(|c| c.addr == IpAddr::V4(*ip)))
+                        .all(|(ip, destination)| {
+                            std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+                                .and_then(|socket| {
+                                    socket.connect((*destination, 9))?;
+                                    socket.local_addr()
+                                })
+                                .is_ok_and(|source| source.ip() == IpAddr::V4(*ip))
+                        });
+                    if ready {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("Windows selected the wrong source");
+            assert_eq!(observe(&adapter).await.addresses, plan.addresses);
+        }
+        provisioner.remove(&adapter).await.unwrap();
     }
 
     #[test]

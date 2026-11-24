@@ -39,6 +39,8 @@ use super::status::{
     NetworkStatus, PeerStatus,
 };
 
+mod selection;
+
 /// An inbound connection that already passed the handshake.
 #[derive(Debug)]
 pub(crate) struct InboundSession {
@@ -327,6 +329,7 @@ struct Runtime {
     /// peer, which outlives any particular path.
     links: HashMap<(EndpointId, String), Arc<HealthLink>>,
     pending_health: HashMap<(EndpointId, String), HealthSettings>,
+    comparisons: HashMap<EndpointId, selection::Schedule>,
     last_failed_protocol: HashMap<EndpointId, String>,
     /// Every data link of this network, and what is reached through what.
     hub: Arc<crate::dataplane::relay::RelayHub>,
@@ -450,6 +453,7 @@ impl Runtime {
             dial_results_rx,
             links: HashMap::new(),
             pending_health: HashMap::new(),
+            comparisons: HashMap::new(),
             last_failed_protocol: HashMap::new(),
             hub,
             reachable: HashMap::new(),
@@ -2024,24 +2028,29 @@ impl Runtime {
             }
         }
         for (peer, protocol) in dead {
-            let reason = self
-                .links
-                .remove(&(peer, protocol.clone()))
-                .map(|link| {
-                    let reason = link
-                        .failure_reason()
-                        .unwrap_or_else(|| "link closed".into());
-                    link.close();
-                    reason
-                })
-                .unwrap_or_else(|| "link closed".into());
+            let Some(link) = self.links.remove(&(peer, protocol.clone())) else {
+                continue;
+            };
+            let planned = self
+                .comparisons
+                .get(&peer)
+                .is_some_and(|s| s.retiring(link.profile_id()));
+            let reason = if planned {
+                "retired after carrier comparison".into()
+            } else {
+                let reason = link
+                    .failure_reason()
+                    .unwrap_or_else(|| "link closed".into());
+                self.data_errors
+                    .insert(peer, format!("{protocol}: {reason}"));
+                self.record_protocol_failure(peer, &protocol);
+                reason
+            };
+            link.close();
             // Only the direct path is gone. Whether the peer is still
             // reachable through somebody is decided below; the protocol's
             // link stays either way.
             self.hub.clear_direct(peer, &protocol);
-            self.data_errors
-                .insert(peer, format!("{protocol}: {reason}"));
-            self.record_protocol_failure(peer, &protocol);
             self.emit(Event::DataLinkDown {
                 network: self.network_id,
                 peer,
@@ -2050,10 +2059,8 @@ impl Runtime {
             });
         }
 
-        // Choose the highest priority mutually supported protocol for each peer.
-        // If a direct data link is already open or opening, do not dial another.
-        // If a protocol recently failed, fall back to other mutually supported
-        // protocols according to backoff cooldown.
+        // Foreground recovery always precedes optional comparisons.
+        self.review_comparisons();
         let now = std::time::Instant::now();
         let mut wanted: Vec<(EndpointId, String)> = Vec::new();
         for session in self.sessions.values() {
@@ -2108,6 +2115,8 @@ impl Runtime {
             }
         }
 
+        let trial = self.next_comparison(&served, now);
+        wanted.extend(trial.iter().cloned());
         for (peer, protocol) in wanted {
             let key = (peer, protocol.clone());
             if self.links.contains_key(&key) || self.opening.contains(&key) {
@@ -2119,6 +2128,7 @@ impl Runtime {
             let transport = Arc::clone(&transport);
             let network = self.network_id;
             let shutdown = self.shutdown.clone();
+            let background = trial.as_ref() == Some(&key);
             self.next_link_attempt = self.next_link_attempt.wrapping_add(1);
             let generation = self.next_link_attempt;
             self.link_attempts.insert(key.clone(), generation);
@@ -2126,8 +2136,16 @@ impl Runtime {
                 let result = tokio::select! {
                     biased;
                     _ = shutdown.wait() => Err("network deactivated".to_string()),
-                    result = transport.open(network, peer, &protocol) => {
-                        result.map_err(|err| err.to_string())
+                    result = async {
+                        let dial = transport.open(network, peer, &protocol);
+                        if background {
+                            tokio::time::timeout(Duration::from_secs(30), dial).await
+                                .map_err(|_| "carrier comparison timed out".to_owned())?
+                        } else {
+                            dial.await
+                        }.map_err(|err| err.to_string())
+                    } => {
+                        result
                     }
                 };
                 let _ = results
@@ -2475,6 +2493,10 @@ impl Runtime {
             self.pending_health.remove(&key)
         };
         let link = HealthLink::new(link, self.local_id, settings);
+        if let Some(primary) = self.hub.direct_kinds(peer).first() {
+            self.hub.prefer_direct(peer, primary);
+        }
+        self.link_installed(peer);
         let path = link.path_description();
         let max_datagram = link.max_datagram_size();
         if let Some(old) = self.links.insert(key, Arc::clone(&link)) {
@@ -2512,6 +2534,7 @@ impl Runtime {
 
     /// Retire only the data plane; authenticated membership and topology remain.
     fn reset_peer_data(&mut self, peer: EndpointId, reason: &str) {
+        self.comparisons.remove(&peer);
         self.data_errors.remove(&peer);
         self.link_attempts.retain(|(id, _), _| *id != peer);
         self.opening.retain(|(id, _)| *id != peer);
@@ -2661,6 +2684,9 @@ impl Runtime {
                 reason,
             });
         }
+        if self.params.carriers.len() > 1 {
+            capabilities.push(selection::capability());
+        }
         capabilities.truncate(self.params.limits.max_capabilities);
         self.local_capabilities = capabilities
             .iter()
@@ -2802,6 +2828,10 @@ impl Runtime {
     fn dispatch_message(&mut self, peer: EndpointId, message: ControlMessage) {
         match &message {
             ControlMessage::Transport { protocol, payload } => {
+                if protocol == selection::PROTOCOL {
+                    self.receive_choice(peer, payload.as_bytes());
+                    return;
+                }
                 if protocol == "link-health" {
                     // Only the elected initiator supplies a profile, for an enabled,
                     // mutually supported physical protocol in this authenticated session.
@@ -3079,6 +3109,7 @@ impl Runtime {
                 .iter()
                 .filter(|cap| {
                     cap.enabled
+                        && cap.protocol != selection::PROTOCOL
                         && self
                             .params
                             .tunnel
@@ -3106,7 +3137,17 @@ impl Runtime {
             .values()
             .map(|session| {
                 let snapshot = snapshot_connection(&session.conn);
+                let selected = self
+                    .hub
+                    .direct_kinds(session.peer)
+                    .into_iter()
+                    .next()
+                    .and_then(|kind| self.links.get(&(session.peer, kind)));
                 PeerStatus {
+                    data_rtt: selected
+                        .and_then(|link| link.quality())
+                        .map(|quality| quality.rtt),
+                    data_transport_detail: selected.map(|link| link.path_description()),
                     broadcast: session.broadcast,
                     exit_node: session.exit_node,
                     endpoint_id: session.peer,

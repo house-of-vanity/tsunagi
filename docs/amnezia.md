@@ -120,9 +120,10 @@ carrier change. Status and the tray show the actual external transport or relay
 route and data readiness. There is no user-selectable internal cipher.
 
 The internal capability is `wireguard-e2e` v4; external `wg` and `awg` use v2,
-`wg-quic` v1 and `tcp-tls` v2. All members must upgrade together. Control ALPN
+`wg-quic` v1 and `tcp-tls` v2, as in 1.0.1. Control ALPN
 `tsunagi/ctrl/8`, discovery, membership and signed state are unchanged. The data
-ALPN is `tsunagi/data/6`; the relay envelope format is unchanged. Local IPC is v23,
+ALPN is `tsunagi/data/6`; the relay envelope format is unchanged. Automatic
+carrier comparisons are optional on the mesh wire. Local IPC is v24,
 so agent, CLI and tray must match. Historical `wg-quic/wireguard.sqlite` is the
 canonical internal key store. Missing keys are imported transactionally from
 `wg` then `awg`, without replacing an existing canonical key or modifying a

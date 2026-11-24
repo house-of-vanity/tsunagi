@@ -107,6 +107,8 @@ pub fn networks(
                         hostname: peer.hostname.clone(),
                         transport: peer.transport.to_string(),
                         rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
+                        data_rtt_ms: peer.data_rtt.map(|rtt| rtt.as_millis() as u64),
+                        data_transport_detail: peer.data_transport_detail.clone(),
                         exit_node: peer.exit_node,
                         path: data_path_report(&peer.data_path),
                     })

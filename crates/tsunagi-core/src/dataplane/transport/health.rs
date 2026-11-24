@@ -1,6 +1,6 @@
 //! Authenticated probes of the actual data link, independent of control RTT.
 //! Keys are negotiated privately for each physical link. No fixed wire magic.
-use super::{PacketLink, SharedLink, TransportError};
+use super::{LinkQuality, PacketLink, SharedLink, TransportError};
 use crate::{BoxFuture, NetworkId};
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
@@ -32,40 +32,74 @@ impl std::fmt::Debug for Settings {
 }
 struct Samples {
     pending: VecDeque<(u64, Instant)>,
-    recent: VecDeque<bool>,
+    recent: VecDeque<Option<Duration>>,
+    last_reply: Option<Instant>,
 }
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const WINDOW: usize = 20;
 impl Samples {
     fn new() -> Self {
         Self {
             pending: VecDeque::new(),
             recent: VecDeque::new(),
+            last_reply: None,
         }
     }
     fn sent(&mut self, seq: u64, now: Instant) {
         self.pending.push_back((seq, now));
     }
-    fn acknowledge(&mut self, seq: u64) {
-        if let Some(i) = self.pending.iter().position(|(n, _)| *n == seq) {
-            self.pending.remove(i);
-            self.recent.push_back(true);
+    fn record(&mut self, rtt: Option<Duration>) {
+        if self.recent.len() == WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(rtt);
+    }
+    fn acknowledge(&mut self, seq: u64, now: Instant) {
+        if let Some(i) = self.pending.iter().position(|(n, _)| *n == seq)
+            && let Some((_, sent)) = self.pending.remove(i)
+        {
+            let rtt = now.saturating_duration_since(sent);
+            let success = rtt < PROBE_TIMEOUT;
+            self.record(success.then_some(rtt));
+            if success {
+                self.last_reply = Some(now);
+            }
         }
     }
     fn expire(&mut self, now: Instant) {
         while self
             .pending
             .front()
-            .is_some_and(|(_, at)| now.duration_since(*at) >= Duration::from_secs(3))
+            .is_some_and(|(_, at)| now.duration_since(*at) >= PROBE_TIMEOUT)
         {
             self.pending.pop_front();
-            self.recent.push_back(false);
-        }
-        while self.recent.len() > 20 {
-            self.recent.pop_front();
+            self.record(None);
         }
     }
     fn degraded(&self) -> bool {
         self.recent.len() >= 15
-            && self.recent.iter().filter(|ok| !**ok).count() * 100 >= self.recent.len() * 60
+            && self.recent.iter().filter(|rtt| rtt.is_none()).count() * 100
+                >= self.recent.len() * 60
+    }
+    fn quality(&self) -> Option<LinkQuality> {
+        let observed_at = self.last_reply?;
+        let mut delays = [Duration::ZERO; WINDOW];
+        let mut samples = 0;
+        for rtt in self.recent.iter().flatten() {
+            delays[samples] = *rtt;
+            samples += 1;
+        }
+        if samples == 0 {
+            return None;
+        }
+        delays[..samples].sort_unstable();
+        let rtt = (delays[(samples - 1) / 2] + delays[samples / 2]) / 2;
+        Some(LinkQuality {
+            rtt,
+            samples,
+            losses: self.recent.len() - samples,
+            observed_at,
+        })
     }
 }
 /// A monitored physical link. It forwards application bytes unchanged.
@@ -75,6 +109,7 @@ pub(crate) struct HealthLink {
     rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     stop: watch::Sender<bool>,
     reason: Mutex<Option<String>>,
+    quality: Mutex<Option<([u8; 16], LinkQuality)>>,
 }
 impl std::fmt::Debug for HealthLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -99,6 +134,7 @@ impl HealthLink {
             rx: tokio::sync::Mutex::new(rx),
             stop,
             reason: Mutex::new(None),
+            quality: Mutex::new(None),
         });
         let weak = Arc::downgrade(&link);
         let mut stopped = link.stop.subscribe();
@@ -117,6 +153,7 @@ impl HealthLink {
                         let Some(link)=weak.upgrade()else{break;};let Some(settings)=lock(&link.settings).clone()else{continue;};
                         if marker != Some(settings.marker) { marker = Some(settings.marker); samples = Samples::new(); since = None; }
                         let start=*since.get_or_insert_with(Instant::now);let now=Instant::now();samples.expire(now);
+                        *lock(&link.quality) = samples.quality().map(|q| (settings.marker, q));
                         if now.duration_since(start)>=Duration::from_secs(20) && samples.degraded() {
                             *lock(&link.reason)=Some("data delivery checks: at least 60% loss over the last 20 probes".into());break;
                         }
@@ -132,7 +169,10 @@ impl HealthLink {
                         if let Some(settings)=settings && packet.starts_with(&settings.marker) {
                             if let Some((kind,seq))=verify(&settings,raw.peer(),&packet) {
                                 if kind==1 {let _=raw.send(probe(&settings,local,2,seq,packet.len()));}
-                                else if kind==2 {samples.acknowledge(seq);}
+                                else if kind==2 && marker == Some(settings.marker) {
+                                    samples.acknowledge(seq, Instant::now());
+                                    *lock(&link.quality) = samples.quality().map(|q| (settings.marker, q));
+                                }
                             }
                         } else {let _=tx.try_send(packet);}
                     }
@@ -148,6 +188,11 @@ impl HealthLink {
     }
     pub(crate) fn configure(&self, settings: Settings) {
         *lock(&self.settings) = Some(settings);
+    }
+    pub(crate) fn profile_id(&self) -> Option<[u8; 16]> {
+        lock(&self.settings)
+            .as_ref()
+            .map(|settings| settings.marker)
     }
 }
 fn probe(settings: &Settings, sender: EndpointId, kind: u8, seq: u64, size: usize) -> Bytes {
@@ -236,6 +281,15 @@ impl PacketLink for HealthLink {
             .clone()
             .or_else(|| self.raw.failure_reason())
     }
+    fn quality(&self) -> Option<LinkQuality> {
+        if self.is_closed() {
+            return None;
+        }
+        let current = self.profile_id()?;
+        lock(&self.quality)
+            .filter(|(profile, quality)| *profile == current && quality.is_fresh(Instant::now()))
+            .map(|(_, quality)| quality)
+    }
     fn path_description(&self) -> String {
         self.raw.path_description()
     }
@@ -252,13 +306,42 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     #[test]
+    fn quality_uses_matched_fresh_replies_and_keeps_losses_in_the_window() {
+        let mut samples = Samples::new();
+        let start = Instant::now();
+        assert!(samples.quality().is_none());
+        for (seq, delay) in [(1, 10), (2, 30), (3, 250)] {
+            samples.sent(seq, start);
+            samples.acknowledge(seq, start + Duration::from_millis(delay));
+        }
+        samples.acknowledge(1, start + Duration::from_secs(1));
+        samples.sent(4, start);
+        samples.expire(start + Duration::from_secs(3));
+        samples.acknowledge(4, start + Duration::from_secs(4));
+        let measured = samples.quality().unwrap();
+        assert_eq!(measured.rtt, Duration::from_millis(30));
+        assert_eq!((measured.samples, measured.losses), (3, 1));
+        assert!(measured.is_fresh(start + Duration::from_secs(4)));
+        assert!(!measured.is_fresh(start + Duration::from_secs(6)));
+
+        for seq in 5..25 {
+            let sent = start + Duration::from_secs(seq);
+            samples.sent(seq, sent);
+            samples.acknowledge(seq, sent + Duration::from_millis(80));
+        }
+        let recovered = samples.quality().unwrap();
+        assert_eq!(recovered.rtt, Duration::from_millis(80));
+        assert_eq!((recovered.samples, recovered.losses), (20, 0));
+    }
+
+    #[test]
     fn no_false_failure_before_window_but_persistent_loss_is_detected() {
         let mut samples = Samples::new();
         let now = Instant::now();
         for seq in 0..20 {
             samples.sent(seq, now);
             if seq % 5 == 0 {
-                samples.acknowledge(seq);
+                samples.acknowledge(seq, now);
             }
         }
         assert!(!samples.degraded());
@@ -266,7 +349,7 @@ mod tests {
         assert!(samples.degraded());
         for seq in 20..40 {
             samples.sent(seq, now);
-            samples.acknowledge(seq);
+            samples.acknowledge(seq, now);
         }
         samples.expire(now + Duration::from_secs(4));
         assert!(!samples.degraded());

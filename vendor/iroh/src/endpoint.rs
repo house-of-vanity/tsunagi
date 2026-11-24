@@ -127,7 +127,7 @@ pub use crate::{net_report::NetReportConfig, portmapper::PortmapperConfig};
 /// new [`EndpointId`].
 ///
 /// To create the [`Endpoint`] call [`Builder::bind`].
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub struct Builder {
     secret_key: Option<SecretKey>,
     alpn_protocols: Vec<Vec<u8>>,
@@ -139,6 +139,8 @@ pub struct Builder {
     /// [`Builder::address_lookup`].
     addr_filter: Option<AddrFilter>,
     direct_addr_filter: Option<AddrFilter>,
+    #[debug(skip)]
+    network_change_filter: Option<socket::NetworkChangeFilter>,
     proxy_url: Option<Url>,
     ca_tls_config: Option<CaTlsConfig>,
     #[cfg(not(wasm_browser))]
@@ -208,6 +210,7 @@ impl Builder {
             address_lookup_user_data: Default::default(),
             addr_filter: None,
             direct_addr_filter: None,
+            network_change_filter: None,
             proxy_url: None,
             ca_tls_config: None,
             #[cfg(not(wasm_browser))]
@@ -274,6 +277,7 @@ impl Builder {
 
         let sock_opts = socket::Options {
             direct_addr_filter: self.direct_addr_filter,
+            network_change_filter: self.network_change_filter,
             transports: self.transports,
             secret_key,
             address_lookup_user_data: self.address_lookup_user_data,
@@ -633,6 +637,22 @@ impl Builder {
     /// are published. Unlike `addr_filter`, this applies to every candidate source.
     pub fn direct_addr_filter(mut self, filter: AddrFilter) -> Self {
         self.direct_addr_filter = Some(filter);
+        self
+    }
+
+    /// Filters OS network changes before rechecking paths and rebinding transports.
+    ///
+    /// Return false only when the change cannot affect this endpoint's underlay,
+    /// for example when an application adds an address to its own overlay interface.
+    /// The next change is compared with the latest snapshot even if this one is ignored.
+    pub fn network_change_filter(
+        mut self,
+        filter: impl Fn(&netwatch::netmon::State, &netwatch::netmon::State) -> bool
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.network_change_filter = Some(Box::new(filter));
         self
     }
 

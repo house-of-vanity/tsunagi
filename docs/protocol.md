@@ -162,6 +162,15 @@ channel is declined, which is an ordinary outcome rather than an error.
 Only one side dials — the one with the smaller endpoint id — so two agents
 never open two channels for the same thing.
 
+The optional `link-choice` v1 capability lets this dialler compare a second
+mutually enabled carrier. An authenticated `Transport` message named
+`link-choice` contains two 16-byte identifiers from the private link-health
+profiles, in keep/retire order. The responder selects the surviving carrier
+and echoes the decision. The dialler keeps accepting traffic on the former
+carrier until confirmation or closure. Choices apply to one peer and network
+and expire with the link generations. Peers without the capability use the
+original carrier negotiation.
+
 Packets ride as QUIC **datagrams**: unreliable and unordered, which is what a
 tunnelled protocol wants, and free of the head-of-line blocking a stream would
 add. `max_datagram` negotiates the reassembled payload limit (at most 65536

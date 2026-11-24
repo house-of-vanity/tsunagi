@@ -106,7 +106,7 @@ struct DnsArgs {
 #[derive(Debug, Args)]
 #[command(
     after_help = "Examples:\n  tsng protocols\n  tsng protocols home\n  tsng protocols home awg,wg-quic\n  tsng protocols home none\n\nThe selection is local to this device, saved per network and applied immediately.\nThe choice governs local incoming and outgoing data links only.
-Adjacent peers need a common external transport; control and discovery are independent."
+The order sets the first choice. Peers that support link comparison can switch to a faster mutually enabled transport."
 )]
 struct ProtocolsArgs {
     #[command(flatten)]
@@ -116,7 +116,7 @@ struct ProtocolsArgs {
     control_socket: Option<PathBuf>,
     /// Network's exact name, id or unique id prefix.
     network: Option<String>,
-    /// Replace the selection, best first: awg,wg-quic; none disables data traffic.
+    /// Replace the enabled transports in initial preference order. Use none for control only.
     #[arg(value_name = "LIST", requires = "network")]
     protocols: Option<String>,
 }
@@ -486,7 +486,7 @@ struct UpArgs {
     #[arg(long, help_heading = "System")]
     no_tun: bool,
 
-    /// Initial protocol selection for networks without a saved choice, best first.
+    /// Enabled transports in initial preference order for networks without a saved choice.
     ///
     /// A pair of peers uses one they both have at the same wire version. A
     /// peer with none in common keeps its control plane and gets no data
@@ -1995,7 +1995,7 @@ async fn protocols_command(args: ProtocolsArgs) -> Result<(), Box<dyn std::error
             None => network.protocols.clone(),
         };
         println!(
-            "protocols {} for `{}` ({}) · preference order",
+            "protocols {} for `{}` ({}) · initial preference order",
             if protocols.is_empty() {
                 "none".into()
             } else {
@@ -2624,8 +2624,11 @@ async fn exit_node_command(args: ExitNodeArgs) -> Result<(), Box<dyn std::error:
                     any = true;
                     let in_use = network.exit.via.as_deref() == Some(peer.endpoint_id.as_str());
                     let mut detail = format!("network {}", network.name);
+                    if let Some(rtt) = peer.data_rtt_ms {
+                        detail.push_str(&format!("  ·  data RTT {rtt}ms"));
+                    }
                     if let Some(rtt) = peer.rtt_ms {
-                        detail.push_str(&format!("  ·  rtt {rtt}ms"));
+                        detail.push_str(&format!("  ·  control RTT {rtt}ms"));
                     }
                     if in_use {
                         detail.push_str("  ·  IN USE");
@@ -3239,6 +3242,13 @@ async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
                 Row::new(Health::Degraded, "cache", "unavailable")
                     .with_note("disposable: the agent runs, rediscovering what it cached")
             });
+            if let Some(error) = &report.overlay_config_error {
+                agent.push(Row::new(
+                    Health::Degraded,
+                    "shared overlay interface",
+                    error,
+                ));
+            }
         }
         Observed::Stored {
             why,
@@ -3398,6 +3408,8 @@ struct MemberRow<'a> {
     /// that control connection reaches the peer.
     transport: Option<&'a str>,
     rtt_ms: Option<u64>,
+    data_rtt_ms: Option<u64>,
+    data_transport_detail: Option<&'a str>,
     overlay_address_v4: Option<&'a str>,
     tunnel: Option<&'a tsunagi::ipc::OverlayPeerReport>,
     failed_dials: u32,
@@ -3440,6 +3452,8 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
             name_taken: None,
             transport: None,
             rtt_ms: None,
+            data_rtt_ms: None,
+            data_transport_detail: None,
             overlay_address_v4: None,
             tunnel: None,
             failed_dials: 0,
@@ -3469,6 +3483,8 @@ fn member_rows<'a>(network: &'a tsunagi::ipc::NetworkReport, own_id: &str) -> Ve
         row.path = Some(&peer.path);
         row.transport = Some(&peer.transport);
         row.rtt_ms = peer.rtt_ms;
+        row.data_rtt_ms = peer.data_rtt_ms;
+        row.data_transport_detail = peer.data_transport_detail.as_deref();
         row.data_error = peer.data_error.as_deref();
     }
     if let Some(overlay) = &network.overlay {
@@ -3873,11 +3889,14 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
         detail.push_str(&format!("{v4:<15}  "));
     }
     detail.push_str(&path);
+    if let Some(rtt) = row.data_rtt_ms {
+        detail.push_str(&format!("  data RTT {rtt}ms"));
+    }
     if let Some(transport) = row.transport {
         detail.push_str(&format!("  ·  control path {}", transport.to_lowercase()));
     }
     if let Some(rtt) = row.rtt_ms {
-        detail.push_str(&format!("  rtt {rtt}ms"));
+        detail.push_str(&format!("  control RTT {rtt}ms"));
     }
     if row.exit_in_use {
         detail.push_str("  ·  your exit node");
@@ -3896,6 +3915,9 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     if let Some(reason) = row.data_error {
         out = out.with_note(reason.to_owned());
     }
+    if !tunnel_up && let Some(path) = row.data_transport_detail {
+        out = out.with_note(path.to_owned());
+    }
     if let Some(tunnel) = row.tunnel {
         out = out.with_note(match tunnel.handshake_secs_ago {
             Some(_) => format!(
@@ -3909,7 +3931,7 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
                 } else {
                     String::new()
                 },
-                tunnel.path
+                row.data_transport_detail.unwrap_or(&tunnel.path)
             ),
             None => "encrypted data channel is not ready yet".into(),
         });
@@ -4707,7 +4729,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("  endpoint id  {}", agent.endpoint_id());
     println!("  hostname     {}", agent.hostname());
     println!(
-        "  protocols    {} (priority order)",
+        "  protocols    {} (initial preference order)",
         protocol_names.join(", ")
     );
     // What this device belongs to is a separate question from whether its
@@ -4839,6 +4861,7 @@ async fn build_report(
     let networks = tsunagi_runtime::report::networks(&status, overlay.as_ref(), wireguard);
 
     StatusReport {
+        overlay_config_error: overlay.and_then(|state| state.address_error),
         available_protocols: PROTOCOLS
             .iter()
             .map(|p| tsunagi::ipc::ProtocolReport {
@@ -5179,6 +5202,8 @@ mod status_tests {
                 hostname: Some("music".into()),
                 transport: "direct".into(),
                 rtt_ms: Some(24),
+                data_rtt_ms: None,
+                data_transport_detail: None,
                 exit_node: false,
                 path: tsunagi::ipc::DataPathReport::Direct {
                     transport: "wg".into(),
@@ -5707,6 +5732,20 @@ mod status_tests {
         out.push(network_section(&network, OWN, false));
         assert_eq!(out.worst(), Health::Good, "{}", out.render(false));
         assert!(out.render(false).contains("control path relay"));
+    }
+
+    #[test]
+    fn data_and_control_latency_are_reported_separately_before_tunnel_traffic() {
+        let mut network = network_after_a_peer_returned();
+        network.overlay = None;
+        network.peers[0].data_rtt_ms = Some(203);
+        network.peers[0].data_transport_detail = Some("relay via relay.example".into());
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert!(text.contains("data RTT 203ms"), "{text}");
+        assert!(text.contains("control RTT 24ms"), "{text}");
+        assert!(text.contains("relay via relay.example"), "{text}");
     }
 
     #[test]

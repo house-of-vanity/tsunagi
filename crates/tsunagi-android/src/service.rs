@@ -178,8 +178,10 @@ pub async fn report(
     dns: &crate::dns::Resolver,
 ) -> tsunagi::Result<StatusReport> {
     let status = agent.status().await?;
+    let overlay = agent.overlay();
     Ok(StatusReport {
-        networks: tsunagi_runtime::report::networks(&status, agent.overlay().as_ref(), wg),
+        networks: tsunagi_runtime::report::networks(&status, overlay.as_ref(), wg),
+        overlay_config_error: overlay.and_then(|state| state.address_error),
         dns: Some(dns.refresh(&status.networks)),
         endpoint_id: status.endpoint_id.to_string(),
         hostname: status.hostname,

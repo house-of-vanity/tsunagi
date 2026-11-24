@@ -51,6 +51,8 @@ pub struct OverlayStatus {
     pub mtu: u32,
     /// The addresses it should be carrying.
     pub addresses: Vec<crate::overlay::Cidr>,
+    /// Last error applying addresses or subnet routes on the shared interface.
+    pub address_error: Option<String>,
     /// What has happened on it.
     pub counters: crate::overlay::Counters,
     /// The route and firewall allowance installed for LAN broadcast, when
@@ -168,6 +170,10 @@ pub struct PeerStatus {
     pub transport: TransportKind,
     /// RTT of the selected path, when iroh reported one.
     pub rtt: Option<Duration>,
+    /// Recent RTT of the selected direct data link, measured by authenticated probes.
+    pub data_rtt: Option<Duration>,
+    /// The selected direct data carrier's own description of its underlying path.
+    pub data_transport_detail: Option<String>,
     /// Per-connection counters.
     pub connection: ConnectionCounters,
     /// Control messages sent on this session.

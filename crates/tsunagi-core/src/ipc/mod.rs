@@ -614,6 +614,8 @@ pub struct LeftReport {
 /// Everything the agent is doing, in one snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusReport {
+    /// Last error applying the shared overlay interface's host addresses and routes.
+    pub overlay_config_error: Option<String>,
     /// Data-plane protocols this agent can enable at runtime.
     pub available_protocols: Vec<ProtocolReport>,
     /// This device's persistent endpoint id.
@@ -837,8 +839,12 @@ pub struct PeerReport {
     /// How the connection reaches the peer: `direct`, `relay` or `unknown`,
     /// as the transport reports it.
     pub transport: String,
-    /// Round-trip time in milliseconds, when a path is selected.
+    /// Round-trip time of the control connection in milliseconds.
     pub rtt_ms: Option<u64>,
+    /// Fresh median RTT of the selected direct data link, in milliseconds.
+    pub data_rtt_ms: Option<u64>,
+    /// Underlying path reported by the selected direct data carrier.
+    pub data_transport_detail: Option<String>,
     /// The peer offers itself as an exit node in this network.
     pub exit_node: bool,
     /// How packets reach it.
@@ -1135,7 +1141,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 23]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 24]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///

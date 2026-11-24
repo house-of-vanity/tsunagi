@@ -222,16 +222,13 @@ fn local_addr_string(addr: &iroh::endpoint::LocalTransportAddr) -> Option<String
 #[derive(Debug, Clone)]
 pub struct EndpointAdapter {
     endpoint: Endpoint,
-    owned_interface: Arc<std::sync::RwLock<String>>,
+    owned_interface: Arc<std::sync::OnceLock<String>>,
 }
 
 impl EndpointAdapter {
     /// Excludes the real name after interface creation (macOS assigns utunN).
     pub(crate) fn exclude_interface(&self, name: &str) {
-        *self
-            .owned_interface
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = name.to_lowercase();
+        let _ = self.owned_interface.set(name.to_owned());
     }
 
     /// Binds an endpoint according to `config`, reusing the persistent device key.
@@ -250,16 +247,40 @@ impl EndpointAdapter {
             TransportPolicy::N0Defaults => builder.preset(presets::N0),
         };
 
-        let owned_interface =
-            Arc::new(std::sync::RwLock::new(config.interface_name.to_lowercase()));
+        let owned_interface = Arc::new(std::sync::OnceLock::<String>::new());
         {
+            let monitor_interface = Arc::clone(&owned_interface);
+            #[cfg(windows)]
+            let adapter_id = std::sync::OnceLock::<String>::new();
+            builder = builder.network_change_filter(move |previous, current| {
+                let Some(name) = monitor_interface.get() else {
+                    return true;
+                };
+                // Wintun gives us its friendly name. netwatch keys Windows
+                // interfaces by GUID. Enumeration can lag adapter creation,
+                // so cache a successful lookup and retry a miss on later events.
+                #[cfg(windows)]
+                let Some(name) = adapter_id.get().or_else(|| {
+                    let id = netdev::get_interfaces()
+                        .into_iter()
+                        .find(|iface| {
+                            iface
+                                .friendly_name
+                                .as_deref()
+                                .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+                        })?
+                        .name;
+                    Some(adapter_id.get_or_init(|| id))
+                }) else {
+                    return true;
+                };
+                !only_owned_interface_changed(previous, current, name)
+            });
             let interface_filter = Arc::clone(&owned_interface);
+            let requested = config.interface_name.clone();
             let factory = config.tun_factory.clone();
             let filter = iroh::address_lookup::AddrFilter::new(move |addrs| {
-                let owned_interface = interface_filter
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone();
+                let owned_interface = interface_filter.get().unwrap_or(&requested).to_lowercase();
                 let mut overlay_ips = std::collections::HashSet::new();
                 if let Some(factory) = &factory {
                     overlay_ips.extend(factory.assigned_addresses());
@@ -491,5 +512,86 @@ impl EndpointAdapter {
     /// Closes the endpoint and waits for it to finish.
     pub async fn close(&self) {
         self.endpoint.close().await;
+    }
+}
+
+/// netwatch treats every new unicast prefix as a link change. A second overlay
+/// prefix on the same TUN cannot affect the paths carrying those tunnels.
+pub(crate) fn only_owned_interface_changed(
+    previous: &netwatch::netmon::State,
+    current: &netwatch::netmon::State,
+    name: &str,
+) -> bool {
+    if previous.default_route_interface != current.default_route_interface
+        || current.default_route_interface.as_deref() == Some(name)
+        || previous.last_unsuspend != current.last_unsuspend
+        || previous.is_expensive != current.is_expensive
+    {
+        return false;
+    }
+
+    // Interface equality in netwatch covers identity and flags. Compare
+    // addresses separately, including family, prefix and IPv6 address flags.
+    let same_interface = |a: &netwatch::interfaces::Interface,
+                          b: &netwatch::interfaces::Interface| {
+        a == b && a.addrs().eq(b.addrs())
+    };
+    let old_tun = previous.interfaces.get(name);
+    let new_tun = current.interfaces.get(name);
+    match (old_tun, new_tun) {
+        (None, None) => return false,
+        (Some(a), Some(b)) if same_interface(a, b) => return false,
+        _ => {}
+    }
+
+    // have_v4, have_v6 and local_addresses are derived from these interfaces
+    // and can all change when only the TUN changes.
+    let old_count = previous.interfaces.len() - usize::from(old_tun.is_some());
+    let new_count = current.interfaces.len() - usize::from(new_tun.is_some());
+    old_count == new_count
+        && previous.interfaces.iter().all(|(iface, old)| {
+            iface == name
+                || current
+                    .interfaces
+                    .get(iface)
+                    .is_some_and(|new| same_interface(old, new))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use netwatch::netmon::State;
+
+    #[test]
+    fn tun_address_changes_leave_existing_underlay_connections_alone() {
+        let before = State::fake();
+        let mut after = before.clone();
+        // netwatch keys interfaces by their OS name. Its fixture provides a
+        // unicast address, precisely the kind of change it classifies as major.
+        let tun = State::fake().interfaces.remove("wifi0").unwrap();
+        let address = tun.addrs().next().unwrap().addr();
+        after.interfaces.insert("utun7".into(), tun);
+        after.local_addresses.regular.push(address);
+        assert!(after.is_major_change(&before));
+        assert!(only_owned_interface_changed(&before, &after, "utun7"));
+        assert!(only_owned_interface_changed(&after, &before, "utun7"));
+        assert!(!only_owned_interface_changed(&before, &after, "utun6"));
+
+        // An update to the real underlay can arrive in the same notification.
+        let mut lost_wifi = after.clone();
+        lost_wifi.interfaces.remove("wifi0");
+        assert!(!only_owned_interface_changed(&before, &lost_wifi, "utun7"));
+        let mut changed_route = after.clone();
+        changed_route.default_route_interface = Some("utun7".to_owned());
+        assert!(!only_owned_interface_changed(
+            &before,
+            &changed_route,
+            "utun7"
+        ));
+        let mut resumed = after;
+        resumed.last_unsuspend = Some(std::time::Instant::now().into());
+        assert!(!only_owned_interface_changed(&before, &resumed, "utun7"));
     }
 }

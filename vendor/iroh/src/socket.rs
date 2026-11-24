@@ -157,10 +157,15 @@ impl From<mpsc::error::SendError<RemoteStateMessage>> for RemoteStateActorStoppe
     }
 }
 
+pub(crate) type NetworkChangeFilter =
+    Box<dyn Fn(&netmon::State, &netmon::State) -> bool + Send + Sync>;
+
 /// Contains options for `Socket::listen`.
 #[derive(derive_more::Debug)]
 pub(crate) struct Options {
     pub(crate) direct_addr_filter: Option<address_lookup::AddrFilter>,
+    #[debug(skip)]
+    pub(crate) network_change_filter: Option<NetworkChangeFilter>,
     /// The configuration for the different transports.
     pub(crate) transports: Vec<TransportConfig>,
 
@@ -883,6 +888,7 @@ impl EndpointInner {
 
         let Options {
             direct_addr_filter,
+            network_change_filter,
             secret_key,
             transports: transport_configs,
             address_lookup_user_data,
@@ -1093,6 +1099,7 @@ impl EndpointInner {
             periodic_re_stun_timer: new_re_stun_timer(false),
             network_monitor,
             local_interfaces_watcher,
+            network_change_filter,
             direct_addr_update_state,
             transports_network_change,
             direct_addr_done_rx,
@@ -1475,6 +1482,7 @@ struct Actor {
     network_monitor: netmon::Monitor,
     /// Watcher for changes to the local network interfaces, IP addresses and routes.
     local_interfaces_watcher: n0_watcher::Direct<netmon::State>,
+    network_change_filter: Option<NetworkChangeFilter>,
     transports_network_change: transports::NetworkChangeSender,
     /// Indicates the direct addr update state.
     direct_addr_update_state: DirectAddrUpdateState,
@@ -1608,14 +1616,19 @@ impl Actor {
                         self.sock.metrics.socket.actor_tick_other.inc();
                         continue;
                     };
-                    let is_major = state.is_major_change(&current_netmon_state);
+                    let previous = std::mem::replace(&mut current_netmon_state, state);
+                    if let Some(filter) = &self.network_change_filter
+                        && !filter(&previous, &current_netmon_state)
+                    {
+                        continue;
+                    }
+                    let is_major = current_netmon_state.is_major_change(&previous);
                     event!(
                         target: "iroh::_events::link_change",
                         Level::DEBUG,
-                        ?state,
+                        state = ?current_netmon_state,
                         is_major
                     );
-                    current_netmon_state = state;
                     self.sock.metrics.socket.actor_link_change.inc();
                     self.handle_network_change(is_major);
                 }
@@ -2192,6 +2205,7 @@ mod tests {
             static_config,
             configured_addrs: Default::default(),
             direct_addr_filter: None,
+            network_change_filter: None,
         }
     }
 
@@ -2609,6 +2623,7 @@ mod tests {
             static_config,
             configured_addrs: Default::default(),
             direct_addr_filter: None,
+            network_change_filter: None,
         };
         let sock = EndpointInner::bind(opts).await?;
         Ok(sock)

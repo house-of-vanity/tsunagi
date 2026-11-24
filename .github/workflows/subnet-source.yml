@@ -1,0 +1,71 @@
+name: Native subnet source selection
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/subnet-source.yml'
+      - 'crates/tsunagi-core/src/overlay/provision/macos.rs'
+      - 'crates/tsunagi-core/src/overlay/provision/windows.rs'
+      - 'crates/tsunagi-core/src/overlay/provision/mod.rs'
+      - 'crates/tsunagi-core/src/overlay/provision/factory.rs'
+      - 'crates/tsunagi-core/src/net.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    if: github.server_url == 'https://github.com'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            test: overlay::provision::macos::tests::unbound_sockets_choose_each_networks_source_on_one_real_utun
+          - os: windows-latest
+            test: overlay::provision::windows::tests::two_windows_subnets_choose_their_own_source_and_survive_removal
+    env:
+      TEST_NAME: ${{ matrix.test }}
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and locate the native test
+        shell: pwsh
+        run: |
+          $artifacts = @(cargo test --locked -p tsunagi-core --lib --features tun-device --no-run --message-format=json-render-diagnostics |
+            ForEach-Object { ConvertFrom-Json -InputObject $_ } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'tsunagi' -and $_.profile.test -and $_.executable })
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($artifacts.Count -ne 1) { throw "Expected one core test binary, found $($artifacts.Count)" }
+          $binary = $artifacts[0].executable
+          $tests = @(& $binary --ignored --exact $env:TEST_NAME --list)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($tests -notcontains "$($env:TEST_NAME): test") { throw "Missing ignored test: $env:TEST_NAME" }
+          "TEST_BINARY=$binary" >> $env:GITHUB_ENV
+      - name: Verify source selection on a real utun
+        if: runner.os == 'macOS'
+        shell: bash
+        run: sudo -n -- "$TEST_BINARY" --ignored --exact "$TEST_NAME" --nocapture
+      - name: Verify source selection on a real Wintun adapter
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'wintun.zip'
+          Invoke-WebRequest -Uri https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile $zip
+          # This is the signed Wintun distribution pinned by the Windows installer.
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne '07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51') {
+            throw 'Unexpected Wintun archive checksum'
+          }
+          $directory = Join-Path $env:RUNNER_TEMP 'wintun-dl'
+          Expand-Archive -Path $zip -DestinationPath $directory
+          Copy-Item (Join-Path $directory 'wintun/bin/amd64/wintun.dll') (Split-Path -Parent $env:TEST_BINARY)
+          & $env:TEST_BINARY --ignored --exact $env:TEST_NAME --nocapture
+          exit $LASTEXITCODE

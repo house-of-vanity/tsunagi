@@ -37,6 +37,7 @@ pub mod carrier;
 pub use carrier::{DataCarrier, SharedCarrier};
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use iroh::EndpointId;
@@ -71,6 +72,25 @@ pub enum TransportError {
     /// Anything else.
     #[error("data transport error: {0}")]
     Other(String),
+}
+
+/// Recent observations from authenticated round trips over a physical data link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkQuality {
+    /// Median round-trip time of successful probes in the window.
+    pub rtt: Duration,
+    /// Successful probes in the window.
+    pub samples: usize,
+    /// Timed-out probes in the same window.
+    pub losses: usize,
+    /// Receipt time of the latest successful probe.
+    pub observed_at: Instant,
+}
+
+impl LinkQuality {
+    pub(crate) fn is_fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.observed_at) <= Duration::from_secs(5)
+    }
 }
 
 /// An authenticated datagram channel to one peer, for one plugin protocol.
@@ -122,6 +142,11 @@ pub trait PacketLink: Send + Sync + std::fmt::Debug + 'static {
 
     /// Observed reason for retiring this link, if available.
     fn failure_reason(&self) -> Option<String> {
+        None
+    }
+
+    /// Fresh measurements from this physical link's own authenticated probes.
+    fn quality(&self) -> Option<LinkQuality> {
         None
     }
 

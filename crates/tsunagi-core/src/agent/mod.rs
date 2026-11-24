@@ -135,7 +135,9 @@ impl Inner {
             .await
             {
                 Ok(interface) => {
-                    self.adapter.exclude_interface(interface.name());
+                    if interface.on_host() {
+                        self.adapter.exclude_interface(interface.name());
+                    }
                     for carrier in &self.config.carriers {
                         carrier.on_interface_ready(interface.name());
                     }
@@ -643,6 +645,7 @@ impl Agent {
             on_host: interface.on_host(),
             mtu: interface.mtu(),
             addresses: interface.wanted_addresses(),
+            address_error: interface.address_error(),
             counters: interface.counters(),
             broadcast_rules: interface.broadcast_rules(),
         })

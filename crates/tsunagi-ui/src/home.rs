@@ -105,6 +105,9 @@ pub fn draw_header(
             "cache unavailable",
         );
     }
+    if let Some(error) = &report.overlay_config_error {
+        ui.colored_label(BAD, format!("Shared overlay interface {error}"));
+    }
 }
 
 /// One compact network tile.
@@ -278,7 +281,7 @@ fn draw_protocols(
     egui::CollapsingHeader::new(format!("data transports  {summary}"))
         .id_salt(("protocols", &network.network_id))
         .show(ui, |ui| {
-            ui.weak("Preference order; changes apply immediately and are saved.");
+            ui.weak("Order sets the first choice. Peers that support link comparison can switch to a faster enabled transport.");
             let mut selected = network.protocols.clone();
             let mut changed = false;
             ui.add_enabled_ui(!agent.busy(), |ui| {

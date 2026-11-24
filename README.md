@@ -122,7 +122,7 @@ The tray does the same with a checkbox. An exit node sees everything you send
 through it, so use only members you trust.
 [Details and per-OS notes](docs/exit-node.md).
 
-The default data transport order is `wg,awg,wg-quic,tcp-tls`. AWG negotiates a
+The initial data transport order is `wg,awg,wg-quic,tcp-tls` by default. AWG negotiates a
 fresh masking profile and outer keys for each pair connection attempt, including
 reentry after fallback. Sustained data loss triggers switching independently of
 the iroh control connection. [Configuration and limits](docs/amnezia.md).
@@ -132,14 +132,19 @@ Change a network's protocol selection without editing its service or restarting:
 ```sh
 tsng protocols                         # available protocols and settings
 tsng protocols home                    # this device's choice for home
-tsng protocols home awg,wg-quic         # prefer AWG, retain QUIC as fallback
+tsng protocols home awg,wg-quic         # enable AWG and QUIC, try AWG first
 tsng protocols home none                # control plane only
 ```
 
 Exact network names, full ids and unique id prefixes work here. The choice is
 local to this device, saved per network and applied immediately; an offline
 change applies on the next start. In the tray, expand **data transports** on a network
-tile to toggle protocols or change their preference order. Adjacent peers need a common external transport at the same wire version.
+tile to enable transports and set their initial preference order. Adjacent peers need a common external transport at the same wire version.
+Peers that both support link comparison probe another mutually enabled transport
+while traffic continues on the current one. They can switch to a faster healthy link.
+`tsng status` and the tray show the direct data link's measured RTT separately
+from the control connection's RTT. A mesh relay's first-hop RTT cannot measure
+the round trip to the destination.
 Selection applies to this device's incoming and outgoing data links; control and
 discovery are independent. A relay's next hop may use a different transport.
 Every pair uses one internal WireGuard cipher, hidden from these controls.

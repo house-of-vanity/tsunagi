@@ -1133,6 +1133,25 @@ async fn two_networks_share_one_interface_with_keys_and_ranges_of_their_own() {
         "the other overlay must see nothing"
     );
 
+    for (network, local, remote) in [(alpha, hub_alpha, &left), (beta, hub_beta, &right)] {
+        let address = remote.overlay(network).await;
+        for (sender, source, receiver, destination) in [
+            (&hub, local, remote, address),
+            (remote, address, &hub, local),
+        ] {
+            let packet = ipv4_packet(source, destination, network.as_bytes());
+            sender.tun(network).await.push_from_os(packet.clone());
+            let received = tokio::time::timeout(
+                tsunagi::testing::DEADLINE,
+                receiver.tun(network).await.pop_to_os(),
+            )
+            .await
+            .expect("bidirectional traffic on both networks")
+            .unwrap();
+            assert_eq!(received, packet);
+        }
+    }
+
     hub.shutdown().await;
     left.shutdown().await;
     right.shutdown().await;

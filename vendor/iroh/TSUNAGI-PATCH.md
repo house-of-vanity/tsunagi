@@ -58,3 +58,13 @@ wire formats are unchanged. The rootless real-endpoint regression is
 `crates/tsunagi-core/tests/iroh_candidates.rs`; overlay subnet filtering for
 introductions is also covered in the core. This prevents the recursive path;
 it does not prove the historical cause of any particular high byte counter.
+
+## Changes to the owned overlay interface
+
+The optional `Builder::network_change_filter` receives consecutive netwatch
+snapshots before iroh rechecks paths and rebinds sockets. Tsunagi suppresses
+events caused solely by its own TUN. Adding a second network can then add an
+address to the shared interface while the first network keeps its UDP sockets.
+Physical interface changes, default-route changes and resume events still
+reach iroh. The watcher advances its baseline even for a skipped event.
+Keep this behaviour when updating the vendored dependency.

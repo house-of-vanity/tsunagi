@@ -52,6 +52,8 @@ struct Device<'a> {
     data_error: Option<&'a str>,
     address: Option<String>,
     control_rtt_ms: Option<u64>,
+    data_rtt_ms: Option<u64>,
+    data_transport_detail: Option<&'a str>,
     overlay: Option<&'a OverlayPeerReport>,
     /// It is connected and offers to be an exit node.
     exit_node: bool,
@@ -438,14 +440,9 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
         .map(|id| {
             let overlay = overlay_peers.iter().find(|p| p.endpoint_id == id);
             let member = network.members.iter().find(|m| m.endpoint_id == id);
-            let online = member.is_some_and(|m| m.online)
-                || network.peers.iter().any(|p| p.endpoint_id == id);
-            let path = network
-                .peers
-                .iter()
-                .find(|p| p.endpoint_id == id)
-                .map(|p| &p.path)
-                .or_else(|| member.map(|m| &m.path));
+            let peer = network.peers.iter().find(|p| p.endpoint_id == id);
+            let online = member.is_some_and(|m| m.online) || peer.is_some();
+            let path = peer.map(|p| &p.path).or_else(|| member.map(|m| &m.path));
             let via_name = match path {
                 Some(DataPathReport::Relayed { via, .. }) => Some(exit::name_of(network, via)),
                 _ => None,
@@ -465,25 +462,15 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
                 hostname,
                 copy: hostname.map(|h| format!("{h}.{}", network.name)),
                 id,
-                data_error: network
-                    .peers
-                    .iter()
-                    .find(|p| p.endpoint_id == id)
-                    .and_then(|p| p.data_error.as_deref()),
+                data_error: peer.and_then(|p| p.data_error.as_deref()),
                 address: overlay
                     .and_then(|p| p.address.clone())
                     .or_else(|| member.and_then(|m| m.overlay_address_v4.clone())),
-                control_rtt_ms: network
-                    .peers
-                    .iter()
-                    .find(|p| p.endpoint_id == id)
-                    .and_then(|p| p.rtt_ms),
+                control_rtt_ms: peer.and_then(|p| p.rtt_ms),
+                data_rtt_ms: peer.and_then(|p| p.data_rtt_ms),
+                data_transport_detail: peer.and_then(|p| p.data_transport_detail.as_deref()),
                 overlay,
-                exit_node: online
-                    && network
-                        .peers
-                        .iter()
-                        .any(|p| p.endpoint_id == id && p.exit_node),
+                exit_node: peer.is_some_and(|p| p.exit_node),
                 in_use: network.exit.via.as_deref() == Some(id),
             }
         })
@@ -501,7 +488,7 @@ const COLUMN_HEADERS: [&str; 10] = [
     "device",
     "exit",
     "data",
-    "RTT",
+    "RTT data / control",
     "address",
     "data path",
     "pkts",
@@ -647,7 +634,7 @@ fn device_table(
         let (path, _) = data_path_text(device.path, device.via_name.as_deref(), device.online);
         for (column, text) in [
             (2, "waiting".to_owned()),
-            (3, rtt_text(device.control_rtt_ms)),
+            (3, rtt_pair(device)),
             (4, device.address.clone().unwrap_or_default()),
             (5, path),
         ] {
@@ -728,8 +715,9 @@ fn device_table(
                 1 => exit_cell(ui, device, network_id, confirm),
                 2 => tunnel_cell(ui, device),
                 3 => {
-                    ui.label(rtt_text(device.control_rtt_ms))
-                        .on_hover_text("Control-connection round-trip time.");
+                    ui.label(rtt_pair(device)).on_hover_text(
+                        "Median authenticated direct data-link RTT / selected control-connection RTT. A dash means there is no current measurement.",
+                    );
                 }
                 4 => match &device.address {
                     Some(address) => format::copy_field(ui, address, address),
@@ -791,9 +779,16 @@ fn device_table(
     );
 }
 
-/// Control RTT is independent of the hidden internal cipher's handshake age.
 fn rtt_text(rtt: Option<u64>) -> String {
     rtt.map_or_else(|| "—".into(), |value| format!("{value} ms"))
+}
+
+fn rtt_pair(device: &Device<'_>) -> String {
+    format!(
+        "{} / {}",
+        rtt_text(device.data_rtt_ms),
+        rtt_text(device.control_rtt_ms)
+    )
 }
 
 fn tunnel_cell(ui: &mut egui::Ui, device: &Device<'_>) {
@@ -855,7 +850,9 @@ fn data_path_cell(ui: &mut egui::Ui, device: &Device<'_>) {
         )
     };
     response.on_hover_text(match device.path {
-        Some(DataPathReport::Direct { .. }) => "Direct transport; no mesh relay.",
+        Some(DataPathReport::Direct { .. }) => device
+            .data_transport_detail
+            .unwrap_or("Direct link to this member."),
         Some(DataPathReport::Relayed { .. }) => "Traffic forwarded through another device.",
         _ if device.online => "Control connected; data transport unavailable.",
         _ => "Unreachable.",
@@ -1110,6 +1107,8 @@ mod tests {
                 data_error: None,
                 endpoint_id: "peer".into(),
                 rtt_ms: Some(27),
+                data_rtt_ms: Some(203),
+                data_transport_detail: Some("relay via relay.example".into()),
                 ..Default::default()
             }],
             overlay: Some(OverlayReport {
@@ -1125,6 +1124,11 @@ mod tests {
         };
         let rows = devices(&network, "own");
         assert_eq!(rtt_text(rows[0].control_rtt_ms), "27 ms");
+        assert_eq!(rtt_text(rows[0].data_rtt_ms), "203 ms");
+        assert_eq!(
+            rows[0].data_transport_detail,
+            Some("relay via relay.example")
+        );
         assert_eq!(rtt_text(None), "—");
     }
 
@@ -1231,8 +1235,8 @@ mod tests {
                 let mut texts = Vec::new();
                 collect_text(&shapes, &mut texts);
                 for (label, next_column) in [
-                    ("RTT".to_string(), "address"),
-                    (rtt_text(Some(12_345)), "address"),
+                    ("RTT data / control".to_string(), "address"),
+                    (rtt_pair(&rows[0]), "address"),
                     (format!("{packets}/{}", packets + 1), "bytes"),
                     (format!("{}/{}", packets * 2, (packets + 1) * 2), "bytes"),
                 ] {

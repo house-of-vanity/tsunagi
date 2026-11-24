@@ -20,6 +20,32 @@ fn tag() -> u64 {
     envelope::protocol_tag("ip")
 }
 
+#[tokio::test]
+async fn measuring_an_alternative_preserves_the_active_link_until_promotion() {
+    let hub = RelayHub::new(network(), peer(1));
+    hub.set_priority(vec!["first".into(), "second".into()]);
+    let first = Wire::new(2, true);
+    let second = Wire::new(2, true);
+    hub.set_direct(peer(2), "second", second.clone());
+    hub.prefer_direct(peer(2), "second");
+    hub.set_direct(peer(2), "first", first.clone());
+    let logical = hub.link(peer(2), "ip");
+    logical.send(Bytes::from_static(b"while testing")).unwrap();
+    assert_eq!(second.take().len(), 1);
+    assert!(first.take().is_empty());
+    hub.prefer_direct(peer(2), "first");
+    logical
+        .send(Bytes::from_static(b"after switching"))
+        .unwrap();
+    assert_eq!(first.take().len(), 1);
+    first.dead.store(true, Ordering::Relaxed);
+    logical.send(Bytes::from_static(b"fallback")).unwrap();
+    assert_eq!(second.take().len(), 1);
+    hub.clear_direct(peer(2), "first");
+    hub.set_direct(peer(2), "first", Wire::new(2, true));
+    assert!(Arc::ptr_eq(&logical, &hub.link(peer(2), "ip")));
+}
+
 #[derive(Debug)]
 struct Wire {
     peer: EndpointId,

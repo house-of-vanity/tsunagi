@@ -153,9 +153,7 @@ pub struct Interface {
     routes: Arc<RoutingTable>,
     carrier: Arc<dyn PacketCarrier>,
     tally: Arc<Tally>,
-    /// What was last applied to the host, so an unchanged table is not
-    /// re-applied on every pass.
-    applied: std::sync::Mutex<Vec<Cidr>>,
+    addresses: std::sync::Mutex<AddressState>,
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
     vip_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     sync_lock: Arc<tokio::sync::Mutex<()>>,
@@ -169,6 +167,13 @@ pub struct Interface {
     /// overlay; read only by hosts that cannot exempt the agent from the
     /// exit node's default route.
     underlay: std::sync::Mutex<std::collections::HashMap<NetworkId, Underlay>>,
+}
+
+/// Addresses and subnet routes are applied together. A partial change
+/// invalidates the cached plan until the whole interface reconciles again.
+struct AddressState {
+    applied: Option<Vec<Cidr>>,
+    last_error: Option<String>,
 }
 
 /// Underlay destinations one network's runtime currently depends on.
@@ -336,7 +341,10 @@ impl Interface {
             routes,
             carrier,
             tally,
-            applied: std::sync::Mutex::new(Vec::new()),
+            addresses: std::sync::Mutex::new(AddressState {
+                applied: Some(Vec::new()),
+                last_error: None,
+            }),
             task: std::sync::Mutex::new(Some(task)),
             vip_task: std::sync::Mutex::new(Some(vip_task)),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -700,13 +708,13 @@ impl Interface {
         let _guard = self.sync_lock.lock().await;
         let wanted = self.wanted_addresses();
         {
-            let applied = match self.applied.lock() {
-                Ok(guard) => guard.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
-            };
-            if applied == wanted {
+            let mut addresses = self.addresses.lock().unwrap_or_else(|e| e.into_inner());
+            if addresses.applied.as_ref() == Some(&wanted) {
                 return Ok(());
             }
+            // A failed or cancelled reconfiguration can leave some aliases or
+            // routes installed. Even a return to the previous plan must retry.
+            addresses.applied = None;
         }
 
         // Every address this agent holds, in every network it is in. The
@@ -717,12 +725,25 @@ impl Interface {
             addresses: wanted.clone(),
             mtu: self.mtu,
         };
-        self.factory.reconfigure(request).await?;
-        match self.applied.lock() {
-            Ok(mut guard) => *guard = wanted,
-            Err(poisoned) => *poisoned.into_inner() = wanted,
+        let result = self.factory.reconfigure(request).await;
+        let mut addresses = self.addresses.lock().unwrap_or_else(|e| e.into_inner());
+        match &result {
+            Ok(()) => {
+                addresses.applied = Some(wanted);
+                addresses.last_error = None;
+            }
+            Err(err) => addresses.last_error = Some(format!("{}: {err}", self.name)),
         }
-        Ok(())
+        result
+    }
+
+    /// Last error applying the shared interface's addresses and subnet routes.
+    pub fn address_error(&self) -> Option<String> {
+        self.addresses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_error
+            .clone()
     }
 
     /// The interface name the operating system gave.
@@ -1242,6 +1263,83 @@ mod tests {
             interface.deliver(id, peer(2), Bytes::from(six)).await,
             Err(Rejected::WrongFamily)
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_network_after_partial_provisioning_removes_its_alias() {
+        #[derive(Debug, Default)]
+        struct PartialFactory {
+            devices: MemoryTunFactory,
+            addresses: std::sync::Mutex<Vec<Cidr>>,
+        }
+
+        impl TunFactory for PartialFactory {
+            fn name(&self) -> &str {
+                "partial"
+            }
+
+            fn on_host(&self) -> bool {
+                false
+            }
+
+            fn create<'a>(
+                &'a self,
+                request: TunRequest,
+            ) -> crate::BoxFuture<'a, Result<Arc<dyn TunDevice>, OverlayError>> {
+                self.devices.create(request)
+            }
+
+            fn reconfigure<'a>(
+                &'a self,
+                request: TunRequest,
+            ) -> crate::BoxFuture<'a, Result<(), OverlayError>> {
+                Box::pin(async move {
+                    let mut host = self.addresses.lock().unwrap();
+                    *host = request.addresses;
+                    if !host.is_empty() {
+                        return Err(OverlayError::Unavailable("subnet route failed".into()));
+                    }
+                    Ok(())
+                })
+            }
+        }
+
+        let routes = Arc::new(RoutingTable::new());
+        let network = network("partial");
+        routes
+            .set_network(
+                network,
+                NetworkRoutes {
+                    local: Some(addr(1)),
+                    range: Some("10.13.37.0/24".parse().unwrap()),
+                    ..NetworkRoutes::default()
+                },
+            )
+            .unwrap();
+        let factory = Arc::new(PartialFactory::default());
+        let interface = Interface::start(
+            factory.clone(),
+            "tsunpartial",
+            1280,
+            routes.clone(),
+            Arc::new(Recorder::default()),
+        )
+        .await
+        .unwrap();
+        assert!(interface.address_error().is_none());
+        assert!(interface.sync_addresses().await.is_err());
+        assert!(
+            interface
+                .address_error()
+                .unwrap()
+                .contains("subnet route failed")
+        );
+        assert_eq!(factory.addresses.lock().unwrap().len(), 1);
+        routes.remove_network(network);
+        interface.sync_addresses().await.unwrap();
+        assert!(interface.address_error().is_none());
+        assert!(factory.addresses.lock().unwrap().is_empty());
+        interface.remove().await;
     }
 
     #[tokio::test]

@@ -50,7 +50,8 @@ boringtun, with an in-memory TUN device so none of it needs privileges. It
 covers real IPv6 packets travelling both ways through a tunnel, a three-agent
 mesh, a peer that sends from an address it does not own being dropped, packets
 for unowned addresses being counted rather than broadcast, a departing peer
-losing its tunnel, two networks keeping separate interfaces and keys, restart
+losing its tunnel, two networks exchanging traffic in both directions over one
+shared interface with separate addresses and keys, restart
 keeping the WireGuard identity, shutdown removing every interface, a forged
 overlay claim being rejected, and the core carrying the payload without
 interpreting it.
@@ -257,7 +258,10 @@ histories. These are headless egui checks, not native desktop screenshots.
 `tsunagi-wg-quic/tests/carriers.rs` uses the same internal WireGuard plugin over
 real ordinary WG UDP and TCP/TLS, with loopback address selection and memory
 TUNs. Exact original IP byte/packet counts exclude health probes and encryption
-overhead. The AWG suite connects AWG-only and QUIC-only endpoints through a
+overhead. An artificial delay on a real TCP/TLS link exercises automatic
+selection of a faster QUIC carrier. Both endpoints exchange packets across the
+transition and retain their original encrypted tunnels. The AWG suite connects
+AWG-only and QUIC-only endpoints through a
 mixed relay. One real smoltcp TCP connection stays established through relay →
 direct QUIC → a dropped packet with all local carriers off → AWG relay; both
 middle TUNs and endpoint keys are checked. This exercises a real userspace TCP

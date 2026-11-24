@@ -39,7 +39,8 @@
 //! `getifaddrs`. An interface is matched by its real `utunN` name, which only
 //! matters on reconfiguration: the first create always makes a fresh device.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use netdev::ipnet::IpNet;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use crate::BoxFuture;
@@ -115,7 +116,7 @@ impl InterfaceProvisioner for UtunProvisioner {
             if self.is_ours(&plan.name) {
                 let current = observe(&plan.name).await;
                 let changes = plan_changes(&current, plan, true)?;
-                configure(&plan.name, &changes).await?;
+                configure(&plan.name, &changes, &plan.addresses).await?;
                 return Ok(Provisioned {
                     changes,
                     device: None,
@@ -136,7 +137,7 @@ impl InterfaceProvisioner for UtunProvisioner {
             // A failure here leaves an interface that exists but cannot carry
             // traffic. Drop the device so the utun closes, and report, rather
             // than leave a trap behind.
-            if let Err(err) = configure(&real, &changes).await {
+            if let Err(err) = configure(&real, &changes, &plan.addresses).await {
                 drop(device);
                 return Err(err);
             }
@@ -225,28 +226,25 @@ async fn observe(name: &str) -> InterfaceState {
 }
 
 /// Applies MTU, link state, addresses and the on-link routes they imply.
-async fn configure(name: &str, changes: &super::Changes) -> Result<(), OverlayError> {
+async fn configure(
+    name: &str,
+    changes: &super::Changes,
+    wanted: &[Cidr],
+) -> Result<(), OverlayError> {
     if let Some(mtu) = changes.set_mtu {
         set_mtu(name, mtu).await?;
     }
     for cidr in &changes.remove {
-        // Best effort: an address that is already gone is the outcome wanted.
-        if let Err(err) = address_del(name, *cidr).await {
-            tracing::debug!(interface = %name, %cidr, %err, "could not remove address");
+        let network = subnet(*cidr)?;
+        if !is_host_route(*cidr)
+            && matches!(subnet_route(network).await?, SubnetRoute::Present { interface, .. } if interface == name)
+        {
+            run("/sbin/route", route_args("delete", name, network)).await?;
         }
-        if let Err(err) = route_del(name, *cidr).await {
-            tracing::debug!(interface = %name, %cidr, %err, "could not remove route");
-        }
+        address_del(name, *cidr).await?;
     }
     for cidr in &changes.add {
         address_add(name, *cidr).await?;
-        // The subnet route makes the whole overlay range reach the interface;
-        // a point-to-point utun does not install one from the address alone. A
-        // host address (/32 or /128) needs none. Best effort: a route that is
-        // already there is the outcome wanted.
-        if let Err(err) = route_add(name, *cidr).await {
-            tracing::debug!(interface = %name, %cidr, %err, "could not add route");
-        }
     }
     if changes.bring_up {
         // Best effort: a utun with a descriptor open is up already, and a
@@ -255,31 +253,22 @@ async fn configure(name: &str, changes: &super::Changes) -> Result<(), OverlayEr
             tracing::debug!(interface = %name, %err, "could not enable the interface");
         }
     }
-    Ok(())
-}
-
-/// The network address of a CIDR, with the host bits cleared.
-fn network_of(cidr: Cidr) -> IpAddr {
-    match cidr.addr {
-        IpAddr::V4(addr) => {
-            let bits = u32::from(addr);
-            let mask = if cidr.prefix_len == 0 {
-                0
-            } else {
-                u32::MAX << (32 - u32::from(cidr.prefix_len))
-            };
-            IpAddr::V4(Ipv4Addr::from(bits & mask))
-        }
-        IpAddr::V6(addr) => {
-            let bits = u128::from(addr);
-            let mask = if cidr.prefix_len == 0 {
-                0
-            } else {
-                u128::MAX << (128 - u32::from(cidr.prefix_len))
-            };
-            IpAddr::V6(Ipv6Addr::from(bits & mask))
+    // An alias may already be present after a partial reconcile, or its old
+    // subnet route may still select the first alias on this utun.
+    let mut result = Ok(());
+    for &cidr in wanted {
+        if !is_host_route(cidr) {
+            // Finish the other networks even when one subnet conflicts.
+            let update = ensure_subnet_route(name, subnet(cidr)?).await;
+            result = result.and(update);
         }
     }
+    result
+}
+
+fn subnet(cidr: Cidr) -> Result<IpNet, OverlayError> {
+    IpNet::new(cidr.addr, cidr.prefix_len)
+        .map_err(|err| OverlayError::Unavailable(format!("invalid overlay prefix {cidr}: {err}")))
 }
 
 /// Whether a CIDR is a single host address, which needs no subnet route.
@@ -326,40 +315,26 @@ fn address_del_args(name: &str, cidr: Cidr) -> Vec<String> {
     ]
 }
 
-/// The `route` arguments that point a CIDR's subnet at the interface.
-fn route_add_args(name: &str, cidr: Cidr) -> Vec<String> {
-    let family = match cidr.addr {
+fn route_args(command: &str, name: &str, subnet: IpNet) -> Vec<String> {
+    let family = match subnet.addr() {
         IpAddr::V4(_) => "-inet",
         IpAddr::V6(_) => "-inet6",
     };
-    vec![
-        "-q".into(),
+    let mut args = vec![
+        if command == "get" { "-v" } else { "-q" }.into(),
         "-n".into(),
-        "add".into(),
+        command.into(),
         family.into(),
         "-net".into(),
-        format!("{}/{}", network_of(cidr), cidr.prefix_len),
-        "-interface".into(),
-        name.into(),
-    ]
-}
-
-/// The `route` arguments that remove that subnet route.
-fn route_del_args(name: &str, cidr: Cidr) -> Vec<String> {
-    let family = match cidr.addr {
-        IpAddr::V4(_) => "-inet",
-        IpAddr::V6(_) => "-inet6",
-    };
-    vec![
-        "-q".into(),
-        "-n".into(),
-        "delete".into(),
-        family.into(),
-        "-net".into(),
-        format!("{}/{}", network_of(cidr), cidr.prefix_len),
-        "-interface".into(),
-        name.into(),
-    ]
+        subnet.trunc().to_string(),
+    ];
+    if command != "get" {
+        args.extend(["-interface".into(), name.into()]);
+    }
+    if matches!(command, "add" | "change") {
+        args.extend(["-ifa".into(), subnet.addr().to_string()]);
+    }
+    args
 }
 
 async fn address_add(name: &str, cidr: Cidr) -> Result<(), OverlayError> {
@@ -370,18 +345,92 @@ async fn address_del(name: &str, cidr: Cidr) -> Result<(), OverlayError> {
     ifconfig(address_del_args(name, cidr)).await
 }
 
-async fn route_add(name: &str, cidr: Cidr) -> Result<(), OverlayError> {
-    if is_host_route(cidr) {
-        return Ok(());
-    }
-    route(route_add_args(name, cidr)).await
+#[derive(Debug, Eq, PartialEq)]
+enum SubnetRoute {
+    Absent,
+    Present { interface: String, source: IpAddr },
 }
 
-async fn route_del(name: &str, cidr: Cidr) -> Result<(), OverlayError> {
-    if is_host_route(cidr) {
-        return Ok(());
+impl SubnetRoute {
+    fn action(&self, name: &str, subnet: IpNet) -> Result<Option<&'static str>, OverlayError> {
+        match self {
+            Self::Absent => Ok(Some("add")),
+            Self::Present { interface, .. } if interface != name => {
+                Err(OverlayError::Unavailable(format!(
+                    "route for {}/{} belongs to {interface}; cannot install it on {name}",
+                    subnet.network(),
+                    subnet.prefix_len()
+                )))
+            }
+            Self::Present { source, .. } if *source == subnet.addr() => Ok(None),
+            Self::Present { .. } => Ok(Some("change")),
+        }
     }
-    route(route_del_args(name, cidr)).await
+}
+
+// A verbose RTM_GET prints two sockaddr lists (request and reply). In the
+// kernel's reply IFA follows the variable-width link address of the interface.
+fn parse_subnet_route(output: &str, subnet: IpNet) -> Result<SubnetRoute, OverlayError> {
+    let invalid =
+        || OverlayError::Unavailable(format!("could not read the kernel route for {subnet}"));
+    let field = |key: &str| {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(key).map(str::trim))
+    };
+    let destination = field("destination:").ok_or_else(invalid)?;
+    let matches = |text: &str, expected: IpAddr| {
+        text.parse::<IpAddr>() == Ok(expected) || (text == "default" && expected.is_unspecified())
+    };
+    if !matches(destination, subnet.network())
+        || !field("mask:").is_some_and(|mask| matches(mask, subnet.netmask()))
+    {
+        return Ok(SubnetRoute::Absent);
+    }
+    let interface = field("interface:").ok_or_else(invalid)?;
+    let (_, reply) = output.rsplit_once("sockaddrs:").ok_or_else(invalid)?;
+    let (fields, addresses) = reply.trim().split_once('\n').ok_or_else(invalid)?;
+    let after = fields
+        .trim()
+        .trim_matches(['<', '>'])
+        .split(',')
+        .rev()
+        .position(|field| field == "IFA")
+        .ok_or_else(invalid)?;
+    let source = addresses
+        .split_whitespace()
+        .rev()
+        .nth(after)
+        .and_then(|ip| ip.parse().ok())
+        .ok_or_else(invalid)?;
+    Ok(SubnetRoute::Present {
+        interface: interface.into(),
+        source,
+    })
+}
+
+async fn subnet_route(subnet: IpNet) -> Result<SubnetRoute, OverlayError> {
+    match run("/sbin/route", route_args("get", "", subnet)).await {
+        Ok(output) => parse_subnet_route(&output, subnet),
+        Err(OverlayError::Unavailable(message)) if message.ends_with("not in table") => {
+            Ok(SubnetRoute::Absent)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn ensure_subnet_route(name: &str, subnet: IpNet) -> Result<(), OverlayError> {
+    if let Some(command) = subnet_route(subnet).await?.action(name, subnet)? {
+        run("/sbin/route", route_args(command, name, subnet)).await?;
+        let observed = subnet_route(subnet).await?;
+        if observed.action(name, subnet)?.is_some() {
+            return Err(OverlayError::Unavailable(format!(
+                "route for {subnet} on {name} did not select source {} (observed {observed:?})",
+                subnet.addr()
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn set_mtu(name: &str, mtu: u32) -> Result<(), OverlayError> {
@@ -394,27 +443,26 @@ async fn set_up(name: &str) -> Result<(), OverlayError> {
 
 /// Runs `/sbin/ifconfig`, turning a non-zero exit into an error with its text.
 async fn ifconfig(args: Vec<String>) -> Result<(), OverlayError> {
-    run("/sbin/ifconfig", args).await
-}
-
-/// Runs `/sbin/route`, turning a non-zero exit into an error with its text.
-async fn route(args: Vec<String>) -> Result<(), OverlayError> {
-    run("/sbin/route", args).await
+    run("/sbin/ifconfig", args).await.map(|_| ())
 }
 
 /// Runs a system tool by absolute path, so nothing on `PATH` can stand in for
 /// it, and turns a non-zero exit into an error carrying what it said.
-async fn run(program: &'static str, args: Vec<String>) -> Result<(), OverlayError> {
+async fn run(program: &'static str, args: Vec<String>) -> Result<String, OverlayError> {
     let display = format!("{program} {}", args.join(" "));
     let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(program).args(&args).output()
+        std::process::Command::new(program)
+            .env("LC_ALL", "C")
+            .args(&args)
+            .output()
     })
     .await
     .map_err(|err| OverlayError::Other(format!("could not run {display}: {err}")))?
     .map_err(|err| OverlayError::Unavailable(format!("could not run {display}: {err}")))?;
 
-    if output.status.success() {
-        return Ok(());
+    // Darwin route can exit successfully after a routing-socket write failed.
+    if output.status.success() && (program != "/sbin/route" || output.stderr.is_empty()) {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
     let message = {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -439,6 +487,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn v4(last: u8, prefix: u8) -> Cidr {
         Cidr::new(IpAddr::V4(Ipv4Addr::new(10, 13, 37, last)), prefix).unwrap()
@@ -476,8 +525,8 @@ mod tests {
     }
 
     #[test]
-    fn a_subnet_route_points_the_masked_network_at_the_interface() {
-        let args = route_add_args("utun5", v4(69, 24));
+    fn a_subnet_route_names_its_own_overlay_source() {
+        let args = route_args("add", "utun5", subnet(v4(69, 24)).unwrap());
         assert_eq!(
             args,
             vec![
@@ -488,9 +537,91 @@ mod tests {
                 "-net",
                 "10.13.37.0/24",
                 "-interface",
-                "utun5"
+                "utun5",
+                "-ifa",
+                "10.13.37.69"
             ]
         );
+    }
+
+    #[test]
+    fn a_wrong_source_is_repaired_only_on_the_owned_interface() {
+        let cidr = subnet(v4(69, 24)).unwrap();
+        let observed = "destination: 10.13.37.0\n  mask: 255.255.255.0\n  interface: utun5\n\
+            sockaddrs: <DST,GATEWAY,NETMASK,IFP,IFA>\n 10.13.37.0 index: 20  255.255.255.0 index: 20 utun5 10.99.0.2\n";
+        let route = parse_subnet_route(observed, cidr).unwrap();
+        assert_eq!(route.action("utun5", cidr).unwrap(), Some("change"));
+        assert!(route.action("utun9", cidr).is_err());
+        let corrected = observed.replace("10.99.0.2", "10.13.37.69");
+        assert_eq!(
+            parse_subnet_route(&corrected, cidr)
+                .unwrap()
+                .action("utun5", cidr)
+                .unwrap(),
+            None
+        );
+        assert!(parse_subnet_route(&observed.replace(",IFA>", ">"), cidr).is_err());
+        assert!(parse_subnet_route("", cidr).is_err());
+        let broader = observed.replace("255.255.255.0", "255.255.0.0");
+        assert_eq!(
+            parse_subnet_route(&broader, cidr).unwrap(),
+            SubnetRoute::Absent
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root and creates a temporary macOS utun with two subnet routes"]
+    async fn unbound_sockets_choose_each_networks_source_on_one_real_utun() {
+        let provisioner = UtunProvisioner::new().unwrap();
+        let first = Cidr::new("198.18.251.1".parse().unwrap(), 30).unwrap();
+        let second = Cidr::new("198.19.251.1".parse().unwrap(), 30).unwrap();
+        let created = provisioner
+            .reconcile(&InterfacePlan::new("tsuntest", 1280, vec![first]))
+            .await
+            .unwrap();
+        let device = created.device.unwrap();
+        let plan = InterfacePlan::new(device.name(), 1280, vec![first, second]);
+        let before = netwatch::netmon::State::new().await;
+        provisioner.reconcile(&plan).await.unwrap();
+        let after = netwatch::netmon::State::new().await;
+        assert!(crate::net::only_owned_interface_changed(
+            &before,
+            &after,
+            device.name()
+        ));
+        for (peer, expected) in [("198.18.251.2", first), ("198.19.251.2", second)] {
+            let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+            socket
+                .connect((peer.parse::<Ipv4Addr>().unwrap(), 9))
+                .unwrap();
+            assert_eq!(socket.local_addr().unwrap().ip(), expected.addr);
+        }
+        // Simulate a route left by an earlier release, with both aliases still present.
+        let second_subnet = subnet(second).unwrap();
+        let mut stale = route_args("change", device.name(), second_subnet);
+        *stale.last_mut().unwrap() = first.addr.to_string();
+        run("/sbin/route", stale).await.unwrap();
+        assert_eq!(
+            subnet_route(second_subnet)
+                .await
+                .unwrap()
+                .action(device.name(), second_subnet)
+                .unwrap(),
+            Some("change")
+        );
+        provisioner.reconcile(&plan).await.unwrap();
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        socket.connect(("198.19.251.2", 9)).unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), second.addr);
+        provisioner
+            .reconcile(&InterfacePlan::new(device.name(), 1280, vec![first]))
+            .await
+            .unwrap();
+        assert_eq!(
+            subnet_route(second_subnet).await.unwrap(),
+            SubnetRoute::Absent
+        );
+        provisioner.remove(device.name()).await.unwrap();
     }
 
     #[test]
@@ -499,22 +630,6 @@ mod tests {
         assert!(is_host_route(v6(1, 128)));
         assert!(!is_host_route(v4(69, 24)));
         assert!(!is_host_route(v6(1, 64)));
-    }
-
-    #[test]
-    fn the_network_address_clears_the_host_bits() {
-        assert_eq!(
-            network_of(v4(69, 24)),
-            IpAddr::V4(Ipv4Addr::new(10, 13, 37, 0))
-        );
-        assert_eq!(
-            network_of(Cidr::new(IpAddr::V4(Ipv4Addr::new(10, 13, 37, 69)), 16).unwrap()),
-            IpAddr::V4(Ipv4Addr::new(10, 13, 0, 0))
-        );
-        assert_eq!(
-            network_of(v6(0x1234, 64)),
-            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0))
-        );
     }
 
     #[test]
