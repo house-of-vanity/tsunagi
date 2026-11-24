@@ -28,7 +28,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             target: x86_64-unknown-linux-musl
             asset: tsunagi-linux-x86_64
             archive: tar.gz
@@ -411,3 +411,74 @@ jobs:
           jq -n --arg repository "$GITHUB_REPOSITORY" --arg tag "$RELEASE_TAG" \
             '{event_type: "new_package", client_payload: {repository: $repository, tag: $tag}}' \
             | gh api --method POST repos/house-of-vanity/arch_repo/dispatches --input -
+
+  publish-openartifact:
+    name: Publish APT and pacman packages
+    needs: publish
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      OA_SERVER: https://repo.hexor.cy
+      APT_SUITE: resolute
+    steps:
+      - name: Download packages attached to this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.deb' --pattern '*.pkg.tar.zst' --dir packages
+
+      - name: Publish packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          id_token=$(curl -fsS -G --data-urlencode "audience=$OA_SERVER" \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -er '.value')
+          oa_token=$(jq -n --arg token "$id_token" \
+            '{token:$token,policy:"github-tsunagi-release"}' | \
+            curl -fsS --json @- "$OA_SERVER/api/v1/auth/oidc/exchange" | jq -er '.access_token')
+          echo "::add-mask::$oa_token"
+          auth=(-H "Authorization: Bearer $oa_token")
+
+          for file in packages/*.deb packages/*.pkg.tar.zst; do
+            [[ -f "$file" ]] || { echo "Missing release artifact: $file"; exit 1; }
+            name=${file##*/}
+            case "$name" in
+              *.deb)
+                arch=$(dpkg-deb -f "$file" Architecture)
+                status=$(curl -sS -o "$RUNNER_TEMP/oa-upload.json" -w '%{http_code}' \
+                  "${auth[@]}" -F "file=@$file" -F "distribution=$APT_SUITE" -F component=main \
+                  "$OA_SERVER/api/v1/repositories/hexor-apt/debs")
+                ;;
+              *.pkg.tar.zst)
+                stem=${name%.pkg.tar.zst}
+                arch=${stem##*-}
+                url="$OA_SERVER/repos/hexor-pacman/os/$arch/$name"
+                status=$(curl -sS -o "$RUNNER_TEMP/oa-upload.json" -w '%{http_code}' \
+                  "${auth[@]}" -T "$file" "$url")
+                ;;
+            esac
+            case "$status" in
+              2??) echo "Published $name" ;;
+              409)
+                # An immutable version may already exist after a partial run.
+                digest=$(sha256sum "$file" | cut -d ' ' -f1)
+                if [[ "$name" == *.deb ]]; then
+                  index="$OA_SERVER/repos/hexor-apt/dists/$APT_SUITE/main/binary-$arch/Packages"
+                  curl -fsS "${auth[@]}" "$index" | grep -Fx "SHA256: $digest" >/dev/null || {
+                    echo "Existing $name has different contents or is outside $APT_SUITE" >&2
+                    exit 1
+                  }
+                else
+                  remote=$(curl -fsS "${auth[@]}" "$url" | sha256sum | cut -d ' ' -f1)
+                  [[ "$remote" == "$digest" ]] || { echo "Different bytes for $name"; exit 1; }
+                fi
+                echo "Already published with matching SHA-256: $name"
+                ;;
+              *) echo "Upload of $name returned HTTP $status" >&2; exit 1 ;;
+            esac
+          done
