@@ -9,7 +9,9 @@ pub(super) const PROTOCOL: &str = "link-choice";
 const RETRY: Duration = Duration::from_secs(3);
 const NEXT_TRIAL: Duration = Duration::from_secs(120);
 const MIN_WINDOW: Duration = Duration::from_secs(6);
-const MAX_WINDOW: Duration = Duration::from_secs(18);
+// Allow a full rolling health window to replace probes sent before the
+// responder installed its profile. Persistent loss still disqualifies a trial.
+const MAX_WINDOW: Duration = Duration::from_secs(30);
 
 pub(super) fn capability() -> PluginCapability {
     PluginCapability {
@@ -25,12 +27,18 @@ fn supports_choice(caps: &[PluginCapability]) -> bool {
         .any(|c| c.enabled && c.protocol == PROTOCOL && c.version == 1)
 }
 
-fn better(current: &LinkQuality, alternative: &LinkQuality) -> bool {
+/// None keeps measuring on the alternative while user traffic stays on the incumbent.
+fn promotion_decision(age: Duration, measured: Option<(LinkQuality, LinkQuality)>) -> Option<bool> {
+    if age < MIN_WINDOW {
+        return None;
+    }
+    let Some((current, alternative)) = measured.filter(|(current, alternative)| {
+        current.samples >= 5 && alternative.samples >= 5 && alternative.losses == 0
+    }) else {
+        return (age >= MAX_WINDOW).then_some(false);
+    };
     let gain = current.rtt.saturating_sub(alternative.rtt);
-    current.samples >= 5
-        && alternative.samples >= 5
-        && alternative.losses == 0
-        && gain >= (current.rtt / 5).max(Duration::from_millis(5))
+    Some(gain >= (current.rtt / 5).max(Duration::from_millis(5)))
 }
 
 /// Fixed-size identifiers from the two privately negotiated health profiles.
@@ -207,17 +215,11 @@ impl Runtime {
                 return;
             };
             let age = now.duration_since(trial.started);
-            if age < MIN_WINDOW {
+            let measured = current.quality().zip(candidate.quality());
+            let Some(promote) = promotion_decision(age, measured) else {
                 return;
-            }
-            let measured = current
-                .quality()
-                .zip(candidate.quality())
-                .filter(|(a, b)| a.samples >= 5 && b.samples >= 5);
-            if measured.is_none() && age < MAX_WINDOW {
-                return;
-            }
-            let promote = measured.is_some_and(|(a, b)| better(&a, &b));
+            };
+            tracing::debug!(peer = %peer.fmt_short(), incumbent = %other, candidate = %trial.protocol, ?measured, promote, "compared data carriers");
             let (winner, loser) = if promote {
                 (candidate, current)
             } else {
@@ -328,7 +330,24 @@ mod tests {
     }
 
     #[test]
+    fn a_loss_during_profile_installation_can_age_out_before_deciding() {
+        let observed =
+            |samples, losses| Some((measurement(200, 20, 0), measurement(30, samples, losses)));
+        assert_eq!(promotion_decision(MIN_WINDOW, observed(5, 1)), None);
+        assert_eq!(
+            promotion_decision(Duration::from_secs(24), observed(20, 0)),
+            Some(true)
+        );
+        assert_eq!(promotion_decision(MAX_WINDOW, observed(18, 2)), Some(false));
+        assert_eq!(promotion_decision(MAX_WINDOW, observed(4, 0)), Some(false));
+        assert_eq!(promotion_decision(MIN_WINDOW / 2, observed(5, 0)), None);
+    }
+
+    #[test]
     fn promote_only_a_sampled_reliable_and_materially_faster_path() {
+        let better = |current: &LinkQuality, candidate: &LinkQuality| {
+            promotion_decision(MAX_WINDOW, Some((*current, *candidate))) == Some(true)
+        };
         let current = measurement(350, 20, 1);
         assert!(better(&current, &measurement(60, 6, 0)));
         assert!(!better(&current, &measurement(60, 1, 0)));

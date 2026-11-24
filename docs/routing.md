@@ -111,8 +111,11 @@ a trial. A failed active link still triggers immediate fallback.
 The measurements use authenticated round trips over the data carrier. After
 at least six seconds and five successful probes on each link, the alternative
 must have zero observed loss in its window and a median RTT improvement of
-at least 20% and 5 ms. Otherwise traffic stays on the incumbent. The agents
-coordinate retirement over their authenticated control session. An older peer
+at least 20% and 5 ms. If early probes are lost while the responder installs
+its probe profile, the dialler keeps sampling for up to 30 seconds so those
+losses can leave the 20-probe window. The incumbent stays selected if the
+alternative fails to qualify. The agents coordinate retirement over their
+authenticated control session. An older peer
 continues using the configured order and failure recovery. One enabled carrier
 restricts the pair to that carrier.
 

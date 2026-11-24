@@ -75,6 +75,7 @@ impl Node {
         ports: Arc<std::sync::Mutex<Vec<(EndpointId, u16)>>>,
         register_transport: bool,
     ) -> Self {
+        tsunagi::testing::init_tracing();
         let root = TempDir::new().unwrap();
         let identity = tsunagi::storage::StateStore::open(
             tsunagi::StoragePaths::under(root.path()).state_db(),
