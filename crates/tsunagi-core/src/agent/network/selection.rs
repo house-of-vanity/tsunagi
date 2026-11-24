@@ -55,6 +55,12 @@ pub(super) struct Schedule {
 }
 
 impl Schedule {
+    pub(super) fn is_trial(&self, protocol: &str) -> bool {
+        self.trial
+            .as_ref()
+            .is_some_and(|trial| trial.protocol == protocol)
+    }
+
     /// The responder can close the losing link before its acknowledgement
     /// arrives. Only an exact generation match makes this a planned closure.
     pub(super) fn retiring(&self, profile: Option<[u8; 16]>) -> bool {
@@ -152,7 +158,7 @@ impl Runtime {
         Some((peer, protocol))
     }
 
-    fn finish_comparison(&mut self, peer: EndpointId) {
+    pub(super) fn finish_comparison(&mut self, peer: EndpointId) {
         if let Some(schedule) = self.comparisons.get_mut(&peer) {
             schedule.trial = None;
             schedule.next = Instant::now() + NEXT_TRIAL;

@@ -10,7 +10,7 @@ use std::{
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tsunagi::dataplane::transport::{DataCarrier, PacketTransport, SharedLink, TransportError};
+use tsunagi::dataplane::transport::{PacketTransport, SharedLink, TransportError};
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::overlay::{MemoryTun, MemoryTunFactory};
 use tsunagi::testing::{config_with, network, wait_for_peers, wait_until};
@@ -58,7 +58,8 @@ struct Node {
     agent: Agent,
     tunnel: Arc<WireguardPlugin>,
     tuns: MemoryTunFactory,
-    accept: tokio::task::JoinHandle<()>,
+    wireguard: Option<Arc<UdpTransport>>,
+    _listeners: tokio::task::JoinSet<()>,
 }
 impl Node {
     async fn new(
@@ -88,52 +89,64 @@ impl Node {
         .await
         .unwrap();
         let tuns = MemoryTunFactory::new();
-        let config = config_with(root.path(), discovery)
+        let mut config = config_with(root.path(), discovery)
             .with_interface(Arc::new(tuns.clone()), "carrier-test", 1280)
             .with_tunnel(tunnel.clone());
-        let protocol = protocols[0];
-        let (agent, accept) = if protocol == "wg" {
-            let transport =
-                UdpTransport::wireguard(identity.endpoint_id(), Ipv4Addr::LOCALHOST, None);
-            let carrier: Arc<dyn DataCarrier> = UdpCarrier::new(transport.clone());
-            let mut config = config.with_carrier(carrier);
-            if register_transport {
-                config = config.with_custom_transport(protocol, transport.clone());
+        let mut wireguard = None;
+        let mut tls = None;
+        for &protocol in protocols {
+            match protocol {
+                "wg" => {
+                    let transport =
+                        UdpTransport::wireguard(identity.endpoint_id(), Ipv4Addr::LOCALHOST, None);
+                    config = config.with_carrier(UdpCarrier::new(transport.clone()));
+                    if register_transport {
+                        config = config.with_custom_transport(protocol, transport.clone());
+                    }
+                    wireguard = Some(transport);
+                }
+                "tcp-tls" => {
+                    let transport = Arc::new(
+                        TcpTlsTransport::bind(&identity, Some(0), None)
+                            .await
+                            .unwrap(),
+                    );
+                    ports
+                        .lock()
+                        .unwrap()
+                        .push((identity.endpoint_id(), transport.bound_port()));
+                    config = config
+                        .with_carrier(TcpTlsCarrier::new(transport.clone()))
+                        .with_custom_transport(
+                            protocol,
+                            Arc::new(LoopbackTls {
+                                inner: transport.clone(),
+                                ports: ports.clone(),
+                            }),
+                        );
+                    tls = Some(transport);
+                }
+                "wg-quic" => {
+                    config = config.with_carrier(Arc::new(
+                        tsunagi::dataplane::transport::iroh_link::IrohCarrier,
+                    ))
+                }
+                _ => panic!("unknown carrier {protocol}"),
             }
-            let agent = Agent::spawn(config).await.unwrap();
+        }
+        let agent = Agent::spawn(config).await.unwrap();
+        let mut listeners = tokio::task::JoinSet::new();
+        if let Some(transport) = wireguard.clone() {
             let incoming = agent.clone();
-            let accept = tokio::spawn(async move {
+            listeners.spawn(async move {
                 while let Some(link) = transport.next_inbound().await {
                     let _ = incoming.install_inbound_link(link).await;
                 }
             });
-            (agent, accept)
-        } else {
-            let transport = Arc::new(
-                TcpTlsTransport::bind(&identity, Some(0), None)
-                    .await
-                    .unwrap(),
-            );
-            ports
-                .lock()
-                .unwrap()
-                .push((identity.endpoint_id(), transport.bound_port()));
-            let carrier: Arc<dyn DataCarrier> = TcpTlsCarrier::new(transport.clone());
-            let custom = Arc::new(LoopbackTls {
-                inner: transport.clone(),
-                ports,
-            });
-            let mut config = config
-                .with_carrier(carrier)
-                .with_custom_transport(protocol, custom);
-            if protocols.contains(&"wg-quic") {
-                config = config.with_carrier(Arc::new(
-                    tsunagi::dataplane::transport::iroh_link::IrohCarrier,
-                ));
-            }
-            let agent = Agent::spawn(config).await.unwrap();
+        }
+        if let Some(transport) = tls {
             let incoming = agent.clone();
-            let accept = tokio::spawn(async move {
+            listeners.spawn(async move {
                 transport
                     .accept_loop(move |link| {
                         let incoming = incoming.clone();
@@ -143,14 +156,14 @@ impl Node {
                     })
                     .await;
             });
-            (agent, accept)
-        };
+        }
         Self {
             _root: root,
             agent,
             tunnel,
             tuns,
-            accept,
+            wireguard,
+            _listeners: listeners,
         }
     }
     fn tun(&self) -> Arc<MemoryTun> {
@@ -200,6 +213,26 @@ async fn delayed_tcp_listener(port: u16) -> (u16, tokio::task::JoinHandle<()>) {
     (local_port, task)
 }
 
+async fn deliver(source: &Node, destination: &Node, id: NetworkId, tag: u8) {
+    let mut packet = vec![0; 32];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&32_u16.to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 253;
+    packet[12..16].copy_from_slice(&source.addr(id).octets());
+    packet[16..20].copy_from_slice(&destination.addr(id).octets());
+    packet[20] = tag;
+    let packet = Bytes::from(packet);
+    source.tun().push_from_os(packet.clone());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), destination.tun().pop_to_os())
+            .await
+            .unwrap()
+            .unwrap(),
+        packet
+    );
+}
+
 #[tokio::test]
 async fn data_flows_over_the_incumbent_while_a_faster_carrier_is_measured_and_promoted() {
     use tsunagi::agent::{DataPath, Event};
@@ -239,25 +272,6 @@ async fn data_flows_over_the_incumbent_while_a_faster_carrier_is_measured_and_pr
         matches!(status.peers.first().map(|p| &p.data_path),
             Some(DataPath::Direct { transport }) if transport == protocol)
     };
-    async fn deliver(source: &Node, destination: &Node, id: NetworkId, tag: u8) {
-        let mut packet = vec![0; 32];
-        packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&32_u16.to_be_bytes());
-        packet[8] = 64;
-        packet[9] = 253;
-        packet[12..16].copy_from_slice(&source.addr(id).octets());
-        packet[16..20].copy_from_slice(&destination.addr(id).octets());
-        packet[20] = tag;
-        let packet = Bytes::from(packet);
-        source.tun().push_from_os(packet.clone());
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), destination.tun().pop_to_os())
-                .await
-                .unwrap()
-                .unwrap(),
-            packet
-        );
-    }
     tokio::time::timeout(Duration::from_secs(60), async {
         wait_until("slow TLS data-link probes are visible", || async {
             let status = a.agent.network_status(id).await.ok()?;
@@ -283,11 +297,90 @@ async fn data_flows_over_the_incumbent_while_a_faster_carrier_is_measured_and_pr
     }).await.expect("comparison must finish with traffic on the existing tunnel");
     a.agent.shutdown().await;
     b.agent.shutdown().await;
-    a.accept.abort();
-    b.accept.abort();
     for proxy in proxies {
         proxy.abort();
     }
+}
+
+#[tokio::test]
+async fn a_stalled_comparison_does_not_delay_recovery_on_a_third_carrier() {
+    use tsunagi::agent::DataPath;
+    let discovery = SharedMemoryDiscovery::new();
+    let ports = Arc::default();
+    let protocols = ["wg", "tcp-tls", "wg-quic"];
+    let a = Node::configured(&discovery, &protocols, Arc::clone(&ports), true).await;
+    let b = Node::configured(&discovery, &protocols, Arc::clone(&ports), true).await;
+    let stalled = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    for (_, port) in &mut *ports.lock().unwrap() {
+        *port = stalled.local_addr().unwrap().port();
+    }
+    let (name, secret) = network("recover-during-comparison");
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    let nodes = [&a, &b];
+    let both_use = |carrier: &'static str| async move {
+        for node in nodes {
+            let status = node.agent.network_status(id).await.ok()?;
+            if !matches!(&status.peers.first()?.data_path, DataPath::Direct { transport } if transport == carrier)
+                || !node
+                    .tunnel
+                    .overview(id)?
+                    .peers
+                    .first()?
+                    .tunnel
+                    .as_ref()?
+                    .health
+                    .is_up()
+            {
+                return None;
+            }
+        }
+        Some(())
+    };
+    wait_until("both endpoints start on native WireGuard", || {
+        both_use("wg")
+    })
+    .await;
+    deliver(&a, &b, id, 1).await;
+    // Accept the real TLS ClientHello but never answer it. The TCP handshake
+    // establishes that the background attempt has started before WG is lost.
+    let mut handshake = tokio::time::timeout(Duration::from_secs(30), async {
+        let (mut handshake, _) = stalled.accept().await.unwrap();
+        assert_eq!(handshake.read_u8().await.unwrap(), 22);
+        handshake
+    })
+    .await
+    .expect("background TLS ClientHello");
+    for (source, destination) in [(&a, &b), (&b, &a)] {
+        source
+            .wireguard
+            .as_ref()
+            .unwrap()
+            .forget_peer(id, destination.agent.endpoint_id());
+    }
+    tokio::time::timeout(Duration::from_secs(8), async {
+        wait_until(
+            "QUIC recovers traffic before the background deadline",
+            || both_use("wg-quic"),
+        )
+        .await;
+        deliver(&a, &b, id, 2).await;
+        deliver(&b, &a, id, 3).await;
+        let mut tail = Vec::new();
+        if let Err(error) = handshake.read_to_end(&mut tail).await {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+                "{error}"
+            );
+        }
+    })
+    .await
+    .expect("the stalled TLS attempt must be cancelled when QUIC can recover");
+    a.agent.shutdown().await;
+    b.agent.shutdown().await;
 }
 
 #[tokio::test]
@@ -321,8 +414,6 @@ async fn missing_native_transport_cannot_silently_turn_wireguard_into_quic() {
     .await;
     a.agent.shutdown().await;
     b.agent.shutdown().await;
-    a.accept.abort();
-    b.accept.abort();
 }
 
 #[tokio::test]
@@ -407,7 +498,5 @@ async fn wireguard_and_tls_carriers_both_carry_the_same_internal_cipher_and_exac
         }
         a.agent.shutdown().await;
         b.agent.shutdown().await;
-        a.accept.abort();
-        b.accept.abort();
     }
 }

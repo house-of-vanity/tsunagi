@@ -2063,11 +2063,19 @@ impl Runtime {
         self.review_comparisons();
         let now = std::time::Instant::now();
         let mut wanted: Vec<(EndpointId, String)> = Vec::new();
+        let mut interrupted = Vec::new();
         for session in self.sessions.values() {
             let peer = session.peer;
-            if self.links.keys().any(|(p, _)| *p == peer)
-                || self.opening.iter().any(|(p, _)| *p == peer)
-            {
+            if self.links.keys().any(|(p, _)| *p == peer) {
+                continue;
+            }
+            let opening = self.opening.iter().find(|(id, _)| *id == peer);
+            if opening.is_some_and(|(_, protocol)| {
+                !self
+                    .comparisons
+                    .get(&peer)
+                    .is_some_and(|s| s.is_trial(protocol))
+            }) {
                 continue;
             }
             if self.no_direct_data(peer) {
@@ -2094,27 +2102,39 @@ impl Runtime {
                 continue;
             }
 
-            let start = next_protocol_index(
-                &supported,
-                self.last_failed_protocol.get(&peer).map(String::as_str),
-            );
+            let last_failed = self.last_failed_protocol.get(&peer);
+            let start = next_protocol_index(&supported, last_failed.map(String::as_str));
             let chosen = supported
                 .iter()
                 .cycle()
                 .skip(start)
                 .take(supported.len())
-                .find(
-                    |proto| match self.protocol_dial_states.get(&(peer, (*proto).clone())) {
-                        Some(state) => state.cooldown_until <= now,
-                        None => true,
-                    },
-                );
+                .find(|proto| {
+                    opening.is_none_or(|(_, kind)| kind != *proto && last_failed != Some(*proto))
+                        && self
+                            .protocol_dial_states
+                            .get(&(peer, (*proto).clone()))
+                            .is_none_or(|state| state.cooldown_until <= now)
+                });
 
             if let Some(proto) = chosen {
                 wanted.push((peer, proto.clone()));
+                if let Some(key) = opening {
+                    interrupted.push(key.clone());
+                }
             }
         }
 
+        // A trial can still recover a two-carrier peer. Cancel it only for a
+        // third eligible carrier, preserving the failure order and cooldowns.
+        for key in interrupted {
+            self.opening.remove(&key);
+            self.link_attempts.remove(&key);
+            if let Some(task) = self.link_tasks.remove(&key) {
+                task.abort();
+            }
+            self.finish_comparison(key.0);
+        }
         let trial = self.next_comparison(&served, now);
         wanted.extend(trial.iter().cloned());
         for (peer, protocol) in wanted {
