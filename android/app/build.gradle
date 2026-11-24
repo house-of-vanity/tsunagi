@@ -22,6 +22,7 @@ android {
         applicationId 'cy.hexor.tsunagi'
         minSdk 26
         targetSdk 35
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
         versionCode providers.gradleProperty('tsunagiVersionCode').getOrElse('1').toInteger()
         versionName providers.gradleProperty('tsunagiVersionName').getOrElse('1.0.1')
         ndk { abiFilters abi }
@@ -33,7 +34,8 @@ def metadata = providers.exec {
     workingDir workspace
     commandLine 'cargo', 'metadata', '--locked', '--format-version', '1', '--filter-platform', 'aarch64-linux-android'
 }.standardOutput.asText.get()
-def verifier = new JsonSlurper().parseText(metadata).packages.find { it.name == 'rustls-platform-verifier-android' }
+def cargoMetadata = new JsonSlurper().parseText(metadata)
+def verifier = cargoMetadata.packages.find { it.name == 'rustls-platform-verifier-android' }
 repositories {
     maven {
         url new File(new File(verifier.manifest_path).parent, 'maven')
@@ -43,7 +45,11 @@ repositories {
     google()
     mavenCentral()
 }
-dependencies { implementation "rustls:rustls-platform-verifier:${verifier.version}" }
+dependencies {
+    implementation "rustls:rustls-platform-verifier:${verifier.version}"
+    androidTestImplementation 'androidx.test:runner:1.5.2'
+    androidTestImplementation 'junit:junit:4.13.2'
+}
 
 abstract class BuildRust extends Exec {
     @OutputDirectory abstract DirectoryProperty getJniLibs()
@@ -63,4 +69,20 @@ androidComponents.onVariants(androidComponents.selector().all()) { variant ->
         if (mode == 'release') args '--release'
     }
     variant.sources.jniLibs.addGeneratedSourceDirectory(nativeBuild) { it.jniLibs }
+    if (variant.androidTest != null) {
+        def probe = tasks.register('cargoVpnSourceProbe', BuildRust) {
+            workingDir workspace
+            jniLibs.set(layout.buildDirectory.dir('generated/rust/vpnSourceTest'))
+            inputs.files(nativeBuild.map { it.inputs.files }, fileTree("${workspace}/crates/tsunagi-android/examples"))
+            commandLine 'cargo', 'ndk', '--target', abi, '--platform', '26',
+                'build', '--locked', '--example', 'vpn_source_probe', '-p', 'tsunagi-android'
+            doLast {
+                project.copy {
+                    from "${cargoMetadata.target_directory}/aarch64-linux-android/debug/examples/libvpn_source_probe.so"
+                    into jniLibs.dir(abi)
+                }
+            }
+        }
+        variant.androidTest.sources.jniLibs.addGeneratedSourceDirectory(probe) { it.jniLibs }
+    }
 }

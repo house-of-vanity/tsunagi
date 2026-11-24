@@ -6,6 +6,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+pub use crate::vip::packet::{Reassembly as Ipv4Reassembly, fragments as fragment_ipv4};
+
 /// The addresses of an IP packet, as far as routing cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpHeader {

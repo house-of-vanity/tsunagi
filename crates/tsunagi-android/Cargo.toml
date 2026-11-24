@@ -11,6 +11,10 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[example]]
+name = "vpn_source_probe"
+crate-type = ["cdylib"]
+
 [dependencies]
 tsunagi-runtime = { path = "../tsunagi-runtime", version = "1.0.1" }
 tsunagi-ui = { path = "../tsunagi-ui" }

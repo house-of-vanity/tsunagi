@@ -1,12 +1,13 @@
 //! A stable packet device over the file descriptors replaced by VpnService.
 use crate::dns::{Resolver, stack::DnsPort};
 use crate::plan::VpnPlan;
+use crate::source::SourceFlows;
 use bytes::Bytes;
 use std::{
     fmt,
     fs::File,
     io::{self, Read, Write},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 use tokio::{
     io::unix::AsyncFd,
@@ -30,6 +31,17 @@ struct Attachment {
     device: Arc<AsyncFd<File>>,
     addresses: Vec<std::net::IpAddr>,
     dns: DnsPort,
+    packets: StdMutex<Option<PacketState>>,
+}
+struct PacketState {
+    flows: SourceFlows,
+    // At most one reassembled IPv4 datagram's worth of remaining fragments.
+    pending: std::vec::IntoIter<Bytes>,
+}
+impl Attachment {
+    fn packets(&self) -> std::sync::MutexGuard<'_, Option<PacketState>> {
+        self.packets.lock().unwrap_or_else(|err| err.into_inner())
+    }
 }
 type Descriptor = Option<Arc<Attachment>>;
 
@@ -76,7 +88,7 @@ impl AndroidTun {
             return Ok(());
         }
         let dns_address = next.dns_address();
-        let fd = if next.addresses.is_empty() {
+        let device = if next.addresses.is_empty() {
             None
         } else {
             let address = dns_address.ok_or_else(|| OverlayError::Unavailable(
@@ -92,12 +104,32 @@ impl AndroidTun {
                 self.0.resolver.clone(),
                 file.clone(),
             );
-            Some(Arc::new(Attachment {
+            Some((file, dns))
+        };
+        // Only retire the old descriptor once establishing its replacement succeeds.
+        let previous = self
+            .0
+            .current
+            .borrow()
+            .clone()
+            .and_then(|fd| fd.packets().take());
+        let fd = device.map(|(file, dns)| {
+            let flows = if let Some(mut previous) = previous {
+                previous.flows.reconfigure(&next);
+                previous.flows
+            } else {
+                SourceFlows::new(&next)
+            };
+            Arc::new(Attachment {
                 device: file,
                 addresses: next.addresses.iter().map(|a| a.addr).collect(),
                 dns,
-            }))
-        };
+                packets: StdMutex::new(Some(PacketState {
+                    flows,
+                    pending: Vec::new().into_iter(),
+                })),
+            })
+        });
         self.0.current.send_replace(fd);
         self.0.resolver.publish(dns_address);
         *applied = next;
@@ -122,10 +154,14 @@ impl TunDevice for Device {
     fn recv(&self) -> BoxFuture<'_, Option<Bytes>> {
         Box::pin(async move {
             let mut rx = self.tun.0.current.subscribe();
-            let mut buffer = vec![0; self.mtu as usize + 1];
+            let mut buffer = Vec::new();
             loop {
                 let fd = rx.borrow_and_update().clone();
                 if let Some(fd) = fd {
+                    if let Some(packet) = fd.packets().as_mut().and_then(|p| p.pending.next()) {
+                        return Some(packet);
+                    }
+                    buffer.resize(self.mtu as usize + 1, 0);
                     let result = tokio::select! {
                         biased;
                         _ = rx.changed() => continue,
@@ -136,7 +172,14 @@ impl TunDevice for Device {
                             continue;
                         }
                         buffer.truncate(len);
-                        return Some(buffer.into());
+                        if let Some(state) = fd.packets().as_mut() {
+                            let frames = state.flows.outbound(std::mem::take(&mut buffer).into());
+                            state.pending = frames.into_iter();
+                            if let Some(packet) = state.pending.next() {
+                                return Some(packet);
+                            }
+                        }
+                        continue;
                     }
                 }
                 // No networks yet, last one left, or Android revoked this fd.
@@ -152,14 +195,22 @@ impl TunDevice for Device {
                 .borrow_and_update()
                 .clone()
                 .ok_or_else(|| OverlayError::Unavailable("VPN has no addresses".into()))?;
-            let len = tokio::select! {
-                biased;
-                _ = rx.changed() => return Err(OverlayError::Unavailable("VPN was reconfigured".into())),
-                write = fd.device.async_io(tokio::io::Interest::WRITABLE, |mut file| file.write(&packet)) =>
-                    write.map_err(|e| OverlayError::Other(e.to_string()))?,
-            };
-            if len != packet.len() {
-                return Err(OverlayError::Other("short VPN datagram write".into()));
+            let packets = fd
+                .packets()
+                .as_mut()
+                .ok_or_else(|| OverlayError::Unavailable("VPN was reconfigured".into()))?
+                .flows
+                .inbound(packet);
+            for packet in packets {
+                let len = tokio::select! {
+                    biased;
+                    _ = rx.changed() => return Err(OverlayError::Unavailable("VPN was reconfigured".into())),
+                    write = fd.device.async_io(tokio::io::Interest::WRITABLE, |mut file| file.write(&packet)) =>
+                        write.map_err(|e| OverlayError::Other(e.to_string()))?,
+                };
+                if len != packet.len() {
+                    return Err(OverlayError::Other("short VPN datagram write".into()));
+                }
             }
             Ok(())
         })

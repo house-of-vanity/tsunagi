@@ -273,15 +273,19 @@ struct Datagram {
     bytes: usize,
 }
 type FragmentKey = (Option<[u8; 32]>, Ipv4Addr, Ipv4Addr, u16, u8);
+/// Bounded IPv4 fragment assembly for a local packet consumer.
 #[derive(Debug, Default)]
-pub(crate) struct Reassembly {
+pub struct Reassembly {
     pending: HashMap<FragmentKey, Datagram>,
 }
 impl Reassembly {
+    /// Forget incomplete datagrams after their five-second lifetime.
     pub fn expire(&mut self, now: Instant) {
         self.pending
             .retain(|_, d| now.duration_since(d.at) < Duration::from_secs(5));
     }
+    /// Accept one fragment or complete packet. `max` bounds pending datagrams;
+    /// `scope` separates authenticated senders sharing an address domain.
     pub fn accept(&mut self, p: Bytes, max: usize, scope: Option<[u8; 32]>) -> Option<Bytes> {
         let n = header(&p)?;
         let flags = u16::from_be_bytes([p[6], p[7]]);
@@ -363,7 +367,7 @@ impl Reassembly {
 }
 
 /// Re-fragments an assembled NAT datagram for the unchanged overlay MTU.
-pub(crate) fn fragments(packet: Bytes, mtu: u32) -> Vec<Bytes> {
+pub fn fragments(packet: Bytes, mtu: u32) -> Vec<Bytes> {
     if packet.len() <= mtu as usize {
         return vec![packet];
     }
