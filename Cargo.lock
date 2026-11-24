@@ -6296,7 +6296,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tsunagi"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anstream",
  "anstyle",
@@ -6320,7 +6320,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-android"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bytes",
  "egui",
@@ -6344,7 +6344,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-awg"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bytes",
  "iroh",
@@ -6359,7 +6359,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -6401,7 +6401,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-runtime"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "tokio",
  "tracing",
@@ -6414,7 +6414,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-tcp-tls"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "bytes",
  "caps",
@@ -6434,7 +6434,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-tray"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "eframe",
  "egui-phosphor",
@@ -6450,7 +6450,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-ui"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "egui",
  "egui-phosphor",
@@ -6460,7 +6460,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-wg-quic"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "boringtun",
  "bytes",
@@ -6487,7 +6487,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagi-wireguard"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "boringtun",
  "bytes",
