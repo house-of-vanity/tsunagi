@@ -12,6 +12,7 @@ name = "tsunagi-tray"
 path = "src/main.rs"
 
 [dependencies]
+tsunagi-ui = { path = "../tsunagi-ui" }
 # The agent control client and the report types: the GUI is a thin client over
 # the same local control interface the CLI uses, so it reuses these directly
 # and never re-implements the protocol.

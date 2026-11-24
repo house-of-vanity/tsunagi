@@ -35,6 +35,8 @@ pub struct ExitHostPlan {
     pub offer: Vec<Ipv4Range>,
     /// Whether this device sends its internet traffic through a member.
     pub client: bool,
+    /// Local address in the selected exit network, for hosts that choose a primary address.
+    pub client_source: Option<std::net::Ipv4Addr>,
     /// The range of every network on the interface. Only the using side
     /// reads it, to keep this agent's own traffic *to* the overlay inside it
     /// where the host has no per-user routing (macOS).

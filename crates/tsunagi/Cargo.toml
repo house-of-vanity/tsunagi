@@ -12,9 +12,9 @@ name = "tsng"
 path = "src/main.rs"
 
 [dependencies]
+tsunagi-runtime = { path = "../tsunagi-runtime", version = "1.0.0" }
 tsunagi-core = { path = "../tsunagi-core", version = "1.0.0", features = ["tun-device", "dns-publish"] }
 tsunagi-wireguard = { path = "../tsunagi-wireguard", version = "1.0.0" }
-tsunagi-awg = { path = "../tsunagi-awg", version = "1.0.0" }
 tsunagi-wg-quic = { path = "../tsunagi-wg-quic", version = "1.0.0" }
 tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls", version = "1.0.0" }
 iroh.workspace = true

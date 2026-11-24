@@ -1,0 +1,42 @@
+[package]
+name = "tsunagi-android"
+version = "1.0.0"
+description = "Android VPN client and egui views for tsunagi."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tsunagi-runtime = { path = "../tsunagi-runtime", version = "1.0.0" }
+tsunagi-ui = { path = "../tsunagi-ui" }
+tsunagi-core = { path = "../tsunagi-core" }
+tsunagi-wg-quic = { path = "../tsunagi-wg-quic" }
+egui = "0.31"
+egui-phosphor = "0.9"
+tokio.workspace = true
+bytes.workspace = true
+zeroize = "1.9"
+simple-dns = "0.12"
+
+[target.'cfg(unix)'.dependencies]
+rand = "0.10"
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+egui_glow = { version = "0.31", default-features = false }
+jni = "0.21"
+iroh.workspace = true
+jni-verifier = { package = "jni", version = "0.22" }
+rustls-platform-verifier = "0.7"
+
+[dev-dependencies]
+tempfile.workspace = true
+tsunagi-core = { path = "../tsunagi-core", features = ["testing"] }
+
+[lints]
+workspace = true

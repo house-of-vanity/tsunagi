@@ -281,6 +281,15 @@ impl RoutingTable {
         exit_via(&self.read())
     }
 
+    /// Whether a default route is selected and the local source valid in that network.
+    pub(crate) fn exit_client(&self) -> (bool, Option<Ipv4Addr>) {
+        let networks = self.read();
+        match exit_via(&networks) {
+            Some((id, _)) => (true, networks.get(&id).and_then(|routes| routes.local)),
+            None => (false, None),
+        }
+    }
+
     /// Networks that offer this agent as an exit node, with the range each
     /// agreed. A network that has not agreed one yet has nothing to
     /// masquerade and is left out.

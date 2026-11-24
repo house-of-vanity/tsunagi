@@ -231,6 +231,7 @@ impl Interface {
         let tally = Arc::new(Tally::default());
 
         let vip_task = {
+            let factory = Arc::clone(&factory);
             let routes = Arc::clone(&routes);
             let carrier = Arc::clone(&carrier);
             tokio::spawn(async move {
@@ -242,7 +243,10 @@ impl Interface {
                         _=interval.tick()=>{
                             let (probes,jobs)=routes.vips.tick(routes.vips.check_capacity().saturating_sub(checks.len()));
                             for (route,packet) in probes {carrier.carry(route,packet);}
-                            for job in jobs {checks.spawn(job.run());}
+                            for job in jobs {
+                                let factory = Arc::clone(&factory);
+                                checks.spawn(job.run(move |socket, source| factory.bind_overlay_socket(socket, source)));
+                            }
                         },
                         Some(result)=checks.join_next(),if !checks.is_empty()=>{
                             if let Ok((job,ok))=result {routes.vips.checked(job,ok);}
@@ -415,7 +419,7 @@ impl Interface {
             .collect();
         ranges.sort_by_key(|range| (range.base, range.prefix_len));
         ranges.dedup();
-        let client = self.routes.exit_via().is_some();
+        let (client, client_source) = self.routes.exit_client();
         let overlay = self.routes.overlay_ranges();
         let (bypass, bypass_hosts) = if client && exit.needs_bypass() {
             self.underlay_targets(&overlay)
@@ -426,6 +430,7 @@ impl Interface {
             interface: self.name.clone(),
             offer: ranges,
             client,
+            client_source,
             overlay,
             bypass,
             bypass_hosts,

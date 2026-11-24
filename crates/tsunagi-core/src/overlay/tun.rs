@@ -90,6 +90,21 @@ pub trait TunFactory: Send + Sync + std::fmt::Debug + 'static {
     /// land on the second.
     fn on_host(&self) -> bool;
 
+    /// Bind a socket carrying a VIP health check to this overlay on platforms
+    /// that explicitly route mesh transport sockets outside the VPN.
+    fn bind_overlay_socket(
+        &self,
+        _socket: &tokio::net::TcpSocket,
+        _source: std::net::Ipv4Addr,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Assigned overlay addresses when the OS chooses a new interface name on reconfiguration.
+    fn assigned_addresses(&self) -> Vec<std::net::IpAddr> {
+        Vec::new()
+    }
+
     /// Creates a device.
     fn create<'a>(
         &'a self,
@@ -229,43 +244,46 @@ impl TunDevice for MemoryTun {
 /// enough here: the agent chose the address, so anything else holding it is a
 /// problem in its own right.
 pub fn address_is_local(address: std::net::IpAddr) -> bool {
-    if std::net::UdpSocket::bind((address, 0)).is_ok() {
-        return true;
-    }
+    let bound = std::net::UdpSocket::bind((address, 0)).is_ok();
     #[cfg(all(feature = "tun-device", target_os = "windows"))]
-    {
-        if let Ok(interfaces) = std::panic::catch_unwind(netdev::get_interfaces) {
-            for iface in interfaces {
-                if iface.is_up() {
-                    match address {
-                        std::net::IpAddr::V4(v4) => {
-                            if iface.ipv4.iter().any(|ip| ip.addr() == v4) {
-                                return true;
-                            }
+    if !bound && let Ok(interfaces) = std::panic::catch_unwind(netdev::get_interfaces) {
+        for iface in interfaces {
+            if iface.is_up() {
+                match address {
+                    std::net::IpAddr::V4(v4) => {
+                        if iface.ipv4.iter().any(|ip| ip.addr() == v4) {
+                            return true;
                         }
-                        std::net::IpAddr::V6(v6) => {
-                            if iface.ipv6.iter().any(|ip| ip.addr() == v6) {
-                                return true;
-                            }
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        if iface.ipv6.iter().any(|ip| ip.addr() == v6) {
+                            return true;
                         }
                     }
                 }
             }
         }
     }
-    false
+    bound
 }
 
 /// Creates [`MemoryTun`] devices.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryTunFactory {
     created: Arc<std::sync::Mutex<Vec<Arc<MemoryTun>>>>,
+    rules: Option<Arc<dyn super::hostrules::BroadcastHostRules>>,
 }
 
 impl MemoryTunFactory {
     /// Creates a factory.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Simulate host rule outcomes alongside this in-memory interface.
+    pub fn with_host_rules(mut self, rules: Arc<dyn super::hostrules::BroadcastHostRules>) -> Self {
+        self.rules = Some(rules);
+        self
     }
 
     /// The device created for an interface name, if any.
@@ -291,6 +309,9 @@ impl MemoryTunFactory {
 }
 
 impl TunFactory for MemoryTunFactory {
+    fn host_rules(&self) -> Option<Arc<dyn super::hostrules::BroadcastHostRules>> {
+        self.rules.clone()
+    }
     fn name(&self) -> &str {
         "memory"
     }

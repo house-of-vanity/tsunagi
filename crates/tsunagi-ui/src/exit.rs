@@ -1,8 +1,6 @@
 //! Exit nodes as the windows show them: what to call one, and what is wrong
 //! with the ones in play.
 
-use eframe::egui;
-
 use tsunagi::ipc::NetworkReport;
 
 use crate::format;
@@ -30,7 +28,7 @@ pub(crate) struct Warning {
 }
 
 /// What to call a device in a network, even while it is away.
-pub(crate) fn name_of(network: &NetworkReport, id: &str) -> String {
+pub fn name_of(network: &NetworkReport, id: &str) -> String {
     network
         .peers
         .iter()

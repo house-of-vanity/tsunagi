@@ -1,0 +1,59 @@
+import groovy.json.JsonSlurper
+
+plugins { id 'com.android.application' version '9.2.1' }
+
+def workspace = rootProject.projectDir.parentFile
+def abi = 'arm64-v8a'
+android {
+    namespace 'cy.hexor.tsunagi'
+    compileSdk 35
+
+    // Cargo also builds standalone cdylibs for these dependencies. Their code
+    // is linked into tsunagi_android; the JVM loads only the application library.
+    packaging.jniLibs.excludes += ['**/libboringtun.so', '**/libiroh.so', '**/libiroh_relay.so']
+    defaultConfig {
+        applicationId 'cy.hexor.tsunagi'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.0.0'
+        ndk { abiFilters abi }
+    }
+}
+
+// rustls ships its Android trust manager as an AAR in the locked Cargo package.
+def metadata = providers.exec {
+    workingDir workspace
+    commandLine 'cargo', 'metadata', '--locked', '--format-version', '1', '--filter-platform', 'aarch64-linux-android'
+}.standardOutput.asText.get()
+def verifier = new JsonSlurper().parseText(metadata).packages.find { it.name == 'rustls-platform-verifier-android' }
+repositories {
+    maven {
+        url new File(new File(verifier.manifest_path).parent, 'maven')
+        metadataSources { mavenPom() }
+        content { includeModule 'rustls', 'rustls-platform-verifier' }
+    }
+    google()
+    mavenCentral()
+}
+dependencies { implementation "rustls:rustls-platform-verifier:${verifier.version}" }
+
+abstract class BuildRust extends Exec {
+    @OutputDirectory abstract DirectoryProperty getJniLibs()
+}
+
+androidComponents.onVariants(androidComponents.selector().all()) { variant ->
+    def mode = variant.buildType
+    def libs = layout.buildDirectory.dir("generated/rust/${mode}")
+    def nativeBuild = tasks.register("cargo${mode.capitalize()}", BuildRust) {
+        workingDir workspace
+        inputs.files(fileTree(workspace) {
+            include 'Cargo.toml', 'Cargo.lock', '.cargo/**', 'crates/**/Cargo.toml', 'crates/**/src/**', 'vendor/**'
+        })
+        jniLibs.set(libs)
+        commandLine 'cargo', 'ndk', '--target', abi, '--platform', '26', '-o', libs.get().asFile,
+            'build', '--locked', '--lib', '-p', 'tsunagi-android'
+        if (mode == 'release') args '--release'
+    }
+    variant.sources.jniLibs.addGeneratedSourceDirectory(nativeBuild) { it.jniLibs }
+}

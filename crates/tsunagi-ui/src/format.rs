@@ -3,8 +3,6 @@
 
 use std::time::{Duration, Instant};
 
-use eframe::egui;
-
 use crate::stats::{Series, Unit};
 
 /// Sparkline accent.
@@ -15,7 +13,7 @@ const COPIED_GREEN: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xb0, 0x4a);
 const FLASH: Duration = Duration::from_secs(1);
 
 /// A short, readable prefix of a long identifier (char-safe, no panic).
-pub(crate) fn short(id: &str) -> String {
+pub fn short(id: &str) -> String {
     const KEEP: usize = 12;
     if id.chars().count() <= KEEP {
         id.to_string()
@@ -25,7 +23,7 @@ pub(crate) fn short(id: &str) -> String {
 }
 
 /// A byte count in binary units.
-pub(crate) fn bytes(n: f64) -> String {
+pub fn bytes(n: f64) -> String {
     const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
     let mut value = n.max(0.0);
     let mut unit = 0;
@@ -41,7 +39,7 @@ pub(crate) fn bytes(n: f64) -> String {
 }
 
 /// A rate in the chosen unit, per second.
-pub(crate) fn rate(value: f32, unit: Unit) -> String {
+pub fn rate(value: f32, unit: Unit) -> String {
     match unit {
         Unit::Packets => {
             if value >= 1000.0 {
@@ -55,14 +53,14 @@ pub(crate) fn rate(value: f32, unit: Unit) -> String {
 }
 
 /// The current rate of a series as a string, or a dash when unsampled.
-pub(crate) fn series_rate(series: Option<&Series>, unit: Unit) -> String {
+pub fn series_rate(series: Option<&Series>, unit: Unit) -> String {
     series.map_or_else(|| "—".to_string(), |s| rate(s.rate(unit), unit))
 }
 
 /// A label whose text is `display` and which copies `value` to the clipboard
 /// when clicked. Feedback is a green flash that fades back over a second — the
 /// text itself never changes, so a dense table does not reflow on a copy.
-pub(crate) fn copy_field(ui: &mut egui::Ui, display: &str, value: &str) {
+pub fn copy_field(ui: &mut egui::Ui, display: &str, value: &str) {
     let id = ui.make_persistent_id(("copy", value, display));
     let copied_at: Option<Instant> = ui.memory(|memory| memory.data.get_temp(id));
     // 1.0 right after the click, fading to 0.0 a second later.
@@ -103,7 +101,7 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 /// A fixed-height sparkline of a series' recent rate, with the peak (top-left)
 /// and current value (bottom-right) overlaid. The space is always reserved —
 /// even with no data — so the layout never jumps when data arrives.
-pub(crate) fn sparkline(ui: &mut egui::Ui, series: Option<&Series>, unit: Unit, height: f32) {
+pub fn sparkline(ui: &mut egui::Ui, series: Option<&Series>, unit: Unit, height: f32) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);

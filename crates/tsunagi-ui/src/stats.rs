@@ -16,7 +16,7 @@ const HISTORY: usize = 60;
 
 /// Which quantity a rate or history is of.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Unit {
+pub enum Unit {
     /// Packets per second.
     Packets,
     /// Bytes per second.
@@ -25,7 +25,7 @@ pub(crate) enum Unit {
 
 /// One series' rolling packet and byte rates.
 #[derive(Default)]
-pub(crate) struct Series {
+pub struct Series {
     last: Option<(Instant, Counters)>,
     packets_rate: f32,
     bytes_rate: f32,
@@ -35,7 +35,7 @@ pub(crate) struct Series {
 
 impl Series {
     /// Samples a single cumulative counter pair (VIP histories own their lifetime).
-    pub(crate) fn sample(&mut self, now: Instant, packets: u64, bytes: u64) {
+    pub fn sample(&mut self, now: Instant, packets: u64, bytes: u64) {
         self.sample_peer(
             now,
             Counters {
@@ -83,7 +83,7 @@ impl Series {
     }
 
     /// The current rate in the chosen unit.
-    pub(crate) fn rate(&self, unit: Unit) -> f32 {
+    pub fn rate(&self, unit: Unit) -> f32 {
         match unit {
             Unit::Packets => self.packets_rate,
             Unit::Bytes => self.bytes_rate,
@@ -91,7 +91,7 @@ impl Series {
     }
 
     /// The rolling history in the chosen unit.
-    pub(crate) fn history(&self, unit: Unit) -> &VecDeque<f32> {
+    pub fn history(&self, unit: Unit) -> &VecDeque<f32> {
         match unit {
             Unit::Packets => &self.packets_history,
             Unit::Bytes => &self.bytes_history,
@@ -107,12 +107,18 @@ fn push(history: &mut VecDeque<f32>, value: f32) {
 }
 
 #[derive(Clone, Copy)]
-struct Counters {
-    epoch: u64,
-    tx_packets: u64,
-    rx_packets: u64,
-    tx_bytes: u64,
-    rx_bytes: u64,
+/// Cumulative tunnel counters in one peer epoch.
+pub struct Counters {
+    /// Counter reset generation.
+    pub epoch: u64,
+    /// Sent packets.
+    pub tx_packets: u64,
+    /// Received packets.
+    pub rx_packets: u64,
+    /// Sent bytes.
+    pub tx_bytes: u64,
+    /// Received bytes.
+    pub rx_bytes: u64,
 }
 
 impl From<&OverlayPeerReport> for Counters {
@@ -129,32 +135,53 @@ impl From<&OverlayPeerReport> for Counters {
 
 /// All traffic series, keyed by a stable string.
 #[derive(Default)]
-pub(crate) struct Traffic {
+pub struct Traffic {
     series: HashMap<String, Series>,
 }
 
 impl Traffic {
     /// Folds a fresh snapshot into the rates. Call once per new generation.
-    pub(crate) fn observe(&mut self, report: &StatusReport, now: Instant) {
+    pub fn observe(&mut self, report: &StatusReport, now: Instant) {
+        self.observe_peers(
+            report.networks.iter().filter_map(|network| {
+                Some((
+                    network.network_id.as_str(),
+                    network
+                        .overlay
+                        .as_ref()?
+                        .peers
+                        .iter()
+                        .map(|p| (p.public_key.as_str(), Counters::from(p))),
+                ))
+            }),
+            now,
+        );
+    }
+
+    /// Sample live per-peer counters from either an in-process agent or IPC.
+    pub fn observe_peers<'a, I>(
+        &mut self,
+        networks: impl IntoIterator<Item = (&'a str, I)>,
+        now: Instant,
+    ) where
+        I: IntoIterator<Item = (&'a str, Counters)>,
+    {
         let mut active = HashSet::new();
-        for network in &report.networks {
-            let Some(overlay) = &network.overlay else {
-                continue;
-            };
+        for (network, peers) in networks {
             let (mut packets_rate, mut bytes_rate) = (0.0, 0.0);
-            for peer in &overlay.peers {
-                let key = peer_key(&network.network_id, &peer.public_key);
+            for (peer, counters) in peers {
+                let key = peer_key(network, peer);
                 // Duplicate rows are not additional traffic.
                 if !active.insert(key.clone()) {
                     continue;
                 }
                 let series = self.series.entry(key).or_default();
-                series.sample_peer(now, peer.into());
+                series.sample_peer(now, counters);
                 packets_rate += series.rate(Unit::Packets);
                 bytes_rate += series.rate(Unit::Bytes);
             }
             // Sum rates, not cumulative counters of a changing set of peers.
-            let key = net_key(&network.network_id);
+            let key = net_key(network);
             active.insert(key.clone());
             self.series
                 .entry(key)
@@ -165,12 +192,12 @@ impl Traffic {
     }
 
     /// The network-total series, if sampled.
-    pub(crate) fn network(&self, network_id: &str) -> Option<&Series> {
+    pub fn network(&self, network_id: &str) -> Option<&Series> {
         self.series.get(&net_key(network_id))
     }
 
     /// One peer's series, if sampled.
-    pub(crate) fn peer(&self, network_id: &str, public_key: &str) -> Option<&Series> {
+    pub fn peer(&self, network_id: &str, public_key: &str) -> Option<&Series> {
         self.series.get(&peer_key(network_id, public_key))
     }
 }

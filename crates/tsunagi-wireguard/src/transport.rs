@@ -81,6 +81,7 @@ struct Inner {
     bind: Ipv4Addr,
     stun: Option<String>,
     excluded_interface: Mutex<Option<String>>,
+    underlay: OnceLock<watch::Receiver<Vec<std::net::IpAddr>>>,
     busy: Mutex<HashSet<Pair>>,
     control: OnceLock<Arc<dyn ControlSender>>,
     allowed: Mutex<HashSet<Pair>>,
@@ -134,9 +135,14 @@ async fn addresses(inner: &Inner, socket: &UdpSocket) -> Result<Vec<SocketAddr>,
     let mut candidates = if inner.bind.is_loopback() {
         vec![local]
     } else {
-        crate::addresses::local_ip_candidates_excluding(lock(&inner.excluded_interface).as_deref())
-            .into_iter()
-            .filter(|ip| ip.is_ipv4())
+        let ips = match inner.underlay.get() {
+            Some(source) => source.borrow().clone(),
+            None => crate::addresses::local_ip_candidates_excluding(
+                lock(&inner.excluded_interface).as_deref(),
+            ),
+        };
+        ips.into_iter()
+            .filter(|ip| matches!(ip, std::net::IpAddr::V4(v4) if crate::addresses::is_candidate_ipv4(*v4)))
             .take(31)
             .map(|ip| SocketAddr::new(ip, local.port()))
             .collect()
@@ -207,6 +213,10 @@ impl AwgTransport {
     pub fn exclude_interface(&self, name: String) {
         *lock(&self.inner.excluded_interface) = Some(name);
     }
+    /// Use the OS-selected physical network on platforms with policy routing.
+    pub fn set_underlay(&self, source: watch::Receiver<Vec<std::net::IpAddr>>) {
+        let _ = self.inner.underlay.set(source);
+    }
     /// Wire version of this carrier's private negotiation and framing.
     pub fn wire_version(&self) -> u16 {
         if self.inner.protocol == "wg" {
@@ -237,6 +247,7 @@ impl AwgTransport {
             bind,
             stun,
             excluded_interface: Mutex::new(None),
+            underlay: OnceLock::new(),
             busy: Mutex::default(),
             control: OnceLock::new(),
             allowed: Mutex::default(),

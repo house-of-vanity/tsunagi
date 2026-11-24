@@ -19,57 +19,12 @@ use tempfile::TempDir;
 use tsunagi::dataplane::IpPlugin;
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::NetworkId;
-use tsunagi::overlay::{
-    BroadcastHostRules, MemoryTun, MemoryTunFactory, MockHostRules, OverlayError, TunDevice,
-    TunFactory, TunRequest,
-};
+use tsunagi::overlay::{MemoryTun, MemoryTunFactory, MockHostRules};
 use tsunagi::testing::{network, wait_until};
 use tsunagi::{Agent, NetworkStatus};
 use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 
 const INTERNET: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
-
-/// An in-memory interface on a host whose rules are a mock.
-///
-/// Not "on the host": the agent must not go looking for an address on a real
-/// link. It only has host *rules*, which is what an exit node needs from it.
-#[derive(Debug, Clone)]
-struct RuledTuns {
-    tuns: MemoryTunFactory,
-    rules: MockHostRules,
-}
-
-impl TunFactory for RuledTuns {
-    fn name(&self) -> &str {
-        "memory-with-rules"
-    }
-
-    fn on_host(&self) -> bool {
-        false
-    }
-
-    fn host_rules(&self) -> Option<Arc<dyn BroadcastHostRules>> {
-        Some(Arc::new(self.rules.clone()))
-    }
-
-    fn create<'a>(
-        &'a self,
-        request: TunRequest,
-    ) -> tsunagi::BoxFuture<'a, Result<Arc<dyn TunDevice>, OverlayError>> {
-        self.tuns.create(request)
-    }
-
-    fn reconfigure<'a>(
-        &'a self,
-        request: TunRequest,
-    ) -> tsunagi::BoxFuture<'a, Result<(), OverlayError>> {
-        self.tuns.reconfigure(request)
-    }
-
-    fn destroy<'a>(&'a self, name: &'a str) -> tsunagi::BoxFuture<'a, ()> {
-        self.tuns.destroy(name)
-    }
-}
 
 struct Node {
     _dir: TempDir,
@@ -94,10 +49,7 @@ impl Node {
             tsunagi::testing::config_with(dir.path(), discovery)
                 .with_overlay_ipv4_range(Some(tsunagi::state::DEFAULT_IPV4_RANGE))
                 .with_interface(
-                    Arc::new(RuledTuns {
-                        tuns: tuns.clone(),
-                        rules: rules.clone(),
-                    }),
+                    Arc::new(tuns.clone().with_host_rules(Arc::new(rules.clone()))),
                     tag,
                     1280,
                 )

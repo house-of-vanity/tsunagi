@@ -26,8 +26,7 @@ use tsunagi::iroh_types::{EndpointAddr, EndpointId};
 use tsunagi::overlay::{MemoryTunFactory, TunFactory};
 use tsunagi::state::Ipv4Range;
 use tsunagi::{Agent, NetworkId};
-use tsunagi_awg::{AWG_PROTOCOL, AWG_WIRE_VERSION, AwgPlugin, AwgTransport};
-use tsunagi_tcp_tls::{TCP_TLS_PROTOCOL, TcpTlsCarrier, TcpTlsConfig, TcpTlsTransport};
+use tsunagi_runtime::{Carriers, PROTOCOLS, ProtocolSpec};
 use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 use tsunagi_wireguard::WG_PROTOCOL;
 
@@ -1227,7 +1226,7 @@ fn dns_publisher() -> Arc<dyn tsunagi::dns::DnsPublisher> {
 /// Every network the agent is in becomes a zone named after it, so joining
 /// or leaving one changes what resolves without restarting anything.
 fn spawn_dns(agent: Agent, port: u16) -> DnsService {
-    use tsunagi::dns::{DnsServer, SharedZone, Zone, ZoneName, Zones, listen_plan};
+    use tsunagi::dns::{DnsServer, RosterZones, SharedZone, listen_plan};
 
     let state = Arc::new(std::sync::Mutex::new(DnsState::default()));
     let publisher = dns_publisher();
@@ -1293,37 +1292,11 @@ fn spawn_dns(agent: Agent, port: u16) -> DnsService {
                 // One zone per network, named after it. A name that cannot
                 // be a zone is said once and skipped: the network works,
                 // it just has no names.
-                let mut zones = Vec::new();
-                let mut labels = Vec::new();
-                let mut warnings = Vec::new();
-                for network in &status.networks {
-                    let zone = match ZoneName::new(network.name.as_str()) {
-                        Ok(zone) => zone,
-                        Err(err) => {
-                            warnings.push(format!(
-                                "`{}` cannot be a zone, so its members have no names: {err}",
-                                network.name
-                            ));
-                            continue;
-                        }
-                    };
-                    if let Some(warning) = zone.collision() {
-                        warnings.push(warning);
-                    }
-                    labels.push(zone.as_str().to_string());
-                    // Names come from signed state, so a member that is
-                    // away is in here too.
-                    let members = network.members.iter().filter_map(|member| {
-                        Some((member.hostname.clone()?, member.overlay_address_v4?))
-                    });
-                    let services = network
-                        .vips
-                        .iter()
-                        .filter(|v| v.error.is_none())
-                        .filter_map(|v| Some((v.config.name.clone(), v.address?)));
-                    zones.push(Zone::new(zone, members.chain(services)));
-                }
-                let zones = Zones::new(zones);
+                let RosterZones {
+                    zones,
+                    labels,
+                    warnings,
+                } = RosterZones::from_networks(&status.networks);
                 let names = zones.names() as u32;
                 shared.set(zones);
                 update(&state, |state| {
@@ -1437,58 +1410,6 @@ fn update(state: &Arc<std::sync::Mutex<DnsState>>, edit: impl FnOnce(&mut DnsSta
         Err(poisoned) => edit(&mut poisoned.into_inner()),
     }
 }
-
-/// What a protocol is called, what it speaks, and what it takes.
-///
-/// A registry rather than a lookup on the plugins themselves, because
-/// `tsng protocols` has to answer before anything is constructed, and
-/// because this is the list `--protocol` resolves against.
-struct ProtocolSpec {
-    /// The name on the wire, which is what peers compare.
-    name: &'static str,
-    /// The wire version. Not the software version: two peers on different
-    /// builds carry traffic for each other as long as this matches.
-    version: u16,
-    /// One line about what it is.
-    summary: &'static str,
-    /// The settings it accepts.
-    options: &'static [tsunagi::dataplane::ProtocolOption],
-}
-
-const WG_OPTIONS: &[tsunagi::dataplane::ProtocolOption] = &[tsunagi::dataplane::ProtocolOption {
-    key: "port",
-    value: "PORT",
-    help: "preferred local UDP port; additional pairs use dynamic ports",
-    default: Some("51820"),
-}];
-
-/// Every protocol this build has.
-const PROTOCOLS: &[ProtocolSpec] = &[
-    ProtocolSpec {
-        name: WG_PROTOCOL,
-        version: tsunagi_wireguard::WG_WIRE_VERSION,
-        summary: "Pure WireGuard direct UDP transport",
-        options: WG_OPTIONS,
-    },
-    ProtocolSpec {
-        name: AWG_PROTOCOL,
-        version: AWG_WIRE_VERSION,
-        summary: "Pairwise Amnezia-masked UDP with fresh private profiles on every connection attempt",
-        options: AwgPlugin::OPTIONS,
-    },
-    ProtocolSpec {
-        name: "wg-quic",
-        version: 1,
-        summary: "iroh QUIC datagram carrier with NAT traversal and relays",
-        options: &[],
-    },
-    ProtocolSpec {
-        name: TCP_TLS_PROTOCOL,
-        version: 2,
-        summary: "TCP TLS 1.3 carrier",
-        options: TcpTlsConfig::OPTIONS,
-    },
-];
 
 /// One `-o` setting, and the protocol it was aimed at.
 #[derive(Clone)]
@@ -1737,12 +1658,12 @@ impl tsunagi::ipc::ReportSource for AgentControl {
 
     fn network_secret(&self, network_id: String) -> tsunagi::BoxFuture<'_, Result<String, String>> {
         Box::pin(async move {
-            let networks = stored_networks(&self.paths);
-            let network = networks
-                .iter()
-                .find(|network| network.network_id.to_string() == network_id)
-                .ok_or_else(|| format!("no configured network with id {network_id}"))?;
-            Ok(network.secret.encode().as_str().to_owned())
+            let id = network_id.parse::<NetworkId>().map_err(|e| e.to_string())?;
+            self.agent
+                .network_secret(id)
+                .await
+                .map(|secret| secret.encode().as_str().to_owned())
+                .map_err(|err| err.to_string())
         })
     }
 
@@ -4710,9 +4631,6 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // The interface belongs to the agent, so it is configured once whatever
     // was selected to carry traffic over it.
-    let mut awg_transport = None;
-    let mut tcp_tls_transport = None;
-    let mut pure_wg_transport: Option<Arc<AwgTransport>> = None;
     if !PROTOCOLS.is_empty() {
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
@@ -4736,15 +4654,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     config = config.with_tunnel(tunnel.clone());
     let wireguard = Some(tunnel);
 
-    let identity_db = paths.state_db();
-    let identity = tokio::task::spawn_blocking(move || {
-        tsunagi::storage::StateStore::open(identity_db)?.load_or_create_device_identity()
-    })
-    .await??;
-
-    for spec in PROTOCOLS {
-        // Unqualified options keep targeting the initial selection; explicitly
-        // scoped options also configure protocols that will be enabled later.
+    let (config, carriers) = Carriers::configure(config, &bootstrap, None, |spec| {
         let scoped: Vec<_> = settings
             .iter()
             .filter(|setting| {
@@ -4752,97 +4662,9 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             })
             .cloned()
             .collect();
-        let options = settings_for(spec, &scoped);
-        match spec.name {
-            AWG_PROTOCOL => {
-                let server = options
-                    .iter()
-                    .find(|(key, _)| key == "stun")
-                    .map(|(_, value)| value.as_str())
-                    .unwrap_or("stun.l.google.com:19302");
-                if server.len() > 255 || (server != "off" && !server.contains(':')) {
-                    return Err("awg:stun must be HOST:PORT or off".into());
-                }
-                let stun = (!matches!(args.reach, Reach::Local) && server != "off")
-                    .then(|| server.to_owned());
-                let transport = AwgTransport::new_with_stun(
-                    identity.endpoint_id(),
-                    std::net::Ipv4Addr::UNSPECIFIED,
-                    stun,
-                );
-                transport.exclude_interface(args.interface.clone());
-                let plugin = AwgPlugin::new(transport.clone());
-                config = config
-                    .with_carrier(
-                        plugin.clone() as Arc<dyn tsunagi::dataplane::transport::DataCarrier>
-                    )
-                    .with_custom_transport(
-                        AWG_PROTOCOL,
-                        transport.clone()
-                            as Arc<dyn tsunagi::dataplane::transport::PacketTransport>,
-                    );
-                awg_transport = Some(transport);
-            }
-            "wg-quic" => {
-                config = config.with_carrier(Arc::new(
-                    tsunagi::dataplane::transport::iroh_link::IrohCarrier,
-                ));
-            }
-            TCP_TLS_PROTOCOL => {
-                let tls_cfg = TcpTlsConfig::new();
-                let tls_cfg = TcpTlsConfig::configure(tls_cfg, &options)?;
-                let transport = Arc::new(
-                    TcpTlsTransport::bind(&identity, tls_cfg.port, tls_cfg.sni)
-                        .await
-                        .map_err(|err| err.to_string())?,
-                );
-                for ep_addr in &bootstrap {
-                    for ip in ep_addr.ip_addrs() {
-                        transport.set_peer_addr(ep_addr.id, *ip);
-                    }
-                }
-                let plugin =
-                    TcpTlsCarrier::with_interface(transport.clone(), args.interface.clone());
-                config = config
-                    .with_carrier(
-                        plugin.clone() as Arc<dyn tsunagi::dataplane::transport::DataCarrier>
-                    )
-                    .with_custom_transport(
-                        TCP_TLS_PROTOCOL,
-                        Arc::clone(&transport)
-                            as Arc<dyn tsunagi::dataplane::transport::PacketTransport>,
-                    );
-                tcp_tls_transport = Some(transport);
-            }
-            WG_PROTOCOL => {
-                let port = options
-                    .iter()
-                    .find(|(key, _)| key == "port")
-                    .map(|(_, value)| value.parse::<u16>())
-                    .transpose()?
-                    .unwrap_or(51820);
-                let transport = AwgTransport::wireguard_with_port(
-                    identity.endpoint_id(),
-                    std::net::Ipv4Addr::UNSPECIFIED,
-                    (!matches!(args.reach, Reach::Local)).then(|| "stun.l.google.com:19302".into()),
-                    port,
-                );
-                transport.exclude_interface(args.interface.clone());
-                let plugin = AwgPlugin::new(transport.clone());
-                config = config
-                    .with_carrier(
-                        plugin.clone() as Arc<dyn tsunagi::dataplane::transport::DataCarrier>
-                    )
-                    .with_custom_transport(
-                        WG_PROTOCOL,
-                        Arc::clone(&transport)
-                            as Arc<dyn tsunagi::dataplane::transport::PacketTransport>,
-                    );
-                pure_wg_transport = Some(transport);
-            }
-            other => return Err(format!("`{other}` is listed but not built in").into()),
-        }
-    }
+        settings_for(spec, &scoped)
+    })
+    .await?;
 
     let agent = match Agent::spawn(config).await {
         Ok(agent) => agent,
@@ -4877,41 +4699,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
     // is never dropped without being closed.
     let mut events = agent.subscribe();
 
-    if let Some(transport) = awg_transport {
-        let inbound_agent = agent.clone();
-        tokio::spawn(async move {
-            while let Some(inbound) = transport.next_inbound().await {
-                if let Err(err) = inbound_agent.install_inbound_link(inbound).await {
-                    tracing::debug!(%err, "failed to install inbound awg link");
-                }
-            }
-        });
-    }
-    if let Some(transport) = tcp_tls_transport {
-        let agent_inbound = agent.clone();
-        tokio::spawn(async move {
-            transport
-                .accept_loop(move |inbound| {
-                    let agent = agent_inbound.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = agent.install_inbound_link(inbound).await {
-                            tracing::debug!(%err, "failed to install inbound tcp-tls link");
-                        }
-                    });
-                })
-                .await;
-        });
-    }
-    if let Some(transport) = pure_wg_transport {
-        let inbound_agent = agent.clone();
-        tokio::spawn(async move {
-            while let Some(inbound) = transport.next_inbound().await {
-                if let Err(err) = inbound_agent.install_inbound_link(inbound).await {
-                    tracing::debug!(%err, "failed to install inbound wg link");
-                }
-            }
-        });
-    }
+    let _listeners = carriers.listen(&agent);
 
     let protocol_names: Vec<&str> = wanted.iter().map(|p| p.name).collect();
 
@@ -5039,9 +4827,7 @@ async fn build_report(
     dns: Option<DnsState>,
     paths: &StoragePaths,
 ) -> tsunagi::ipc::StatusReport {
-    use tsunagi::ipc::{
-        MemberReport, NetworkReport, OverlayPeerReport, OverlayReport, PeerReport, StatusReport,
-    };
+    use tsunagi::ipc::StatusReport;
 
     let overlay = agent.overlay();
     let dns = dns.map(dns_report);
@@ -5050,159 +4836,7 @@ async fn build_report(
         return StatusReport::default();
     };
 
-    let networks = status
-        .networks
-        .iter()
-        .map(|network| {
-            let wg_view = wireguard.and_then(|plugin| plugin.overview(network.network_id));
-            let wg_overlay_addr = wg_view.as_ref().and_then(|v| v.overlay_address_v4);
-            let wg_prefix_len = wg_view
-                .as_ref()
-                .and_then(|v| v.ipv4_range)
-                .map_or(0, |r| r.prefix_len);
-            let has_any_plugin = wg_view.is_some();
-
-            let overlay = if has_any_plugin && overlay.is_some() {
-                let mut peers: Vec<OverlayPeerReport> = Vec::new();
-
-                if let Some(view) = &wg_view {
-                    for peer in &view.peers {
-                        let tunnel = peer.tunnel.as_ref();
-                        peers.push(OverlayPeerReport {
-                            counter_epoch: tunnel.map_or(0, |t| t.stats.counter_epoch),
-                            endpoint_id: peer.endpoint_id.to_string(),
-                            protocol: String::new(),
-                            public_key: peer.public_key.to_string(),
-                            address: peer.overlay_address_v4.map(|a| a.to_string()),
-                            handshake_secs_ago: tunnel
-                                .and_then(|t| t.health.since_handshake.map(|s| s.as_secs())),
-                            tx_packets: tunnel.map_or(0, |t| t.stats.tx_packets),
-                            rx_packets: tunnel.map_or(0, |t| t.stats.rx_packets),
-                            tx_bytes: tunnel.map_or(0, |t| t.stats.tx_bytes),
-                            rx_bytes: tunnel.map_or(0, |t| t.stats.rx_bytes),
-                            dropped: tunnel.map_or(0, |t| {
-                                t.stats.dropped_wrong_source + t.stats.dropped_oversize
-                            }),
-                            protocol_errors: tunnel.map_or(0, |t| t.stats.protocol_errors),
-                            path: tunnel.map_or_else(|| "no data path".into(), |t| t.path.clone()),
-                        });
-                    }
-                }
-
-                let (address, prefix_len) = if wg_overlay_addr.is_some() {
-                    (wg_overlay_addr.map(|addr| addr.to_string()), wg_prefix_len)
-                } else {
-                    (
-                        network
-                            .members
-                            .iter()
-                            .find(|m| m.endpoint_id == status.endpoint_id)
-                            .and_then(|m| m.overlay_address_v4)
-                            .map(|a| a.to_string()),
-                        network.range.map_or(0, |r| r.prefix_len),
-                    )
-                };
-
-                Some(OverlayReport {
-                    interface: overlay
-                        .as_ref()
-                        .map_or_else(String::new, |o| o.interface.clone()),
-                    on_host: overlay.as_ref().is_some_and(|o| o.on_host),
-                    mtu: overlay.as_ref().map_or(0, |o| o.mtu),
-                    address,
-                    prefix_len,
-                    peers,
-                    unroutable_packets: overlay.as_ref().map_or(0, |o| o.counters.unroutable),
-                    multicast_packets: overlay.as_ref().map_or(0, |o| o.counters.multicast),
-                    unroutable_sample: overlay
-                        .as_ref()
-                        .and_then(|o| o.counters.unroutable_sample.map(|a| a.to_string())),
-                    broadcast_rules: overlay
-                        .as_ref()
-                        .and_then(|o| o.broadcast_rules.as_ref())
-                        .map(|rules| tsunagi::ipc::HostRulesReport {
-                            ok: rules.is_ok(),
-                            detail: rules.summary(),
-                            source: rules.plan.source.to_string(),
-                        }),
-                })
-            } else {
-                None
-            };
-
-            NetworkReport {
-                vips: network.vips.clone(),
-                protocols: network.protocols.clone(),
-                auto_start: network.auto_start,
-                exit: exit_report(network),
-                broadcast: network.broadcast,
-                name: network.name.to_string(),
-                network_id: network.network_id.to_string(),
-                active: matches!(network.state, tsunagi::agent::NetworkState::Active),
-                candidates: network.candidates.len() as u32,
-                relay_forwarded: network.relay.forwarded,
-                relay_sent_via: network.relay.sent_via,
-                relay_received_via: network.relay.received_via,
-                peers: network
-                    .peers
-                    .iter()
-                    .map(|peer| PeerReport {
-                        data_error: peer.data_error.clone(),
-                        endpoint_id: peer.endpoint_id.to_string(),
-                        hostname: peer.hostname.clone(),
-                        transport: peer.transport.to_string(),
-                        rtt_ms: peer.rtt.map(|rtt| rtt.as_millis() as u64),
-                        exit_node: peer.exit_node,
-                        path: data_path_report(&peer.data_path),
-                    })
-                    .collect(),
-                members: network
-                    .members
-                    .iter()
-                    .map(|member| MemberReport {
-                        record_version: member.record_version,
-                        endpoint_id: member.endpoint_id.to_string(),
-                        overlay_address_v4: member.overlay_address_v4.map(|addr| addr.to_string()),
-                        // What this agent is currently experiencing trying to
-                        // reach it, so a dial-failure count can be attributed
-                        // to the member it belongs to instead of floating
-                        // free as a network-wide number.
-                        failed_dials: network
-                            .candidates
-                            .iter()
-                            .find(|candidate| candidate.endpoint_id == member.endpoint_id)
-                            .map_or(0, |candidate| candidate.consecutive_failures),
-                        hostname: member
-                            .last_hostname
-                            .clone()
-                            .or_else(|| member.hostname.clone()),
-                        online: member.online,
-                        path: data_path_report(&member.data_path),
-                        hostname_conflict: member.hostname_conflict.as_ref().map(conflict_report),
-                    })
-                    .collect(),
-                range: network.range.map(|range| range.to_string()),
-                range_conflict: network.range_conflict.map(|range| range.to_string()),
-                range_conflicts: network
-                    .range_conflicts
-                    .iter()
-                    .map(|c| tsunagi::ipc::RangeConflictReport {
-                        network_id: c.network_id.to_string(),
-                        name: c.name.to_string(),
-                        range: c.range.to_string(),
-                    })
-                    .collect(),
-                dial_failures: network.metrics.dial_failures,
-                handshake_failures: network.metrics.handshake_failures,
-                control_messages: (
-                    network.metrics.control_messages_sent,
-                    network.metrics.control_messages_received,
-                ),
-                overlay,
-                hostname_conflict: network.hostname_conflict.as_ref().map(conflict_report),
-            }
-        })
-        .collect();
+    let networks = tsunagi_runtime::report::networks(&status, overlay.as_ref(), wireguard);
 
     StatusReport {
         available_protocols: PROTOCOLS
@@ -5237,46 +4871,6 @@ async fn build_report(
             }
             tsunagi::overlay::Privilege::Unsupported => tsunagi::ipc::PrivilegeReport::Unsupported,
         },
-    }
-}
-
-fn data_path_report(path: &tsunagi::agent::DataPath) -> tsunagi::ipc::DataPathReport {
-    match path {
-        tsunagi::agent::DataPath::None => tsunagi::ipc::DataPathReport::None,
-        tsunagi::agent::DataPath::Direct { transport } => tsunagi::ipc::DataPathReport::Direct {
-            transport: transport.clone(),
-        },
-        tsunagi::agent::DataPath::Relayed { hops, via } => tsunagi::ipc::DataPathReport::Relayed {
-            hops: *hops,
-            via: via.to_string(),
-        },
-    }
-}
-
-fn conflict_report(
-    conflict: &tsunagi::agent::HostnameConflict,
-) -> tsunagi::ipc::HostnameConflictReport {
-    tsunagi::ipc::HostnameConflictReport {
-        name: conflict.name.clone(),
-        holder: conflict.holder.to_string(),
-    }
-}
-
-/// One network's exit-node settings, as the control interface reports them.
-fn exit_report(network: &tsunagi::agent::NetworkStatus) -> tsunagi::ipc::ExitReport {
-    let rules = |report: &Option<tsunagi::overlay::RuleSetReport>| {
-        report.as_ref().map(|report| tsunagi::ipc::RuleSetReport {
-            ok: report.ok,
-            detail: report.detail.clone(),
-        })
-    };
-    tsunagi::ipc::ExitReport {
-        offering: network.exit_offer,
-        offer_rules: rules(&network.exit_rules.offer),
-        forwarding: network.exit_rules.forwarding,
-        via: network.exit_via.map(|peer| peer.to_string()),
-        via_online: network.exit_via_online,
-        client_rules: rules(&network.exit_rules.client),
     }
 }
 

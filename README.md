@@ -55,6 +55,7 @@ with relay fallback), and keep the network state among themselves.
 - **LAN games:** UDP broadcasts are relayed, so "LAN" lobbies show up across the mesh.
 - **Several networks at once** on one device.
 - **Tray app** for Windows, macOS and Linux; a command line for everything.
+- **Android prototype** for ARM64 phones, with the same egui forms and a foreground VPN service. [Build and run the Android client](android/README.md).
 
 ## Install
 

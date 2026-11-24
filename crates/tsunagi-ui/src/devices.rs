@@ -6,13 +6,16 @@
 //! the main window.
 
 use std::collections::HashMap;
+mod compact;
+mod exit_picker;
+pub use crate::exit::name_of;
+pub use exit_picker::choose_exit;
 
-use eframe::egui;
 use egui_phosphor::regular as icon;
 
 use tsunagi::ipc::{DataPathReport, NetworkReport, OverlayPeerReport};
 
-use crate::agent::{AgentClient, Command};
+use crate::client::{Client, Command};
 use crate::exit;
 use crate::format;
 use crate::stats::{Traffic, Unit};
@@ -22,7 +25,7 @@ use crate::stats::{Traffic, Unit};
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa4, 0x2c);
 
 /// A readable title for a network's window.
-pub(crate) fn title(network: &NetworkReport) -> String {
+pub fn title(network: &NetworkReport) -> String {
     format!("tsunagi · {}", network.name)
 }
 
@@ -58,7 +61,7 @@ struct Device<'a> {
 
 /// An exit-node choice the user has to confirm: all their traffic goes through
 /// somebody else's device, or stops doing so.
-pub(crate) struct ExitConfirm {
+pub struct ExitConfirm {
     network_id: String,
     peer_id: String,
     name: String,
@@ -69,7 +72,7 @@ pub(crate) struct ExitConfirm {
 }
 
 /// An exact offline claim selected for durable cleanup.
-pub(crate) struct ForgetConfirm {
+pub struct ForgetConfirm {
     network_id: String,
     peer: String,
     version: u64,
@@ -79,7 +82,7 @@ pub(crate) struct ForgetConfirm {
 
 impl ExitConfirm {
     /// A question about stopping the exit node a network's tile shows.
-    pub(crate) fn stop_from_tile(network: &NetworkReport, peer_id: &str) -> Self {
+    pub fn stop_from_tile(network: &NetworkReport, peer_id: &str) -> Self {
         Self {
             network_id: network.network_id.clone(),
             peer_id: peer_id.to_string(),
@@ -126,9 +129,9 @@ fn name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
 }
 
 /// Draws the window body into its viewport.
-pub(crate) fn show(
+pub fn show(
     ctx: &egui::Context,
-    agent: &AgentClient,
+    agent: &dyn Client,
     unit: &mut Unit,
     confirmations: (&mut Option<ExitConfirm>, &mut Option<ForgetConfirm>),
     network: &NetworkReport,
@@ -148,6 +151,23 @@ pub(crate) fn show(
         // A copy of the chosen unit for the read-only rendering below.
         let unit = *unit;
 
+        if ctx.os() == egui::os::OperatingSystem::Android || ui.available_width() < 620.0 {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.collapsing("Network details", |ui| summary(ui, network));
+                    format::sparkline(ui, traffic.network(&network.network_id), unit, 34.0);
+                    compact::roster(
+                        ui,
+                        network,
+                        own_id,
+                        traffic,
+                        unit,
+                        (confirm, forget_confirm),
+                    );
+                });
+            return;
+        }
         summary(ui, network);
         ui.add_space(6.0);
 
@@ -185,7 +205,7 @@ pub(crate) fn show(
 
 fn confirm_forget(
     ctx: &egui::Context,
-    agent: &AgentClient,
+    agent: &dyn Client,
     confirm: &mut Option<ForgetConfirm>,
     network: &str,
 ) {
@@ -216,7 +236,7 @@ fn confirm_forget(
             }
             ui.label("The network will forget this claim and free its name and IP. A returning device can publish a new claim; this does not ban it.");
             ui.horizontal(|ui| {
-                accepted = ui.add_enabled(!agent.snapshot().busy, egui::Button::new("Forget")).clicked();
+                accepted = ui.add_enabled(!agent.busy(), egui::Button::new("Forget")).clicked();
                 cancelled = ui.button("Cancel").clicked();
             });
         });
@@ -237,9 +257,9 @@ fn confirm_forget(
 ///
 /// `network_id` is the devices window the question is drawn in, or `None` for
 /// the main window; a question appears in the window it was asked in only.
-pub(crate) fn confirm_exit(
+pub fn confirm_exit(
     ctx: &egui::Context,
-    agent: &AgentClient,
+    agent: &dyn Client,
     confirm: &mut Option<ExitConfirm>,
     network_id: Option<&str>,
 ) {
@@ -266,14 +286,24 @@ pub(crate) fn confirm_exit(
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_max_width(380.0);
+            ui.set_max_width((ctx.screen_rect().width() - 40.0).clamp(160.0, 380.0));
+            let phone = ctx.os() == egui::os::OperatingSystem::Android;
             ui.label(if pending.stop {
                 format!("Stop using {}?", pending.name)
+            } else if phone {
+                format!(
+                    "Route this phone’s IPv4 internet traffic through {}?",
+                    pending.name
+                )
             } else {
                 format!("Use {} as exit node?", pending.name)
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
+                if phone {
+                    ui.spacing_mut().interact_size = egui::vec2(104., 48.);
+                    ui.spacing_mut().button_padding.x = 18.;
+                }
                 if ui
                     .button(if pending.stop { "Stop" } else { "Use" })
                     .clicked()
@@ -303,7 +333,12 @@ fn summary(ui: &mut egui::Ui, network: &NetworkReport) {
         .spacing([12.0, 3.0])
         .show(ui, |ui| {
             ui.weak("id");
-            format::copy_field(ui, &network.network_id, &network.network_id);
+            let id = if ui.ctx().os() == egui::os::OperatingSystem::Android {
+                format::short(&network.network_id)
+            } else {
+                network.network_id.clone()
+            };
+            format::copy_field(ui, &id, &network.network_id);
             ui.end_row();
 
             ui.weak("active");
@@ -365,12 +400,12 @@ fn known_ids<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<&'a str> {
 }
 
 /// How many other devices can be reached now, by any path.
-pub(crate) fn online_count(network: &NetworkReport, own_id: &str) -> usize {
+pub fn online_count(network: &NetworkReport, own_id: &str) -> usize {
     devices(network, own_id).iter().filter(|d| d.online).count()
 }
 
 /// How many other devices this network knows of, connected or not.
-pub(crate) fn known_count(network: &NetworkReport, own_id: &str) -> usize {
+pub fn known_count(network: &NetworkReport, own_id: &str) -> usize {
     known_ids(network, own_id).len()
 }
 
@@ -688,22 +723,7 @@ fn device_table(
             |column, ui| match column {
                 0 => {
                     name_cell(ui, device);
-                    if !device.online
-                        && !device.in_use
-                        && let Some(version) = device.record_version
-                        && ui
-                            .add_enabled(network.active, egui::Button::new("Forget"))
-                            .on_hover_text("Free this offline device's name and IPv4")
-                            .clicked()
-                    {
-                        *forget_confirm = Some(ForgetConfirm {
-                            network_id: network.network_id.clone(),
-                            peer: device.id.into(),
-                            version,
-                            name: device.name(),
-                            address: device.address.clone(),
-                        });
-                    }
+                    forget_button(ui, device, network, forget_confirm);
                 }
                 1 => exit_cell(ui, device, network_id, confirm),
                 2 => tunnel_cell(ui, device),
@@ -842,6 +862,30 @@ fn data_path_cell(ui: &mut egui::Ui, device: &Device<'_>) {
     });
 }
 
+fn forget_button(
+    ui: &mut egui::Ui,
+    device: &Device<'_>,
+    network: &NetworkReport,
+    confirm: &mut Option<ForgetConfirm>,
+) {
+    if !device.online
+        && !device.in_use
+        && let Some(version) = device.record_version
+        && ui
+            .add_enabled(network.active, egui::Button::new("Forget"))
+            .on_hover_text("Free this offline device's name and IPv4")
+            .clicked()
+    {
+        *confirm = Some(ForgetConfirm {
+            network_id: network.network_id.clone(),
+            peer: device.id.into(),
+            version,
+            name: device.name(),
+            address: device.address.clone(),
+        });
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -859,6 +903,109 @@ mod tests {
             online,
             path,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn phone_roster_fits_each_width_and_expands_only_the_tapped_member() {
+        struct ReadOnly;
+        impl Client for ReadOnly {
+            fn send(&self, _: Command) {
+                panic!("reading a row issued an action");
+            }
+            fn busy(&self) -> bool {
+                false
+            }
+        }
+        let mut network = NetworkReport {
+            network_id: "a".repeat(60),
+            name: "lab".into(),
+            ..Default::default()
+        };
+        for (i, name) in [
+            "alpha",
+            "bravo",
+            "charlie",
+            "long-hostname-that-cannot-fit-a-phone-row",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut m = member(name, i < 2, DataPathReport::None);
+            m.hostname = Some(name.into());
+            m.overlay_address_v4 = Some(format!("192.168.254.{}", 240 + i));
+            network.members.push(m);
+        }
+        for width in [320.0, 360.0, 430.0, 870.0] {
+            let ctx = egui::Context::default();
+            ctx.set_os(egui::os::OperatingSystem::Android);
+            let frame = |events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 720.),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        show(
+                            ctx,
+                            &ReadOnly,
+                            &mut Unit::Packets,
+                            (&mut None, &mut None),
+                            &network,
+                            "self",
+                            &Traffic::default(),
+                        )
+                    },
+                )
+            };
+            let positions = |out: &egui::FullOutput, value: &str| -> Vec<egui::Pos2> {
+                out.shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text() == value => {
+                            Some(t.pos + t.galley.rect.center().to_vec2())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            frame(vec![]);
+            let out = frame(vec![]);
+            let a = positions(&out, "alpha")[0];
+            let b = positions(&out, "bravo")[0];
+            assert!(
+                (15.0..=29.0).contains(&(b.y - a.y)),
+                "one text line per device at {width}"
+            );
+            for i in 240..244 {
+                let p = positions(&out, &format!("192.168.254.{i}"))[0];
+                assert!(p.x < width - 30.0, "IPv4 outside row at {width}: {p:?}");
+            }
+            assert!(positions(&out, "Endpoint ID").is_empty());
+            let click = |p: egui::Pos2| {
+                for pressed in [true, false] {
+                    frame(vec![
+                        egui::Event::PointerMoved(p),
+                        egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ]);
+                }
+                frame(vec![])
+            };
+            let expanded = click(a);
+            assert_eq!(positions(&expanded, "Endpoint ID").len(), 1);
+            let switched = click(positions(&expanded, "bravo")[0]);
+            assert_eq!(positions(&switched, "Endpoint ID").len(), 1);
+            let closed = click(positions(&switched, "bravo")[0]);
+            assert!(positions(&closed, "Endpoint ID").is_empty());
         }
     }
 

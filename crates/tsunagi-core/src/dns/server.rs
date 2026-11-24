@@ -81,7 +81,22 @@ impl SharedZone {
 /// server should reply to, and replying anyway would make this a useful
 /// amplifier for somebody spoofing a source address.
 pub fn respond(zones: &Zones, query: &[u8]) -> Option<Vec<u8>> {
-    let packet = simple_dns::Packet::parse(query).ok()?;
+    match resolve(zones, query)? {
+        Resolution::Local(reply) | Resolution::Outside(reply) => Some(reply),
+    }
+}
+
+/// An authoritative decision for a host resolver that also handles external domains.
+pub enum Resolution {
+    /// Answer locally, including authoritative denials and protocol errors.
+    Local(Vec<u8>),
+    /// A well-formed question outside all mesh zones, with the authoritative server's REFUSED reply.
+    Outside(Vec<u8>),
+}
+
+/// Distinguish an external question from an unknown name inside a mesh zone.
+pub fn resolve(zones: &Zones, query: &[u8]) -> Option<Resolution> {
+    let packet = parse_message(query)?;
     if packet.has_flags(PacketFlag::RESPONSE) {
         return None;
     }
@@ -95,18 +110,18 @@ pub fn respond(zones: &Zones, query: &[u8]) -> Option<Vec<u8>> {
 
     if packet.opcode() != simple_dns::OPCODE::StandardQuery {
         *reply.rcode_mut() = RCODE::NotImplemented;
-        return reply.build_bytes_vec().ok();
+        return reply.build_bytes_vec().ok().map(Resolution::Local);
     }
 
     // Exactly one question. Zero is nothing to answer; more than one has no
     // agreed meaning and every real server rejects it.
     let [question] = packet.questions.as_slice() else {
         *reply.rcode_mut() = RCODE::FormatError;
-        return reply.build_bytes_vec().ok();
+        return reply.build_bytes_vec().ok().map(Resolution::Local);
     };
     if !matches!(question.qclass, QCLASS::CLASS(simple_dns::CLASS::IN)) {
         *reply.rcode_mut() = RCODE::Refused;
-        return reply.build_bytes_vec().ok();
+        return reply.build_bytes_vec().ok().map(Resolution::Local);
     }
 
     let qname = question.qname.to_string();
@@ -117,7 +132,10 @@ pub fn respond(zones: &Zones, query: &[u8]) -> Option<Vec<u8>> {
         None => {
             reply.questions.push(question.clone());
             *reply.rcode_mut() = RCODE::Refused;
-            return reply.build_bytes_vec_compressed().ok();
+            return reply
+                .build_bytes_vec_compressed()
+                .ok()
+                .map(Resolution::Outside);
         }
     };
     reply.questions.push(question.clone());
@@ -163,7 +181,22 @@ pub fn respond(zones: &Zones, query: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    reply.build_bytes_vec_compressed().ok()
+    reply
+        .build_bytes_vec_compressed()
+        .ok()
+        .map(Resolution::Local)
+}
+
+/// Parse a DNS message only after bounding its section allocations against the bytes received.
+pub fn parse_message(wire: &[u8]) -> Option<simple_dns::Packet<'_>> {
+    let header = wire.get(..12)?;
+    let counts = |at: usize| usize::from(u16::from_be_bytes([header[at], header[at + 1]]));
+    // Even a root question needs five bytes. An empty root resource record needs eleven.
+    let minimum = 12 + counts(4) * 5 + (counts(6) + counts(8) + counts(10)) * 11;
+    if wire.len() < minimum || wire.len() > usize::from(u16::MAX) {
+        return None;
+    }
+    simple_dns::Packet::parse(wire).ok()
 }
 
 /// The zone's start of authority.
@@ -202,8 +235,7 @@ fn query_kind(qtype: QTYPE) -> Query {
 
 /// Whether the client offered EDNS, and so how large an answer it will take.
 fn udp_limit(query: &[u8]) -> usize {
-    simple_dns::Packet::parse(query)
-        .ok()
+    parse_message(query)
         .and_then(|packet| packet.opt().map(|opt| opt.udp_packet_size as usize))
         .unwrap_or(CLASSIC_UDP_LIMIT as u16 as usize)
         .clamp(CLASSIC_UDP_LIMIT, MAX_MESSAGE_LEN)
@@ -214,20 +246,19 @@ fn udp_limit(query: &[u8]) -> usize {
 /// The records are dropped and the truncated bit set, which tells a resolver
 /// to ask again over TCP. Sending a reply it cannot reassemble would just
 /// look like packet loss.
-fn truncate_for_udp(query: &[u8], reply: Vec<u8>) -> Vec<u8> {
-    let limit = udp_limit(query);
+pub fn truncate_for_udp(query: &[u8], reply: Vec<u8>, payload_limit: usize) -> Vec<u8> {
+    let limit = udp_limit(query).min(payload_limit);
     if reply.len() <= limit {
         return reply;
     }
-    let Ok(parsed) = simple_dns::Packet::parse(&reply) else {
+    let Some(mut short) = parse_message(&reply) else {
         return reply;
     };
-    let mut short = simple_dns::Packet::new_reply(parsed.id());
-    short.set_flags(PacketFlag::TRUNCATION | PacketFlag::AUTHORITATIVE_ANSWER);
-    *short.rcode_mut() = parsed.rcode();
-    for question in &parsed.questions {
-        short.questions.push(question.clone());
-    }
+    short.set_flags(PacketFlag::TRUNCATION);
+    short.answers.clear();
+    short.name_servers.clear();
+    short.additional_records.clear();
+    *short.opt_mut() = None;
     short.build_bytes_vec().unwrap_or(reply)
 }
 
@@ -264,7 +295,7 @@ impl DnsServer {
                 let Some(reply) = respond(&udp_zone.get(), query) else {
                     continue;
                 };
-                let reply = truncate_for_udp(query, reply);
+                let reply = truncate_for_udp(query, reply, MAX_MESSAGE_LEN);
                 if let Err(err) = udp.send_to(&reply, from).await {
                     tracing::debug!(%err, "dns udp reply failed");
                 }
@@ -494,7 +525,7 @@ mod tests {
             "the test needs a big answer"
         );
 
-        let short = truncate_for_udp(&query, full);
+        let short = truncate_for_udp(&query, full, MAX_MESSAGE_LEN);
         assert!(short.len() <= CLASSIC_UDP_LIMIT);
         let parsed = simple_dns::Packet::parse(&short).unwrap();
         assert!(parsed.has_flags(PacketFlag::TRUNCATION));

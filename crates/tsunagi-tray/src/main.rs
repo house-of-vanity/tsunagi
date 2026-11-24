@@ -9,19 +9,15 @@
 // Nothing here is a library.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod about;
+use tsunagi_ui::about;
 mod agent;
 mod app;
-mod devices;
-mod exit;
-mod format;
+use tsunagi_ui::devices;
 mod icon;
-mod stats;
-mod table;
+use tsunagi_ui::stats;
 mod tray;
 mod ui;
-mod vip;
-mod vip_status;
+use tsunagi_ui::vip;
 mod watch;
 
 use eframe::egui;

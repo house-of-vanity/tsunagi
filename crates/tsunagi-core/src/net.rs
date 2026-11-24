@@ -254,12 +254,16 @@ impl EndpointAdapter {
             Arc::new(std::sync::RwLock::new(config.interface_name.to_lowercase()));
         {
             let interface_filter = Arc::clone(&owned_interface);
+            let factory = config.tun_factory.clone();
             let filter = iroh::address_lookup::AddrFilter::new(move |addrs| {
                 let owned_interface = interface_filter
                     .read()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
                 let mut overlay_ips = std::collections::HashSet::new();
+                if let Some(factory) = &factory {
+                    overlay_ips.extend(factory.assigned_addresses());
+                }
                 for iface in netdev::get_interfaces() {
                     let name = iface.name.to_lowercase();
                     let friendly = iface

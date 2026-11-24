@@ -1179,6 +1179,19 @@ impl Agent {
         self.inner.networks.read().await.contains_key(&network_id)
     }
 
+    /// Retrieve the locally stored secret for an explicit user export.
+    /// Status and ordinary network listings never include it.
+    pub async fn network_secret(&self, network_id: NetworkId) -> Result<NetworkSecret> {
+        self.inner
+            .storage
+            .list_networks()
+            .await?
+            .into_iter()
+            .find(|network| network.network_id == network_id)
+            .map(|network| network.secret)
+            .ok_or(Error::NetworkUnknown(network_id))
+    }
+
     /// Lists configured networks and whether each is running.
     pub async fn list_networks(&self) -> Result<Vec<ConfiguredNetwork>> {
         let active: Vec<NetworkId> = self.inner.networks.read().await.keys().copied().collect();

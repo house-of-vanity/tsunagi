@@ -1,9 +1,10 @@
 //! Per-network VIP editor. Drafts never issue commands until Save is pressed.
-use crate::agent::{AgentClient, Command, Snapshot};
+use crate::client::{Client, Command, Snapshot};
 use crate::vip_status;
-use eframe::egui;
 use tsunagi::ipc::NetworkReport;
-use tsunagi::vip::{Backend, Listener, Protocol, VipConfig};
+use tsunagi::vip::VipConfig;
+#[cfg(test)]
+use tsunagi::vip::{Listener, Protocol};
 #[derive(Clone)]
 struct Draft {
     config: VipConfig,
@@ -25,7 +26,8 @@ impl Draft {
     }
 }
 #[derive(Default)]
-pub(crate) struct Window {
+/// A network’s edit draft, selection and traffic history.
+pub struct Window {
     draft: Option<Draft>,
     pending: Option<String>,
     error: Option<String>,
@@ -37,28 +39,30 @@ pub(crate) struct Window {
     acknowledged_generation: Option<u64>,
 }
 impl Window {
+    /// Ask whether to discard an outstanding draft.
     pub fn request_close(&mut self) {
         self.close_question = true;
         self.close_after_save = true;
     }
+    /// Whether closing needs confirmation.
     pub fn dirty(&self) -> bool {
         self.draft.as_ref().is_some_and(Draft::dirty) || self.pending.is_some()
     }
 }
-fn peer_name<'a>(n: &'a NetworkReport, id: &'a str) -> &'a str {
-    n.members
-        .iter()
-        .find(|m| m.endpoint_id == id)
-        .and_then(|m| m.hostname.as_deref())
-        .unwrap_or(id)
-}
-pub(crate) fn show(
+/// Render the editor and overview. Returns true when its view can close.
+pub fn show(
     ctx: &egui::Context,
-    agent: &AgentClient,
+    agent: &dyn Client,
     state: &mut Window,
     n: &NetworkReport,
     snapshot: &Snapshot,
 ) -> bool {
+    if state.generation == 0
+        && state.draft.is_none()
+        && let [vip] = n.vips.as_slice()
+    {
+        state.draft = Some(Draft::new(vip.config.clone(), Some(vip.revision.clone())));
+    }
     if state.generation != snapshot.generation {
         state.generation = snapshot.generation;
         if let Some(at) = snapshot.at {
@@ -92,7 +96,7 @@ pub(crate) fn show(
         ui.heading(format!("VIP · {}", n.name));
         ui.weak("Configuration is shared with every member. Changes take effect only after Save.");
         if state.close_question {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Unsaved changes.");
                 if ui
                     .add_enabled(
@@ -172,7 +176,7 @@ pub(crate) fn show(
             );
         }
         let busy = state.pending.is_some();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let valid = draft.config.validate(&tsunagi::Limits::default());
             if !n.active {
                 ui.weak("Start the network to save changes.");
@@ -229,7 +233,7 @@ pub(crate) fn show(
             .show(ui, |ui| {
                 if state.configure {
                     ui.add_enabled_ui(!busy, |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("Name");
                             ui.add(
                                 egui::TextEdit::singleline(&mut draft.config.name)
@@ -258,32 +262,23 @@ pub(crate) fn show(
     close
 }
 fn edit_listeners(ui: &mut egui::Ui, config: &mut VipConfig, n: &NetworkReport) {
-    let mut remove = None;
-    for (index, l) in config.listeners.iter_mut().enumerate() {
-        ui.push_id(index,|ui|{egui::Frame::group(ui.style()).show(ui,|ui|{
-    ui.horizontal(|ui|{egui::ComboBox::from_id_salt("protocol").selected_text(l.protocol.to_string()).show_ui(ui,|ui|{ui.selectable_value(&mut l.protocol,Protocol::Tcp,"TCP");ui.selectable_value(&mut l.protocol,Protocol::Udp,"UDP");});ui.label("Port");ui.add(egui::DragValue::new(&mut l.port).range(1..=65535));if ui.button("Remove listener").clicked(){remove=Some(index);}});
-    if l.protocol==Protocol::Tcp{ui.checkbox(&mut l.port_check,"Active TCP port checks");}else{ui.weak("UDP health: encrypted path probes and explicit port errors; application readiness is unknown.");}
-    ui.collapsing("Checks and flow expiry",|ui|{egui::Grid::new("settings").show(ui,|ui|{
-        ui.label("Check interval, ms");ui.add(egui::DragValue::new(&mut l.check_interval_ms).range(250..=3_600_000));ui.end_row();
-        ui.label("Check timeout, ms");ui.add(egui::DragValue::new(&mut l.check_timeout_ms).range(100..=60_000));ui.end_row();
-        ui.label("Failures before exclusion");ui.add(egui::DragValue::new(&mut l.failure_threshold).range(1..=255));ui.end_row();
-        ui.label("Successes before recovery");ui.add(egui::DragValue::new(&mut l.recovery_threshold).range(1..=255));ui.end_row();
-        ui.label("Flow idle timeout, seconds");ui.add(egui::DragValue::new(&mut l.idle_timeout_secs).range(1..=604800));ui.end_row();
-    });});
-    let mut remove_backend=None;for(i,b)in l.backends.iter_mut().enumerate(){ui.push_id(i,|ui|{ui.horizontal(|ui|{
-        egui::ComboBox::from_id_salt("node").width(240.).selected_text(peer_name(n,&b.peer)).show_ui(ui,|ui|{for m in &n.members{let label=format!("{} ({})",m.hostname.as_deref().unwrap_or("unnamed"),m.endpoint_id.chars().take(8).collect::<String>());ui.selectable_value(&mut b.peer,m.endpoint_id.clone(),label);}});
-        ui.label("Target port");ui.add(egui::DragValue::new(&mut b.port).range(1..=65535));if ui.button("Remove").clicked(){remove_backend=Some(i);}
-    });});}if let Some(i)=remove_backend{l.backends.remove(i);}
-    if ui.button("+ Backend").clicked(){l.backends.push(Backend{peer:n.members.first().map(|m|m.endpoint_id.clone()).unwrap_or_default(),port:l.port});}
-});});
-    }
-    if let Some(index) = remove {
-        config.listeners.remove(index);
-    }
-    if ui.button("+ Listener").clicked() {
-        config.listeners.push(Listener::new(Protocol::Tcp, 443));
-    }
+    let members = n
+        .members
+        .iter()
+        .map(|m| {
+            (
+                m.endpoint_id.clone(),
+                format!(
+                    "{} ({})",
+                    m.hostname.as_deref().unwrap_or("unnamed"),
+                    crate::format::short(&m.endpoint_id)
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    crate::listeners::edit(ui, config, &members);
 }
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -291,7 +286,17 @@ mod tests {
     use tsunagi::vip::VipStatus;
     #[test]
     fn editing_the_actual_form_sends_nothing_until_save_is_clicked() {
-        let (agent, mut commands) = AgentClient::test_client();
+        let (tx, commands) = std::sync::mpsc::channel();
+        struct TestClient(std::sync::mpsc::Sender<Command>);
+        impl Client for TestClient {
+            fn send(&self, command: Command) {
+                self.0.send(command).unwrap();
+            }
+            fn busy(&self) -> bool {
+                false
+            }
+        }
+        let agent = TestClient(tx);
         let ctx = egui::Context::default();
         let mut config = VipConfig::new("api");
         config.listeners.push(Listener::new(Protocol::Tcp, 443));

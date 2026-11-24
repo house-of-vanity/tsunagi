@@ -156,10 +156,7 @@ pub(crate) fn is_candidate_ip(addr: std::net::IpAddr) -> bool {
             }
             let segments = v6.segments();
             // Filter link-local fe80::/10
-            if (segments[0] & 0xffc0) == 0xfe80 {
-                return false;
-            }
-            true
+            (segments[0] & 0xffc0) != 0xfe80
         }
     }
 }
@@ -238,6 +235,7 @@ impl TcpTlsConfig {
 pub struct TcpTlsCarrier {
     transport: Arc<TcpTlsTransport>,
     excluded_interface: std::sync::Mutex<Option<String>>,
+    underlay: std::sync::OnceLock<tokio::sync::watch::Receiver<Vec<std::net::IpAddr>>>,
     peers: std::sync::Mutex<
         std::collections::HashMap<(NetworkId, EndpointId), Vec<std::net::SocketAddr>>,
     >,
@@ -248,6 +246,7 @@ impl TcpTlsCarrier {
         Arc::new(Self {
             transport,
             excluded_interface: std::sync::Mutex::new(None),
+            underlay: Default::default(),
             peers: Default::default(),
         })
     }
@@ -256,8 +255,13 @@ impl TcpTlsCarrier {
         Arc::new(Self {
             transport,
             excluded_interface: std::sync::Mutex::new(Some(interface)),
+            underlay: Default::default(),
             peers: Default::default(),
         })
+    }
+    /// Use only the addresses assigned to the OS-selected physical network.
+    pub fn set_underlay(&self, source: tokio::sync::watch::Receiver<Vec<std::net::IpAddr>>) {
+        let _ = self.underlay.set(source);
     }
     fn update_peer(
         &self,
@@ -302,17 +306,23 @@ impl tsunagi::dataplane::transport::DataCarrier for TcpTlsCarrier {
         &self,
         _: NetworkId,
     ) -> Result<Option<tsunagi::dataplane::PluginCapability>, PluginError> {
-        let data = postcard::to_allocvec(&(
-            self.transport.bound_port(),
-            local_ip_candidates_excluding(
+        let ips = match self.underlay.get() {
+            Some(source) => source
+                .borrow()
+                .iter()
+                .copied()
+                .filter(|ip| is_candidate_ip(*ip))
+                .collect(),
+            None => local_ip_candidates_excluding(
                 self.excluded_interface
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .as_deref(),
-            )
-            .into_iter()
-            .take(32)
-            .collect::<Vec<_>>(),
+            ),
+        };
+        let data = postcard::to_allocvec(&(
+            self.transport.bound_port(),
+            ips.into_iter().take(32).collect::<Vec<_>>(),
         ))
         .map_err(|_| PluginError::Other("cannot encode TLS addresses".into()))?;
         Ok(Some(tsunagi::dataplane::PluginCapability {

@@ -6310,12 +6310,36 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tsunagi-awg",
  "tsunagi-core",
+ "tsunagi-runtime",
  "tsunagi-tcp-tls",
  "tsunagi-wg-quic",
  "tsunagi-wireguard",
  "windows-service",
+]
+
+[[package]]
+name = "tsunagi-android"
+version = "1.0.0"
+dependencies = [
+ "bytes",
+ "egui",
+ "egui-phosphor",
+ "egui_glow",
+ "iroh",
+ "jni 0.21.1",
+ "jni 0.22.4",
+ "rand 0.10.3",
+ "rustls-platform-verifier",
+ "simple-dns",
+ "smoltcp",
+ "tempfile",
+ "tokio",
+ "tsunagi-core",
+ "tsunagi-runtime",
+ "tsunagi-ui",
+ "tsunagi-wg-quic",
+ "zeroize",
 ]
 
 [[package]]
@@ -6376,6 +6400,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsunagi-runtime"
+version = "1.0.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tsunagi-awg",
+ "tsunagi-core",
+ "tsunagi-tcp-tls",
+ "tsunagi-wg-quic",
+ "tsunagi-wireguard",
+]
+
+[[package]]
 name = "tsunagi-tcp-tls"
 version = "1.0.0"
 dependencies = [
@@ -6407,7 +6444,18 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "tsunagi-core",
+ "tsunagi-ui",
  "winit",
+]
+
+[[package]]
+name = "tsunagi-ui"
+version = "1.0.0"
+dependencies = [
+ "egui",
+ "egui-phosphor",
+ "tsunagi-core",
+ "zeroize",
 ]
 
 [[package]]

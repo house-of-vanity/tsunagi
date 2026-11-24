@@ -407,6 +407,7 @@ mod tests {
             overlay: vec![range()],
             bypass: vec![Ipv4Addr::new(138, 201, 61, 182)],
             bypass_hosts: vec!["relay.example".into()],
+            ..Default::default()
         }
     }
 

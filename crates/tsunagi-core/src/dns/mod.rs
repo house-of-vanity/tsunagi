@@ -59,6 +59,56 @@ pub fn listen_plan(port: u16) -> ListenPlan {
 pub use server::{DnsServer, SharedZone};
 pub use zone::{Answer, Query, Zone, ZoneError, ZoneName, Zones};
 
+/// Authoritative zones and the publication diagnostics for one agent snapshot.
+pub struct RosterZones {
+    /// Member and service records indexed by zone.
+    pub zones: Zones,
+    /// Zone names in configured-network order.
+    pub labels: Vec<String>,
+    /// Unusable or potentially conflicting zone names.
+    pub warnings: Vec<String>,
+}
+
+impl RosterZones {
+    /// Build the desktop and mobile DNS view from the same signed state.
+    pub fn from_networks(networks: &[crate::NetworkStatus]) -> Self {
+        let mut zones = Vec::new();
+        let mut labels = Vec::new();
+        let mut warnings = Vec::new();
+        for network in networks {
+            let zone = match ZoneName::new(network.name.as_str()) {
+                Ok(zone) => zone,
+                Err(err) => {
+                    warnings.push(format!(
+                        "`{}` cannot be a zone, so its members have no names: {err}",
+                        network.name
+                    ));
+                    continue;
+                }
+            };
+            if let Some(warning) = zone.collision() {
+                warnings.push(warning);
+            }
+            labels.push(zone.as_str().to_string());
+            let members = network
+                .members
+                .iter()
+                .filter_map(|member| Some((member.hostname.clone()?, member.overlay_address_v4?)));
+            let services = network
+                .vips
+                .iter()
+                .filter(|vip| vip.error.is_none())
+                .filter_map(|vip| Some((vip.config.name.clone(), vip.address?)));
+            zones.push(Zone::new(zone, members.chain(services)).with_reverse_range(network.range));
+        }
+        Self {
+            zones: Zones::new(zones),
+            labels,
+            warnings,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

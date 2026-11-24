@@ -14,76 +14,21 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use tokio::sync::mpsc;
 
-use tsunagi::ipc::{self, StatusReport};
+use tsunagi::ipc;
 
 /// How often the worker refreshes status while idle.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// A request from the UI to the agent.
-pub(crate) enum Command {
-    SaveVip {
-        token: String,
-        network_id: String,
-        config: tsunagi::vip::VipConfig,
-        expected: Option<String>,
-        delete: bool,
-    },
-    /// Retire the exact offline-node claim selected in the devices window.
-    ForgetNode {
-        network_id: String,
-        peer: String,
-        expected_version: u64,
-    },
-    /// Replace the network's enabled protocols in preference order.
-    SetProtocols {
-        network_id: String,
-        protocols: Vec<String>,
-    },
-    /// Stop serving a network, or start serving it again.
-    SetActive { network_id: String, active: bool },
-    /// Turn local broadcast participation on or off for a network.
-    SetBroadcast { network_id: String, enabled: bool },
-    /// Offer this device as an exit node in a network, or stop.
-    SetExitOffer { network_id: String, enabled: bool },
-    /// Send all this device's internet traffic through a member of a
-    /// network, or (`None`) back the ordinary way.
-    SetExitNode {
-        network_id: String,
-        peer: Option<String>,
-    },
-    /// Join a network, or start one already configured.
-    Join { name: String, secret: String },
-    /// Leave a network entirely.
-    Leave { network_id: String },
-    /// Change the hostname this device announces.
-    SetHostname(String),
-    /// Fetch a network's shared secret and place it on the clipboard.
-    CopySecret { network_id: String },
-}
+use tsunagi_ui::client::Client;
+pub(crate) use tsunagi_ui::client::{Command, Snapshot, VipSaveResult};
 
-/// The latest the worker knows, read by the UI each frame.
-#[derive(Clone)]
-pub(crate) struct VipSaveResult {
-    pub token: String,
-    pub result: Result<Vec<tsunagi::vip::VipStatus>, String>,
-}
-#[derive(Clone, Default)]
-pub(crate) struct Snapshot {
-    pub vip_result: Option<VipSaveResult>,
-    /// The last status, or the reason it could not be read (agent down, no
-    /// permission on the socket, …).
-    pub status: Option<Result<StatusReport, String>>,
-    /// The outcome of the most recent command, for a transient banner.
-    pub last_action: Option<Result<String, String>>,
-    /// Whether a command is currently being executed.
-    pub busy: bool,
-    /// Bumped each time `status` is refreshed, so the UI can tell new data from
-    /// a repaint of the same data and sample traffic rates only on change.
-    pub generation: u64,
-    /// When this status was read, for computing rates between refreshes.
-    pub at: Option<Instant>,
-    /// The socket the last request went to.
-    pub socket: PathBuf,
+impl Client for AgentClient {
+    fn send(&self, command: Command) {
+        self.send(command);
+    }
+    fn busy(&self) -> bool {
+        lock(&self.shared).busy
+    }
 }
 
 /// Handle the UI holds: send commands, read the latest snapshot.
@@ -97,18 +42,6 @@ pub(crate) struct AgentClient {
 }
 
 impl AgentClient {
-    #[cfg(test)]
-    pub(crate) fn test_client() -> (Self, mpsc::UnboundedReceiver<Command>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (
-            Self {
-                tx,
-                shared: Arc::new(Mutex::new(Snapshot::default())),
-                pending_copy: Arc::new(Mutex::new(None)),
-            },
-            rx,
-        )
-    }
     /// Starts the worker on `runtime`, reporting to `ctx` (for repaints).
     pub(crate) fn spawn(runtime: &tokio::runtime::Handle, ctx: egui::Context) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -203,7 +136,7 @@ async fn refresh(shared: &Arc<Mutex<Snapshot>>, ctx: &egui::Context) {
         .map_err(|err| err.to_string());
     {
         let mut guard = lock(shared);
-        guard.status = Some(status);
+        guard.status = Some(status.map(Arc::new));
         guard.generation = guard.generation.wrapping_add(1);
         guard.at = Some(Instant::now());
         guard.socket = socket;

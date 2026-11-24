@@ -1,0 +1,651 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use super::plan::VpnPlan;
+use std::net::{IpAddr, Ipv4Addr};
+use tsunagi::overlay::Cidr;
+
+fn addr(octet: u8) -> Cidr {
+    Cidr::new(IpAddr::V4(Ipv4Addr::new(10, octet, 42, 19)), 24).unwrap()
+}
+
+#[tokio::test]
+async fn notification_tracks_the_selected_exit_and_a_stale_disconnect_keeps_the_current_route() {
+    use crate::service::{disconnect_exit, exit_notice, report};
+    use tsunagi::{
+        discovery::SharedMemoryDiscovery,
+        testing::{TestAgent, network, wait_until},
+    };
+    let discovery = SharedMemoryDiscovery::new();
+    let phone = TestAgent::spawn(&discovery).await.unwrap();
+    let rules = std::sync::Arc::new(tsunagi::overlay::MockHostRules::new());
+    let tuns = tsunagi::overlay::MemoryTunFactory::new().with_host_rules(rules);
+    let exit = TestAgent::spawn_with(
+        |cfg| cfg.with_interface(std::sync::Arc::new(tuns), "gateway", 1280),
+        &discovery,
+    )
+    .await
+    .unwrap();
+    let (name, secret) = network("travel");
+    let id = phone.agent.join_network(&name, &secret).await.unwrap();
+    exit.agent.set_hostname("gateway").await.unwrap();
+    exit.agent.join_network(&name, &secret).await.unwrap();
+    exit.agent.set_exit_offer(id, true).await.unwrap();
+    let peer = exit.agent.endpoint_id();
+    wait_until("authenticated exit offer", || async {
+        phone
+            .agent
+            .network_status(id)
+            .await
+            .ok()?
+            .peers
+            .iter()
+            .any(|p| p.endpoint_id == peer && p.exit_node)
+            .then_some(())
+    })
+    .await;
+    let dns = crate::dns::Resolver::new(|_| None);
+    assert!(exit_notice(&report(&phone.agent, None, &dns).await.unwrap()).is_none());
+    phone.agent.set_exit_via(id, Some(peer)).await.unwrap();
+    let notice = exit_notice(&report(&phone.agent, None, &dns).await.unwrap()).unwrap();
+    assert_eq!(notice.name, "gateway");
+    assert_eq!(notice.network_name, "travel");
+    assert!(notice.online);
+    disconnect_exit(
+        &phone.agent,
+        &id.to_string(),
+        &phone.agent.endpoint_id().to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        phone.agent.network_status(id).await.unwrap().exit_via,
+        Some(peer)
+    );
+    exit.stop().await;
+    wait_until(
+        "offline exit remains selected in the notification",
+        || async {
+            let report = report(&phone.agent, None, &dns).await.ok()?;
+            exit_notice(&report).filter(|n| !n.online)
+        },
+    )
+    .await;
+    disconnect_exit(&phone.agent, &notice.network, &notice.peer)
+        .await
+        .unwrap();
+    assert!(exit_notice(&report(&phone.agent, None, &dns).await.unwrap()).is_none());
+    assert!(phone.agent.is_active(id).await);
+    phone.stop().await;
+}
+
+#[tokio::test]
+async fn vpn_dns_answers_hosts_and_vips_in_each_zone_and_only_forwards_external_names() {
+    use crate::dns::Resolver;
+    use simple_dns::{CLASS, Name, Packet, PacketFlag, Question, RCODE, TYPE, rdata::RData};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tsunagi::dns::{Zone, ZoneName, Zones};
+
+    fn query(name: &str, kind: TYPE) -> Vec<u8> {
+        let mut packet = Packet::new_query(119);
+        packet.set_flags(PacketFlag::RECURSION_DESIRED);
+        packet.questions.push(Question::new(
+            Name::new(name).unwrap(),
+            kind.into(),
+            CLASS::IN.into(),
+            false,
+        ));
+        packet.build_bytes_vec().unwrap()
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let forwarded = calls.clone();
+    let resolver = Resolver::new(move |wire| {
+        forwarded.fetch_add(1, Ordering::Relaxed);
+        let query = Packet::parse(wire).unwrap();
+        let mut answer = Packet::new_reply(999);
+        answer.questions = query.questions;
+        answer.build_bytes_vec().ok()
+    });
+    let private = query("k8s.tsng", TYPE::A);
+    let answer = resolver.answer(&private).await.unwrap();
+    assert_eq!(
+        Packet::parse(&answer).unwrap().rcode(),
+        RCODE::ServerFailure
+    );
+    let lab = |name, members| Zone::new(ZoneName::new(name).unwrap(), members);
+    resolver.replace(Some(Zones::new([
+        lab(
+            "tsng",
+            vec![
+                ("ai".into(), [10, 1, 1, 100].into()),
+                ("k8s".into(), [10, 1, 1, 106].into()),
+            ],
+        ),
+        lab("lab", vec![("ai".into(), [10, 2, 1, 100].into())]),
+    ])));
+    for (name, ip) in [
+        ("AI.TSNG", [10, 1, 1, 100]),
+        ("k8s.tsng", [10, 1, 1, 106]),
+        ("ai.lab", [10, 2, 1, 100]),
+    ] {
+        let reply = resolver.answer(&query(name, TYPE::A)).await.unwrap();
+        let packet = Packet::parse(&reply).unwrap();
+        assert!(packet.has_flags(PacketFlag::AUTHORITATIVE_ANSWER));
+        assert!(
+            matches!(&packet.answers[0].rdata, RData::A(a) if Ipv4Addr::from(a.address) == Ipv4Addr::from(ip))
+        );
+    }
+    for (name, kind, code) in [
+        ("missing.tsng", TYPE::A, RCODE::NameError),
+        ("k8s.tsng", TYPE::AAAA, RCODE::NoError),
+    ] {
+        let reply = resolver.answer(&query(name, kind)).await.unwrap();
+        let packet = Packet::parse(&reply).unwrap();
+        assert_eq!(packet.rcode(), code);
+        assert!(packet.answers.is_empty());
+        assert!(packet.has_flags(PacketFlag::AUTHORITATIVE_ANSWER));
+    }
+    assert!(resolver.answer(b"invalid").await.is_none());
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    let reply = resolver
+        .answer(&query("example.org", TYPE::HTTPS))
+        .await
+        .unwrap();
+    let packet = Packet::parse(&reply).unwrap();
+    assert_eq!(packet.id(), 119);
+    assert_eq!(packet.questions[0].qtype, TYPE::HTTPS.into());
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn local_dns_address_is_routed_and_cannot_claim_an_overlay_ip() {
+    let mut plan = VpnPlan {
+        addresses: vec![addr(1)],
+        ..Default::default()
+    };
+    let dns = plan.dns_address().unwrap();
+    assert!(plan.routes().contains(&format!("{dns}/32")));
+    plan.addresses.push(Cidr::new(dns.into(), 24).unwrap());
+    let other = plan.dns_address().unwrap();
+    assert_ne!(other, dns);
+    assert!(plan.routes().contains(&format!("{other}/32")));
+    plan.addresses.clear();
+    assert!(plan.dns_address().is_none());
+}
+
+#[tokio::test]
+async fn service_dns_tracks_signed_hostnames_vip_deletion_and_reverse_ranges() {
+    use tsunagi::{
+        Agent,
+        dns::{Answer, Query, RosterZones},
+        testing,
+        vip::VipConfig,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let agent = Agent::spawn(testing::local_config(dir.path()))
+        .await
+        .unwrap();
+    let (network, secret) = testing::network("tsng");
+    let id = agent.join_network(&network, &secret).await.unwrap();
+    agent.set_hostname("worker").await.unwrap();
+    let vip = agent
+        .save_vip(id, VipConfig::new("k8s"), None, false)
+        .await
+        .unwrap()
+        .remove(0);
+    let status = agent.status().await.unwrap();
+    let roster = RosterZones::from_networks(&status.networks);
+    let worker = status.networks[0]
+        .members
+        .iter()
+        .find(|m| m.hostname.as_deref() == Some("worker"))
+        .unwrap()
+        .overlay_address_v4
+        .unwrap();
+    for (name, ip) in [("worker.tsng", worker), ("k8s.tsng", vip.address.unwrap())] {
+        assert_eq!(
+            roster.zones.lookup(name, Query::A).unwrap().1,
+            Answer::Addresses(vec![ip])
+        );
+        let [a, b, c, d] = ip.octets();
+        assert_eq!(
+            roster
+                .zones
+                .lookup(&format!("{d}.{c}.{b}.{a}.in-addr.arpa"), Query::Ptr)
+                .unwrap()
+                .1,
+            Answer::Name(name.into())
+        );
+    }
+    assert!(
+        roster
+            .zones
+            .lookup("8.8.8.8.in-addr.arpa", Query::Ptr)
+            .is_none()
+    );
+    agent
+        .save_vip(id, vip.config, Some(vip.revision), true)
+        .await
+        .unwrap();
+    let zones = RosterZones::from_networks(&agent.status().await.unwrap().networks).zones;
+    assert_eq!(
+        zones.lookup("k8s.tsng", Query::A).unwrap().1,
+        Answer::NoSuchName
+    );
+    agent.shutdown().await;
+}
+
+#[test]
+fn changing_the_exit_keeps_every_mesh_route_and_prefers_the_selected_source() {
+    let first = addr(2);
+    let second = addr(5);
+    let mut plan = VpnPlan {
+        addresses: vec![first, second],
+        mtu: 1280,
+        ..Default::default()
+    };
+    assert_eq!(
+        plan.routes(),
+        ["10.2.42.0/24", "10.5.42.0/24", "192.0.2.53/32"]
+    );
+    assert_eq!(plan.addresses_in_order(), [first, second]);
+    plan.full_tunnel = true;
+    plan.exit = Some(second.addr);
+    assert_eq!(plan.addresses_in_order(), [second, first]);
+    assert!(plan.routes().contains(&"0.0.0.0/0".into()));
+    assert!(plan.routes().contains(&"10.2.42.0/24".into()));
+    plan.full_tunnel = false;
+    plan.exit = None;
+    plan.addresses.remove(0);
+    assert_eq!(plan.routes(), ["10.5.42.0/24", "192.0.2.53/32"]);
+}
+
+#[test]
+fn broadcast_route_is_only_present_when_requested() {
+    let mut plan = VpnPlan {
+        addresses: vec![addr(1)],
+        mtu: 1280,
+        ..Default::default()
+    };
+    plan.broadcast = true;
+    assert!(plan.routes().contains(&"255.255.255.255/32".into()));
+    plan.broadcast = false;
+    assert_eq!(plan.routes(), ["10.1.42.0/24", "192.0.2.53/32"]);
+}
+
+#[tokio::test]
+async fn all_four_desktop_carriers_register_and_each_network_keeps_its_preference() {
+    use tsunagi::{Agent, testing};
+    use tsunagi_runtime::{Carriers, PROTOCOLS};
+    let dir = tempfile::tempdir().unwrap();
+    let names = ["wg", "awg", "wg-quic", "tcp-tls"];
+    let (network, secret) = testing::network("carriers");
+    for restart in [false, true] {
+        let config = testing::local_config(dir.path());
+        let (config, carriers) = Carriers::configure(config, &[], None, |spec| {
+            if spec.name == "tcp-tls" {
+                vec![("port".into(), "0".into())]
+            } else {
+                Vec::new()
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            config
+                .carriers
+                .iter()
+                .map(|c| c.protocol_id())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert!(
+            config
+                .carriers
+                .iter()
+                .zip(PROTOCOLS)
+                .all(|(c, spec)| c.protocol_version() == spec.version)
+        );
+        let agent = Agent::spawn(config).await.unwrap();
+        let _listeners = carriers.listen(&agent);
+        let id = agent.join_network(&network, &secret).await.unwrap();
+        let saved = agent.network_status(id).await.unwrap().protocols;
+        if restart {
+            assert_eq!(saved, ["tcp-tls", "wg"]);
+        } else {
+            assert_eq!(saved, names);
+            agent
+                .set_protocols(id, vec!["tcp-tls".into(), "wg".into()])
+                .await
+                .unwrap();
+            let (other, secret) = testing::network("other");
+            let second = agent.join_network(&other, &secret).await.unwrap();
+            assert_eq!(agent.network_status(second).await.unwrap().protocols, names);
+        }
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn commands_scope_vip_edits_and_leaving_to_the_selected_network() {
+    use crate::service::apply;
+    use tsunagi::vip::VipConfig;
+    use tsunagi::{Agent, NetworkName, NetworkSecret, testing};
+    use tsunagi_ui::client::Command;
+    let dir = tempfile::tempdir().unwrap();
+    let agent = Agent::spawn(testing::local_config(dir.path()))
+        .await
+        .unwrap();
+    let name = NetworkName::new("shared-name").unwrap();
+    let one = NetworkSecret::generate();
+    let two = NetworkSecret::generate();
+    for secret in [&one, &two] {
+        apply(
+            Command::Join {
+                name: name.to_string(),
+                secret: secret.encode(),
+            },
+            &agent,
+        )
+        .await
+        .unwrap();
+    }
+    let first = tsunagi::identity::NetworkKeys::derive(&name, &one)
+        .network_id()
+        .to_string();
+    let second = tsunagi::identity::NetworkKeys::derive(&name, &two).network_id();
+    let config = VipConfig::new("web");
+    let save = |expected, delete| Command::SaveVip {
+        token: "draft".into(),
+        network_id: first.clone(),
+        config: config.clone(),
+        expected,
+        delete,
+    };
+    apply(save(None, false), &agent).await.unwrap();
+    assert!(
+        apply(save(Some("stale".into()), true), &agent)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        agent
+            .network_status(first.parse().unwrap())
+            .await
+            .unwrap()
+            .vips
+            .len(),
+        1
+    );
+    assert!(agent.network_status(second).await.unwrap().vips.is_empty());
+    assert!(
+        apply(
+            Command::SetExitNode {
+                network_id: second.to_string(),
+                peer: Some(agent.endpoint_id().to_string())
+            },
+            &agent
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        apply(
+            Command::SetExitOffer {
+                network_id: second.to_string(),
+                enabled: true
+            },
+            &agent
+        )
+        .await
+        .is_err()
+    );
+    apply(Command::Leave { network_id: first }, &agent)
+        .await
+        .unwrap();
+    let saved = agent.list_networks().await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].network_id, second);
+    agent.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn tun_reader_survives_address_changes_failed_establish_and_last_network_leaving() {
+    use std::io;
+    use std::os::{fd::OwnedFd, unix::net::UnixDatagram};
+    use std::sync::{Arc, Mutex};
+    use tsunagi::overlay::{TunFactory, TunRequest};
+    let sockets = Arc::new(Mutex::new(Vec::new()));
+    let peers = sockets.clone();
+    let factory = crate::tun::AndroidTun::new(
+        crate::dns::Resolver::new(|_| None),
+        move |plan| {
+            if plan.addresses.contains(&addr(9)) {
+                return Err(io::Error::other("permission revoked"));
+            }
+            let (dev, os) = UnixDatagram::pair()?;
+            dev.set_nonblocking(true)?;
+            peers.lock().unwrap().push(os);
+            Ok(OwnedFd::from(dev).into())
+        },
+        |_, _| Ok(()),
+    );
+    let mut req = TunRequest::bare("tsun0", 1280);
+    let dev = factory.create(req.clone()).await.unwrap();
+    let reader = tokio::spawn({
+        let dev = dev.clone();
+        async move { dev.recv().await.unwrap() }
+    });
+    req.addresses = vec![addr(2)];
+    factory.reconfigure(req.clone()).await.unwrap();
+    assert_eq!(factory.assigned_addresses(), [addr(2).addr]);
+    req.addresses.push(addr(9));
+    assert!(factory.reconfigure(req.clone()).await.is_err());
+    assert_eq!(factory.assigned_addresses(), [addr(2).addr]);
+    sockets
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .send(b"first")
+        .unwrap();
+    assert_eq!(
+        &tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .unwrap()
+            .unwrap()[..],
+        b"first"
+    );
+    req.addresses.clear();
+    factory.reconfigure(req.clone()).await.unwrap();
+    assert!(
+        dev.send(bytes::Bytes::from_static(b"offline"))
+            .await
+            .is_err()
+    );
+    assert!(factory.assigned_addresses().is_empty());
+    req.addresses = vec![addr(5)];
+    factory.reconfigure(req).await.unwrap();
+    sockets
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .send(b"second")
+        .unwrap();
+    assert_eq!(&dev.recv().await.unwrap()[..], b"second");
+}
+
+#[tokio::test]
+async fn phone_metadata_rows_use_text_line_height_in_a_portrait_view() {
+    use crate::{
+        service::{State, report},
+        view::{Phone, configure},
+    };
+    use egui::epaint::Shape;
+    use std::{sync::Arc, time::Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let agent = tsunagi::Agent::spawn(tsunagi::testing::local_config(dir.path()))
+        .await
+        .unwrap();
+    let (name, secret) = tsunagi::testing::network("layout");
+    agent.join_network(&name, &secret).await.unwrap();
+    let mut sample = report(&agent, None, &crate::dns::Resolver::new(|_| None))
+        .await
+        .unwrap();
+    sample.networks[0].overlay = Some(tsunagi::ipc::OverlayReport {
+        address: Some("10.1.2.3".into()),
+        ..Default::default()
+    });
+    let state = State::Ready(Arc::new(sample), Instant::now());
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let mut phone = Phone::default();
+    let frame = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(360., 720.),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            phone.draw(ctx, &state, |_| {
+                panic!("drawing the overview issued a command")
+            });
+        },
+    );
+    let y = |label: &str| {
+        frame
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.text() == label => Some(text.pos.y),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing label {label}"))
+    };
+    assert!((0.0..=26.0).contains(&(y("host") - y("device"))));
+    assert!((0.0..=26.0).contains(&(y("range") - y("id"))));
+    assert!((0.0..=26.0).contains(&(y("peers") - y("addr"))));
+    agent.shutdown().await;
+}
+
+#[test]
+fn portrait_navigation_opens_the_tray_vip_overview_and_draft_without_writing() {
+    use crate::service::State;
+    use crate::view::{Phone, configure};
+    use egui::{Event, PointerButton, Pos2, RawInput, Rect, Shape};
+    use std::{sync::Arc, time::Instant};
+    use tsunagi::{
+        ipc::{NetworkReport, StatusReport},
+        vip::{
+            Backend, BackendStatus, Counters, Listener, ListenerStatus, Protocol, VipConfig,
+            VipStatus,
+        },
+    };
+    let backend = Backend {
+        peer: "node".into(),
+        port: 8080,
+    };
+    let mut config = VipConfig::new("web");
+    let mut listener = Listener::new(Protocol::Tcp, 80);
+    listener.backends.push(backend.clone());
+    config.listeners.push(listener);
+    let network = NetworkReport {
+        active: true,
+        name: "lab".into(),
+        network_id: "network".into(),
+        vips: vec![VipStatus {
+            config,
+            address: None,
+            revision: "r1".into(),
+            error: None,
+            listeners: vec![ListenerStatus {
+                protocol: Protocol::Tcp,
+                port: 80,
+                selected: Some(backend.clone()),
+                counters: Counters::default(),
+                backends: vec![BackendStatus {
+                    backend,
+                    state: "ready".into(),
+                    rtt_us: Some(1000),
+                    measurement_age_ms: Some(1),
+                    active_flows: 1,
+                    counters: Counters::default(),
+                }],
+            }],
+        }],
+        ..Default::default()
+    };
+    let state = State::Ready(
+        Arc::new(StatusReport {
+            networks: vec![network],
+            ..Default::default()
+        }),
+        Instant::now(),
+    );
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let mut phone = Phone::default();
+    let mut frame = |events| {
+        ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(360., 800.))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                phone.draw(ctx, &state, |_| panic!("navigation wrote to the network"));
+            },
+        )
+    };
+    let position = |output: &egui::FullOutput, label: &str| {
+        output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                Shape::Text(t) if t.galley.text() == label => {
+                    Some(t.pos + t.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {label}"))
+    };
+    let mut click = |label: &str| {
+        frame(vec![]);
+        let p = position(&frame(vec![]), label);
+        for pressed in [true, false] {
+            frame(vec![
+                Event::PointerMoved(p),
+                Event::PointerButton {
+                    pos: p,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]);
+        }
+        frame(vec![])
+    };
+    let live = click("VIP");
+    for label in ["Overview", "Configuration", "Next new flow", "node:8080"] {
+        let p = position(&live, label);
+        assert!(
+            (0.0..360.0).contains(&p.x),
+            "{label} is outside the portrait view"
+        );
+    }
+    let editor = click("Configuration");
+    for label in [
+        "Active TCP port checks",
+        "Checks and flow expiry",
+        "+ Backend",
+        "+ Listener",
+    ] {
+        position(&editor, label);
+    }
+}

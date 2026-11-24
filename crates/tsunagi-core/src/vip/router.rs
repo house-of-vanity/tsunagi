@@ -92,18 +92,20 @@ type CheckKey = (NetworkId, EndpointId, Ipv4Addr, Protocol, u16);
 /// A bounded TCP connect check prepared off the packet path.
 pub(crate) struct CheckJob {
     key: CheckKey,
+    source: Ipv4Addr,
     timeout: Duration,
 }
 impl CheckJob {
-    pub async fn run(self) -> (Self, bool) {
-        let ok = matches!(
-            tokio::time::timeout(
-                self.timeout,
-                tokio::net::TcpStream::connect((self.key.2, self.key.4))
-            )
-            .await,
-            Ok(Ok(_))
-        );
+    pub async fn run(
+        self,
+        bind: impl FnOnce(&tokio::net::TcpSocket, Ipv4Addr) -> std::io::Result<()>,
+    ) -> (Self, bool) {
+        let connect = async {
+            let socket = tokio::net::TcpSocket::new_v4()?;
+            bind(&socket, self.source)?;
+            socket.connect((self.key.2, self.key.4).into()).await
+        };
+        let ok = matches!(tokio::time::timeout(self.timeout, connect).await, Ok(Ok(_)));
         (self, ok)
     }
 }
@@ -396,6 +398,7 @@ impl VipRouter {
             for (l, b) in listeners {
                 let key = (network, peer, address, l.protocol, b.port);
                 wanted_checks.insert(key);
+                let Some(source) = source else { continue };
                 if l.protocol != Protocol::Tcp || !l.port_check {
                     continue;
                 }
@@ -412,6 +415,7 @@ impl VipRouter {
                 {
                     jobs.push(CheckJob {
                         key,
+                        source,
                         timeout: Duration::from_millis(u64::from(l.check_timeout_ms)),
                     });
                 }
@@ -1079,6 +1083,38 @@ mod tests {
         assert_eq!(packet::tuple(&reply), Some(t.reverse()));
     }
     #[tokio::test]
+    async fn tcp_check_connects_only_after_the_overlay_socket_is_bound() {
+        use std::io;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_, network, local, _, _, _) = fixture(Protocol::Tcp);
+        let server = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = server.local_addr().unwrap().port();
+        let job = || CheckJob {
+            key: (network, local, Ipv4Addr::LOCALHOST, Protocol::Tcp, port),
+            source: Ipv4Addr::LOCALHOST,
+            timeout: Duration::from_secs(1),
+        };
+        let called = AtomicUsize::new(0);
+        let (_, ok) = job()
+            .run(|_, source| {
+                assert_eq!(source, Ipv4Addr::LOCALHOST);
+                called.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::other("VPN replaced"))
+            })
+            .await;
+        assert!(!ok);
+        assert_eq!(called.load(Ordering::Relaxed), 1);
+        let (_, ok) = job()
+            .run(|socket, source| socket.bind((source, 0).into()))
+            .await;
+        assert!(ok);
+        let (_, peer) = server.accept().await.unwrap();
+        assert_eq!(peer.ip(), Ipv4Addr::LOCALHOST);
+    }
+
+    #[tokio::test]
     async fn active_tcp_port_checks_recover_after_a_real_listener_appears() {
         let (r, n, local, _, _, _) = fixture(Protocol::Tcp);
         let server = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1099,7 +1135,7 @@ mod tests {
         }
         let (_, jobs) = r.tick(32);
         for job in jobs {
-            let (job, ok) = job.run().await;
+            let (job, ok) = job.run(|_, _| Ok(())).await;
             assert!(ok);
             r.checked(job, ok);
         }
@@ -1112,7 +1148,7 @@ mod tests {
         }
         let (_, jobs) = r.tick(32);
         for job in jobs {
-            let (job, ok) = job.run().await;
+            let (job, ok) = job.run(|_, _| Ok(())).await;
             assert!(!ok);
             r.checked(job, ok);
         }
@@ -1127,7 +1163,7 @@ mod tests {
         }
         let (_, jobs) = r.tick(32);
         for job in jobs {
-            let (job, ok) = job.run().await;
+            let (job, ok) = job.run(|_, _| Ok(())).await;
             r.checked(job, ok);
         }
         assert!(r.statuses(n)[0].listeners[0].selected.is_some());

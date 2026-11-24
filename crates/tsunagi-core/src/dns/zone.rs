@@ -208,6 +208,7 @@ pub enum Answer {
 #[derive(Debug, Clone)]
 pub struct Zone {
     origin: ZoneName,
+    reverse_range: Option<crate::state::Ipv4Range>,
     /// Name relative to the origin, to the addresses it answers to.
     hosts: BTreeMap<String, Vec<Ipv4Addr>>,
     /// Address to the name that holds it.
@@ -246,10 +247,21 @@ impl Zone {
         let serial = content_serial(&hosts);
         Self {
             origin,
+            // Standalone authoritative zones retain their original broad PTR view.
+            // Agent snapshots scope the authority to each network's actual range.
+            reverse_range: Some(crate::state::Ipv4Range {
+                base: Ipv4Addr::UNSPECIFIED,
+                prefix_len: 0,
+            }),
             hosts,
             names,
             serial,
         }
+    }
+
+    pub(super) fn with_reverse_range(mut self, range: Option<crate::state::Ipv4Range>) -> Self {
+        self.reverse_range = range;
+        self
     }
 
     /// The zone's origin.
@@ -300,6 +312,12 @@ impl Zone {
     /// Answers one question.
     pub fn lookup(&self, qname: &str, query: Query) -> Answer {
         if let Some(address) = reverse_address(qname) {
+            if !self
+                .reverse_range
+                .is_some_and(|range| range.contains(address))
+            {
+                return Answer::NotOurs;
+            }
             return match self.names.get(&address) {
                 Some(name) if query == Query::Ptr => {
                     Answer::Name(format!("{name}.{}", self.origin.as_str()))

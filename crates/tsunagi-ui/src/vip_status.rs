@@ -2,7 +2,6 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use eframe::egui;
 use tsunagi::ipc::NetworkReport;
 use tsunagi::vip::{Backend, BackendStatus, Counters, ListenerStatus, Protocol, VipStatus};
 
@@ -61,12 +60,14 @@ fn key(v: &VipStatus, l: &ListenerStatus, b: &Backend) -> Key {
     )
 }
 struct Camera {
+    layout_width: f32,
     rect: egui::Rect,
     members: Vec<Backend>,
 }
 impl Default for Camera {
     fn default() -> Self {
         Self {
+            layout_width: 0.0,
             rect: egui::Rect::NOTHING,
             members: Vec::new(),
         }
@@ -450,21 +451,36 @@ fn diagram(
         .entry((v.config.id.clone(), l.protocol.to_string(), l.port))
         .or_default();
     let members: Vec<_> = l.backends.iter().map(|b| b.backend.clone()).collect();
-    let height = (members.len().max(1) as f32 * 92.0 + 32.0).max(180.0);
-    let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(860.0, height));
-    if camera.members != members || !camera.rect.is_positive() {
+    let compact = ui.available_width() < 540.0;
+    let width = if compact {
+        ui.available_width().max(240.0)
+    } else {
+        860.0
+    };
+    let pitch = if compact { 66.0 } else { 92.0 };
+    let height = (members.len().max(1) as f32 * pitch + 32.0).max(160.0);
+    let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+    if camera.members != members
+        || !camera.rect.is_positive()
+        || (camera.layout_width - width).abs() > 1.0
+    {
         camera.rect = bounds;
+        camera.layout_width = width;
         camera.members = members;
     }
     ui.horizontal_wrapped(|ui| {
         legend(ui, "Traffic", ACTIVE, true);
         legend(ui, "Next new flow", NEXT, false);
-        ui.weak("Click a backend · drag to pan · Ctrl+scroll to zoom");
+        ui.weak(if compact {
+            "Tap a backend · pinch to zoom"
+        } else {
+            "Click a backend · drag to pan · Ctrl+scroll to zoom"
+        });
         if ui.small_button("Fit").clicked() {
             camera.rect = bounds;
         }
     });
-    let size = egui::vec2(ui.available_width(), height.clamp(180.0, 360.0));
+    let size = egui::vec2(ui.available_width(), height.clamp(160.0, 360.0));
     let (outer, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     ui.painter()
         .rect_filled(outer, 6.0, ui.visuals().extreme_bg_color);
@@ -475,12 +491,19 @@ fn diagram(
         .show(&mut child, &mut camera.rect, |ui| {
             ui.set_min_size(bounds.size());
             let center = height / 2.0;
-            let source =
-                egui::Rect::from_min_size(egui::pos2(18.0, center - 32.0), egui::vec2(204.0, 64.0));
-            let listener = egui::Rect::from_min_size(
-                egui::pos2(290.0, center - 32.0),
-                egui::vec2(146.0, 64.0),
-            );
+            let rect = |x, y, w, h| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+            let (source, listener) = if compact {
+                let w = width * 0.40;
+                (
+                    rect(8.0, center - 65.0, w, 52.0),
+                    rect(8.0, center + 12.0, w, 52.0),
+                )
+            } else {
+                (
+                    rect(18.0, center - 32.0, 204.0, 64.0),
+                    rect(290.0, center - 32.0, 146.0, 64.0),
+                )
+            };
             let active = l.backends.iter().any(|b| {
                 view.backends
                     .get(&key(v, l, &b.backend))
@@ -488,8 +511,16 @@ fn diagram(
             });
             edge(
                 ui,
-                source.right_center(),
-                listener.left_center(),
+                if compact {
+                    source.center_bottom()
+                } else {
+                    source.right_center()
+                },
+                if compact {
+                    listener.center_top()
+                } else {
+                    listener.left_center()
+                },
                 if active { ACTIVE } else { NEXT },
                 active,
             );
@@ -513,10 +544,16 @@ fn diagram(
                 let key = key(v, l, &b.backend);
                 let rates = view.backends.get(&key);
                 let state = branch(l, b, rates, Instant::now());
-                let rect = egui::Rect::from_min_size(
-                    egui::pos2(558.0, 24.0 + index as f32 * 92.0),
-                    egui::vec2(278.0, 68.0),
-                );
+                let rect = if compact {
+                    rect(
+                        width * 0.51,
+                        10.0 + index as f32 * pitch,
+                        width * 0.49 - 8.0,
+                        56.0,
+                    )
+                } else {
+                    rect(558.0, 24.0 + index as f32 * pitch, 278.0, 68.0)
+                };
                 let color = if state.active {
                     ACTIVE
                 } else if state.next {
@@ -575,7 +612,7 @@ fn diagram(
             }
             if l.backends.is_empty() {
                 ui.painter().text(
-                    egui::pos2(570.0, center),
+                    egui::pos2(if compact { width * 0.52 } else { 570.0 }, center),
                     egui::Align2::LEFT_CENTER,
                     "No backends",
                     egui::FontId::proportional(15.0),
@@ -648,14 +685,15 @@ fn text_line(
     painter.galley(position, painter.layout_job(job), color);
 }
 fn edge(ui: &egui::Ui, start: egui::Pos2, end: egui::Pos2, color: egui::Color32, active: bool) {
-    let bend = (end.x - start.x) * 0.5;
+    let delta = end - start;
+    let direction = if delta.x.abs() < 1.0 {
+        egui::Vec2::Y
+    } else {
+        egui::Vec2::X
+    };
+    let bend = direction * delta.dot(direction) * 0.5;
     let curve = egui::epaint::CubicBezierShape::from_points_stroke(
-        [
-            start,
-            start + egui::vec2(bend, 0.0),
-            end - egui::vec2(bend, 0.0),
-            end,
-        ],
+        [start, start + bend, end - bend, end],
         false,
         egui::Color32::TRANSPARENT,
         egui::Stroke::new(if active { 3.0_f32 } else { 1.5_f32 }, color),
@@ -668,8 +706,8 @@ fn edge(ui: &egui::Ui, start: egui::Pos2, end: egui::Pos2, color: egui::Color32,
         ui.ctx().request_repaint_after(Duration::from_millis(40));
     }
     ui.painter().arrow(
-        end - egui::vec2(12.0, 0.0),
-        egui::vec2(10.0, 0.0),
+        end - direction * 12.0,
+        direction * 10.0,
         egui::Stroke::new(1.5_f32, color),
     );
 }
@@ -859,7 +897,7 @@ mod tests {
         let (n, v) = fixture();
         let ctx = egui::Context::default();
         let mut view = View::default();
-        for width in [650.0, 1000.0, 1800.0, 650.0] {
+        for width in [360.0, 412.0, 650.0, 1000.0, 1800.0, 360.0] {
             for _ in 0..2 {
                 let _ = ctx.run(
                     egui::RawInput {

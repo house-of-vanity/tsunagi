@@ -4,11 +4,9 @@
 //! half is whatever the agent says about itself, so a client and an agent that
 //! are not the same build show up as such.
 
-use eframe::egui;
-
 use tsunagi::ipc::{PrivilegeReport, StatusReport};
 
-use crate::agent::Snapshot;
+use crate::client::Snapshot;
 use crate::format;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
@@ -16,7 +14,7 @@ const AUTHOR: &str = "AB <tsunagi@hexor.cy>";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Draws the window body into its viewport.
-pub(crate) fn show(ctx: &egui::Context, socket: &std::path::Path, snapshot: &Snapshot) {
+pub fn show(ctx: &egui::Context, socket: Option<&std::path::Path>, snapshot: &Snapshot) {
     egui::CentralPanel::default().show(ctx, |ui| {
         // Long paths and a taller agent table must scroll rather than be cut.
         egui::ScrollArea::both()
@@ -25,7 +23,7 @@ pub(crate) fn show(ctx: &egui::Context, socket: &std::path::Path, snapshot: &Sna
     });
 }
 
-fn body(ui: &mut egui::Ui, socket: &std::path::Path, snapshot: &Snapshot) {
+fn body(ui: &mut egui::Ui, socket: Option<&std::path::Path>, snapshot: &Snapshot) {
     {
         ui.horizontal(|ui| {
             ui.heading("tsunagi");
@@ -61,11 +59,13 @@ fn body(ui: &mut egui::Ui, socket: &std::path::Path, snapshot: &Snapshot) {
 
         ui.add_space(8.0);
         section(ui, "agent");
-        let socket = socket.display().to_string();
+        let socket = socket.map(|p| p.display().to_string());
         match &snapshot.status {
             None => {
                 grid(ui, "about agent", |ui| {
-                    row(ui, "socket", |ui| format::copy_field(ui, &socket, &socket));
+                    if let Some(socket) = &socket {
+                        row(ui, "socket", |ui| format::copy_field(ui, socket, socket));
+                    }
                     row(ui, "state", |ui| {
                         ui.label("connecting…");
                     });
@@ -73,7 +73,9 @@ fn body(ui: &mut egui::Ui, socket: &std::path::Path, snapshot: &Snapshot) {
             }
             Some(Err(error)) => {
                 grid(ui, "about agent", |ui| {
-                    row(ui, "socket", |ui| format::copy_field(ui, &socket, &socket));
+                    if let Some(socket) = &socket {
+                        row(ui, "socket", |ui| format::copy_field(ui, socket, socket));
+                    }
                     row(ui, "state", |ui| {
                         ui.colored_label(egui::Color32::from_rgb(0xd8, 0x4a, 0x3a), "unreachable");
                     });
@@ -82,14 +84,16 @@ fn body(ui: &mut egui::Ui, socket: &std::path::Path, snapshot: &Snapshot) {
                     });
                 });
             }
-            Some(Ok(report)) => agent_table(ui, &socket, report),
+            Some(Ok(report)) => agent_table(ui, socket.as_deref(), report),
         }
     }
 }
 
-fn agent_table(ui: &mut egui::Ui, socket: &str, report: &StatusReport) {
+fn agent_table(ui: &mut egui::Ui, socket: Option<&str>, report: &StatusReport) {
     grid(ui, "about agent", |ui| {
-        row(ui, "socket", |ui| format::copy_field(ui, socket, socket));
+        if let Some(socket) = socket {
+            row(ui, "socket", |ui| format::copy_field(ui, socket, socket));
+        }
         row(ui, "state", |ui| {
             ui.colored_label(egui::Color32::from_rgb(0x3c, 0xb0, 0x4a), "connected");
         });
@@ -134,7 +138,11 @@ fn agent_table(ui: &mut egui::Ui, socket: &str, report: &StatusReport) {
                 ui.weak("unknown");
             }
             PrivilegeReport::Available => {
-                ui.label("can be managed (CAP_NET_ADMIN)");
+                ui.label(if socket.is_some() {
+                    "can be managed (CAP_NET_ADMIN)"
+                } else {
+                    "Android VPN service"
+                });
             }
             PrivilegeReport::Missing(_) => {
                 ui.colored_label(egui::Color32::from_rgb(0xd8, 0x9a, 0x2a), "no privileges");

@@ -1,6 +1,5 @@
 //! Fixed row geometry for dense live tables. Children cannot resize a row or
 //! paint into its neighbours; the enclosing scroll area owns overflow.
-use eframe::egui;
 
 pub(crate) const GAP: f32 = 10.0;
 

@@ -15,11 +15,7 @@ use crate::devices;
 use crate::stats::Traffic;
 use crate::ui::{self, UiState};
 
-fn app_fonts() -> egui::FontDefinitions {
-    let mut fonts = egui::FontDefinitions::default();
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    fonts
-}
+use tsunagi_ui::app_fonts;
 
 /// The window's state.
 pub(crate) struct App {
@@ -140,7 +136,7 @@ impl App {
             egui::ViewportId::from_hash_of("about"),
             builder,
             |vctx, _class| {
-                about::show(vctx, &socket, snapshot);
+                about::show(vctx, Some(&socket), snapshot);
                 !vctx.input(|i| i.viewport().close_requested())
             },
         );
