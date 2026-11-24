@@ -1,9 +1,7 @@
 name: Release
 
-# GitHub version of the release pipeline. The build half mirrors the Gitea one
-# in .gitea/workflows/release.yml (static musl Linux via cargo-zigbuild, native
-# macOS and Windows); only the publish half differs: it uses the current
-# artifact actions (Node 24) and fills the release with `gh`.
+# Desktop builds mirror .gitea/workflows/release.yml. GitHub also builds and
+# signs the Android APK and attaches all platform packages to the tag with gh.
 #
 # Every job is gated on `github.server_url == 'https://github.com'`, so this file
 # runs only on GitHub. Gitea runs its own copy in .gitea/workflows (which pins
@@ -276,9 +274,77 @@ jobs:
             tsunagi-setup-*.exe
           if-no-files-found: error
 
+  android:
+    name: Android ARM64 APK
+    if: ${{ github.server_url == 'https://github.com' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      NDK_VERSION: '30.0.16248370'
+      BUILD_TOOLS_VERSION: '36.0.0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm64-${{ env.NDK_VERSION }}
+
+      - name: Install Android build tools
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            'platforms;android-35' "build-tools;$BUILD_TOOLS_VERSION" "ndk;$NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          cargo install --locked --version 4.1.2 cargo-ndk
+
+      - name: Build the ARM64 release APK
+        run: |
+          android/gradlew -p android --no-daemon :app:assembleRelease \
+            "-PtsunagiVersionName=${GITHUB_REF_NAME#v}" "-PtsunagiVersionCode=$GITHUB_RUN_NUMBER"
+
+      - name: Sign the APK
+        id: sign
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_KEYSTORE_BASE64:?Set the ANDROID_KEYSTORE_BASE64 Actions secret}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Set the ANDROID_KEYSTORE_PASSWORD Actions secret}"
+          umask 077
+          keystore=$(mktemp "$RUNNER_TEMP/tsunagi-keystore.XXXXXXXX")
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          apk="$RUNNER_TEMP/tsunagi-android-${GITHUB_REF_NAME#v}-arm64-v8a.apk"
+          "$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner" sign \
+            --ks "$keystore" --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --v4-signing-enabled false --out "$apk" android/app/build/outputs/apk/release/app-release-unsigned.apk
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: Test the signed APK
+        env:
+          APK: ${{ steps.sign.outputs.apk }}
+        run: |
+          bash android/test-release-apk.sh "$APK" "${GITHUB_REF_NAME#v}" "$GITHUB_RUN_NUMBER" \
+            "$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tsunagi-android
+          path: ${{ steps.sign.outputs.apk }}
+          if-no-files-found: error
+
   publish:
     name: Publish release
-    needs: build
+    needs: [build, android]
     if: ${{ github.server_url == 'https://github.com' }}
     runs-on: ubuntu-latest
     permissions:
@@ -303,6 +369,9 @@ jobs:
           # download-artifact nests each artifact under its own directory, so
           # the archives are artifacts/<asset>/<file>.
           mapfile -t files < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.pkg.tar.zst' -o -name 'tsunagi-setup-*.exe' \))
+          apk="artifacts/tsunagi-android/tsunagi-android-${TAG#v}-arm64-v8a.apk"
+          [[ -s "$apk" ]] || { echo "::error::Missing release APK at $apk"; exit 1; }
+          files+=("$apk")
           printf 'asset: %s\n' "${files[@]}"
 
           prerelease=()

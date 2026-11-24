@@ -7,6 +7,13 @@ def abi = 'arm64-v8a'
 android {
     namespace 'cy.hexor.tsunagi'
     compileSdk 35
+    def cargoNdk = providers.environmentVariable('ANDROID_NDK_HOME')
+    if (cargoNdk.isPresent()) {
+        ndkPath = cargoNdk.get()
+        def ndkProperties = new Properties()
+        file("$ndkPath/source.properties").withInputStream { ndkProperties.load(it) }
+        ndkVersion = ndkProperties.getProperty('Pkg.Revision')
+    }
 
     // Cargo also builds standalone cdylibs for these dependencies. Their code
     // is linked into tsunagi_android; the JVM loads only the application library.
@@ -15,8 +22,8 @@ android {
         applicationId 'cy.hexor.tsunagi'
         minSdk 26
         targetSdk 35
-        versionCode 1
-        versionName '1.0.0'
+        versionCode providers.gradleProperty('tsunagiVersionCode').getOrElse('1').toInteger()
+        versionName providers.gradleProperty('tsunagiVersionName').getOrElse('1.0.0')
         ndk { abiFilters abi }
     }
 }

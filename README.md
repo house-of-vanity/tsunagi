@@ -64,6 +64,7 @@ Grab a build from the [latest release](https://github.com/house-of-vanity/tsunag
 | Platform              | How                                                                              |
 | --------------------- | -------------------------------------------------------------------------------- |
 | **Windows**           | Run `tsunagi-setup-<version>-x86_64.exe`. Installs the service, the tray and `tsng`. |
+| **Android**           | Open `tsunagi-android-<version>-arm64-v8a.apk` on an ARM64 phone running Android 8 or later. |
 | **macOS**             | `brew tap house-of-vanity/tap && brew install --cask tsunagi-gui`<br>CLI only: `brew install tsunagi` |
 | **Debian / Ubuntu**   | `sudo apt install ./tsunagi-gui_<version>_amd64.deb` (`tsunagi_…` for no tray)   |
 | **Arch**              | `sudo pacman -U tsunagi-gui-<version>-1-x86_64.pkg.tar.zst`                      |
