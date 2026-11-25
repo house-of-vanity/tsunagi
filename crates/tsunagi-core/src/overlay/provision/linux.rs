@@ -76,7 +76,9 @@ enum Command {
     DelBroadcastRoute(String, Reply<()>),
     /// Send the host's default traffic through this interface, except what
     /// this user id sends.
-    SetExitClient(String, u32, Reply<()>),
+    SetExitClient(String, u32, Option<Ipv4Addr>, Reply<()>),
+    /// Replace only the default route on an already protected interface.
+    UpdateExitSource(String, Option<Ipv4Addr>, Reply<()>),
     /// Take those routing rules away again.
     ClearExitClient(Reply<()>),
     /// Stop the thread.
@@ -213,10 +215,25 @@ impl RouteHandle {
 
     /// Sends the host's default traffic through `interface`, except what the
     /// user id `uid` sends. Replaces what an earlier call set up.
-    pub(crate) fn set_exit_client(&self, interface: &str, uid: u32) -> Result<(), OverlayError> {
+    pub(crate) fn set_exit_client(
+        &self,
+        interface: &str,
+        uid: u32,
+        source: Option<Ipv4Addr>,
+    ) -> Result<(), OverlayError> {
         let interface = interface.to_string();
         call_thread(&self.commands, |reply| {
-            Command::SetExitClient(interface, uid, reply)
+            Command::SetExitClient(interface, uid, source, reply)
+        })
+    }
+
+    pub(crate) fn update_exit_source(
+        &self,
+        interface: &str,
+        source: Option<Ipv4Addr>,
+    ) -> Result<(), OverlayError> {
+        call_thread(&self.commands, |reply| {
+            Command::UpdateExitSource(interface.to_string(), source, reply)
         })
     }
 
@@ -346,7 +363,8 @@ fn netlink_thread(requests: mpsc::Receiver<Command>) {
                     | Command::Configure(_, reply)
                     | Command::SetBroadcastRoute(_, _, reply)
                     | Command::DelBroadcastRoute(_, reply)
-                    | Command::SetExitClient(_, _, reply) => {
+                    | Command::SetExitClient(_, _, _, reply)
+                    | Command::UpdateExitSource(_, _, reply) => {
                         let _ = reply.send(Err(OverlayError::Unavailable(message)));
                     }
                     Command::ClearExitClient(reply) => {
@@ -398,9 +416,19 @@ fn netlink_thread(requests: mpsc::Receiver<Command>) {
                 });
                 let _ = reply.send(result);
             }
-            Command::SetExitClient(name, uid, reply) => {
+            Command::SetExitClient(name, uid, source, reply) => {
                 let result = NetAdmin::acquire().and_then(|guard| {
-                    let result = runtime.block_on(set_exit_client(&name, uid));
+                    let result = runtime.block_on(set_exit_client(&name, uid, source));
+                    drop(guard);
+                    result
+                });
+                let _ = reply.send(result);
+            }
+            Command::UpdateExitSource(name, source, reply) => {
+                let result = NetAdmin::acquire().and_then(|guard| {
+                    let result = runtime.block_on(with_netlink(|handle| async move {
+                        replace_exit_default(&handle, &name, source).await
+                    }));
                     drop(guard);
                     result
                 });
@@ -704,12 +732,18 @@ fn is_exit_rule(rule: &RuleMessage) -> bool {
     }
 }
 
-fn exit_default_route(index: Option<u32>) -> rtnetlink::packet_route::route::RouteMessage {
+fn exit_default_route(
+    index: Option<u32>,
+    source: Option<Ipv4Addr>,
+) -> rtnetlink::packet_route::route::RouteMessage {
     let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
         .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
         .table_id(EXIT_TABLE);
     if let Some(index) = index {
         builder = builder.output_interface(index).scope(RouteScope::Link);
+    }
+    if let Some(source) = source {
+        builder = builder.pref_source(source);
     }
     builder.build()
 }
@@ -772,7 +806,12 @@ async fn remove_exit_rules(
 
 async fn remove_exit_client(handle: &rtnetlink::Handle) -> Result<(), OverlayError> {
     remove_exit_rules(handle, IpVersion::V4).await?;
-    match handle.route().del(exit_default_route(None)).execute().await {
+    match handle
+        .route()
+        .del(exit_default_route(None, None))
+        .execute()
+        .await
+    {
         Ok(()) => {}
         // "No such process": no such route, which is the goal.
         Err(err) if err.to_string().contains("No such") => {}
@@ -797,10 +836,32 @@ async fn remove_exit_client(handle: &rtnetlink::Handle) -> Result<(), OverlayErr
     }
 }
 
+/// Replace the default route atomically when the selected overlay address changes.
+async fn replace_exit_default(
+    handle: &rtnetlink::Handle,
+    name: &str,
+    source: Option<Ipv4Addr>,
+) -> Result<(), OverlayError> {
+    let index = link_index(handle, name).await.ok_or_else(|| {
+        OverlayError::Unavailable(format!(
+            "interface `{name}` disappeared before the exit node route could be added"
+        ))
+    })?;
+    handle
+        .route()
+        .add(exit_default_route(Some(index), source))
+        .replace()
+        .execute()
+        .await
+        .map_err(|err| {
+            OverlayError::Unavailable(format!("cannot set the exit node default route: {err}"))
+        })
+}
+
 /// Sets up the using side of an exit node.
 ///
 /// ```text
-/// ip route replace default dev <if> table 0x7473
+/// ip route replace default dev <if> src <selected overlay address> table 0x7473
 /// ip rule add priority 5205 fwmark 0x40000000/0x40000000 lookup main
 /// ip rule add priority 5206 uidrange <uid>-<uid> lookup main
 /// ip rule add priority 5290 lookup main suppress_prefixlength 0
@@ -813,24 +874,17 @@ async fn remove_exit_client(handle: &rtnetlink::Handle) -> Result<(), OverlayErr
 /// What an earlier call left is removed first, so repeating it is safe, and
 /// the rules go in last, so a failure part way never leaves a rule that
 /// sends traffic to a table with no route in it.
-async fn set_exit_client(name: &str, uid: u32) -> Result<(), OverlayError> {
+async fn set_exit_client(
+    name: &str,
+    uid: u32,
+    source: Option<Ipv4Addr>,
+) -> Result<(), OverlayError> {
     with_netlink(|handle| async move {
-        let index = link_index(&handle, name).await.ok_or_else(|| {
-            OverlayError::Unavailable(format!(
-                "interface `{name}` disappeared before the exit node routes could be added"
-            ))
-        })?;
         remove_exit_client(&handle).await?;
         let fail = |what: &str, err: rtnetlink::Error| {
             OverlayError::Unavailable(format!("cannot add the exit node {what}: {err}"))
         };
-        handle
-            .route()
-            .add(exit_default_route(Some(index)))
-            .replace()
-            .execute()
-            .await
-            .map_err(|err| fail("default route", err))?;
+        replace_exit_default(&handle, name, source).await?;
 
         add_mark_bypass(&handle, false).await?;
 
@@ -1190,13 +1244,17 @@ mod tests {
 
     #[test]
     fn the_default_route_of_the_exit_table_names_the_table_and_the_interface() {
-        let route = exit_default_route(Some(7));
+        let source = Ipv4Addr::new(10, 99, 0, 1);
+        let route = exit_default_route(Some(7), Some(source));
         assert_eq!(route.header.destination_prefix_length, 0);
         let debug = format!("{route:?}");
         assert!(debug.contains(&format!("Table({EXIT_TABLE})")), "{debug}");
         assert!(debug.contains("Oif(7)"), "{debug}");
+        assert!(route.attributes.contains(
+            &rtnetlink::packet_route::route::RouteAttribute::PrefSource(source.into())
+        ));
         // Deleting names no interface, so it matches whatever it was added on.
-        assert!(!format!("{:?}", exit_default_route(None)).contains("Oif"));
+        assert!(!format!("{:?}", exit_default_route(None, None)).contains("Oif"));
     }
 
     #[test]

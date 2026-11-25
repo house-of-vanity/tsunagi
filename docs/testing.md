@@ -225,6 +225,12 @@ retained. It requires root, iproute2,
 iptables/ip6tables and Python; it does not run in the default suite or claim
 to test the entire mesh inside these namespaces.
 
+`tsunagi-wg-quic/tests/exit_node.rs` runs a client in two disjoint meshes
+with a different exit peer in each. It switches the internet route, exchanges
+packets in both meshes over encrypted tunnels, races two exit selections and
+restarts the client from its SQLite directory to check the winning choice.
+The interfaces in this test are memory TUNs.
+
 Devices-window tests render the egui grid at multiple widths with its real
 scroll area. They check stretching and shrinking without an expanding first
 column, control RTT without internal handshake/protocol clutter, unknown measurements

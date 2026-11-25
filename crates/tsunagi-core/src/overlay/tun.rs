@@ -66,6 +66,10 @@ pub trait TunDevice: Send + Sync + std::fmt::Debug + 'static {
     /// The interface MTU.
     fn mtu(&self) -> u32;
 
+    /// Supply the local Wintun address and exit selection used for off-mesh flows.
+    #[cfg(any(windows, test))]
+    fn set_exit_source(&self, _addresses: &[super::Cidr], _source: Option<std::net::Ipv4Addr>) {}
+
     /// The next packet the operating system wants to send, or `None` once the
     /// device is gone.
     fn recv(&self) -> BoxFuture<'_, Option<Bytes>>;
@@ -476,12 +480,16 @@ mod system {
         let name = request.name.clone();
 
         let (reader, writer) = tokio::io::split(device);
-        Ok(Arc::new(SystemTun {
+        let device: Arc<dyn TunDevice> = Arc::new(SystemTun {
             name,
             mtu: request.mtu,
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
-        }) as Arc<dyn TunDevice>)
+        });
+        #[cfg(windows)]
+        let device: Arc<dyn TunDevice> =
+            Arc::new(crate::overlay::source::windows::ExitSourceTun::new(device));
+        Ok(device)
     }
 
     fn open_error(name: &str, error: tun::Error) -> OverlayError {

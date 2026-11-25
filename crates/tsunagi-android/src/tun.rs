@@ -1,7 +1,6 @@
 //! A stable packet device over the file descriptors replaced by VpnService.
 use crate::dns::{Resolver, stack::DnsPort};
 use crate::plan::VpnPlan;
-use crate::source::SourceFlows;
 use bytes::Bytes;
 use std::{
     fmt,
@@ -21,6 +20,7 @@ use tsunagi::{
             BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport, ExitHostPlan,
             ExitHostReport, ExitHostRules, RuleOutcome,
         },
+        source::{SourceFlows, SourceMode},
     },
 };
 
@@ -114,11 +114,16 @@ impl AndroidTun {
             .clone()
             .and_then(|fd| fd.packets().take());
         let fd = device.map(|(file, dns)| {
+            let aliases = next.addresses_in_order();
+            let exit = match (next.full_tunnel, next.exit) {
+                (true, Some(std::net::IpAddr::V4(source))) => Some(source),
+                _ => None,
+            };
             let flows = if let Some(mut previous) = previous {
-                previous.flows.reconfigure(&next);
+                previous.flows.reconfigure(&aliases, exit, next.mtu);
                 previous.flows
             } else {
-                SourceFlows::new(&next)
+                SourceFlows::new(&aliases, exit, next.mtu, SourceMode::Primary)
             };
             Arc::new(Attachment {
                 device: file,

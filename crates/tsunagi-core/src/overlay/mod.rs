@@ -46,6 +46,7 @@ pub mod interface;
 pub mod packet;
 pub mod provision;
 pub mod router;
+pub mod source;
 pub mod tun;
 
 pub use config::{Cidr, DEFAULT_INTERFACE_PREFIX, MAX_INTERFACE_NAME_LEN, interface_name};

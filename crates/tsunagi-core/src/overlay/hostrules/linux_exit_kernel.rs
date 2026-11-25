@@ -217,7 +217,9 @@ fn client() {
         ip(&["-6", "route", "add", "throw", prefix, "table", "52"]);
     }
     let mut passive = spawn_listener("listener");
-    route.set_exit_client("tsun0", 990).unwrap();
+    route
+        .set_exit_client("tsun0", 990, Some("10.99.0.1".parse().unwrap()))
+        .unwrap();
     // uid bypass alone cannot protect reverse lookups, reproducing the bug.
     run_probes("blocked");
     install(&run_firewall, "tsun0", 990, true).unwrap();
@@ -248,6 +250,25 @@ for family,source,target in [(socket.AF_INET,'198.51.100.2','192.0.2.1'),(socket
     install(&run_firewall, "tsun0", 990, true).unwrap();
     run_probes("pass");
     assert!(ip(&["-4", "route", "get", "198.51.100.2", "uid", "991"]).contains("dev tsun0"));
+    // Check our own default table without the foreign VPN's higher-priority default.
+    ip(&["-4", "rule", "del", "priority", "5270"]);
+    for (destination, source) in [
+        ("10.13.37.2", "10.13.37.1"),
+        ("10.99.0.2", "10.99.0.1"),
+        ("198.51.100.2", "10.99.0.1"),
+    ] {
+        let result = ip(&["-4", "route", "get", destination, "uid", "991"]);
+        assert!(
+            result.contains("dev tsun0") && result.contains(&format!("src {source}")),
+            "{result}"
+        );
+    }
+    route
+        .update_exit_source("tsun0", Some("10.13.37.1".parse().unwrap()))
+        .unwrap();
+    assert!(ip(&["-4", "route", "get", "198.51.100.2", "uid", "991"]).contains("src 10.13.37.1"));
+    assert!(ip(&["-4", "route", "get", "10.99.0.2", "uid", "991"]).contains("src 10.99.0.1"));
+    ip(&["-4", "rule", "add", "priority", "5270", "table", "52"]);
     let blocked = Command::new("ip")
         .args(["-6", "route", "get", "2001:db8:2::2", "uid", "991"])
         .output()
@@ -384,6 +405,15 @@ fn strict_firewall_preserves_underlay_and_application_exit_routing() {
         "tsun0",
     ]);
     ip(&["-n", &client_name, "link", "set", "tsun0", "up"]);
+    ip(&[
+        "-n",
+        &client_name,
+        "addr",
+        "add",
+        "10.99.0.1/24",
+        "dev",
+        "tsun0",
+    ]);
     let echo_code = r#"import socket,selectors,sys
 selector=selectors.DefaultSelector()
 for family in [socket.AF_INET,socket.AF_INET6]:

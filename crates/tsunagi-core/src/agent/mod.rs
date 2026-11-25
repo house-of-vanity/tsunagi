@@ -104,7 +104,7 @@ struct Inner {
     networks: RwLock<HashMap<NetworkId, NetworkHandle>>,
     shutdown: Shutdown,
     /// Serialises start, stop, switching and conflict cleanup, including teardown.
-    lifecycle: Mutex<()>,
+    lifecycle: Arc<Mutex<()>>,
     range_changed: watch::Sender<()>,
     range_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     accept_task: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -450,7 +450,7 @@ impl Agent {
             events,
             networks: RwLock::new(HashMap::new()),
             shutdown: Shutdown::new(),
-            lifecycle: Mutex::new(()),
+            lifecycle: Arc::new(Mutex::new(())),
             range_changed,
             range_task: std::sync::Mutex::new(None),
             accept_task: std::sync::Mutex::new(None),
@@ -797,47 +797,27 @@ impl Agent {
     /// choice in the others. The member has to be connected and offering
     /// to be an exit node. Remembered across restarts.
     pub async fn set_exit_via(&self, network_id: NetworkId, via: Option<EndpointId>) -> Result<()> {
-        let active = self.is_active(network_id).await;
-        if via.is_some() && !active {
-            return Err(Error::NetworkNotActive(network_id));
-        }
-        if active {
-            let (reply, receive) = oneshot::channel();
-            self.command(network_id, NetCommand::SetExitVia { via, reply })
-                .await?;
-            receive
-                .await
-                .map_err(|_| Error::Stopped)?
-                .map_err(|reason| Error::Rejected { reason })?;
-        }
-        self.inner
-            .storage
-            .set_exit_via(network_id, via.map(|peer| *peer.as_bytes()))
-            .await?;
-        if via.is_some() {
-            // One default route: whatever the other networks were doing, they
-            // are not any more.
-            let others: Vec<NetworkId> = self
-                .inner
-                .networks
-                .read()
-                .await
-                .keys()
-                .copied()
-                .filter(|other| *other != network_id)
-                .collect();
-            for other in others {
-                let (reply, receive) = oneshot::channel();
-                if self
-                    .command(other, NetCommand::SetExitVia { via: None, reply })
-                    .await
-                    .is_ok()
-                {
-                    let _ = receive.await;
-                }
+        let lifecycle = self.inner.lifecycle.clone().lock_owned().await;
+        if !self.is_active(network_id).await {
+            if via.is_some() {
+                return Err(Error::NetworkNotActive(network_id));
             }
+            return self.inner.storage.set_exit_via(network_id, None).await;
         }
-        Ok(())
+
+        // The actor owns the guard through validation, persistence and routing,
+        // even if the requesting IPC client disconnects halfway through.
+        let (reply, receive) = oneshot::channel();
+        self.command(
+            network_id,
+            NetCommand::SetExitVia {
+                via,
+                lifecycle,
+                reply,
+            },
+        )
+        .await?;
+        receive.await.map_err(|_| Error::Stopped)?
     }
 
     /// Changes a network's local broadcast policy now and after restart.
@@ -961,6 +941,13 @@ impl Agent {
             )?;
         }
         let range = self.desired_range(network_id).await?;
+        let exit = crate::overlay::ExitPolicy {
+            offer: stored.as_ref().is_some_and(|s| s.exit_node),
+            via: stored
+                .as_ref()
+                .and_then(|s| s.exit_via)
+                .and_then(|bytes| EndpointId::from_bytes(&bytes).ok()),
+        };
         if let Some(range) = range {
             let conflicts = self.inner.routes.overlapping_networks(network_id, range);
             if !conflicts.is_empty() {
@@ -970,19 +957,20 @@ impl Agent {
                     conflicts: conflicts.into_iter().map(|(id, _)| id).collect(),
                 });
             }
-            self.inner
-                .routes
-                .set_network(
-                    network_id,
-                    crate::overlay::NetworkRoutes {
-                        range: Some(range),
-                        ..Default::default()
-                    },
-                )
-                .map_err(|err| Error::Rejected {
-                    reason: err.to_string(),
-                })?;
         }
+        self.inner
+            .routes
+            .set_network(
+                network_id,
+                crate::overlay::NetworkRoutes {
+                    range,
+                    exit,
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| Error::Rejected {
+                reason: err.to_string(),
+            })?;
         let mut backends = Vec::new();
         if let Some(discovery) = &self.inner.config.discovery {
             backends.push(discovery.clone());
@@ -1006,17 +994,10 @@ impl Agent {
         if !plugins.is_empty() {
             self.inner.ensure_interface().await;
         }
-        let exit_offer = stored.as_ref().is_some_and(|stored| stored.exit_node);
-        let exit_via = stored
-            .as_ref()
-            .and_then(|stored| stored.exit_via)
-            .and_then(|bytes| EndpointId::from_bytes(&bytes).ok());
         let handle = network::spawn(RuntimeParams {
             vips,
             retirements,
             broadcast,
-            exit_offer,
-            exit_via,
             keys,
             adapter: self.inner.adapter.clone(),
             storage: self.inner.storage.clone(),

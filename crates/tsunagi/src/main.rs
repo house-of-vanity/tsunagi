@@ -80,7 +80,8 @@ enum Command {
     /// device's internet traffic through one.
     ///
     /// The other half of `tsng network exit-node`, which is what makes a
-    /// device offer itself. A device uses one exit node at a time.
+    /// device offer itself. One exit serves all active networks. Traffic to
+    /// peers and services in each mesh keeps its own route.
     ExitNode(ExitNodeArgs),
     /// Removes everything this device has stored and starts over.
     Wipe(WipeArgs),

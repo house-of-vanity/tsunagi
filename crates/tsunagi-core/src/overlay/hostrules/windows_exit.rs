@@ -141,13 +141,18 @@ fn bypass_script(index: u32, gateway: Ipv4Addr, addresses: &[Ipv4Addr]) -> Strin
         .collect();
     format!(
         "$ErrorActionPreference = 'Stop'\n\
+         $keep = @(@({}) | ForEach-Object {{ \"$_/32\" }})\n\
+         foreach ($p in $keep) {{\n\
+         if (-not (Get-NetRoute -DestinationPrefix $p -InterfaceIndex {index} -NextHop '{gateway}' \
+         -PolicyStore ActiveStore -ErrorAction SilentlyContinue)) {{\n\
+         New-NetRoute -DestinationPrefix $p -InterfaceIndex {index} -NextHop '{gateway}' \
+         -RouteMetric {BYPASS_METRIC} -PolicyStore ActiveStore | Out-Null\n\
+         }}\n\
+         }}\n\
          Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | \
-         Where-Object {{ $_.RouteMetric -eq {BYPASS_METRIC} -and $_.DestinationPrefix.EndsWith('/32') }} | \
-         Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n\
-         foreach ($ip in @({})) {{\n\
-         New-NetRoute -DestinationPrefix \"$ip/32\" -InterfaceIndex {index} -NextHop '{gateway}' \
-         -RouteMetric {BYPASS_METRIC} -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null\n\
-         }}\n",
+         Where-Object {{ $_.RouteMetric -eq {BYPASS_METRIC} -and $_.DestinationPrefix.EndsWith('/32') -and \
+         ($keep -notcontains $_.DestinationPrefix -or $_.InterfaceIndex -ne {index} -or $_.NextHop -ne '{gateway}') }} | \
+         Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n",
         list.join(", ")
     )
 }
@@ -159,14 +164,14 @@ fn halves_script(interface: &str) -> String {
         "$ErrorActionPreference = 'Stop'\n\
          $alias = {alias}\n\
          foreach ($p in '0.0.0.0/1', '128.0.0.0/1') {{\n\
-         Get-NetRoute -DestinationPrefix $p -InterfaceAlias $alias -PolicyStore ActiveStore \
-         -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n\
+         if (Get-NetRoute -DestinationPrefix $p -InterfaceAlias $alias -NextHop '0.0.0.0' \
+         -PolicyStore ActiveStore -ErrorAction SilentlyContinue) {{ continue }}\n\
          New-NetRoute -DestinationPrefix $p -InterfaceAlias $alias -NextHop '0.0.0.0' \
          -RouteMetric 1 -PolicyStore ActiveStore | Out-Null\n\
          }}\n\
          foreach ($p in '::/1', '8000::/1') {{\n\
-         Get-NetRoute -DestinationPrefix $p -InterfaceAlias $alias -PolicyStore ActiveStore \
-         -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue\n\
+         if (Get-NetRoute -DestinationPrefix $p -InterfaceAlias $alias -NextHop '::' \
+         -PolicyStore ActiveStore -ErrorAction SilentlyContinue) {{ continue }}\n\
          New-NetRoute -DestinationPrefix $p -InterfaceAlias $alias -NextHop '::' \
          -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null\n\
          }}\n"
@@ -197,13 +202,21 @@ fn bypass_addresses(
     resolve: Resolve<'_>,
     addresses: &[Ipv4Addr],
     hosts: &[String],
+    overlay: &[Ipv4Range],
 ) -> Vec<Ipv4Addr> {
     let mut all: std::collections::BTreeSet<Ipv4Addr> = addresses.iter().copied().collect();
     for host in hosts {
         all.extend(resolve(host));
     }
     all.into_iter()
-        .filter(|a| !a.is_loopback() && !a.is_unspecified() && !a.is_multicast())
+        .filter(|a| {
+            !a.is_loopback()
+                && !a.is_unspecified()
+                && !a.is_multicast()
+                && !a.is_link_local()
+                && !a.is_broadcast()
+                && !overlay.iter().any(|range| range.contains(*a))
+        })
         .collect()
 }
 
@@ -216,7 +229,7 @@ fn apply_client(
     let gateway = run(&gateway_script(interface))?;
     let (index, hop) = parse_gateway(&gateway)
         .ok_or_else(|| format!("cannot read the default gateway from `{}`", gateway.trim()))?;
-    let addresses = bypass_addresses(resolve, &plan.bypass, &plan.bypass_hosts);
+    let addresses = bypass_addresses(resolve, &plan.bypass, &plan.bypass_hosts, &plan.overlay);
     run(&bypass_script(index, hop, &addresses))?;
     if let Err(why) = run(&halves_script(interface)) {
         // Do not leave a half-installed set: bypass routes alone are harmless
@@ -437,8 +450,10 @@ mod tests {
         assert!(script.contains("-InterfaceIndex 12 -NextHop '192.168.1.1'"));
         assert!(script.contains("-RouteMetric 7373"));
         assert!(script.contains("-PolicyStore ActiveStore"));
-        // Stale marked routes go first, and only /32 ones with our metric.
-        assert!(script.find("Remove-NetRoute").unwrap() < script.find("New-NetRoute").unwrap());
+        // Install missing routes before pruning stale entries. Existing paths
+        // continue carrying the tunnel throughout another network's update.
+        assert!(script.find("New-NetRoute").unwrap() < script.find("Remove-NetRoute").unwrap());
+        assert!(script.contains("$keep -notcontains $_.DestinationPrefix"));
         assert!(script.contains("RouteMetric -eq 7373"));
         assert!(script.contains("EndsWith('/32')"));
     }
@@ -446,6 +461,10 @@ mod tests {
     #[test]
     fn the_halves_go_through_the_overlay_and_ipv6_is_blackholed() {
         let script = halves_script("tsun0");
+        assert!(
+            !script.contains("Remove-NetRoute"),
+            "reapplying must keep existing split defaults: {script}"
+        );
         assert!(script.contains("'0.0.0.0/1', '128.0.0.0/1'"));
         assert!(script.contains("-InterfaceAlias $alias -NextHop '0.0.0.0'"));
         assert!(script.contains("'::/1', '8000::/1'"));
@@ -473,6 +492,7 @@ mod tests {
                 Ipv4Addr::UNSPECIFIED,
             ],
             &["relay.example".into(), "gone.example".into()],
+            &[],
         );
         assert_eq!(
             all,
@@ -506,11 +526,35 @@ mod tests {
     }
 
     #[test]
+    fn relay_dns_cannot_install_a_host_route_over_either_overlay() {
+        let mut plan = client_plan();
+        plan.overlay.push("10.99.0.0/24".parse().unwrap());
+        let resolve = |_: &str| {
+            ["10.13.37.4", "10.99.0.6", "9.9.9.9"]
+                .map(|ip| ip.parse().unwrap())
+                .to_vec()
+        };
+        let calls = RefCell::new(Vec::new());
+        let run = |script: &str| {
+            calls.borrow_mut().push(script.to_string());
+            Ok("12 192.168.1.1".to_string())
+        };
+        apply_client(&run, &resolve, &plan).unwrap();
+        let calls = calls.borrow();
+        let bypass = calls
+            .iter()
+            .find(|c| c.contains("-RouteMetric 7373"))
+            .unwrap();
+        assert!(bypass.contains("'9.9.9.9'") && bypass.contains("'138.201.61.182'"));
+        assert!(!bypass.contains("'10.13.37.4'") && !bypass.contains("'10.99.0.6'"));
+    }
+
+    #[test]
     fn nothing_goes_through_the_overlay_when_the_bypass_cannot_be_written() {
         let run = |script: &str| -> Result<String, String> {
             if script.contains("Select-Object -First 1") {
                 Ok("12 192.168.1.1".to_string())
-            } else if script.contains("-RouteMetric 7373") && script.contains("foreach ($ip") {
+            } else if script.contains("-RouteMetric 7373") && script.contains("New-NetRoute") {
                 Err("Access is denied".to_string())
             } else {
                 assert!(!script.contains("-NextHop '0.0.0.0'"), "{script}");

@@ -40,6 +40,12 @@ pub struct Route {
     pub peer: EndpointId,
 }
 
+/// An internet source is valid only for a reply to our address in the exit's network.
+pub(super) enum PacketSource {
+    Member,
+    ExitReply { local: Option<Ipv4Addr> },
+}
+
 /// A network's exit-node settings, as far as packets are concerned.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExitPolicy {
@@ -120,7 +126,29 @@ impl RoutingTable {
     /// interface an address can belong to only one network, and guessing
     /// which would send somebody's traffic to a stranger.
     pub fn set_network(&self, network: NetworkId, routes: NetworkRoutes) -> Result<(), RouteError> {
+        self.replace_network(&mut self.write(), network, routes)
+    }
+
+    /// A fresh allocation snapshot cannot change the operator's exit settings.
+    pub(crate) fn update_allocations(
+        &self,
+        network: NetworkId,
+        mut routes: NetworkRoutes,
+    ) -> Result<(), RouteError> {
         let mut networks = self.write();
+        routes.exit = networks
+            .get(&network)
+            .map(|current| current.exit)
+            .unwrap_or_default();
+        self.replace_network(&mut networks, network, routes)
+    }
+
+    fn replace_network(
+        &self,
+        networks: &mut HashMap<NetworkId, NetworkRoutes>,
+        network: NetworkId,
+        routes: NetworkRoutes,
+    ) -> Result<(), RouteError> {
         if let Some(range) = routes.range {
             for (other, existing) in networks.iter() {
                 if *other == network {
@@ -139,9 +167,12 @@ impl RoutingTable {
                 }
             }
         }
+        if routes.exit.via.is_some() {
+            clear_other_exits(networks, network);
+        }
         networks.insert(network, routes);
         self.broadcast
-            .store(Arc::new(BroadcastTable::build(&networks)));
+            .store(Arc::new(BroadcastTable::build(networks)));
         Ok(())
     }
 
@@ -172,8 +203,16 @@ impl RoutingTable {
     /// A network that has no entry yet (its range is not agreed) takes them
     /// from [`NetworkRoutes::exit`] when it is added.
     pub fn set_exit(&self, network: NetworkId, policy: ExitPolicy) {
-        if let Some(routes) = self.write().get_mut(&network) {
-            routes.exit = policy;
+        self.update_exit(network, |current| *current = policy);
+    }
+
+    pub(crate) fn update_exit(&self, network: NetworkId, update: impl FnOnce(&mut ExitPolicy)) {
+        let mut networks = self.write();
+        if let Some(routes) = networks.get_mut(&network) {
+            update(&mut routes.exit);
+            if routes.exit.via.is_some() {
+                clear_other_exits(&mut networks, network);
+            }
         }
     }
 
@@ -241,20 +280,30 @@ impl RoutingTable {
     /// internet carries the internet's addresses, so from *that* peer any
     /// source outside the overlay ranges is accepted.
     pub fn may_send_from(&self, network: NetworkId, peer: EndpointId, source: Ipv4Addr) -> bool {
+        self.packet_source(network, peer, source).is_some()
+    }
+
+    pub(super) fn packet_source(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+        source: Ipv4Addr,
+    ) -> Option<PacketSource> {
         let networks = self.read();
-        let Some(routes) = networks.get(&network) else {
-            return false;
-        };
+        let routes = networks.get(&network)?;
         if routes
             .peers
             .iter()
             .any(|(address, holder)| *address == source && *holder == peer)
         {
-            return true;
+            return Some(PacketSource::Member);
         }
-        routes.exit.via == Some(peer)
+        (exit_via(&networks) == Some((network, peer))
             && is_internet_destination(source)
-            && !in_any_range(&networks, source)
+            && !in_any_range(&networks, source))
+        .then_some(PacketSource::ExitReply {
+            local: routes.local,
+        })
     }
 
     /// Whether this agent, as an exit node of `network`, takes a member's
@@ -275,8 +324,7 @@ impl RoutingTable {
 
     /// The network and member this device sends its internet traffic through.
     ///
-    /// One default route, so one answer; if several networks claim one (they
-    /// should not) the lowest network id decides, so two runs agree.
+    /// Choosing another exit replaces the previous one under the table's write lock.
     pub fn exit_via(&self) -> Option<(NetworkId, EndpointId)> {
         exit_via(&self.read())
     }
@@ -423,12 +471,19 @@ fn in_any_range(networks: &HashMap<NetworkId, NetworkRoutes>, address: Ipv4Addr)
         .any(|routes| routes.range.is_some_and(|range| range.contains(address)))
 }
 
-/// The exit node in use, if any, from the lowest network that names one.
+fn clear_other_exits(networks: &mut HashMap<NetworkId, NetworkRoutes>, selected: NetworkId) {
+    for (id, routes) in networks {
+        if *id != selected {
+            routes.exit.via = None;
+        }
+    }
+}
+
+/// Only the selected network can have an exit peer.
 fn exit_via(networks: &HashMap<NetworkId, NetworkRoutes>) -> Option<(NetworkId, EndpointId)> {
     networks
         .iter()
-        .filter_map(|(network, routes)| Some((*network, routes.exit.via?)))
-        .min_by_key(|(network, _)| *network)
+        .find_map(|(network, routes)| Some((*network, routes.exit.via?)))
 }
 
 /// Whether two ranges share any address.
@@ -746,6 +801,46 @@ mod tests {
     const INTERNET: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
 
     #[test]
+    fn refreshing_either_networks_addresses_preserves_the_last_exit_choice() {
+        let table = RoutingTable::new();
+        let (a, b) = (network("first"), network("second"));
+        let first = with_exit(true, Some(peer(2)));
+        let second = NetworkRoutes {
+            range: Some("10.99.0.0/24".parse().unwrap()),
+            local: Some(Ipv4Addr::new(10, 99, 0, 1)),
+            ..Default::default()
+        };
+        table.set_network(a, first.clone()).unwrap();
+        table.set_network(b, second.clone()).unwrap();
+        table.set_exit(
+            b,
+            ExitPolicy {
+                offer: false,
+                via: Some(peer(3)),
+            },
+        );
+
+        table.update_allocations(a, first).unwrap();
+        table.update_allocations(b, second).unwrap();
+        assert_eq!(
+            table.exit_client(),
+            (true, Some(Ipv4Addr::new(10, 99, 0, 1)))
+        );
+        assert_eq!(table.exit_via(), Some((b, peer(3))));
+        assert_eq!(
+            table.exit_settings(a).unwrap().0,
+            ExitPolicy {
+                offer: true,
+                via: None
+            }
+        );
+        table.remove_network(a);
+        assert_eq!(table.exit_via(), Some((b, peer(3))));
+        table.remove_network(b);
+        assert_eq!(table.exit_via(), None);
+    }
+
+    #[test]
     fn without_an_exit_node_the_internet_has_nowhere_to_go() {
         let table = RoutingTable::new();
         table.set_network(network("plain"), routes()).unwrap();
@@ -819,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn two_exit_choices_resolve_to_the_lowest_network_id() {
+    fn competing_exit_choices_use_the_same_peer_for_requests_and_replies() {
         let table = RoutingTable::new();
         let (a, b) = (network("one"), network("two"));
         table
@@ -838,9 +933,10 @@ mod tests {
                 },
             )
             .unwrap();
-        let (chosen, _) = table.exit_via().unwrap();
-        assert_eq!(chosen, a.min(b));
-        assert_eq!(table.route(INTERNET).unwrap().network, a.min(b));
+        assert_eq!(table.exit_via(), Some((b, peer(9))));
+        assert_eq!(table.route(INTERNET).unwrap().network, b);
+        assert!(table.may_send_from(b, peer(9), INTERNET));
+        assert!(!table.may_send_from(a, peer(2), INTERNET));
     }
 
     #[test]

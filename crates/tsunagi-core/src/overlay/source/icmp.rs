@@ -133,19 +133,48 @@ mod tests {
     }
 
     #[test]
-    fn inbound_pmtu_restores_a_truncated_udp_quote_and_preserves_the_reporting_router() {
-        use crate::plan::VpnPlan;
-        use crate::source::SourceFlows;
-        use tsunagi::overlay::Cidr;
+    fn wintun_keeps_mesh_errors_and_restores_exit_errors_from_a_mesh_router() {
+        use super::super::{SourceFlows, SourceMode};
+        use crate::overlay::Cidr;
 
-        let mut flows = SourceFlows::new(&VpnPlan {
-            addresses: vec![
+        let external = Ipv4Addr::new(203, 0, 113, 200);
+        let mut flows = SourceFlows::new(
+            &[
                 Cidr::new(APP.into(), 24).unwrap(),
                 Cidr::new(WIRE.into(), 24).unwrap(),
             ],
-            mtu: 1280,
-            ..Default::default()
-        });
+            Some(WIRE),
+            1280,
+            SourceMode::ExitOnly,
+        );
+        let mut udp = [0; 8];
+        udp[4..6].copy_from_slice(&8u16.to_be_bytes());
+        let mesh_packet = ipv4(17, WIRE, PEER, &udp);
+        let mesh_error = error(ROUTER, WIRE, &mesh_packet);
+        assert_eq!(flows.inbound(mesh_error.clone()), [mesh_error]);
+
+        let original = ipv4(17, APP, external, &udp);
+        let translated = flows.outbound(original.clone().into()).pop().unwrap();
+        assert_eq!(
+            flows.inbound(error(ROUTER, WIRE, &translated)),
+            [error(ROUTER, APP, &original)]
+        );
+    }
+
+    #[test]
+    fn inbound_pmtu_restores_a_truncated_udp_quote_and_preserves_the_reporting_router() {
+        use super::super::{SourceFlows, SourceMode};
+        use crate::overlay::Cidr;
+
+        let mut flows = SourceFlows::new(
+            &[
+                Cidr::new(APP.into(), 24).unwrap(),
+                Cidr::new(WIRE.into(), 24).unwrap(),
+            ],
+            None,
+            1280,
+            SourceMode::Primary,
+        );
         let mut udp = [0x71; 16];
         udp[4..6].copy_from_slice(&16u16.to_be_bytes());
         UdpPacket::new_unchecked(&mut udp[..]).fill_checksum(&APP.into(), &PEER.into());

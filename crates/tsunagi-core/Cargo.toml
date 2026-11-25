@@ -59,6 +59,8 @@ rand = "0.10"
 # zone logic is ours and a full server framework would be a large dependency
 # for answering A records from memory.
 simple-dns = "0.12"
+# IPv4 packet and checksum codecs shared by the Android VPN and Wintun.
+smoltcp = { version = "0.12", default-features = false, features = ["std", "proto-ipv4"] }
 # The IANA top-level domain list, compiled in: one function, no
 # dependencies, no network. Used only to warn that a zone name shadows a
 # real public domain, never to refuse one.

@@ -96,7 +96,8 @@ pub(crate) enum NetCommand {
     /// Send this device's internet traffic through a member, or stop.
     SetExitVia {
         via: Option<EndpointId>,
-        reply: oneshot::Sender<std::result::Result<(), String>>,
+        lifecycle: tokio::sync::OwnedMutexGuard<()>,
+        reply: oneshot::Sender<Result<()>>,
     },
     /// Resend this agent's announcement to every peer of this network.
     Reannounce,
@@ -177,10 +178,6 @@ pub(crate) struct RuntimeParams {
     pub(crate) vips: crate::vip::VipSet,
     pub(crate) retirements: Vec<SignedRetirement>,
     pub(crate) broadcast: bool,
-    /// This agent offers itself as an exit node here.
-    pub(crate) exit_offer: bool,
-    /// The member this device's internet traffic goes through.
-    pub(crate) exit_via: Option<EndpointId>,
     pub(crate) keys: NetworkKeys,
     pub(crate) adapter: EndpointAdapter,
     pub(crate) storage: Storage,
@@ -689,25 +686,24 @@ impl Runtime {
                 let _ = reply.send(());
             }
             NetCommand::SetExitOffer { enabled, reply } => {
-                self.params.exit_offer = enabled;
+                self.params
+                    .routes
+                    .update_exit(self.network_id, |exit| exit.offer = enabled);
                 self.apply_exit().await;
                 self.reannounce();
                 let _ = reply.send(());
             }
-            NetCommand::SetExitVia { via, reply } => {
-                let outcome = match via {
-                    Some(peer) if !self.exit_node_online(peer) => Err(
-                        "that member is not connected or does not offer to be an exit node"
-                            .to_string(),
-                    ),
-                    _ => Ok(()),
-                };
-                if outcome.is_ok() {
-                    self.params.exit_via = via;
-                    self.exit_via_was_online = via.is_some();
+            NetCommand::SetExitVia {
+                via,
+                lifecycle,
+                reply,
+            } => {
+                let result = self.select_exit(via).await;
+                drop(lifecycle);
+                if result.is_ok() {
                     self.apply_exit().await;
                 }
-                let _ = reply.send(outcome);
+                let _ = reply.send(result);
             }
             NetCommand::Recheck => self.discovery_round().await,
             NetCommand::Reannounce => {
@@ -907,7 +903,12 @@ impl Runtime {
     /// the relays in use. Only hosts that cannot exempt the agent from an
     /// exit node's default route read it.
     async fn refresh_underlay(&self) {
-        let Some(interface) = self.params.interface.clone() else {
+        let Some(interface) = self
+            .params
+            .interface
+            .as_ref()
+            .filter(|i| i.needs_underlay_targets())
+        else {
             return;
         };
         let mut addresses = Vec::new();
@@ -1308,7 +1309,7 @@ impl Runtime {
                 "the node is online; only offline history can be forgotten".into(),
             ));
         }
-        if self.params.exit_via == Some(peer) {
+        if self.exit_policy().via == Some(peer) {
             return Err(Error::ForgetNode(
                 "stop using this exit node before forgetting it".into(),
             ));
@@ -1770,20 +1771,36 @@ impl Runtime {
     }
 
     fn exit_policy(&self) -> crate::overlay::ExitPolicy {
-        crate::overlay::ExitPolicy {
-            offer: self.params.exit_offer,
-            via: self.params.exit_via,
+        self.params
+            .routes
+            .exit_settings(self.network_id)
+            .map(|(policy, _)| policy)
+            .unwrap_or_default()
+    }
+
+    async fn select_exit(&mut self, via: Option<EndpointId>) -> Result<()> {
+        if via.is_some_and(|peer| !self.exit_node_online(peer)) {
+            return Err(Error::Rejected {
+                reason: "that member is not connected or does not offer to be an exit node".into(),
+            });
         }
+        self.params
+            .storage
+            .set_exit_via(self.network_id, via.map(|peer| *peer.as_bytes()))
+            .await?;
+        self.params
+            .routes
+            .update_exit(self.network_id, |exit| exit.via = via);
+        self.exit_via_was_online = via.is_some();
+        Ok(())
     }
 
     /// Whether this agent offers to be an exit node and can really be one.
     fn exit_ready(&self) -> bool {
-        self.params.exit_offer
-            && self
-                .params
-                .interface
-                .as_ref()
-                .is_some_and(|interface| interface.exit_offer_ready(self.network_id))
+        self.params
+            .interface
+            .as_ref()
+            .is_some_and(|interface| interface.exit_offer_ready(self.network_id))
     }
 
     /// Whether a member is connected and says it is an exit node.
@@ -1793,15 +1810,12 @@ impl Runtime {
             .is_some_and(|session| session.exit_node)
     }
 
-    /// Puts the exit settings into the routing table and the host rules.
+    /// Reconciles the host rules with the shared routing table.
     ///
     /// The routes and the rules stay as they are when the exit node in use
     /// goes away: dropping them would send the traffic out the old way, in
     /// the clear, without anyone having asked.
     async fn apply_exit(&mut self) {
-        self.params
-            .routes
-            .set_exit(self.network_id, self.exit_policy());
         if let Some(interface) = self.params.interface.clone() {
             interface.sync_exit_rules().await;
         }
@@ -1814,7 +1828,7 @@ impl Runtime {
 
     /// Says so, once, when the exit node in use is lost or comes back.
     fn watch_exit_via(&mut self) {
-        let Some(via) = self.params.exit_via else {
+        let Some(via) = self.exit_policy().via else {
             return;
         };
         let online = self.exit_node_online(via);
@@ -1865,7 +1879,7 @@ impl Runtime {
         // a packet for ourselves does not go over a tunnel.
         let local = self.state.address_of(&self.local_id);
         let routes = crate::overlay::NetworkRoutes {
-            exit: self.exit_policy(),
+            exit: Default::default(),
             broadcast: self.broadcast_policy(),
             range: Some(range),
             local,
@@ -1878,7 +1892,7 @@ impl Runtime {
         if self
             .params
             .routes
-            .set_network(self.network_id, routes)
+            .update_allocations(self.network_id, routes)
             .is_err()
         {
             self.range_blocked
@@ -2647,6 +2661,9 @@ impl Runtime {
 
         let snapshot = snapshot_connection(&conn);
         self.sessions.insert(peer, session);
+        // An exit may be selected as soon as the peer advertises it, before
+        // the next discovery tick. Keep this transport on its physical path.
+        self.refresh_underlay().await;
         if let Some(worker) = &self.discovery_worker {
             worker.set_connected(true);
         }
@@ -3246,6 +3263,7 @@ impl Runtime {
         members.sort_by(|a, b| a.endpoint_id.as_bytes().cmp(b.endpoint_id.as_bytes()));
         members.dedup_by(|a, b| a.endpoint_id == b.endpoint_id);
 
+        let exit = self.exit_policy();
         NetworkStatus {
             vips: self.params.routes.vips.statuses(self.network_id),
             protocols: self
@@ -3256,12 +3274,9 @@ impl Runtime {
                 .collect(),
             auto_start: true,
             broadcast: self.params.broadcast,
-            exit_offer: self.params.exit_offer,
-            exit_via: self.params.exit_via,
-            exit_via_online: self
-                .params
-                .exit_via
-                .is_some_and(|via| self.exit_node_online(via)),
+            exit_offer: exit.offer,
+            exit_via: exit.via,
+            exit_via_online: exit.via.is_some_and(|via| self.exit_node_online(via)),
             exit_rules: self
                 .params
                 .interface

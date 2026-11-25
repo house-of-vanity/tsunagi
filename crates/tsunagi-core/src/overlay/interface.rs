@@ -35,7 +35,7 @@ use super::hostrules::{
     RuleOutcome, offer_detail,
 };
 use super::packet::IpHeader;
-use super::router::{Route, RoutingTable};
+use super::router::{PacketSource, Route, RoutingTable};
 use super::tun::{TunDevice, TunFactory, TunRequest};
 use super::{Cidr, OverlayError};
 
@@ -428,6 +428,9 @@ impl Interface {
         ranges.sort_by_key(|range| (range.base, range.prefix_len));
         ranges.dedup();
         let (client, client_source) = self.routes.exit_client();
+        #[cfg(windows)]
+        self.device
+            .set_exit_source(&self.wanted_addresses(), client_source);
         let overlay = self.routes.overlay_ranges();
         let (bypass, bypass_hosts) = if client && exit.needs_bypass() {
             self.underlay_targets(&overlay)
@@ -521,6 +524,14 @@ impl Interface {
         state.report = Some(report);
     }
 
+    /// Whether the host routes its own transport by destination.
+    pub(crate) fn needs_underlay_targets(&self) -> bool {
+        self.host_rules
+            .as_ref()
+            .and_then(|rules| rules.exit_rules())
+            .is_some_and(|exit| exit.needs_bypass())
+    }
+
     /// Tells the interface where a network's runtime reaches peers and
     /// relays outside the overlay. When the host needs those kept out of the
     /// exit node's default route and the set changed, the rules follow.
@@ -545,13 +556,7 @@ impl Interface {
                 map.insert(network, new.clone()) != Some(new)
             }
         };
-        let needed = changed
-            && self.routes.exit_via().is_some()
-            && self
-                .host_rules
-                .as_ref()
-                .and_then(|rules| rules.exit_rules())
-                .is_some_and(|exit| exit.needs_bypass());
+        let needed = changed && self.routes.exit_via().is_some() && self.needs_underlay_targets();
         if needed {
             self.sync_exit_rules().await;
         }
@@ -831,12 +836,19 @@ impl Interface {
             self.tally.wrong_source.fetch_add(1, Ordering::Relaxed);
             return Err(Rejected::WrongFamily);
         };
-        if !self.routes.may_send_from(network, peer, source) {
+        let Some(origin) = self.routes.packet_source(network, peer, source) else {
             self.tally.wrong_source.fetch_add(1, Ordering::Relaxed);
             return Err(Rejected::WrongSource);
-        }
-        let broadcast = match header.destination() {
-            IpAddr::V4(destination) if self.routes.is_broadcast(destination) => {
+        };
+        let broadcast = match (origin, header.destination()) {
+            (PacketSource::ExitReply { local: Some(local) }, IpAddr::V4(destination))
+                if destination == local =>
+            {
+                false
+            }
+            (PacketSource::Member, IpAddr::V4(destination))
+                if self.routes.is_broadcast(destination) =>
+            {
                 if !super::broadcast::valid_udp(&packet)
                     || !self.routes.accepts_broadcast(network, peer, destination)
                 {
@@ -845,12 +857,10 @@ impl Interface {
                 }
                 true
             }
-            IpAddr::V4(destination) if self.routes.is_local_destination(network, destination) => {
-                false
-            }
-            // This agent is an exit node of this network: a member's packet
-            // for the internet goes to the host, which masquerades it.
-            IpAddr::V4(destination) if self.routes.accepts_exit_traffic(network, destination) => {
+            (PacketSource::Member, IpAddr::V4(destination))
+                if self.routes.is_local_destination(network, destination)
+                    || self.routes.accepts_exit_traffic(network, destination) =>
+            {
                 false
             }
             _ => {
@@ -1576,6 +1586,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_exit_reply_must_terminate_locally_even_while_this_agent_offers_forwarding() {
+        use super::super::broadcast::BroadcastPolicy;
+        let (interface, device, routes, _, id) = interface(false).await;
+        routes.set_exit(
+            id,
+            ExitPolicy {
+                offer: true,
+                via: Some(peer(2)),
+            },
+        );
+        routes.set_broadcast(
+            id,
+            BroadcastPolicy {
+                enabled: true,
+                peers: [peer(2)].into_iter().collect(),
+            },
+        );
+
+        let udp = [0, 1, 0, 2, 0, 8, 0, 0];
+        for destination in [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::BROADCAST] {
+            assert_eq!(
+                interface
+                    .deliver(id, peer(2), ipv4(INTERNET, destination, &udp))
+                    .await,
+                Err(Rejected::WrongDestination)
+            );
+        }
+        assert_eq!(interface.counters().received, 0);
+
+        // The same peer can still return internet traffic to us, and can
+        // originate its own ordinary packets under the network's offer.
+        for packet in [ipv4(INTERNET, addr(1), &udp), ipv4(addr(2), INTERNET, &udp)] {
+            interface
+                .deliver(id, peer(2), packet.clone())
+                .await
+                .unwrap();
+            assert_eq!(device.pop_to_os().await.unwrap(), packet);
+        }
+    }
+
+    #[tokio::test]
     async fn an_exit_node_hands_a_members_internet_packet_to_the_host_only_while_offering() {
         let (interface, device, routes, _carrier, id) = interface(false).await;
 
@@ -1673,6 +1724,19 @@ mod tests {
         assert_eq!(
             rules.exit().installed().unwrap().bypass,
             vec![Ipv4Addr::new(5, 6, 7, 8)]
+        );
+
+        let second = network("second underlay");
+        let second_path = Ipv4Addr::new(203, 0, 113, 10);
+        interface.set_underlay(second, [second_path], []).await;
+        assert_eq!(
+            rules.exit().installed().unwrap().bypass,
+            [Ipv4Addr::new(5, 6, 7, 8), second_path]
+        );
+        interface.set_underlay(second, [], []).await;
+        assert_eq!(
+            rules.exit().installed().unwrap().bypass,
+            [Ipv4Addr::new(5, 6, 7, 8)]
         );
 
         // Not using an exit node: nothing to keep direct.

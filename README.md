@@ -114,9 +114,12 @@ explicit Save. [Commands, health, metrics and limits](docs/vip.md).
 ```sh
 tsng network exit-node home on    # on the machine that should be the exit
 tsng exit-node                    # on another one: who offers an exit
-tsng exit-node laptop             # send everything through it
+tsng exit-node laptop             # send internet traffic through it
 tsng exit-node off
 ```
+
+One exit serves the whole agent. Peers in every active Tsunagi network stay
+reachable on their own mesh routes.
 
 The tray does the same with a checkbox. An exit node sees everything you send
 through it, so use only members you trust.

@@ -29,8 +29,8 @@
 //! Linux scheme does not carry over. Instead:
 //!
 //! ```text
-//! route add -net 0.0.0.0/1   -interface <if>
-//! route add -net 128.0.0.0/1 -interface <if>
+//! route add -net 0.0.0.0/1   -interface <if> -ifa <selected overlay address>
+//! route add -net 128.0.0.0/1 -interface <if> -ifa <selected overlay address>
 //! pass out quick on <if> route-to (<egress> <gateway>) inet proto { tcp udp }
 //!     from any to ! <overlay ranges> user <agent uid>
 //! nat on <egress> inet from (<if>) to any -> (<egress>)
@@ -104,6 +104,7 @@ pub(super) fn run_tool(tool: Tool, args: &[String], stdin: Option<&str>) -> Ran 
 
     let mut command = Command::new(tool.path());
     command
+        .env("LC_ALL", "C")
         .args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -206,8 +207,8 @@ fn run_ok(
         Ran::Exited {
             success: true,
             stdout,
-            ..
-        } => Ok(stdout),
+            stderr,
+        } if tool != Tool::Route || stderr.is_empty() => Ok(stdout),
         Ran::Exited { stderr, stdout, .. } => Err(format!(
             "{} {} failed: {}",
             tool.path(),
@@ -380,8 +381,17 @@ const HALVES: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
 /// The IPv6 halves, made unreachable.
 const HALVES_V6: [&str; 2] = ["::/1", "8000::/1"];
 
-fn route_add_args(half: &str, interface: &str) -> Vec<String> {
-    owned(&["-q", "-n", "add", "-net", half, "-interface", interface])
+fn route_set_args(
+    action: &str,
+    half: &str,
+    interface: &str,
+    source: Option<Ipv4Addr>,
+) -> Vec<String> {
+    let mut args = owned(&["-q", "-n", action, "-net", half, "-interface", interface]);
+    if let Some(source) = source {
+        args.extend(["-ifa".into(), source.to_string()]);
+    }
+    args
 }
 
 fn route_del_args(half: &str, interface: &str) -> Vec<String> {
@@ -407,12 +417,57 @@ fn clear_routes(run: Run<'_>, interface: &str) {
     }
 }
 
-fn set_routes(run: Run<'_>, interface: &str) -> Result<(), String> {
-    clear_routes(run, interface);
+/// Installs a split default, or changes its source in place when the route
+/// already belongs to this utun. Returns whether this call added it.
+fn set_half(
+    run: Run<'_>,
+    half: &str,
+    interface: &str,
+    source: Option<Ipv4Addr>,
+) -> Result<bool, String> {
+    match run_ok(
+        run,
+        Tool::Route,
+        &route_set_args("add", half, interface, source),
+        None,
+    ) {
+        Ok(_) => Ok(true),
+        Err(why) if why.contains("File exists") => {
+            let lookup = run_ok(run, Tool::Route, &owned(&["-n", "get", "-net", half]), None)
+                .map_err(|inspect| format!("{why}; {inspect}"))?;
+            let field = |key: &str| {
+                lookup
+                    .lines()
+                    .filter_map(|line| line.trim().split_once(':'))
+                    .find_map(|(name, value)| (name == key).then(|| value.trim()))
+            };
+            if field("mask") != Some("128.0.0.0") || field("interface") != Some(interface) {
+                return Err(why);
+            }
+            run_ok(
+                run,
+                Tool::Route,
+                &route_set_args("change", half, interface, source),
+                None,
+            )?;
+            Ok(false)
+        }
+        Err(why) => Err(why),
+    }
+}
+
+fn set_routes(run: Run<'_>, interface: &str, source: Option<Ipv4Addr>) -> Result<(), String> {
+    let mut added = Vec::new();
     for half in HALVES {
-        if let Err(why) = run_ok(run, Tool::Route, &route_add_args(half, interface), None) {
-            clear_routes(run, interface);
-            return Err(why);
+        match set_half(run, half, interface, source) {
+            Ok(true) => added.push(half),
+            Ok(false) => {}
+            Err(why) => {
+                for half in added {
+                    let _ = run(Tool::Route, &route_del_args(half, interface), None);
+                }
+                return Err(why);
+            }
         }
     }
     for half in HALVES_V6 {
@@ -490,7 +545,7 @@ fn apply_rules(
     // The routes come after the rules that keep the agent's own traffic off
     // them: the other order would loop for as long as it takes.
     if plan.client {
-        set_routes(run, interface)?;
+        set_routes(run, interface, plan.client_source)?;
     } else {
         clear_routes(run, interface);
     }
@@ -545,6 +600,7 @@ destination: default\n\
         pf_missing: bool,
         pf_load_fails: bool,
         route_add_fails: bool,
+        half_interface: Option<&'static str>,
         pf_enable_output: &'static str,
     }
 
@@ -558,6 +614,7 @@ destination: default\n\
                 pf_missing: false,
                 pf_load_fails: false,
                 route_add_fails: false,
+                half_interface: None,
                 pf_enable_output: "pf enabled\nToken : 4242\n",
             }
         }
@@ -581,14 +638,29 @@ destination: default\n\
             match tool {
                 Tool::Id => ok("0\n", ""),
                 Tool::Sysctl => ok(self.forwarding, ""),
+                Tool::Route
+                    if args.iter().any(|arg| arg == "get")
+                        && args.iter().any(|arg| arg == "-net") =>
+                {
+                    match self.half_interface {
+                        Some(name) => ok(&format!("mask: 128.0.0.0\ninterface: {name}\n"), ""),
+                        None => fail("not in table"),
+                    }
+                }
                 Tool::Route if args.first().map(String::as_str) == Some("-n") => {
                     match &self.default_route {
                         Some(text) => ok(text, ""),
                         None => fail("route: writing to routing socket: not in table"),
                     }
                 }
-                Tool::Route if args.contains(&"add".to_string()) && self.route_add_fails => {
-                    fail("route: writing to routing socket: File exists")
+                Tool::Route
+                    if args.contains(&"add".to_string())
+                        && ((self.route_add_fails && args.iter().any(|a| a == HALVES[1]))
+                            || (self.half_interface.is_some()
+                                && HALVES.iter().any(|half| args.iter().any(|a| a == half)))) =>
+                {
+                    // Darwin route can return success after a routing-socket write failed.
+                    ok("", "route: writing to routing socket: File exists")
                 }
                 Tool::Route => ok("", ""),
                 Tool::Pfctl if self.pf_missing => Ran::Missing,
@@ -718,7 +790,7 @@ destination: default\n\
     #[test]
     fn the_overlay_default_routes_are_halves_and_ipv6_is_rejected() {
         assert_eq!(
-            route_add_args("0.0.0.0/1", "utun5").join(" "),
+            route_set_args("add", "0.0.0.0/1", "utun5", None).join(" "),
             "-q -n add -net 0.0.0.0/1 -interface utun5"
         );
         assert_eq!(
@@ -803,6 +875,55 @@ destination: default\n\
         assert!(fake.stdins.borrow()[0].contains("user 0"));
         // The default route was read before any overlay route existed.
         assert!(fake.position("-n get default").unwrap() < add);
+    }
+
+    #[test]
+    fn both_exit_halves_use_the_selected_networks_address_on_a_shared_utun() {
+        let fake = Fake::new();
+        let token = Mutex::new(None);
+        let mut selected = plan(false, true);
+        selected.overlay.push("10.99.0.0/24".parse().unwrap());
+        for source in ["10.99.0.17", "10.13.37.34"] {
+            selected.client_source = Some(source.parse().unwrap());
+            let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &selected);
+            assert_eq!(report.client, Some(RuleOutcome::Applied));
+            for half in HALVES {
+                assert!(
+                    fake.position(&format!("add -net {half} -interface utun5 -ifa {source}"))
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changing_the_active_exit_keeps_both_halves_routed_through_its_utun() {
+        let mut selected = plan(false, true);
+        selected.client_source = Some("10.99.0.17".parse().unwrap());
+        let mut fake = Fake::new();
+        fake.half_interface = Some("utun5");
+        let report = apply_plan(&|t, a, s| fake.run(t, a, s), &Mutex::new(None), &selected);
+        assert_eq!(report.client, Some(RuleOutcome::Applied));
+        for half in HALVES {
+            assert!(
+                fake.position(&format!(
+                    "change -net {half} -interface utun5 -ifa 10.99.0.17"
+                ))
+                .is_some()
+            );
+        }
+        assert_eq!(fake.count(" delete "), 0);
+
+        let mut foreign = Fake::new();
+        foreign.half_interface = Some("utun9");
+        let report = apply_plan(
+            &|t, a, s| foreign.run(t, a, s),
+            &Mutex::new(None),
+            &selected,
+        );
+        assert!(matches!(report.client, Some(RuleOutcome::Failed(_))));
+        assert_eq!(foreign.count(" change "), 0);
+        assert_eq!(foreign.count(" delete "), 0);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # Exit nodes
 
 A member can offer itself as an **exit node** in a network. Other members can
-then send *all* their internet traffic through it, the way a commercial VPN
-or Tailscale's exit nodes work. Linux only for now.
+then send their default IPv4 internet traffic through it. Linux, macOS and
+Windows can offer or use an exit node. Android can use one.
 
 ## Using it
 
@@ -23,16 +23,20 @@ The using side:
 
 ```sh
 tsng exit-node                  # who offers one
-tsng exit-node <name|id>        # send everything through it
+tsng exit-node <name|id>        # choose the device's internet exit
+tsng exit-node -n work gateway  # choose gateway in work if the name is ambiguous
 tsng exit-node off
 ```
 
 The tray does the same: a checkbox on the network tile to offer, and an icon on
 each device in the devices window that offers one, with a confirmation.
 
-One device has one default route, so it uses **one** exit node at a time;
-choosing another replaces the first. Offering is per network, so a device can
-be an exit node in one network and not in another.
+An agent uses **one exit node across all active networks**. Choosing another
+replaces the previous selection and survives restart. Internet packets use
+the local address in the selected exit's network. Each active mesh keeps
+its own subnet route, including routes to the exit peer's overlay address,
+other peers and virtual services. An unused address inside an active mesh
+subnet is dropped locally. Offering an exit remains a per-network choice.
 
 ## How it works
 
@@ -44,7 +48,8 @@ be an exit node in one network and not in another.
   network stops, and when the agent exits. Only networks that offer have
   rules, so the others' traffic is not forwarded.
 - **Client:** policy routing, with no change to the main table. Table `29811`
-  holds `default dev <interface>`. Rules `5205 fwmark 0x40000000/0x40000000
+  holds `default dev <interface> src <local address in the exit network>` once
+  that address is assigned. Rules `5205 fwmark 0x40000000/0x40000000
   lookup main` and `5206 uidrange <agent uid> lookup main` keep the agent's
   sockets and their replies outside the tunnel, before Tailscale's rules.
   `5290 lookup main suppress_prefixlength 0` preserves LAN and other specific
@@ -73,9 +78,9 @@ be an exit node in one network and not in another.
   error if marks would be ignored. It never disables `rp_filter` or changes
   host sysctls. Netfilter strict reverse checks also need their mark-aware
   form, such as `rpfilter --validmark`, which NixOS already uses.
-- Packets for addresses outside every overlay range are sent to the exit node
-  by the router; the exit node's replies are accepted from any source. A member
-  that is not your exit node cannot do that.
+- The router sends ordinary IPv4 unicast outside all active mesh ranges to
+  the selected exit. It accepts replies with external source addresses from
+  that peer only when they target this device's address in the exit network.
 - **IPv6 is blocked while you use one.** There is no IPv6 through an exit node,
   and letting it go the ordinary way would leak it. The same three rules exist
   for IPv6 with an `unreachable default` in the table, so applications get an
@@ -96,7 +101,8 @@ is built from `pf` and `route`. The agent runs as root there.
   macOS forgets at reboot. The egress is the default route's interface **at the
   time the rules are applied**; after it changes (Wi-Fi to Ethernet) switch the
   offer off and on.
-- **Using:** `0.0.0.0/1` and `128.0.0.0/1` routes through the overlay interface,
+- **Using:** `0.0.0.0/1` and `128.0.0.0/1` routes through the overlay interface
+  with the local address of the exit network as their source,
   and a `pf` `route-to` rule that sends the agent's own traffic (matched by its
   user id, root) back out the physical interface, with translation to that
   interface's address. Anything else you run as root also bypasses the tunnel.
@@ -119,8 +125,12 @@ is built from `pf` and `route`. The agent runs as root there.
   through the physical default gateway is added for every address the agent
   talks to directly: verified direct paths of its connections, plus the relays
   it uses, resolved when the rules are applied. The set follows path changes. A
-  path that appears after the last apply goes through the tunnel until the next
-  one. IPv6 is blackholed with `::/1` and `8000::/1` on the overlay interface,
+  newly authenticated connection supplies its direct paths immediately and the
+  discovery tick refreshes them. Physical bypass routes exclude every active
+  mesh subnet. Wintun can choose any local alias for the default route. For
+  TCP, UDP and ICMP echo, the agent uses the exit network's address on the
+  tunnel and restores replies to the address the Windows socket used.
+  IPv6 is blackholed with `::/1` and `8000::/1` on the overlay interface,
   so applications fall back to IPv4 after a delay rather than at once.
   Everything is in the active store: a reboot clears it.
 - Not verified on a live host when this was written. To inspect:

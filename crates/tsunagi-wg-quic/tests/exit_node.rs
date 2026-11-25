@@ -20,6 +20,7 @@ use tsunagi::dataplane::IpPlugin;
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::identity::NetworkId;
 use tsunagi::overlay::{MemoryTun, MemoryTunFactory, MockHostRules};
+use tsunagi::state::{DEFAULT_IPV4_RANGE, Ipv4Range};
 use tsunagi::testing::{network, wait_until};
 use tsunagi::{Agent, NetworkStatus};
 use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
@@ -27,7 +28,7 @@ use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 const INTERNET: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
 
 struct Node {
-    _dir: TempDir,
+    dir: TempDir,
     agent: Agent,
     plugin: Arc<WireguardPlugin>,
     tuns: MemoryTunFactory,
@@ -36,7 +37,21 @@ struct Node {
 
 impl Node {
     async fn spawn(discovery: &SharedMemoryDiscovery, tag: &str) -> Self {
-        let dir = TempDir::new().unwrap();
+        Self::open(
+            TempDir::new().unwrap(),
+            discovery,
+            tag,
+            Some(DEFAULT_IPV4_RANGE),
+        )
+        .await
+    }
+
+    async fn open(
+        dir: TempDir,
+        discovery: &SharedMemoryDiscovery,
+        tag: &str,
+        range: Option<Ipv4Range>,
+    ) -> Self {
         let tuns = MemoryTunFactory::new();
         let rules = MockHostRules::new();
         let plugin = WireguardPlugin::open(
@@ -47,7 +62,7 @@ impl Node {
         .unwrap();
         let agent = Agent::spawn(
             tsunagi::testing::config_with(dir.path(), discovery)
-                .with_overlay_ipv4_range(Some(tsunagi::state::DEFAULT_IPV4_RANGE))
+                .with_overlay_ipv4_range(range)
                 .with_interface(
                     Arc::new(tuns.clone().with_host_rules(Arc::new(rules.clone()))),
                     tag,
@@ -61,7 +76,7 @@ impl Node {
         .await
         .unwrap();
         Self {
-            _dir: dir,
+            dir,
             agent,
             plugin,
             tuns,
@@ -99,6 +114,22 @@ impl Node {
     async fn status(&self, network: NetworkId) -> NetworkStatus {
         self.agent.network_status(network).await.unwrap()
     }
+
+    async fn selected_exits(&self) -> Vec<(NetworkId, EndpointId)> {
+        self.agent
+            .status()
+            .await
+            .unwrap()
+            .networks
+            .into_iter()
+            .filter_map(|network| Some((network.network_id, network.exit_via?)))
+            .collect()
+    }
+
+    async fn shutdown(self) -> TempDir {
+        self.agent.shutdown().await;
+        self.dir
+    }
 }
 
 fn ipv4_packet(source: Ipv4Addr, destination: Ipv4Addr, payload: &[u8]) -> Bytes {
@@ -122,6 +153,151 @@ async fn next(tun: &MemoryTun) -> Bytes {
         .await
         .expect("a packet reaches the operating system")
         .unwrap()
+}
+
+struct ExitNetwork<'a> {
+    id: NetworkId,
+    peer: &'a Node,
+    client_addr: Ipv4Addr,
+    peer_addr: Ipv4Addr,
+    peer_tun: Arc<MemoryTun>,
+}
+
+impl<'a> ExitNetwork<'a> {
+    async fn join(client: &Node, peer: &'a Node, name: &str, range: Ipv4Range) -> Self {
+        let (name, secret) = network(name);
+        let id = peer.agent.join_network(&name, &secret).await.unwrap();
+        peer.overlay(id).await;
+        peer.agent.set_exit_offer(id, true).await.unwrap();
+        client.agent.join_network(&name, &secret).await.unwrap();
+        client.wait_for_tunnels(id, 1).await;
+        peer.wait_for_tunnels(id, 1).await;
+        let client_addr = wait_until(
+            "client adopts the peer's range and sees its exit offer",
+            || async {
+                let address = client.plugin.overview(id)?.overlay_address_v4?;
+                (range.contains(address)
+                    && client
+                        .status(id)
+                        .await
+                        .peers
+                        .iter()
+                        .any(|p| p.endpoint_id == peer.id() && p.exit_node))
+                .then_some(address)
+            },
+        )
+        .await;
+        Self {
+            id,
+            peer,
+            client_addr,
+            peer_addr: peer.overlay(id).await,
+            peer_tun: peer.tun().await,
+        }
+    }
+
+    async fn check_mesh(&self, client_tun: &MemoryTun) {
+        let request = ipv4_packet(self.client_addr, self.peer_addr, self.id.as_bytes());
+        client_tun.push_from_os(request.clone());
+        assert_eq!(next(&self.peer_tun).await, request);
+        let reply = ipv4_packet(self.peer_addr, self.client_addr, self.id.as_bytes());
+        self.peer_tun.push_from_os(reply.clone());
+        assert_eq!(next(client_tun).await, reply);
+    }
+}
+
+#[tokio::test]
+async fn switching_the_exit_between_networks_keeps_both_overlays_reachable() {
+    let discovery = SharedMemoryDiscovery::new();
+    let client = Node::open(TempDir::new().unwrap(), &discovery, "client", None).await;
+    let left = Node::spawn(&discovery, "left").await;
+    let right_range = "10.99.0.0/16".parse().unwrap();
+    let right = Node::open(
+        TempDir::new().unwrap(),
+        &discovery,
+        "right",
+        Some(right_range),
+    )
+    .await;
+    let alpha = ExitNetwork::join(&client, &left, "exit-left", DEFAULT_IPV4_RANGE).await;
+    let beta = ExitNetwork::join(&client, &right, "exit-right", right_range).await;
+    let tun = client.tun().await;
+
+    for exit in [&alpha, &beta] {
+        client
+            .agent
+            .set_exit_via(exit.id, Some(exit.peer.id()))
+            .await
+            .unwrap();
+        let plan = client.rules.exit().installed().unwrap();
+        assert_eq!(plan.client_source, Some(exit.client_addr));
+        assert_eq!(plan.overlay.len(), 2);
+        let internet = ipv4_packet(exit.client_addr, INTERNET, b"request");
+        tun.push_from_os(internet.clone());
+        assert_eq!(next(&exit.peer_tun).await, internet);
+        let reply = ipv4_packet(INTERNET, exit.client_addr, b"reply");
+        exit.peer_tun.push_from_os(reply.clone());
+        assert_eq!(next(&tun).await, reply);
+
+        for net in [&alpha, &beta] {
+            let selected = (net.id == exit.id).then(|| net.peer.id());
+            assert_eq!(client.status(net.id).await.exit_via, selected);
+            net.check_mesh(&tun).await;
+        }
+    }
+    // Right offers on beta only. An invalid replacement must preserve the live route.
+    assert!(
+        client
+            .agent
+            .set_exit_via(alpha.id, Some(right.id()))
+            .await
+            .is_err()
+    );
+    assert_eq!(client.selected_exits().await, [(beta.id, right.id())]);
+    let request = ipv4_packet(beta.client_addr, INTERNET, b"still using beta");
+    tun.push_from_os(request.clone());
+    assert_eq!(next(&beta.peer_tun).await, request);
+
+    // Two independent commands may race. Both must leave one effective exit,
+    // and restarting from the same SQLite state must restore that exact choice.
+    let (one, two) = tokio::join!(
+        client.agent.set_exit_via(alpha.id, Some(left.id())),
+        client.agent.set_exit_via(beta.id, Some(right.id())),
+    );
+    one.unwrap();
+    two.unwrap();
+    let exits = client.selected_exits().await;
+    assert!(
+        exits == [(alpha.id, left.id())] || exits == [(beta.id, right.id())],
+        "{exits:?}"
+    );
+    let (lost, live) = if exits[0].0 == alpha.id {
+        (&alpha, &beta)
+    } else {
+        (&beta, &alpha)
+    };
+    lost.peer.agent.shutdown().await;
+    client.wait_for_tunnels(lost.id, 0).await;
+    wait_until("the selected exit is offline", || async {
+        let status = client.status(lost.id).await;
+        (status.exit_via == Some(lost.peer.id()) && !status.exit_via_online).then_some(())
+    })
+    .await;
+    assert!(client.rules.exit().installed().unwrap().client);
+    let dropped = client.agent.overlay().unwrap().counters.undeliverable;
+    tun.push_from_os(ipv4_packet(lost.client_addr, INTERNET, b"offline exit"));
+    wait_until(
+        "internet traffic cannot use the other offering peer",
+        || async { (client.agent.overlay()?.counters.undeliverable > dropped).then_some(()) },
+    )
+    .await;
+    live.check_mesh(&tun).await;
+
+    let dir = client.shutdown().await;
+    let restarted = Node::open(dir, &discovery, "client", None).await;
+    assert_eq!(restarted.selected_exits().await, exits);
+    restarted.agent.shutdown().await;
+    live.peer.agent.shutdown().await;
 }
 
 #[tokio::test]

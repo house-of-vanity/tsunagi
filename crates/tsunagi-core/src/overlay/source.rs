@@ -1,13 +1,16 @@
-//! Normalize Android's primary IPv4 source at the local VPN boundary.
-use crate::plan::VpnPlan;
+//! Translate host-selected IPv4 aliases at the local packet interface.
+use super::Cidr;
+use super::packet::{Ipv4Reassembly, fragment_ipv4};
 use bytes::Bytes;
 use smoltcp::wire::{Ipv4Cidr, Ipv4Packet};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
-use tsunagi::overlay::packet::{Ipv4Reassembly, fragment_ipv4};
 
 mod icmp;
+
+#[cfg(any(all(windows, feature = "tun-device"), test))]
+pub(crate) mod windows;
 
 // No mappings are persisted, and a new flow cannot evict a live socket.
 const MAX_FLOWS: usize = 4096;
@@ -74,16 +77,27 @@ struct Binding {
     expires: Instant,
 }
 
-#[derive(Default)]
+/// How the host chooses a source at the TUN boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceMode {
+    /// Android can choose the primary VPN address even for another mesh.
+    Primary,
+    /// Windows chooses the matching subnet for mesh traffic, but may select
+    /// any local alias for a default route.
+    ExitOnly,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct Domains {
     aliases: Vec<Ipv4Cidr>,
     exit: Option<Ipv4Addr>,
+    mode: SourceMode,
 }
+
 impl Domains {
-    fn from_plan(plan: &VpnPlan) -> Self {
-        let aliases = plan
-            .addresses_in_order()
-            .into_iter()
+    fn new(addresses: &[Cidr], exit: Option<Ipv4Addr>, mode: SourceMode) -> Self {
+        let aliases = addresses
+            .iter()
             .filter_map(|cidr| match cidr.addr {
                 IpAddr::V4(addr) if cidr.prefix_len <= 32 => {
                     Some(Ipv4Cidr::new(addr, cidr.prefix_len))
@@ -93,10 +107,15 @@ impl Domains {
             .collect();
         Self {
             aliases,
-            exit: match (plan.full_tunnel, plan.exit) {
-                (true, Some(IpAddr::V4(addr))) => Some(addr),
-                _ => None,
-            },
+            exit,
+            mode,
+        }
+    }
+
+    fn primary(&self) -> Option<Ipv4Addr> {
+        match self.mode {
+            SourceMode::Primary => self.aliases.first().map(Ipv4Cidr::address),
+            SourceMode::ExitOnly => None,
         }
     }
     fn has(&self, addr: Ipv4Addr) -> bool {
@@ -112,15 +131,15 @@ impl Domains {
             return None;
         }
         if let Some(prefix) = self.aliases.iter().find(|p| p.contains_addr(&remote)) {
-            return (prefix.broadcast() != Some(remote)).then(|| prefix.address());
+            return (self.mode == SourceMode::Primary && prefix.broadcast() != Some(remote))
+                .then(|| prefix.address());
         }
         self.exit
     }
 }
 
-/// Android's VPN routes name only the interface. The local host socket keeps
-/// its address while authenticated mesh traffic uses the subnet's own alias.
-pub(crate) struct SourceFlows {
+/// Bounded flow bindings restore replies to the socket that opened each flow.
+pub struct SourceFlows {
     domains: Domains,
     mtu: u32,
     flows: HashMap<Ipv4Addr, HashMap<WireFlow, Binding>>,
@@ -131,10 +150,11 @@ pub(crate) struct SourceFlows {
 }
 
 impl SourceFlows {
-    pub(crate) fn new(plan: &VpnPlan) -> Self {
+    /// Addresses are in the same order as on the device, primary first where applicable.
+    pub fn new(addresses: &[Cidr], exit: Option<Ipv4Addr>, mtu: u32, mode: SourceMode) -> Self {
         Self {
-            domains: Domains::from_plan(plan),
-            mtu: plan.mtu,
+            domains: Domains::new(addresses, exit, mode),
+            mtu,
             flows: HashMap::new(),
             primary_has_translations: false,
             last_sweep: Instant::now(),
@@ -143,9 +163,10 @@ impl SourceFlows {
         }
     }
 
-    pub(crate) fn reconfigure(&mut self, plan: &VpnPlan) {
-        self.domains = Domains::from_plan(plan);
-        self.mtu = plan.mtu;
+    /// Keep live bindings whose host and wire addresses still belong to the same domains.
+    pub fn reconfigure(&mut self, addresses: &[Cidr], exit: Option<Ipv4Addr>, mtu: u32) {
+        self.domains = Domains::new(addresses, exit, self.domains.mode);
+        self.mtu = mtu;
         self.flows.retain(|_, table| {
             table.retain(|wire, entry| {
                 self.domains.has(entry.host) && self.domains.owner(wire.remote) == Some(wire.local)
@@ -159,7 +180,7 @@ impl SourceFlows {
     }
 
     fn refresh_primary(&mut self) {
-        if let Some(primary) = self.domains.aliases.first().map(Ipv4Cidr::address) {
+        if let Some(primary) = self.domains.primary() {
             self.primary_has_translations = self
                 .flows
                 .get(&primary)
@@ -170,11 +191,13 @@ impl SourceFlows {
         }
     }
 
-    pub(crate) fn outbound(&mut self, packet: Bytes) -> Vec<Bytes> {
+    /// Packets read from the host.
+    pub fn outbound(&mut self, packet: Bytes) -> Vec<Bytes> {
         self.process(packet, true)
     }
 
-    pub(crate) fn inbound(&mut self, packet: Bytes) -> Vec<Bytes> {
+    /// Packets admitted by the mesh and destined for the host.
+    pub fn inbound(&mut self, packet: Bytes) -> Vec<Bytes> {
         self.process(packet, false)
     }
 
@@ -186,7 +209,7 @@ impl SourceFlows {
             return vec![];
         };
         let h = usize::from(ip.header_len());
-        if h < 20 || usize::from(ip.total_len()) != packet.len() || !ip.verify_checksum() {
+        if h < 20 || usize::from(ip.total_len()) != packet.len() {
             return vec![];
         }
         let (local, remote) = if outbound {
@@ -197,11 +220,27 @@ impl SourceFlows {
         // ICMP errors can come from a router other than the original peer.
         let is_icmp = packet[9] == 1;
         let owner = self.domains.owner(remote);
-        let primary = self.domains.aliases[0].address();
+        let fragmented = ip.more_frags() || ip.frag_offset() != 0;
+        if self.domains.mode == SourceMode::ExitOnly {
+            // A mesh router can report PMTU for an internet flow whose source
+            // we translated. All other native mesh and forwarded packets pass
+            // directly, including fragments and packets headed to the gateway.
+            let exit_error = !outbound
+                && Some(local) == self.domains.exit
+                && is_icmp
+                && (fragmented || matches!(packet.get(h), Some(3 | 11 | 12)));
+            if !self.domains.has(local) || (owner.is_none() && !exit_error) {
+                return vec![packet];
+            }
+        }
+        if !ip.verify_checksum() {
+            return vec![];
+        }
+        let primary = self.domains.primary();
         // The kernel already uses the primary address for its own subnet. A
         // primary change can leave earlier translated sockets draining there.
-        if local == primary
-            && (!outbound || owner == Some(primary))
+        if Some(local) == primary
+            && (!outbound || owner == primary)
             && !self.primary_has_translations
         {
             return vec![packet];
@@ -223,7 +262,6 @@ impl SourceFlows {
             self.refresh_primary();
             self.last_sweep = now;
         }
-        let fragmented = u16::from_be_bytes([packet[6], packet[7]]) & 0x3fff != 0;
         let packet = if fragmented {
             let parts = if outbound {
                 &mut self.outgoing_parts
@@ -253,9 +291,15 @@ impl SourceFlows {
                 .is_some_and(|kind| matches!(kind, 3 | 11 | 12))
         {
             icmp::rewrite_error(packet, h, !outbound, |quote, quote_outbound| {
-                let flow = WireFlow::parse(quote, quote_outbound)?;
+                let binding = WireFlow::parse(quote, quote_outbound)
+                    .and_then(|flow| self.domains.owner(flow.remote).map(|alias| (flow, alias)));
+                let Some((flow, alias)) = binding else {
+                    // The quote passed validation but never required exit translation,
+                    // for example a native socket talking to a peer inside the mesh.
+                    return (self.domains.mode == SourceMode::ExitOnly).then_some((local, local));
+                };
                 let wire = WireFlow {
-                    local: self.domains.owner(flow.remote)?,
+                    local: alias,
                     ..flow
                 };
                 let entry = self
@@ -264,8 +308,10 @@ impl SourceFlows {
                     .and_then(|table| table.get(&wire))
                     .filter(|entry| now < entry.expires);
                 let Some(entry) = entry else {
-                    return (wire.local == primary && flow.local == primary)
-                        .then_some((primary, primary));
+                    return (wire.local == flow.local
+                        && (Some(wire.local) == primary
+                            || self.domains.mode == SourceMode::ExitOnly))
+                        .then_some((wire.local, wire.local));
                 };
                 if quote_outbound {
                     (flow.local == wire.local).then_some((wire.local, entry.host))
@@ -333,17 +379,21 @@ impl SourceFlows {
             table.remove(&wire);
         }
         if !table.contains_key(&wire) {
-            if alias == self.domains.aliases.first()?.address() && local == alias {
+            if Some(alias) == self.domains.primary() && local == alias {
                 return Some(packet);
             }
             if table.len() >= MAX_FLOWS {
                 return None;
             }
-            if outbound && local != alias {
-                let primary = self.domains.aliases.first()?.address();
-                if local != primary || flow.protocol == 6 && data[13] & 0x12 != 2 {
-                    return None;
-                }
+            if outbound
+                && local != alias
+                && (self
+                    .domains
+                    .primary()
+                    .is_some_and(|primary| primary != local)
+                    || flow.protocol == 6 && data[13] & 0x12 != 2)
+            {
+                return None;
             }
         }
         let entry = table.entry(wire).or_insert(Binding {
@@ -356,7 +406,7 @@ impl SourceFlows {
                 let wildcard_reply = entry.remote_initiated
                     && entry.host == alias
                     && flow.protocol == 17
-                    && self.domains.aliases.first()?.address() == local;
+                    && self.domains.primary() == Some(local);
                 if !wildcard_reply {
                     return None;
                 }
@@ -416,21 +466,16 @@ fn update_checksum(checksum: u16, old: Ipv4Addr, new: Ipv4Addr) -> u16 {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use tsunagi::overlay::Cidr;
 
     const FIRST: Ipv4Addr = Ipv4Addr::new(10, 1, 0, 1);
     const SECOND: Ipv4Addr = Ipv4Addr::new(10, 2, 0, 1);
     const PEER: Ipv4Addr = Ipv4Addr::new(10, 2, 0, 8);
 
-    fn plan() -> VpnPlan {
-        VpnPlan {
-            addresses: vec![
-                Cidr::new(FIRST.into(), 24).unwrap(),
-                Cidr::new(SECOND.into(), 24).unwrap(),
-            ],
-            mtu: 1280,
-            ..Default::default()
-        }
+    fn aliases() -> Vec<Cidr> {
+        vec![
+            Cidr::new(FIRST.into(), 24).unwrap(),
+            Cidr::new(SECOND.into(), 24).unwrap(),
+        ]
     }
 
     fn udp(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload: &[u8]) -> Bytes {
@@ -455,7 +500,7 @@ mod tests {
 
     #[test]
     fn connected_udp_keeps_its_kernel_address_while_the_peer_sees_the_right_alias() {
-        let mut flows = SourceFlows::new(&plan());
+        let mut flows = SourceFlows::new(&aliases(), None, 1280, SourceMode::Primary);
         let request = udp(FIRST, PEER, 4123, 1234, b"request");
         assert_eq!(
             flows.outbound(request),
@@ -485,8 +530,67 @@ mod tests {
     }
 
     #[test]
+    fn windows_exit_accepts_any_local_alias_and_restores_external_replies() {
+        let mut flows = SourceFlows::new(&aliases(), Some(FIRST), 1280, SourceMode::ExitOnly);
+        let internet = Ipv4Addr::new(203, 0, 113, 2);
+        let request = udp(SECOND, internet, 4123, 443, b"external");
+        assert_eq!(
+            flows.outbound(request),
+            [udp(FIRST, internet, 4123, 443, b"external")]
+        );
+        assert_eq!(
+            flows.inbound(udp(internet, FIRST, 443, 4123, b"reply")),
+            [udp(internet, SECOND, 443, 4123, b"reply")]
+        );
+        // An explicitly bound socket cannot take replies from this flow.
+        assert!(
+            flows
+                .outbound(udp(FIRST, internet, 4123, 443, b"collision"))
+                .is_empty()
+        );
+        // An address in either overlay, including the gateway itself, stays native.
+        let mesh = udp(SECOND, PEER, 4123, 443, b"mesh");
+        assert_eq!(flows.outbound(mesh.clone()), [mesh]);
+    }
+
+    #[tokio::test]
+    async fn wintun_normalizes_only_external_flows_while_an_exit_is_selected() {
+        use super::windows::ExitSourceTun;
+        use crate::overlay::{MemoryTun, TunDevice};
+
+        let device = MemoryTun::new("test", 1280);
+        let tun = ExitSourceTun::new(device.clone());
+        let internet = Ipv4Addr::new(203, 0, 113, 2);
+        let request = udp(FIRST, internet, 4000, 80, &[1; 1600]);
+        let on_wire = udp(SECOND, internet, 4000, 80, &[1; 1600]);
+        tun.set_exit_source(&aliases(), Some(SECOND));
+        for part in fragment_ipv4(request.clone(), 1280) {
+            device.push_from_os(part);
+        }
+        for expected in fragment_ipv4(on_wire, 1280) {
+            assert_eq!(tun.recv().await, Some(expected));
+        }
+        // Periodic exit rule refreshes must preserve the original socket.
+        tun.set_exit_source(&aliases(), Some(SECOND));
+        tun.send(udp(internet, SECOND, 80, 4000, b"reply"))
+            .await
+            .unwrap();
+        assert_eq!(
+            device.pop_to_os().await,
+            Some(udp(internet, FIRST, 80, 4000, b"reply"))
+        );
+        let forwarded = udp(PEER, internet, 4000, 80, b"forwarded");
+        device.push_from_os(forwarded.clone());
+        assert_eq!(tun.recv().await, Some(forwarded));
+
+        tun.set_exit_source(&aliases(), None);
+        device.push_from_os(request.clone());
+        assert_eq!(tun.recv().await, Some(request));
+    }
+
+    #[test]
     fn proper_bound_flows_and_limited_broadcast_keep_their_identity() {
-        let mut flows = SourceFlows::new(&plan());
+        let mut flows = SourceFlows::new(&aliases(), None, 1280, SourceMode::Primary);
         let native = udp(SECOND, PEER, 3000, 3001, b"bound");
         assert_eq!(flows.outbound(native.clone()), vec![native]);
         assert!(
@@ -533,15 +637,14 @@ mod tests {
 
     #[test]
     fn tcp_keeps_direction_and_bindings_survive_unrelated_plans() {
-        let mut plan = plan();
-        let mut flows = SourceFlows::new(&plan);
+        let mut aliases = aliases();
+        let mut flows = SourceFlows::new(&aliases, None, 1280, SourceMode::Primary);
         assert!(flows.outbound(tcp(FIRST, PEER, 333, 443, 16)).is_empty());
         assert_eq!(
             flows.outbound(tcp(FIRST, PEER, 333, 443, 2)),
             [tcp(SECOND, PEER, 333, 443, 2)]
         );
-        plan.broadcast = !plan.broadcast;
-        flows.reconfigure(&plan);
+        flows.reconfigure(&aliases, None, 1280);
         assert_eq!(
             flows.inbound(tcp(PEER, SECOND, 443, 333, 18)),
             [tcp(PEER, FIRST, 443, 333, 18)]
@@ -552,8 +655,8 @@ mod tests {
         assert_eq!(flows.inbound(inbound.clone()), [inbound]);
         let syn_ack = tcp(SECOND, PEER, 80, 12345, 18);
         assert_eq!(flows.outbound(syn_ack.clone()), [syn_ack]);
-        plan.addresses.remove(0);
-        flows.reconfigure(&plan);
+        aliases.remove(0);
+        flows.reconfigure(&aliases, None, 1280);
         assert!(
             !flows
                 .flows
@@ -564,12 +667,11 @@ mod tests {
 
     #[test]
     fn a_new_primary_drains_earlier_translations_and_passes_its_own_packets() {
-        let mut plan = plan();
-        let mut flows = SourceFlows::new(&plan);
+        let mut aliases = aliases();
+        let mut flows = SourceFlows::new(&aliases, None, 1280, SourceMode::Primary);
         assert_eq!(flows.outbound(udp(FIRST, PEER, 2222, 53, b"q")).len(), 1);
-        plan.full_tunnel = true;
-        plan.exit = Some(SECOND.into());
-        flows.reconfigure(&plan);
+        aliases.swap(0, 1);
+        flows.reconfigure(&aliases, Some(SECOND), 1280);
         assert_eq!(
             flows.inbound(udp(PEER, SECOND, 53, 2222, b"a")),
             [udp(PEER, FIRST, 53, 2222, b"a")]
@@ -583,8 +685,8 @@ mod tests {
 
     #[test]
     fn untracked_primary_errors_and_point_to_point_destinations_are_preserved() {
-        let mut plan = plan();
-        let mut flows = SourceFlows::new(&plan);
+        let mut aliases = aliases();
+        let mut flows = SourceFlows::new(&aliases, None, 1280, SourceMode::Primary);
         let router = Ipv4Addr::new(10, 1, 0, 7);
         let mut unreachable = vec![3, 1, 0, 0, 0, 0, 0, 0];
         unreachable.extend_from_slice(&udp(FIRST, router, 50_000, 7, b"probe")[..28]);
@@ -594,8 +696,8 @@ mod tests {
         let directed = udp(FIRST, Ipv4Addr::new(10, 2, 0, 255), 5, 6, b"broadcast");
         assert_eq!(flows.outbound(directed.clone()), [directed]);
         let point = Ipv4Addr::new(10, 2, 0, 0);
-        plan.addresses[1] = Cidr::new(point.into(), 31).unwrap();
-        flows.reconfigure(&plan);
+        aliases[1] = Cidr::new(point.into(), 31).unwrap();
+        flows.reconfigure(&aliases, None, 1280);
         assert_eq!(
             flows.outbound(udp(FIRST, SECOND, 5, 6, b"p2p")),
             [udp(point, SECOND, 5, 6, b"p2p")]
@@ -604,7 +706,7 @@ mod tests {
 
     #[test]
     fn echo_ids_can_match_in_both_directions() {
-        let mut flows = SourceFlows::new(&plan());
+        let mut flows = SourceFlows::new(&aliases(), None, 1280, SourceMode::Primary);
         let message = |src, dst, kind| {
             use smoltcp::wire::Icmpv4Packet;
             let mut data = [kind, 0, 0, 0, 0x12, 0x34, 0, 2];
@@ -631,7 +733,7 @@ mod tests {
 
     #[test]
     fn saturated_network_does_not_take_another_networks_capacity() {
-        let mut flows = SourceFlows::new(&plan());
+        let mut flows = SourceFlows::new(&aliases(), None, 1280, SourceMode::Primary);
         for port in 0..MAX_FLOWS {
             assert_eq!(
                 flows
@@ -661,7 +763,7 @@ mod tests {
 
     #[test]
     fn fragmented_udp_translates_after_assembly_in_both_directions() {
-        let mut flows = SourceFlows::new(&plan());
+        let mut flows = SourceFlows::new(&aliases(), None, 1280, SourceMode::Primary);
         let mut original = udp(FIRST, PEER, 3333, 4444, &[7; 1900]);
         let parts = fragment_ipv4(original.clone(), 1280);
         let mut output = Vec::new();

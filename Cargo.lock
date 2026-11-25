@@ -6384,6 +6384,7 @@ dependencies = [
  "serde",
  "sha2",
  "simple-dns",
+ "smoltcp",
  "subtle",
  "tempfile",
  "thiserror 2.0.20",

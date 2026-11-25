@@ -24,7 +24,7 @@
 //! Policy routing, with no `/1` routes and nothing in the main table:
 //!
 //! ```text
-//! table 0x7473:  default dev <if>
+//! table 0x7473:  default dev <if> src <selected overlay address>
 //! 5205: from all fwmark 0x40000000/0x40000000 lookup main
 //! 5206: from all uidrange <euid>-<euid> lookup main
 //! 5290: from all lookup main suppress_prefixlength 0
@@ -45,6 +45,7 @@
 
 use crate::BoxFuture;
 use crate::state::Ipv4Range;
+use std::net::Ipv4Addr;
 
 use super::RuleOutcome;
 use super::exit::{ExitHostPlan, ExitHostReport, ExitHostRules, exit_tag, exit_tag_prefix};
@@ -441,7 +442,7 @@ impl LinuxHostRules {
             .map_err(|err| format!("the task failed: {err}"))
     }
 
-    async fn apply_client(&self, interface: &str) -> RuleOutcome {
+    async fn apply_client(&self, interface: &str, source: Option<Ipv4Addr>) -> RuleOutcome {
         let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
         if let Some(reason) = client_refusal(xdg.as_deref()) {
             // Whatever an earlier run left must not stay in force.
@@ -461,7 +462,15 @@ impl LinuxHostRules {
             .as_ref()
             .is_some_and(|(name, _, routed)| name == interface && *routed);
         if installed {
-            // A failed socket refresh must never remove an active exit route.
+            // A different network can now supply the exit on this same TUN.
+            // Preserve the policy rules and underlay protection during the switch.
+            let route = self.route.clone();
+            let name = interface.to_string();
+            match Self::blocking(move || route.update_exit_source(&name, source)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return RuleOutcome::Failed(err.to_string()),
+                Err(reason) => return RuleOutcome::Failed(reason),
+            }
             return self
                 .refresh_sockets(interface)
                 .await
@@ -492,7 +501,8 @@ impl LinuxHostRules {
         }
         let route = self.route.clone();
         let name = interface.to_string();
-        let outcome = match Self::blocking(move || route.set_exit_client(&name, euid)).await {
+        let outcome = match Self::blocking(move || route.set_exit_client(&name, euid, source)).await
+        {
             Ok(Ok(())) => RuleOutcome::Applied,
             Ok(Err(err)) => RuleOutcome::Failed(err.to_string()),
             Err(reason) => RuleOutcome::Failed(reason),
@@ -616,7 +626,7 @@ impl ExitHostRules for LinuxHostRules {
                 forwarding_state(read_sysctl, &interface)
             };
             let client = if plan.client {
-                Some(self.apply_client(&interface).await)
+                Some(self.apply_client(&interface, plan.client_source).await)
             } else {
                 if let Err(reason) = self.clear_client(&interface).await {
                     tracing::warn!(%reason, "cannot remove exit-client rules");
