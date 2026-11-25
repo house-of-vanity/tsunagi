@@ -29,6 +29,7 @@ impl Client for AgentClient {
 }
 
 /// Handle the UI holds: send commands, read the latest snapshot.
+#[derive(Clone)]
 pub(crate) struct AgentClient {
     tx: mpsc::UnboundedSender<Command>,
     shared: Arc<Mutex<Snapshot>>,
@@ -122,7 +123,7 @@ async fn worker(
                 run(&resolve_socket(), command, &shared, &pending_copy, &ctx).await;
                 refresh(&shared, &ctx).await;
                 lock(&shared).busy = false;
-                ctx.request_repaint();
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
             }
         }
     }
@@ -145,7 +146,7 @@ async fn refresh(shared: &Arc<Mutex<Snapshot>>, ctx: &egui::Context) {
         guard.at = Some(Instant::now());
         guard.socket = socket;
     }
-    ctx.request_repaint();
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
 }
 
 /// Runs one command and records its outcome.
@@ -157,7 +158,7 @@ async fn run(
     ctx: &egui::Context,
 ) {
     lock(shared).busy = true;
-    ctx.request_repaint();
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
 
     let outcome: Result<String, String> = match command {
         Command::SaveVip {
@@ -302,7 +303,7 @@ async fn run(
             Some(outcome)
         };
     }
-    ctx.request_repaint();
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
 }
 
 /// Where the GUI looks for the agent: `TSUNAGI_CONTROL_SOCKET` if set, else the

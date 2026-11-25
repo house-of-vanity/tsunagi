@@ -85,6 +85,44 @@ pub struct NetworkRoutes {
     pub peers: Vec<(Ipv4Addr, EndpointId)>,
 }
 
+impl NetworkRoutes {
+    fn address_pair(&self, peer: EndpointId) -> Option<(Ipv4Addr, Ipv4Addr)> {
+        let local = self.local?;
+        let (remote, _) = self.peers.iter().find(|(_, owner)| *owner == peer)?;
+        Some((local, *remote))
+    }
+}
+
+/// The signed addresses negotiated for one running diagnostic. A new allocation can
+/// invalidate either end, so an active probe must recheck them when ownership changes.
+pub(crate) struct DiagnosticPeer {
+    network: NetworkId,
+    peer: EndpointId,
+    pub(crate) local: Ipv4Addr,
+    pub(crate) remote: Ipv4Addr,
+    // Even revision of the checked routing table, plus one if both addresses matched.
+    checked: AtomicU64,
+}
+
+impl DiagnosticPeer {
+    pub(crate) fn is_current(&self, table: &RoutingTable) -> bool {
+        let revision = table.address_revision.load(Ordering::Acquire);
+        let checked = self.checked.load(Ordering::Relaxed);
+        if checked & !1 == revision {
+            return checked & 1 != 0;
+        }
+        let networks = table.read();
+        let pair = networks
+            .get(&self.network)
+            .and_then(|n| n.address_pair(self.peer));
+        let valid = pair == Some((self.local, self.remote));
+        let revision = table.address_revision.load(Ordering::Relaxed);
+        self.checked
+            .store(revision | u64::from(valid), Ordering::Relaxed);
+        valid
+    }
+}
+
 /// Why a network cannot be added to the table.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RouteError {
@@ -114,6 +152,8 @@ pub struct RoutingTable {
     broadcast: ArcSwap<BroadcastTable>,
     selected_exit: ArcSwapOption<SelectedExit>,
     networks: RwLock<HashMap<NetworkId, NetworkRoutes>>,
+    /// Advanced by two under the routing write lock when signed address ownership changes.
+    address_revision: AtomicU64,
 }
 
 impl RoutingTable {
@@ -123,15 +163,20 @@ impl RoutingTable {
     }
 
     /// Exact local and signed remote addresses for a mesh diagnostic. Exit routes do not qualify.
-    pub(crate) fn peer_addresses(
+    pub(crate) fn diagnostic_peer(
         &self,
         network: NetworkId,
         peer: EndpointId,
-    ) -> Option<(Ipv4Addr, Ipv4Addr)> {
+    ) -> Option<DiagnosticPeer> {
         let networks = self.read();
-        let routes = networks.get(&network)?;
-        let (address, _) = routes.peers.iter().find(|(_, owner)| *owner == peer)?;
-        Some((routes.local?, *address))
+        let (local, remote) = networks.get(&network)?.address_pair(peer)?;
+        Some(DiagnosticPeer {
+            network,
+            peer,
+            local,
+            remote,
+            checked: AtomicU64::new(self.address_revision.load(Ordering::Relaxed) | 1),
+        })
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<NetworkId, NetworkRoutes>> {
@@ -198,7 +243,13 @@ impl RoutingTable {
         if routes.exit.via.is_some() {
             clear_other_exits(networks, network);
         }
+        let ownership_changed = networks
+            .get(&network)
+            .is_none_or(|old| old.local != routes.local || old.peers != routes.peers);
         networks.insert(network, routes);
+        if ownership_changed {
+            self.address_revision.fetch_add(2, Ordering::Release);
+        }
         self.refresh_exit(networks);
         self.broadcast
             .store(Arc::new(BroadcastTable::build(networks)));
@@ -209,7 +260,9 @@ impl RoutingTable {
     pub fn remove_network(&self, network: NetworkId) {
         self.vips.remove_network(network);
         let mut networks = self.write();
-        networks.remove(&network);
+        if networks.remove(&network).is_some() {
+            self.address_revision.fetch_add(2, Ordering::Release);
+        }
         self.refresh_exit(&networks);
         self.broadcast
             .store(Arc::new(BroadcastTable::build(&networks)));
@@ -607,6 +660,60 @@ mod tests {
             local: Some(addr(1)),
             peers: vec![(addr(2), peer(2)), (addr(3), peer(3))],
         }
+    }
+
+    #[test]
+    fn a_running_diagnostic_tracks_signed_ownership_across_route_changes() {
+        let table = RoutingTable::new();
+        let id = network("diagnostic");
+        let other = network("other");
+        table.set_network(id, routes()).unwrap();
+        let bound = table.diagnostic_peer(id, peer(2)).unwrap();
+        assert_eq!((bound.local, bound.remote), (addr(1), addr(2)));
+        assert!(bound.is_current(&table));
+        assert!(table.diagnostic_peer(id, peer(9)).is_none());
+        assert!(table.set_network(other, routes()).is_err());
+        table.set_exit(
+            id,
+            ExitPolicy {
+                offer: true,
+                via: Some(peer(3)),
+            },
+        );
+        assert!(bound.is_current(&table));
+
+        let mut changed = routes();
+        changed.peers[1].0 = addr(9);
+        table.update_allocations(id, changed.clone()).unwrap();
+        assert!(bound.is_current(&table), "another member moved");
+        changed.peers[0].0 = addr(7);
+        table.update_allocations(id, changed).unwrap();
+        assert!(
+            !bound.is_current(&table),
+            "the old peer address is no longer owned"
+        );
+        assert!(!bound.is_current(&table));
+        let moved = table.diagnostic_peer(id, peer(2)).unwrap();
+        assert!(moved.is_current(&table));
+        table
+            .update_allocations(
+                id,
+                NetworkRoutes {
+                    local: None,
+                    ..routes()
+                },
+            )
+            .unwrap();
+        assert!(!moved.is_current(&table));
+        assert!(table.diagnostic_peer(id, peer(2)).is_none());
+        table.update_allocations(id, routes()).unwrap();
+        assert!(bound.is_current(&table));
+        table.remove_network(id);
+        table.set_network(other, routes()).unwrap();
+        assert!(
+            !bound.is_current(&table),
+            "same member and IPs in a different network"
+        );
     }
 
     #[test]

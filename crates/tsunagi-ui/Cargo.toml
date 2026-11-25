@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-ui"
-version = "1.0.7"
+version = "1.0.8"
 description = "Shared egui widgets for the tray and Android clients."
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 postcard.workspace = true
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 tempfile.workspace = true
 egui = "0.31"
 egui-phosphor = "0.9"

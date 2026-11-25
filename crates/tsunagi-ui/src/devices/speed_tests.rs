@@ -273,7 +273,9 @@ fn exit_batch_requires_an_online_capable_exit_and_stops_in_its_own_network() {
     s.click(&n, start);
     n.speed.batch = Some(SpeedBatchReport { done: 0, total: 1 });
     let batch = s.frame(&n, vec![]);
-    assert!(!positions(&batch, |s| s.contains("0/1")).is_empty());
+    assert!(!positions(&batch, |s| s == format!("{}  Stop  0/1", icon::STOP_CIRCLE)).is_empty());
+    let font = egui::TextStyle::Button.resolve(&s.ctx.style());
+    assert!(s.ctx.fonts(|f| f.has_glyphs(&font, icon::STOP_CIRCLE)));
     s.click(&n, positions(&batch, |s| s.contains("Stop"))[0]);
     assert!(matches!(s.log.0.borrow().as_slice(), [
         Command::StartSpeedTest { network_id, peer: None },

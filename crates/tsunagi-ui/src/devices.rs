@@ -232,9 +232,20 @@ pub fn show(
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let table = desktop_columns(ui, unit, network, &devices, traffic);
-                let required = table.widths.iter().sum::<f32>() + crate::table::GAP * 8.;
-                if required <= ui.available_width() {
+                // Remembered desktop widths only grow. While this window is compact,
+                // an animation frame need not format and measure all peers a second time.
+                let available = ui.available_width();
+                let id = egui::Id::new(("devices column widths", &network.network_id));
+                let fits = |w: &[f32; 9]| {
+                    w[..8].iter().sum::<f32>() + MIN_PLOT_WIDTH + crate::table::GAP * 8.
+                        <= available
+                };
+                let could_fit = ui
+                    .data(|d| d.get_temp::<[f32; 9]>(id))
+                    .is_none_or(|w| fits(&w));
+                let table =
+                    could_fit.then(|| desktop_columns(ui, unit, network, &devices, traffic));
+                if let Some(table) = table.filter(|t| fits(&t.widths)) {
                     device_table(
                         ui,
                         network,
@@ -626,9 +637,11 @@ fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 9] {
     })
 }
 
+const MIN_PLOT_WIDTH: f32 = 100.;
+
 fn stretch_columns(mut widths: [f32; 9], available: f32) -> [f32; 9] {
     let gaps = crate::table::GAP * (widths.len() - 1) as f32;
-    widths[8] = (available - gaps - widths[..8].iter().sum::<f32>()).clamp(100.0, 180.0);
+    widths[8] = (available - gaps - widths[..8].iter().sum::<f32>()).clamp(MIN_PLOT_WIDTH, 180.0);
     widths
 }
 
@@ -1553,6 +1566,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn compact_frames_skip_the_hidden_desktop_layout_until_the_window_grows() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::app_fonts());
+        let id = egui::Id::new(("devices column widths", "lab"));
+        let mut net = NetworkReport {
+            network_id: "lab".into(),
+            members: vec![member("peer", true, DataPathReport::None)],
+            ..Default::default()
+        };
+        let draw = |width, net: &NetworkReport| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 600.),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(
+                        ctx,
+                        &ReadOnly,
+                        &mut Unit::Bytes,
+                        (&mut None, &mut None),
+                        net,
+                        "self",
+                        &Traffic::default(),
+                    )
+                },
+            );
+            ctx.data(|d| d.get_temp::<[f32; 9]>(id)).unwrap()
+        };
+        let first = draw(660., &net);
+        net.members[0].hostname = Some("a-much-longer-peer-name-for-the-wide-table".into());
+        assert_eq!(draw(660., &net), first);
+        assert!(draw(2300., &net)[0] > first[0]);
     }
 
     #[test]

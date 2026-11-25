@@ -15,6 +15,7 @@ use crate::dataplane::PluginCapability;
 use crate::error::{Error, Result};
 use crate::identity::NetworkId;
 use crate::ipc::{SpeedBatchReport, SpeedPeerReport, SpeedPhase, SpeedRate, SpeedReport};
+use crate::overlay::router::DiagnosticPeer;
 use crate::proto::message::{ControlMessage, TransportPayload};
 
 type Key = (NetworkId, EndpointId);
@@ -56,6 +57,7 @@ struct Channel {
     key: Key,
     id: u64,
     limit: u32,
+    addresses: DiagnosticPeer,
     handle: wire::Handle,
 }
 
@@ -199,7 +201,8 @@ pub(super) fn receive_packet(
         && channel.key == (network, peer)
         && let Some(data) = wire::decode_packet(packet)
         && data.id == channel.id
-        && inner.routes.peer_addresses(network, peer) == Some((data.destination, data.source))
+        && (data.destination, data.source) == (channel.addresses.local, channel.addresses.remote)
+        && channel.addresses.is_current(&inner.routes)
     {
         inner
             .routes
@@ -219,21 +222,22 @@ fn config(
     id: u64,
     bytes: u32,
     rtt: Option<Duration>,
-) -> Option<wire::Config> {
-    let (local, remote) = inner.routes.peer_addresses(key.0, key.1)?;
+) -> Option<(wire::Config, DiagnosticPeer)> {
+    let addresses = inner.routes.diagnostic_peer(key.0, key.1)?;
     let ceiling = if inner.speed.metered.load(Ordering::Relaxed) {
         wire::METERED_BYTES
     } else {
         wire::NORMAL_BYTES
     };
-    Some(wire::Config {
+    let cfg = wire::Config {
         id,
-        local,
-        remote,
+        local: addresses.local,
+        remote: addresses.remote,
         mtu: u16::try_from(inner.config.interface_mtu).unwrap_or(u16::MAX),
         byte_limit: bytes.min(ceiling),
         rtt: rtt.unwrap_or(Duration::from_millis(100)),
-    })
+    };
+    Some((cfg, addresses))
 }
 
 pub(super) fn receive_control(
@@ -253,13 +257,14 @@ pub(super) fn receive_control(
         {
             return envelope(&wire::Control::Busy { id });
         }
-        let cfg = config(inner, key, id, request.byte_limit, rtt())?;
+        let (cfg, addresses) = config(inner, key, id, request.byte_limit, rtt())?;
         let limit = cfg.byte_limit;
         let (handle, session) = wire::respond(cfg, request);
         inner.speed.active.store(Some(Arc::new(Channel {
             key,
             id,
             limit,
+            addresses,
             handle,
         })));
         drop(jobs);
@@ -575,7 +580,7 @@ async fn run_outgoing(
         p.endpoint_id == key.1 && (!exits_only || p.exit_node) && supported(&p.capabilities)
     })?;
     let id = rand::random();
-    let cfg = config(inner, key, id, limit, peer.data_rtt.or(peer.rtt))?;
+    let (cfg, addresses) = config(inner, key, id, limit, peer.data_rtt.or(peer.rtt))?;
     let limit = cfg.byte_limit;
     let (handle, session) = wire::initiate(cfg);
     let io = TestIo::new(inner, key, Some(generation));
@@ -591,6 +596,7 @@ async fn run_outgoing(
             key,
             id,
             limit,
+            addresses,
             handle,
         })));
     }

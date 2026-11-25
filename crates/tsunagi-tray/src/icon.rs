@@ -4,6 +4,7 @@
 //! It is the same shape as `dist/linux/tsunagi.svg` (a disc, a ring, a dot).
 
 use crate::watch::Health;
+use std::sync::{Arc, LazyLock};
 
 /// Normal operation. The colour of the logo itself.
 const BLUE: [u8; 3] = [0x2f, 0x80, 0xd8];
@@ -89,12 +90,17 @@ pub(crate) fn tray(health: Health) -> Option<tray_icon::Icon> {
 }
 
 /// The icon of the application's windows.
-pub(crate) fn window() -> eframe::egui::IconData {
-    eframe::egui::IconData {
-        rgba: rgba(BLUE),
-        width: SIZE,
-        height: SIZE,
-    }
+pub(crate) fn window() -> Arc<eframe::egui::IconData> {
+    // egui compares viewport icons by Arc identity. Reuse both the pixels and
+    // their allocation so animating a row does not update a native window icon.
+    static ICON: LazyLock<Arc<eframe::egui::IconData>> = LazyLock::new(|| {
+        Arc::new(eframe::egui::IconData {
+            rgba: rgba(BLUE),
+            width: SIZE,
+            height: SIZE,
+        })
+    });
+    Arc::clone(&ICON)
 }
 
 #[cfg(test)]
@@ -120,6 +126,13 @@ mod tests {
         // Halfway between the ring and the edge is the colour itself.
         let body = pixel(&pixels, SIZE / 2, SIZE / 2 - (SIZE * 44 / 128));
         assert_eq!(body, [GREEN[0], GREEN[1], GREEN[2], 255]);
+    }
+
+    #[test]
+    fn repainting_a_devices_viewport_does_not_ask_the_os_to_replace_its_icon() {
+        let viewport = || eframe::egui::ViewportBuilder::default().with_icon(window());
+        let (commands, recreate) = viewport().patch(viewport());
+        assert!(!recreate && commands.is_empty(), "{commands:?}");
     }
 
     #[test]

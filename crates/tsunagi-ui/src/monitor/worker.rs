@@ -1,15 +1,19 @@
-use super::history::{Filter, History, Page};
+use super::{
+    Names,
+    history::{Filter, History, Page},
+};
 use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, MutexGuard},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tsunagi::traffic::TrafficSnapshot;
 
 struct Work {
     samples: VecDeque<(u64, TrafficSnapshot)>,
     filter: Filter,
+    names: Arc<Names>,
     keep: bool,
     dirty: bool,
     closed: bool,
@@ -79,6 +83,7 @@ impl Worker {
             state: Mutex::new(Work {
                 samples: VecDeque::new(),
                 filter: Filter::default(),
+                names: Arc::default(),
                 keep: false,
                 dirty: true,
                 closed: false,
@@ -109,6 +114,12 @@ impl Worker {
     }
     pub fn protocols(&self) -> Vec<u8> {
         self.feed.0.lock().protocols.iter().copied().collect()
+    }
+    pub fn names(&self, names: Arc<Names>) {
+        let mut w = self.feed.0.lock();
+        w.names = names;
+        w.dirty = true;
+        self.feed.0.wake.notify_one();
     }
     pub fn options(&self, filter: Filter, keep: bool) {
         let mut w = self.feed.0.lock();
@@ -142,18 +153,26 @@ fn run(shared: &Shared, directory: Option<PathBuf>) -> Result<(), String> {
     let mut db = History::open(directory.as_deref())?;
     shared.lock().interrupt = Some(db.interrupt());
     loop {
-        let (mut samples, filter, keep) = {
+        let (mut samples, filter, keep, names) = {
             let w = shared.lock();
-            let mut w = shared
+            let (mut w, _) = shared
                 .wake
-                .wait_while(w, |w| !w.closed && !w.dirty && w.samples.is_empty())
+                .wait_timeout_while(w, Duration::from_secs(1), |w| {
+                    !w.closed && !w.dirty && w.samples.is_empty()
+                })
                 .unwrap_or_else(|e| e.into_inner());
             if w.closed {
                 return Ok(());
             }
             w.dirty = false;
-            (std::mem::take(&mut w.samples), w.filter.clone(), w.keep)
+            (
+                std::mem::take(&mut w.samples),
+                w.filter.clone(),
+                w.keep,
+                w.names.clone(),
+            )
         };
+        db.use_names(names.clone());
         if samples.is_empty() {
             db.apply(&[], shared.start.elapsed().as_millis() as u64, 0, keep)?;
         }
@@ -162,7 +181,7 @@ fn run(shared: &Shared, directory: Option<PathBuf>) -> Result<(), String> {
         }
         let page = Arc::new(db.page(&filter)?);
         let mut w = shared.lock();
-        if !w.closed && filter == w.filter {
+        if !w.closed && filter == w.filter && Arc::ptr_eq(&names, &w.names) {
             w.page = page;
         }
     }

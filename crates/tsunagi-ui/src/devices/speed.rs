@@ -33,8 +33,15 @@ impl<'a> Controls<'a> {
         let (label, help, available) = if self.running {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
             let label = self.network.speed.batch.map_or_else(
-                || format!("{}  Stop test", icon::STOP),
-                |batch| format!("{}  Stop  {}/{}", icon::STOP, batch.done, batch.total),
+                || format!("{}  Stop test", icon::STOP_CIRCLE),
+                |batch| {
+                    format!(
+                        "{}  Stop  {}/{}",
+                        icon::STOP_CIRCLE,
+                        batch.done,
+                        batch.total
+                    )
+                },
             );
             (
                 label,
@@ -63,7 +70,7 @@ impl<'a> Controls<'a> {
         let width = ui
             .painter()
             .layout_no_wrap(
-                format!("{}  Stop  9999/9999", icon::STOP),
+                format!("{}  Stop  9999/9999", icon::STOP_CIRCLE),
                 egui::TextStyle::Button.resolve(ui.style()),
                 ui.visuals().text_color(),
             )
