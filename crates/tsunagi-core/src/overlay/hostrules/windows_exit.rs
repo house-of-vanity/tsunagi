@@ -108,8 +108,8 @@ fn forwarding_script(interface: &str) -> String {
     )
 }
 
-/// Prints `<interface index> <next hop>` of the best default route that is
-/// not through the overlay interface.
+/// Prints the physical default and the more specific routes that already
+/// outrank the split defaults. Ignore our own host routes when refreshing.
 fn gateway_script(interface: &str) -> String {
     let alias = ps_literal(interface);
     format!(
@@ -121,7 +121,11 @@ fn gateway_script(interface: &str) -> String {
          (Get-NetIPInterface -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4).InterfaceMetric }} | \
          Select-Object -First 1\n\
          if (-not $best) {{ throw 'the host has no default gateway outside the overlay' }}\n\
-         \"$($best.InterfaceIndex) $($best.NextHop)\"\n"
+         \"$($best.InterfaceIndex) $($best.NextHop)\"\n\
+         Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object {{ \
+         $_.InterfaceAlias -ne $alias -and $_.State -ne 'Dead' -and \
+         -not ($_.RouteMetric -eq {BYPASS_METRIC} -and $_.DestinationPrefix.EndsWith('/32')) }} | \
+         Select-Object -ExpandProperty DestinationPrefix\n"
     )
 }
 
@@ -220,17 +224,42 @@ fn bypass_addresses(
         .collect()
 }
 
-fn apply_client(
+pub(super) fn refresh_bypass(
     run: RunScript<'_>,
     resolve: Resolve<'_>,
     plan: &ExitHostPlan,
 ) -> Result<(), String> {
     let interface = plan.interface.as_str();
     let gateway = run(&gateway_script(interface))?;
-    let (index, hop) = parse_gateway(&gateway)
-        .ok_or_else(|| format!("cannot read the default gateway from `{}`", gateway.trim()))?;
-    let addresses = bypass_addresses(resolve, &plan.bypass, &plan.bypass_hosts, &plan.overlay);
-    run(&bypass_script(index, hop, &addresses))?;
+    let mut lines = gateway.lines();
+    let first = lines.next().unwrap_or_default();
+    let (index, hop) = parse_gateway(first)
+        .ok_or_else(|| format!("cannot read the default gateway from `{first}`"))?;
+    let mut addresses = bypass_addresses(resolve, &plan.bypass, &plan.bypass_hosts, &plan.overlay);
+    for line in lines {
+        let prefix = line.trim();
+        let (network, bits) = prefix
+            .split_once('/')
+            .and_then(|(address, bits)| {
+                Some((address.parse::<Ipv4Addr>().ok()?, bits.parse::<u8>().ok()?))
+            })
+            .filter(|(_, bits)| *bits <= 32)
+            .ok_or_else(|| format!("cannot read physical route prefix `{prefix}`"))?;
+        if bits > 1 {
+            let mask = u32::MAX << (32 - bits);
+            addresses.retain(|addr| u32::from(*addr) & mask != u32::from(network) & mask);
+        }
+    }
+    run(&bypass_script(index, hop, &addresses)).map(|_| ())
+}
+
+fn apply_client(
+    run: RunScript<'_>,
+    resolve: Resolve<'_>,
+    plan: &ExitHostPlan,
+) -> Result<(), String> {
+    refresh_bypass(run, resolve, plan)?;
+    let interface = &plan.interface;
     if let Err(why) = run(&halves_script(interface)) {
         // Do not leave a half-installed set: bypass routes alone are harmless
         // but the next apply starts clean.
@@ -412,6 +441,58 @@ mod tests {
         Vec::new()
     }
 
+    /// Run the real refresh against the Windows ActiveStore. The fixture
+    /// only permits its TEST-NET /32 and refuses to prune pre-existing routes.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an elevated disposable Windows runner with a physical default gateway"]
+    fn windows_refresh_installs_only_the_external_test_address() {
+        use super::super::windows::run_powershell_output;
+
+        let target = Ipv4Addr::new(198, 51, 100, 207);
+        let inventory = run_powershell_output(&gateway_script("tsng-native-test")).unwrap();
+        let (index, gateway) = parse_gateway(inventory.lines().next().unwrap()).unwrap();
+        let plan = ExitHostPlan {
+            interface: "tsng-native-test".into(),
+            bypass: vec![gateway, target],
+            client: true,
+            ..Default::default()
+        };
+        let run = |script: &str| {
+            if script == gateway_script(&plan.interface) {
+                return Ok(inventory.clone());
+            }
+            // Catch a failure to recognize the gateway's connected LAN before
+            // executing a script which might create a route to the gateway.
+            assert!(script.contains(&format!("$keep = @(@('{target}') |")));
+            let guarded = format!(
+                r#"$ErrorActionPreference = 'Stop'
+$prefix = '{target}/32'
+$before = @(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object {{
+    $_.DestinationPrefix -eq $prefix -or ($_.RouteMetric -eq {BYPASS_METRIC} -and $_.DestinationPrefix.EndsWith('/32'))
+}})
+if ($before.Count) {{ throw 'fixture requires an unused test prefix and no pre-existing bypass routes' }}
+try {{
+    {script}
+    $actual = @(Get-NetRoute -DestinationPrefix $prefix -PolicyStore ActiveStore -ErrorAction Stop)
+    if ($actual.Count -ne 1 -or $actual[0].InterfaceIndex -ne {index} -or
+        $actual[0].NextHop -ne '{gateway}' -or $actual[0].RouteMetric -ne {BYPASS_METRIC}) {{
+        throw 'unexpected physical bypass route'
+    }}
+}} finally {{
+    Get-NetRoute -DestinationPrefix $prefix -InterfaceIndex {index} -NextHop '{gateway}' -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+        Where-Object {{ $_.RouteMetric -eq {BYPASS_METRIC} }} | Remove-NetRoute -Confirm:$false
+}}
+if (Get-NetRoute -DestinationPrefix $prefix -PolicyStore ActiveStore -ErrorAction SilentlyContinue) {{
+    throw 'test route still present after cleanup'
+}}
+exit 0"#
+            );
+            run_powershell_output(&guarded)
+        };
+        refresh_bypass(&run, &no_names, &plan).unwrap();
+    }
+
     fn client_plan() -> ExitHostPlan {
         ExitHostPlan {
             interface: "tsun0".into(),
@@ -547,6 +628,47 @@ mod tests {
             .unwrap();
         assert!(bypass.contains("'9.9.9.9'") && bypass.contains("'138.201.61.182'"));
         assert!(!bypass.contains("'10.13.37.4'") && !bypass.contains("'10.99.0.6'"));
+    }
+
+    #[test]
+    fn a_connected_lan_and_an_existing_host_route_stay_on_their_own_paths() {
+        let mut plan = client_plan();
+        for addr in ["192.168.1.11", "198.51.100.7", "198.51.100.9"] {
+            plan.bypass.push(addr.parse().unwrap());
+        }
+        let calls = RefCell::new(Vec::new());
+        let run = |script: &str| {
+            calls.borrow_mut().push(script.to_string());
+            Ok("12 192.168.1.1\n192.168.1.0/24\n198.51.100.7/32\n".into())
+        };
+        apply_client(&run, &no_names, &plan).unwrap();
+        let calls = calls.borrow();
+        let bypass = calls.iter().find(|s| s.contains("New-NetRoute")).unwrap();
+        assert!(!bypass.contains("'192.168.1.11'"));
+        assert!(!bypass.contains("'198.51.100.7'"));
+        assert!(bypass.contains("'198.51.100.9'"));
+    }
+
+    #[test]
+    fn refreshing_uses_the_new_physical_gateway_without_touching_the_exit_routes() {
+        let plan = client_plan();
+        let routes = RefCell::new(Vec::new());
+        for gateway in ["12 192.168.1.1", "17 10.0.0.1"] {
+            let run = |script: &str| {
+                if script.contains("Select-Object -First 1") {
+                    Ok(gateway.into())
+                } else {
+                    routes.borrow_mut().push(script.to_owned());
+                    Ok(String::new())
+                }
+            };
+            refresh_bypass(&run, &no_names, &plan).unwrap();
+        }
+        let routes = routes.into_inner();
+        assert_eq!(routes.len(), 2);
+        assert!(routes[0].contains("-InterfaceIndex 12 -NextHop '192.168.1.1'"));
+        assert!(routes[1].contains("-InterfaceIndex 17 -NextHop '10.0.0.1'"));
+        assert!(routes.iter().all(|s| !s.contains("'0.0.0.0/1'")));
     }
 
     #[test]

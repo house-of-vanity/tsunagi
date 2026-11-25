@@ -4658,7 +4658,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         let tun_factory: Arc<dyn TunFactory> = if args.no_tun {
             Arc::new(MemoryTunFactory::new())
         } else {
-            system_tun_factory()?
+            system_tun_factory(&paths.state_dir)?
         };
         let mtu = args.mtu.unwrap_or(tsunagi_wg_quic::DEFAULT_MTU);
         config = config.with_interface(tun_factory, args.interface.clone(), mtu);
@@ -4955,7 +4955,9 @@ async fn stop_signal() -> &'static str {
 /// an open file descriptor and goes away with the agent, however the agent
 /// goes away.
 #[cfg(target_os = "linux")]
-fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+fn system_tun_factory(
+    _state_dir: &std::path::Path,
+) -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     use tsunagi::overlay::{ManagedTunFactory, NetlinkProvisioner};
     let provisioner = NetlinkProvisioner::new()?;
     let rules = Arc::new(provisioner.host_rules());
@@ -4967,7 +4969,9 @@ fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error
 /// The Wintun adapter, created and configured by the agent and removed when it
 /// exits, the same as the Linux one.
 #[cfg(target_os = "windows")]
-fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+fn system_tun_factory(
+    _state_dir: &std::path::Path,
+) -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     use tsunagi::overlay::{ManagedTunFactory, WindowsHostRules, WintunProvisioner};
     let provisioner = WintunProvisioner::new()?;
     Ok(Arc::new(
@@ -4980,12 +4984,14 @@ fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error
 /// exits, the same as the Linux and Windows ones. The kernel assigns the utun
 /// unit, so the interface reports a `utunN` name the agent adopts.
 #[cfg(target_os = "macos")]
-fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+fn system_tun_factory(
+    state_dir: &std::path::Path,
+) -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     use tsunagi::overlay::{MacosHostRules, ManagedTunFactory, UtunProvisioner};
     let provisioner = UtunProvisioner::new()?;
     Ok(Arc::new(
         ManagedTunFactory::new(Arc::new(provisioner))
-            .with_host_rules(Arc::new(MacosHostRules::new())),
+            .with_host_rules(Arc::new(MacosHostRules::with_state_dir(state_dir))),
     ))
 }
 
@@ -4994,7 +5000,9 @@ fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error
 /// Refused here rather than at the first packet, and with the one thing that
 /// does work on every platform named.
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-fn system_tun_factory() -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
+fn system_tun_factory(
+    _state_dir: &std::path::Path,
+) -> Result<Arc<dyn TunFactory>, Box<dyn std::error::Error>> {
     Err(format!(
         "managing the overlay interface is not implemented on {} yet. \
          Run with `--no-tun` to keep the tunnels off the operating system.",

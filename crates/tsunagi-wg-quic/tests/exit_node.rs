@@ -18,11 +18,11 @@ use iroh::EndpointId;
 use tempfile::TempDir;
 use tsunagi::dataplane::IpPlugin;
 use tsunagi::discovery::SharedMemoryDiscovery;
-use tsunagi::identity::NetworkId;
+use tsunagi::identity::{NetworkId, NetworkName, NetworkSecret};
 use tsunagi::overlay::{MemoryTun, MemoryTunFactory, MockHostRules};
 use tsunagi::state::{DEFAULT_IPV4_RANGE, Ipv4Range};
 use tsunagi::testing::{network, wait_until};
-use tsunagi::{Agent, NetworkStatus};
+use tsunagi::{Agent, AgentConfig, NetworkStatus};
 use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 
 const INTERNET: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
@@ -52,6 +52,12 @@ impl Node {
         tag: &str,
         range: Option<Ipv4Range>,
     ) -> Self {
+        let config =
+            tsunagi::testing::config_with(dir.path(), discovery).with_overlay_ipv4_range(range);
+        Self::start(dir, tag, config).await
+    }
+
+    async fn start(dir: TempDir, tag: &str, config: AgentConfig) -> Self {
         let tuns = MemoryTunFactory::new();
         let rules = MockHostRules::new();
         let plugin = WireguardPlugin::open(
@@ -61,8 +67,7 @@ impl Node {
         .await
         .unwrap();
         let agent = Agent::spawn(
-            tsunagi::testing::config_with(dir.path(), discovery)
-                .with_overlay_ipv4_range(range)
+            config
                 .with_interface(
                     Arc::new(tuns.clone().with_host_rules(Arc::new(rules.clone()))),
                     tag,
@@ -164,10 +169,15 @@ struct ExitNetwork<'a> {
 }
 
 impl<'a> ExitNetwork<'a> {
-    async fn join(client: &Node, peer: &'a Node, name: &str, range: Ipv4Range) -> Self {
-        let (name, secret) = network(name);
+    async fn join(
+        client: &Node,
+        peer: &'a Node,
+        credentials: (NetworkName, NetworkSecret),
+    ) -> Self {
+        let (name, secret) = credentials;
         let id = peer.agent.join_network(&name, &secret).await.unwrap();
         peer.overlay(id).await;
+        let range = peer.status(id).await.range.unwrap();
         peer.agent.set_exit_offer(id, true).await.unwrap();
         client.agent.join_network(&name, &secret).await.unwrap();
         client.wait_for_tunnels(id, 1).await;
@@ -219,8 +229,8 @@ async fn switching_the_exit_between_networks_keeps_both_overlays_reachable() {
         Some(right_range),
     )
     .await;
-    let alpha = ExitNetwork::join(&client, &left, "exit-left", DEFAULT_IPV4_RANGE).await;
-    let beta = ExitNetwork::join(&client, &right, "exit-right", right_range).await;
+    let alpha = ExitNetwork::join(&client, &left, network("exit-left")).await;
+    let beta = ExitNetwork::join(&client, &right, network("exit-right")).await;
     let tun = client.tun().await;
 
     for exit in [&alpha, &beta] {
@@ -298,6 +308,60 @@ async fn switching_the_exit_between_networks_keeps_both_overlays_reachable() {
     assert_eq!(restarted.selected_exits().await, exits);
     restarted.agent.shutdown().await;
     live.peer.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn selecting_a_shared_peer_uses_only_the_chosen_membership_for_exit() {
+    let discovery = SharedMemoryDiscovery::new();
+    let client = Node::open(TempDir::new().unwrap(), &discovery, "client", None).await;
+    let dir = TempDir::new().unwrap();
+    let config = tsunagi::testing::config_with(dir.path(), &discovery);
+    let peer = Node::start(dir, "shared", config).await;
+    // Fixed credentials keep the two automatically derived /24s distinct.
+    let mut meshes = Vec::new();
+    for (name, secret) in [("shared-left", [1; 32]), ("shared-right", [2; 32])] {
+        let credentials = (
+            NetworkName::new(name).unwrap(),
+            NetworkSecret::from_bytes(secret).unwrap(),
+        );
+        meshes.push(ExitNetwork::join(&client, &peer, credentials).await);
+    }
+    let tun = client.tun().await;
+    for (chosen, other) in [(&meshes[0], &meshes[1]), (&meshes[1], &meshes[0])] {
+        client
+            .agent
+            .set_exit_via(chosen.id, Some(peer.id()))
+            .await
+            .unwrap();
+        assert_eq!(client.selected_exits().await, [(chosen.id, peer.id())]);
+        assert_eq!(
+            client.rules.exit().installed().unwrap().client_source,
+            Some(chosen.client_addr)
+        );
+        chosen.check_mesh(&tun).await;
+        other.check_mesh(&tun).await;
+        let request = ipv4_packet(chosen.client_addr, INTERNET, b"external");
+        tun.push_from_os(request.clone());
+        assert_eq!(next(&chosen.peer_tun).await, request);
+        // Both memberships authenticate the same device key. A reply through
+        // its other tunnel still lacks the external-source exception.
+        let wrong_source = client.agent.overlay().unwrap().counters.wrong_source;
+        chosen
+            .peer_tun
+            .push_from_os(ipv4_packet(INTERNET, other.client_addr, b"wrong mesh"));
+        wait_until(
+            "external reply on unselected membership is rejected",
+            || async {
+                (client.agent.overlay()?.counters.wrong_source > wrong_source).then_some(())
+            },
+        )
+        .await;
+        let reply = ipv4_packet(INTERNET, chosen.client_addr, b"reply");
+        chosen.peer_tun.push_from_os(reply.clone());
+        assert_eq!(next(&tun).await, reply);
+    }
+    peer.agent.shutdown().await;
+    client.agent.shutdown().await;
 }
 
 #[tokio::test]

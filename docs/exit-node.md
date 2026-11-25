@@ -101,14 +101,20 @@ is built from `pf` and `route`. The agent runs as root there.
   macOS forgets at reboot. The egress is the default route's interface **at the
   time the rules are applied**; after it changes (Wi-Fi to Ethernet) switch the
   offer off and on.
-- **Using:** `0.0.0.0/1` and `128.0.0.0/1` routes through the overlay interface
-  with the local address of the exit network as their source,
-  and a `pf` `route-to` rule that sends the agent's own traffic (matched by its
-  user id, root) back out the physical interface, with translation to that
-  interface's address. Anything else you run as root also bypasses the tunnel.
-  IPv6 is blocked with rejecting `::/1` and `8000::/1` routes.
-- Not verified on a live host when this was written: run `tsng exit-node` and
-  check `sudo pfctl -a com.apple/tsunagi-exit-utunN -s rules -s nat`.
+- When **using** an exit, ordinary IPv4 internet connections take the two
+  split-default routes through the utun, with the local address of the selected
+  network. More specific routes continue to reach their own networks.
+- Sockets already using the physical address need matching routes scoped to
+  the uplink. Without them, macOS can reject a send before the packet reaches
+  PF. For new TCP and UDP sockets, PF sends the agent's traffic out the uplink
+  and preserves its source port. Replies to these tagged connections return
+  through loopback after reverse NAT so macOS can deliver them to a socket
+  whose local address belongs to the utun. This exemption matches the
+  daemon's user ID, so it also applies to other processes running as root.
+  IPv6 internet traffic is blocked with rejecting `::/1` and `8000::/1` routes.
+- To inspect an active exit, run `tsng exit-node` and
+  `sudo pfctl -a com.apple/tsunagi-exit-utunN -vvsr`, using the daemon's utun
+  number. The physical interface and the utun should both see transport packets.
 
 ## Windows
 
@@ -123,11 +129,15 @@ is built from `pf` and `route`. The agent runs as root there.
   off the tunnel *by destination*. `0.0.0.0/1` and `128.0.0.0/1` go through the
   overlay interface; a `/32` route with metric 7373 (the marker for "ours")
   through the physical default gateway is added for every address the agent
-  talks to directly: verified direct paths of its connections, plus the relays
-  it uses, resolved when the rules are applied. The set follows path changes. A
-  newly authenticated connection supplies its direct paths immediately and the
-  discovery tick refreshes them. Physical bypass routes exclude every active
-  mesh subnet. Wintun can choose any local alias for the default route. For
+  talks to directly, including verified connection paths and current relay
+  servers. Existing LAN and other more specific routes keep their next hop.
+  A newly authenticated connection supplies its direct paths immediately.
+  After a disconnect, the agent keeps its last verified paths for up to two
+  minutes to allow reconnection. It checks the physical gateway and relay
+  DNS every 30 seconds while the exit is active. Recent DNS answers remain
+  usable for up to two minutes after rotation or a failed lookup.
+  Physical bypass routes exclude every active mesh subnet. Wintun can choose
+  any local alias for the default route. For
   TCP, UDP and ICMP echo, the agent uses the exit network's address on the
   tunnel and restores replies to the address the Windows socket used.
   IPv6 is blackholed with `::/1` and `8000::/1` on the overlay interface,

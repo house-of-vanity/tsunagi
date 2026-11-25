@@ -5,6 +5,8 @@ on:
     branches: [master]
     paths:
       - '.github/workflows/subnet-source.yml'
+      - 'crates/tsunagi-core/src/overlay/hostrules/macos*.rs'
+      - 'crates/tsunagi-core/src/overlay/hostrules/windows*.rs'
       - 'crates/tsunagi-core/src/overlay/provision/macos.rs'
       - 'crates/tsunagi-core/src/overlay/provision/windows.rs'
       - 'crates/tsunagi-core/src/overlay/provision/mod.rs'
@@ -55,6 +57,15 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: sudo -n -- "$TEST_BINARY" --ignored --exact "$TEST_NAME" --nocapture
+      - name: Verify exit routing and PF translation on two real utuns
+        if: runner.os == 'macOS'
+        shell: bash
+        timeout-minutes: 2
+        env:
+          EXIT_TEST: overlay::hostrules::macos_exit::kernel::exit_preserves_underlay_and_both_meshes
+        run: |
+          "$TEST_BINARY" --ignored --exact "$EXIT_TEST" --list | grep -Fx "$EXIT_TEST: test"
+          sudo -n -- "$TEST_BINARY" --ignored --exact "$EXIT_TEST" --nocapture
       - name: Verify source selection on a real Wintun adapter
         if: runner.os == 'Windows'
         shell: pwsh
@@ -69,4 +80,15 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath $directory
           Copy-Item (Join-Path $directory 'wintun/bin/amd64/wintun.dll') (Split-Path -Parent $env:TEST_BINARY)
           & $env:TEST_BINARY --ignored --exact $env:TEST_NAME --nocapture
+          exit $LASTEXITCODE
+      - name: Verify one Windows exit bypass route through the physical gateway
+        if: runner.os == 'Windows'
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $test = 'overlay::hostrules::windows_exit::tests::windows_refresh_installs_only_the_external_test_address'
+          $listing = @(& $env:TEST_BINARY --ignored --exact $test --list)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($listing -notcontains "${test}: test") { throw "Missing ignored test: $test" }
+          & $env:TEST_BINARY --ignored --exact $test --nocapture
           exit $LASTEXITCODE

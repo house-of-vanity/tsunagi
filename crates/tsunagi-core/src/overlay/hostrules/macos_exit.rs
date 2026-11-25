@@ -16,9 +16,8 @@
 //! evaluates `nat-anchor "com.apple/*"` and `anchor "com.apple/*"`, so the
 //! rules take effect without editing the user's ruleset. `pf` cannot say
 //! "every interface but one" in a translation address, so the egress is the
-//! interface of the default route **when the rules are applied**; after the
-//! default route moves (Wi-Fi to Ethernet) the rules are re-applied by
-//! switching the exit node off and on, or restarting the agent.
+//! interface of the physical default route. An active exit client refreshes
+//! the rules when this egress changes.
 //!
 //! The kernel's `net.inet.ip.forwarding` is only read, never written: it
 //! changes how the whole host behaves, which is the owner's decision.
@@ -29,21 +28,32 @@
 //! Linux scheme does not carry over. Instead:
 //!
 //! ```text
+//! route add -net 0.0.0.0/1   <gateway> -ifscope <egress>
+//! route add -net 128.0.0.0/1 <gateway> -ifscope <egress>
 //! route add -net 0.0.0.0/1   -interface <if> -ifa <selected overlay address>
 //! route add -net 128.0.0.0/1 -interface <if> -ifa <selected overlay address>
 //! pass out quick on <if> route-to (<egress> <gateway>) inet proto { tcp udp }
-//!     from any to ! <overlay ranges> user <agent uid>
-//! nat on <egress> inet from (<if>) to any -> (<egress>)
+//!     from any to ! <overlay ranges> user <agent uid> tag <underlay> no state
+//! nat on <egress> inet from (<if>) to any tagged <underlay> -> (<egress>) static-port
+//! pass out quick on <egress> reply-to (lo0 127.0.0.1) inet proto { tcp udp }
+//!     from any to any flags any tagged <underlay> keep state (if-bound)
 //! ```
 //!
-//! The two halves outrank the default route without replacing it, and every
-//! more specific route (LAN, another VPN) keeps working. The `route-to` rule
+//! The scoped routes preserve the physical path for sockets that already
+//! use its source address. The unscoped halves capture ordinary internet
+//! traffic. More specific routes (LAN and active meshes) keep working. The `route-to` rule
 //! sends the *agent's own* traffic — QUIC, relay, DHT, which would otherwise
 //! loop into the tunnel it carries — back out the physical interface, and the
 //! translation gives it that interface's address, since an unbound socket
-//! picked the overlay address when the route pointed at the overlay. Like the
-//! Linux exemption this is by user id, so anything else running as root also
-//! bypasses the tunnel.
+//! picked the overlay address when the route pointed at the overlay. The
+//! first pass is stateless: a floating `route-to` state would match again
+//! on physical egress before PF could apply the translation. Only the egress
+//! pass tracks the connection and reverses NAT on replies there. Once NAT
+//! restores the socket's utun address, macOS's default hybrid end-system
+//! model would discard the reply arriving over the physical interface.
+//! `reply-to` delivers that state's replies locally through loopback. Like
+//! the Linux exemption this is by user id, so anything else running as root
+//! also bypasses the tunnel.
 //!
 //! IPv6 is blocked while an exit node is in use, as on Linux: `::/1` and
 //! `8000::/1` are rejecting routes, so applications fall back to IPv4 at once
@@ -59,6 +69,13 @@ use crate::state::Ipv4Range;
 
 use super::RuleOutcome;
 use super::exit::{ExitHostPlan, ExitHostReport};
+
+#[cfg(all(test, target_os = "macos", feature = "tun-device"))]
+#[path = "macos_exit_kernel.rs"]
+mod kernel;
+#[path = "macos_scoped.rs"]
+mod scoped;
+use scoped::ScopedRoutes;
 
 /// The programs this module runs, always by absolute path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,10 +180,25 @@ fn anchor_name(interface: &str) -> Result<String, String> {
 }
 
 /// The default route as `route -n get default` reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct DefaultRoute {
     pub interface: String,
     pub gateway: Option<Ipv4Addr>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct HostState {
+    token: Mutex<Option<String>>,
+    routes: Mutex<ScopedRoutes>,
+}
+
+impl HostState {
+    pub(super) fn with_state_dir(dir: &std::path::Path) -> Self {
+        Self {
+            routes: Mutex::new(ScopedRoutes::with_journal(dir.join("macos-exit-routes"))),
+            ..Self::default()
+        }
+    }
 }
 
 /// Reads `interface:` and `gateway:` out of `route -n get default`.
@@ -277,16 +309,11 @@ fn pf_rules(
     let out = &egress.interface;
     let mut nat = Vec::new();
     let mut filter = Vec::new();
-    for range in offer {
-        nat.push(format!("nat on {out} inet from {range} to any -> ({out})"));
-        filter.push(format!(
-            "pass in quick on {interface} inet from {range} to ! {range}"
-        ));
-    }
     let mut tables = Vec::new();
     if let Some(client) = client {
+        let tag = format!("tsng_underlay_{interface}");
         nat.push(format!(
-            "nat on {out} inet from ({interface}) to any -> ({out})"
+            "nat on {out} inet from ({interface}) to any tagged {tag} -> ({out}) static-port"
         ));
         let target = if client.overlay.is_empty() {
             "any".to_string()
@@ -306,8 +333,22 @@ fn pf_rules(
         };
         filter.push(format!(
             "pass out quick on {interface} route-to {via} inet proto {{ tcp udp }} \
-             from any to {target} user {}",
+             from any to {target} user {} tag {tag} no state",
             client.uid
+        ));
+        // A relay TCP stream may already be established when exit routing changes.
+        // Only responses to tagged underlay traffic get local loopback delivery.
+        filter.push(format!(
+            "pass out quick on {out} reply-to (lo0 127.0.0.1) inet proto {{ tcp udp }} \
+             from any to any flags any tagged {tag} keep state (if-bound)"
+        ));
+    }
+    for range in offer {
+        // PF takes the first matching NAT rule. Preserve the transport's source
+        // port even when its overlay source falls inside one of our own offers.
+        nat.push(format!("nat on {out} inet from {range} to any -> ({out})"));
+        filter.push(format!(
+            "pass in quick on {interface} inet from {range} to ! {range}"
         ));
     }
     tables
@@ -368,10 +409,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-fn flush_args(anchor: &str) -> Vec<String> {
-    owned(&["-q", "-a", anchor, "-F", "all"])
-}
-
 fn load_args(anchor: &str) -> Vec<String> {
     owned(&["-q", "-a", anchor, "-f", "-"])
 }
@@ -380,6 +417,22 @@ fn load_args(anchor: &str) -> Vec<String> {
 const HALVES: [&str; 2] = ["0.0.0.0/1", "128.0.0.0/1"];
 /// The IPv6 halves, made unreachable.
 const HALVES_V6: [&str; 2] = ["::/1", "8000::/1"];
+
+/// A scoped route is available to sockets already using this egress. It
+/// coexists with the unscoped route for ordinary applications.
+fn scoped_args(action: &str, prefix: &str, egress: &DefaultRoute) -> Vec<String> {
+    let mut args = owned(&["-q", "-n", action, "-net", prefix]);
+    if let Some(gateway) = egress.gateway {
+        args.push(gateway.to_string());
+    } else {
+        args.extend(owned(&["-interface", &egress.interface]));
+    }
+    args.extend(owned(&["-ifscope", &egress.interface]));
+    if action != "delete" {
+        args.push("-proto2".into());
+    }
+    args
+}
 
 fn route_set_args(
     action: &str,
@@ -406,15 +459,56 @@ fn route_del_v6_args(half: &str) -> Vec<String> {
     owned(&["-q", "-n", "delete", "-inet6", "-net", half, "::1"])
 }
 
+fn captures_half(run: Run<'_>, half: &str, interface: &str) -> bool {
+    run_ok(run, Tool::Route, &owned(&["-n", "get", "-net", half]), None).is_ok_and(|text| {
+        scoped::field(&text, "mask") == Some("128.0.0.0")
+            && scoped::field(&text, "interface") == Some(interface)
+            && !scoped::flag(&text, "IFSCOPE")
+    })
+}
+
 /// Takes away the overlay default routes. Best effort: what is not there is
 /// the state wanted.
 fn clear_routes(run: Run<'_>, interface: &str) {
     for half in HALVES {
-        let _ = run(Tool::Route, &route_del_args(half, interface), None);
+        if captures_half(run, half, interface) {
+            let _ = run(Tool::Route, &route_del_args(half, interface), None);
+        }
     }
+}
+
+fn ipv6_reject(run: Run<'_>, half: &str) -> Result<Option<String>, String> {
+    let args = owned(&["-n", "get", "-inet6", "-net", half]);
+    match run_ok(run, Tool::Route, &args, None) {
+        Ok(text)
+            if scoped::flag(&text, "REJECT") && scoped::field(&text, "gateway") == Some("::1") =>
+        {
+            Ok(Some(text))
+        }
+        Ok(_) => Ok(None),
+        Err(why)
+            if why.contains("not in table")
+                || why.contains("No such process")
+                || why.contains("Address family not supported") =>
+        {
+            Ok(None)
+        }
+        Err(why) => Err(why),
+    }
+}
+
+fn clear_v6(run: Run<'_>, scoped: &mut ScopedRoutes) -> Result<(), String> {
+    let Some(marker) = scoped.ipv6_marker() else {
+        return Ok(());
+    };
     for half in HALVES_V6 {
-        let _ = run(Tool::Route, &route_del_v6_args(half), None);
+        if ipv6_reject(run, half)?.is_some_and(|text| {
+            scoped::flag(&text, "PROTO2") && scoped::marker(&text) == Some(marker)
+        }) {
+            run_ok(run, Tool::Route, &route_del_v6_args(half), None)?;
+        }
     }
+    scoped.record_ipv6(false).map(|_| ())
 }
 
 /// Installs a split default, or changes its source in place when the route
@@ -431,17 +525,12 @@ fn set_half(
         &route_set_args("add", half, interface, source),
         None,
     ) {
-        Ok(_) => Ok(true),
+        Ok(_) if captures_half(run, half, interface) => Ok(true),
+        Ok(_) => Err(format!(
+            "the unscoped route for {half} does not use {interface}"
+        )),
         Err(why) if why.contains("File exists") => {
-            let lookup = run_ok(run, Tool::Route, &owned(&["-n", "get", "-net", half]), None)
-                .map_err(|inspect| format!("{why}; {inspect}"))?;
-            let field = |key: &str| {
-                lookup
-                    .lines()
-                    .filter_map(|line| line.trim().split_once(':'))
-                    .find_map(|(name, value)| (name == key).then(|| value.trim()))
-            };
-            if field("mask") != Some("128.0.0.0") || field("interface") != Some(interface) {
+            if !captures_half(run, half, interface) {
                 return Err(why);
             }
             run_ok(
@@ -456,7 +545,14 @@ fn set_half(
     }
 }
 
-fn set_routes(run: Run<'_>, interface: &str, source: Option<Ipv4Addr>) -> Result<(), String> {
+fn set_routes(
+    run: Run<'_>,
+    interface: &str,
+    source: Option<Ipv4Addr>,
+    scoped: &mut ScopedRoutes,
+) -> Result<(), String> {
+    let already_using_v6 = scoped.ipv6_marker().is_some();
+    let marker = scoped.record_ipv6(true)?;
     let mut added = Vec::new();
     for half in HALVES {
         match set_half(run, half, interface, source) {
@@ -466,31 +562,43 @@ fn set_routes(run: Run<'_>, interface: &str, source: Option<Ipv4Addr>) -> Result
                 for half in added {
                     let _ = run(Tool::Route, &route_del_args(half, interface), None);
                 }
+                if !already_using_v6 {
+                    scoped.record_ipv6(false)?;
+                }
                 return Err(why);
             }
         }
     }
     for half in HALVES_V6 {
-        // A host without IPv6 has nothing to block; not a failure.
-        if let Err(why) = run_ok(run, Tool::Route, &route_add_v6_args(half), None) {
-            tracing::debug!(%why, "cannot block IPv6 for the exit node");
+        let mut args = route_add_v6_args(half);
+        args.extend(["-proto2".into(), "-hopcount".into(), marker.to_string()]);
+        if let Err(why) = run_ok(run, Tool::Route, &args, None) {
+            if why.contains("Address family not supported")
+                || (why.contains("File exists")
+                    && ipv6_reject(run, half).is_ok_and(|route| route.is_some()))
+            {
+                continue;
+            }
+            for half in added {
+                let _ = run(Tool::Route, &route_del_args(half, interface), None);
+            }
+            if !already_using_v6 {
+                clear_v6(run, scoped)?;
+            }
+            return Err(why);
         }
     }
     Ok(())
 }
 
 /// Makes the host match the plan.
-pub(super) fn apply_plan(
-    run: Run<'_>,
-    token: &Mutex<Option<String>>,
-    plan: &ExitHostPlan,
-) -> ExitHostReport {
+pub(super) fn apply_plan(run: Run<'_>, state: &HostState, plan: &ExitHostPlan) -> ExitHostReport {
     let forwarding = if plan.offer.is_empty() {
         None
     } else {
         forwarding_state(run)
     };
-    let outcome = apply_rules(run, token, plan);
+    let outcome = apply_rules(run, state, plan, None);
     let verdict = |ok: bool, why: &str| {
         if ok {
             RuleOutcome::Applied
@@ -522,12 +630,16 @@ pub(super) fn apply_plan(
 
 fn apply_rules(
     run: Run<'_>,
-    token: &Mutex<Option<String>>,
+    state: &HostState,
     plan: &ExitHostPlan,
+    checked_egress: Option<DefaultRoute>,
 ) -> Result<(), String> {
     let interface = plan.interface.as_str();
     let anchor = anchor_name(interface)?;
-    let egress = default_route(run, interface)?;
+    let egress = match checked_egress {
+        Some(egress) => egress,
+        None => default_route(run, interface)?,
+    };
     let uid = if plan.client {
         Some(agent_uid(run)?)
     } else {
@@ -539,30 +651,99 @@ fn apply_rules(
     });
     let rules = pf_rules(interface, &egress, &plan.offer, client.as_ref());
 
-    acquire_pf(run, token)?;
+    let mut scoped = lock(&state.routes);
+    scoped.load()?;
+    acquire_pf(run, &state.token)?;
     run_ok(run, Tool::Pfctl, &load_args(&anchor), Some(&rules))
         .map_err(|why| format!("cannot load the pf rules: {why}"))?;
     // The routes come after the rules that keep the agent's own traffic off
     // them: the other order would loop for as long as it takes.
     if plan.client {
-        set_routes(run, interface, plan.client_source)?;
+        let previous = scoped.previous();
+        let wanted = ScopedRoutes::desired(&egress);
+        let result = scoped
+            .ensure(run, &wanted)
+            .and_then(|()| set_routes(run, interface, plan.client_source, &mut scoped));
+        if let Err(reason) = result {
+            // A same-interface gateway change may already have updated one
+            // scoped route. Restore the former gateway before dropping new adds.
+            if let Err(cleanup) = scoped
+                .ensure(run, &previous)
+                .and_then(|()| scoped.retain(run, &previous))
+            {
+                return Err(format!(
+                    "{reason}; restoring prior scoped routes failed: {cleanup}"
+                ));
+            }
+            return Err(reason);
+        }
+        scoped.retain(run, &wanted)?;
+        scoped.active = Some(egress);
     } else {
         clear_routes(run, interface);
+        clear_v6(run, &mut scoped)?;
+        scoped.retain(run, &[])?;
+        scoped.active = None;
     }
     Ok(())
 }
 
 /// Removes everything this agent put there for the interface.
-pub(super) fn clear_all(run: Run<'_>, token: &Mutex<Option<String>>, interface: &str) {
+pub(super) fn clear_all(run: Run<'_>, state: &HostState, interface: &str) {
+    let mut scoped = lock(&state.routes);
     clear_routes(run, interface);
+    if let Err(why) = scoped
+        .load()
+        .and_then(|()| clear_v6(run, &mut scoped))
+        .and_then(|()| scoped.retain(run, &[]))
+    {
+        tracing::warn!(%why, "cannot remove scoped exit routes");
+    }
+    scoped.active = None;
     if let Ok(anchor) = anchor_name(interface) {
         // Flushing an anchor nothing was ever loaded into is not an error
         // worth reporting.
-        if let Err(why) = run_ok(run, Tool::Pfctl, &flush_args(&anchor), None) {
+        if let Err(why) = run_ok(run, Tool::Pfctl, &load_args(&anchor), Some("")) {
             tracing::debug!(%why, "cannot flush the exit node pf anchor");
         }
     }
-    release_pf(run, token);
+    release_pf(run, &state.token);
+}
+
+/// The logical plan can be unchanged while Wi-Fi changes gateway or moves
+/// to Ethernet. Rebuild both PF and physical scope against that new egress.
+pub(super) fn refresh_client(
+    run: Run<'_>,
+    state: &HostState,
+    plan: &ExitHostPlan,
+) -> Option<RuleOutcome> {
+    if !plan.client || !lock(&state.routes).check_due(std::time::Instant::now()) {
+        return None;
+    }
+    let egress = match default_route(run, &plan.interface) {
+        Ok(egress) => egress,
+        Err(reason) => return Some(RuleOutcome::Failed(reason)),
+    };
+    {
+        let mut routes = lock(&state.routes);
+        if routes.active.as_ref() == Some(&egress) {
+            // A physical link may reconnect with the same name and gateway
+            // after the kernel has discarded that interface's scoped routes.
+            if let Err(reason) = routes.ensure(run, &ScopedRoutes::desired(&egress)) {
+                return Some(RuleOutcome::Failed(reason));
+            }
+            if HALVES
+                .iter()
+                .all(|half| captures_half(run, half, &plan.interface))
+            {
+                return None;
+            }
+        }
+    }
+    Some(match apply_rules(run, state, plan, Some(egress)) {
+        Ok(()) => RuleOutcome::Applied,
+        Err(reason) => RuleOutcome::Failed(reason),
+    })
 }
 
 #[cfg(test)]
@@ -601,6 +782,9 @@ destination: default\n\
         pf_load_fails: bool,
         route_add_fails: bool,
         half_interface: Option<&'static str>,
+        v6: RefCell<std::collections::BTreeMap<String, u32>>,
+        capture: RefCell<std::collections::BTreeMap<String, String>>,
+        scoped: RefCell<std::collections::BTreeMap<(String, String), String>>,
         pf_enable_output: &'static str,
     }
 
@@ -615,6 +799,9 @@ destination: default\n\
                 pf_load_fails: false,
                 route_add_fails: false,
                 half_interface: None,
+                v6: RefCell::default(),
+                capture: RefCell::default(),
+                scoped: RefCell::default(),
                 pf_enable_output: "pf enabled\nToken : 4242\n",
             }
         }
@@ -638,11 +825,64 @@ destination: default\n\
             match tool {
                 Tool::Id => ok("0\n", ""),
                 Tool::Sysctl => ok(self.forwarding, ""),
+                Tool::Route if args.iter().any(|a| a == "-inet6") => {
+                    let half = args[args.iter().position(|a| a == "-net").unwrap() + 1].clone();
+                    let mut table = self.v6.borrow_mut();
+                    if args.iter().any(|a| a == "get") {
+                        return table.get(&half).map_or_else(|| fail("not in table"),|marker|
+                            ok(&format!("gateway: ::1\nflags: <UP,REJECT,PROTO2>\nhopcount mtu\n{marker} 16384\n"),""));
+                    }
+                    if args.iter().any(|a| a == "delete") {
+                        table.remove(&half);
+                    } else if let std::collections::btree_map::Entry::Vacant(entry) =
+                        table.entry(half)
+                    {
+                        entry.insert(args.last().unwrap().parse().unwrap());
+                    } else {
+                        return fail("File exists");
+                    }
+                    ok("", "")
+                }
+                Tool::Route if args.iter().any(|a| a == "-ifscope") => {
+                    let after = |name: &str| {
+                        args.iter()
+                            .position(|a| a == name)
+                            .map(|i| args[i + 1].clone())
+                    };
+                    let scope = after("-ifscope").unwrap();
+                    let prefix = after("-net").unwrap();
+                    let key = (scope.clone(), prefix.clone());
+                    let mut table = self.scoped.borrow_mut();
+                    if args.iter().any(|a| a == "get") {
+                        return table
+                            .get(&key)
+                            .map_or_else(|| fail("not in table"), |text| ok(text, ""));
+                    }
+                    if args.iter().any(|a| a == "delete") {
+                        table.remove(&key);
+                    } else {
+                        let gateway = args
+                            .iter()
+                            .find(|a| a.parse::<Ipv4Addr>().is_ok())
+                            .cloned()
+                            .unwrap_or_default();
+                        let marker = after("-hopcount").unwrap();
+                        table.insert(key, format!("destination: {}\nmask: 128.0.0.0\ninterface: {scope}\ngateway: {gateway}\nflags: <UP,PROTO2,IFSCOPE>\nhopcount mtu\n{marker} 1500\n", prefix.split('/').next().unwrap()));
+                    }
+                    ok("", "")
+                }
                 Tool::Route
                     if args.iter().any(|arg| arg == "get")
                         && args.iter().any(|arg| arg == "-net") =>
                 {
-                    match self.half_interface {
+                    let half = args.last().unwrap();
+                    match self
+                        .capture
+                        .borrow()
+                        .get(half)
+                        .map(String::as_str)
+                        .or(self.half_interface)
+                    {
                         Some(name) => ok(&format!("mask: 128.0.0.0\ninterface: {name}\n"), ""),
                         None => fail("not in table"),
                     }
@@ -656,11 +896,30 @@ destination: default\n\
                 Tool::Route
                     if args.contains(&"add".to_string())
                         && ((self.route_add_fails && args.iter().any(|a| a == HALVES[1]))
+                            || args.iter().any(|a| self.capture.borrow().contains_key(a))
                             || (self.half_interface.is_some()
                                 && HALVES.iter().any(|half| args.iter().any(|a| a == half)))) =>
                 {
                     // Darwin route can return success after a routing-socket write failed.
                     ok("", "route: writing to routing socket: File exists")
+                }
+                Tool::Route if args.iter().any(|a| a == "-interface") => {
+                    let half = args
+                        .iter()
+                        .position(|a| a == "-net")
+                        .map(|i| args[i + 1].clone())
+                        .unwrap();
+                    let iface = args
+                        .iter()
+                        .position(|a| a == "-interface")
+                        .map(|i| args[i + 1].clone())
+                        .unwrap();
+                    if args.iter().any(|a| a == "delete") {
+                        self.capture.borrow_mut().remove(&half);
+                    } else {
+                        self.capture.borrow_mut().insert(half, iface);
+                    }
+                    ok("", "")
                 }
                 Tool::Route => ok("", ""),
                 Tool::Pfctl if self.pf_missing => Ran::Missing,
@@ -741,7 +1000,27 @@ destination: default\n\
     }
 
     #[test]
-    fn using_sends_the_agents_own_traffic_back_out_the_physical_interface() {
+    fn the_agents_tagged_nat_precedes_any_general_masquerade_for_offered_ranges() {
+        let ranges = [range()];
+        let client = ClientRules {
+            uid: 0,
+            overlay: &ranges,
+        };
+        let text = pf_rules("utun5", &egress(), &ranges, Some(&client));
+        let mut nat = text.lines().filter(|line| line.starts_with("nat "));
+        assert!(
+            nat.next()
+                .unwrap()
+                .ends_with("tagged tsng_underlay_utun5 -> (en0) static-port")
+        );
+        assert_eq!(
+            nat.next(),
+            Some("nat on en0 inet from 10.13.37.0/24 to any -> (en0)")
+        );
+    }
+
+    #[test]
+    fn using_keeps_the_reroute_and_the_physical_nat_in_separate_pf_passes() {
         let other: Ipv4Range = "10.99.0.0/16".parse().unwrap();
         let overlay = [range(), other];
         let client = ClientRules {
@@ -755,19 +1034,17 @@ destination: default\n\
             ),
             "{text}"
         );
-        assert!(
-            text.contains("nat on en0 inet from (utun5) to any -> (en0)\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains(
+        let rules: Vec<_> = text.lines().skip(1).collect();
+        assert_eq!(
+            rules,
+            [
+                "nat on en0 inet from (utun5) to any tagged tsng_underlay_utun5 -> (en0) static-port",
                 "pass out quick on utun5 route-to (en0 192.168.1.1) inet proto { tcp udp } \
-                 from any to ! <tsunagi_overlay_utun5> user 0\n"
-            ),
-            "{text}"
+                 from any to ! <tsunagi_overlay_utun5> user 0 tag tsng_underlay_utun5 no state",
+                "pass out quick on en0 reply-to (lo0 127.0.0.1) inet proto { tcp udp } from any to any flags any \
+                 tagged tsng_underlay_utun5 keep state (if-bound)",
+            ]
         );
-        // Only the agent's user, and only what is not the overlay.
-        assert!(!text.contains("from any to any"));
 
         let direct = DefaultRoute {
             interface: "ppp0".into(),
@@ -789,6 +1066,10 @@ destination: default\n\
 
     #[test]
     fn the_overlay_default_routes_are_halves_and_ipv6_is_rejected() {
+        assert_eq!(
+            scoped_args("add", "128.0.0.0/1", &egress()).join(" "),
+            "-q -n add -net 128.0.0.0/1 192.168.1.1 -ifscope en0 -proto2"
+        );
         assert_eq!(
             route_set_args("add", "0.0.0.0/1", "utun5", None).join(" "),
             "-q -n add -net 0.0.0.0/1 -interface utun5"
@@ -818,7 +1099,7 @@ destination: default\n\
     #[test]
     fn offering_loads_the_anchor_and_reads_but_never_writes_forwarding() {
         let fake = Fake::new();
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, false));
         assert_eq!(report.offer, vec![(range(), RuleOutcome::Applied)]);
         assert_eq!(report.forwarding, Some(true));
@@ -845,14 +1126,14 @@ destination: default\n\
         );
         // No client routes were added for an offer alone.
         assert_eq!(fake.count(" add "), 0);
-        assert_eq!(token.lock().unwrap().as_deref(), Some("4242"));
+        assert_eq!(token.token.lock().unwrap().as_deref(), Some("4242"));
     }
 
     #[test]
     fn forwarding_off_is_reported_and_unreadable_is_none() {
         let mut fake = Fake::new();
         fake.forwarding = "0\n";
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, false));
         assert_eq!(report.forwarding, Some(false));
         fake.forwarding = "junk";
@@ -863,12 +1144,18 @@ destination: default\n\
     #[test]
     fn the_client_rules_are_loaded_before_the_routes_that_need_them() {
         let fake = Fake::new();
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(false, true));
         assert_eq!(report.client, Some(RuleOutcome::Applied));
         assert!(report.offer.is_empty());
         let load = fake.position("-f -").unwrap();
-        let add = fake.position(" add -net 0.0.0.0/1").unwrap();
+        let scoped = fake
+            .position(" add -net 128.0.0.0/1 192.168.1.1 -ifscope en0")
+            .unwrap();
+        let add = fake
+            .position(" add -net 0.0.0.0/1 -interface utun5")
+            .unwrap();
+        assert!(load < scoped && scoped < add);
         assert!(load < add, "{:?}", fake.calls());
         assert!(fake.position("add -net 128.0.0.0/1").is_some());
         assert!(fake.position("-inet6 -net ::/1 ::1 -reject").is_some());
@@ -880,17 +1167,19 @@ destination: default\n\
     #[test]
     fn both_exit_halves_use_the_selected_networks_address_on_a_shared_utun() {
         let fake = Fake::new();
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let mut selected = plan(false, true);
         selected.overlay.push("10.99.0.0/24".parse().unwrap());
-        for source in ["10.99.0.17", "10.13.37.34"] {
+        for (action, source) in [("add", "10.99.0.17"), ("change", "10.13.37.34")] {
             selected.client_source = Some(source.parse().unwrap());
             let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &selected);
             assert_eq!(report.client, Some(RuleOutcome::Applied));
             for half in HALVES {
                 assert!(
-                    fake.position(&format!("add -net {half} -interface utun5 -ifa {source}"))
-                        .is_some()
+                    fake.position(&format!(
+                        "{action} -net {half} -interface utun5 -ifa {source}"
+                    ))
+                    .is_some()
                 );
             }
         }
@@ -902,7 +1191,11 @@ destination: default\n\
         selected.client_source = Some("10.99.0.17".parse().unwrap());
         let mut fake = Fake::new();
         fake.half_interface = Some("utun5");
-        let report = apply_plan(&|t, a, s| fake.run(t, a, s), &Mutex::new(None), &selected);
+        let report = apply_plan(
+            &|t, a, s| fake.run(t, a, s),
+            &HostState::default(),
+            &selected,
+        );
         assert_eq!(report.client, Some(RuleOutcome::Applied));
         for half in HALVES {
             assert!(
@@ -918,19 +1211,104 @@ destination: default\n\
         foreign.half_interface = Some("utun9");
         let report = apply_plan(
             &|t, a, s| foreign.run(t, a, s),
-            &Mutex::new(None),
+            &HostState::default(),
             &selected,
         );
         assert!(matches!(report.client, Some(RuleOutcome::Failed(_))));
         assert_eq!(foreign.count(" change "), 0);
-        assert_eq!(foreign.count(" delete "), 0);
+        assert!(
+            foreign.scoped.borrow().is_empty(),
+            "new scoped routes were rolled back"
+        );
+        assert_eq!(foreign.count("delete -net 0.0.0.0/1 -interface utun9"), 0);
+    }
+
+    #[test]
+    fn restart_cleans_scoped_routes_by_journal_and_kernel_marker_even_on_a_new_utun() {
+        let fake = Fake::new();
+        let dir = tempfile::tempdir().unwrap();
+        let run = |t, a: &[String], s: Option<&str>| fake.run(t, a, s);
+        let state = HostState::with_state_dir(dir.path());
+        assert_eq!(
+            apply_plan(&run, &state, &plan(false, true)).client,
+            Some(RuleOutcome::Applied)
+        );
+        assert_eq!(fake.scoped.borrow().len(), 2);
+        // An administrator replaces one of the two routes before we restart.
+        for ((_, half), listing) in fake.scoped.borrow_mut().iter_mut() {
+            if half == HALVES[0] {
+                *listing = listing.replace("PROTO2", "STATIC");
+            }
+        }
+        drop(state);
+        clear_all(&run, &HostState::with_state_dir(dir.path()), "utun9");
+        assert_eq!(fake.scoped.borrow().len(), 1);
+        assert!(
+            fake.scoped
+                .borrow()
+                .contains_key(&("en0".into(), HALVES[0].into()))
+        );
+        assert!(!dir.path().join("macos-exit-routes").exists());
+    }
+
+    #[test]
+    fn cleanup_preserves_an_ipv6_reject_installed_by_another_owner() {
+        let fake = Fake::new();
+        fake.v6.borrow_mut().insert("::/1".into(), 0);
+        let dir = tempfile::tempdir().unwrap();
+        let state = HostState::with_state_dir(dir.path());
+        let run = |t, a: &[String], s: Option<&str>| fake.run(t, a, s);
+        assert_eq!(
+            apply_plan(&run, &state, &plan(false, true)).client,
+            Some(RuleOutcome::Applied)
+        );
+        assert_eq!(fake.v6.borrow().len(), 2);
+        clear_all(&run, &HostState::with_state_dir(dir.path()), "utun9");
+        assert_eq!(
+            fake.v6.borrow().keys().cloned().collect::<Vec<_>>(),
+            ["::/1"]
+        );
+    }
+
+    #[test]
+    fn refreshing_a_changed_gateway_updates_pf_and_replaces_only_our_previous_scope() {
+        let mut fake = Fake::new();
+        let state = HostState::default();
+        let plan = plan(false, true);
+        assert_eq!(
+            apply_plan(&|t, a, s| fake.run(t, a, s), &state, &plan).client,
+            Some(RuleOutcome::Applied)
+        );
+        fake.default_route = Some(
+            DEFAULT_ROUTE
+                .replace("en0", "en1")
+                .replace("192.168.1.1", "10.0.0.1"),
+        );
+        assert_eq!(
+            refresh_client(&|t, a, s| fake.run(t, a, s), &state, &plan),
+            Some(RuleOutcome::Applied)
+        );
+        assert_eq!(fake.scoped.borrow().len(), 2);
+        assert!(
+            fake.scoped
+                .borrow()
+                .keys()
+                .all(|(interface, _)| interface == "en1")
+        );
+        assert!(
+            fake.stdins
+                .borrow()
+                .last()
+                .unwrap()
+                .contains("route-to (en1 10.0.0.1)")
+        );
     }
 
     #[test]
     fn no_routes_are_added_when_the_rules_did_not_load() {
         let mut fake = Fake::new();
         fake.pf_load_fails = true;
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, true));
         let Some(RuleOutcome::Failed(why)) = report.client else {
             panic!("{report:?}");
@@ -947,7 +1325,7 @@ destination: default\n\
     fn a_failing_route_is_a_failure_and_leaves_nothing_behind() {
         let mut fake = Fake::new();
         fake.route_add_fails = true;
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(false, true));
         let Some(RuleOutcome::Failed(why)) = report.client else {
             panic!("{report:?}");
@@ -970,7 +1348,7 @@ destination: default\n\
     fn a_missing_pfctl_or_default_route_says_what_is_wrong() {
         let mut fake = Fake::new();
         fake.pf_missing = true;
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, false));
         let RuleOutcome::Failed(why) = &report.offer[0].1 else {
             panic!("{report:?}");
@@ -991,7 +1369,7 @@ destination: default\n\
     fn a_default_route_through_the_overlay_is_refused() {
         let mut fake = Fake::new();
         fake.default_route = Some("gateway: 10.13.37.1\ninterface: utun5\n".into());
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, false));
         let RuleOutcome::Failed(why) = &report.offer[0].1 else {
             panic!("{report:?}");
@@ -1002,7 +1380,7 @@ destination: default\n\
     #[test]
     fn pf_is_enabled_once_and_released_once_on_clear() {
         let fake = Fake::new();
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let run = |t, a: &[String], s: Option<&str>| fake.run(t, a, s);
         apply_plan(&run, &token, &plan(true, false));
         apply_plan(&run, &token, &plan(true, true));
@@ -1010,15 +1388,12 @@ destination: default\n\
 
         clear_all(&run, &token, "utun5");
         assert_eq!(fake.count("Pfctl -X 4242"), 1);
-        assert!(
-            fake.position("-a com.apple/tsunagi-exit-utun5 -F all")
-                .is_some()
-        );
+        assert_eq!(fake.stdins.borrow().last().map(String::as_str), Some(""));
         assert!(
             fake.position("delete -net 0.0.0.0/1 -interface utun5")
                 .is_some()
         );
-        assert_eq!(*token.lock().unwrap(), None);
+        assert_eq!(*token.token.lock().unwrap(), None);
         // A second clear has nothing to release and still succeeds.
         clear_all(&run, &token, "utun5");
         assert_eq!(fake.count("Pfctl -X"), 1);
@@ -1027,10 +1402,15 @@ destination: default\n\
     #[test]
     fn dropping_the_client_removes_its_routes() {
         let fake = Fake::new();
-        let token = Mutex::new(None);
+        let token = HostState::default();
         let run = |t, a: &[String], s: Option<&str>| fake.run(t, a, s);
+        assert_eq!(
+            apply_plan(&run, &token, &plan(false, true)).client,
+            Some(RuleOutcome::Applied)
+        );
+        let adds = fake.count(" add ");
         apply_plan(&run, &token, &plan(true, false));
         assert!(fake.position("delete -net 0.0.0.0/1").is_some());
-        assert_eq!(fake.count(" add "), 0);
+        assert_eq!(fake.count(" add "), adds);
     }
 }

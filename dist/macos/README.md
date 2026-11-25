@@ -41,6 +41,12 @@ The cask starts the service for you. The agent runs as root, and its control
 socket is open to the `admin` group, so the CLI and the tray work without
 `sudo` for an administrator.
 
+After upgrading the CLI, run `sudo brew services restart tsunagi` to load the
+new binary into the system daemon. Running `brew services start tsunagi` in
+a user shell creates a separate launch agent. If that happened, remove the
+user service with `brew services stop tsunagi`, then check the system daemon
+with `sudo brew services info tsunagi`.
+
 ### Publishing Homebrew packages
 
 After a stable `vMAJOR.MINOR.PATCH` GitHub release uploads its assets, the

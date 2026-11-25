@@ -19,10 +19,10 @@
 
 use crate::BoxFuture;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::exit::{ExitHostPlan, ExitHostReport, ExitHostRules};
-use super::macos_exit::{apply_plan, clear_all, run_tool};
+use super::macos_exit::{HostState, apply_plan, clear_all, refresh_client, run_tool};
 use super::{BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport, RuleOutcome};
 
 /// The limited-broadcast destination routed through the overlay interface.
@@ -68,15 +68,23 @@ fn firewall_todo(plan: &BroadcastRulesPlan) -> String {
 /// `pf` plus `route` for exit nodes (see [`super::macos_exit`]).
 #[derive(Debug, Default)]
 pub struct MacosHostRules {
-    /// The reference `pfctl -E` handed out, held while exit-node rules need
-    /// `pf` on and released when they are removed.
-    pub(super) pf_token: Arc<Mutex<Option<String>>>,
+    /// The PF reference and the physical routes owned by this agent.
+    state: Arc<HostState>,
 }
 
 impl MacosHostRules {
-    /// Creates the host rules.
+    /// Creates host rules with process-lifetime ownership. System services
+    /// use [`Self::with_state_dir`] for recovery after abrupt termination.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Tie crash recovery to this agent's state directory, even when macOS
+    /// assigns its utun a different number on the next run.
+    pub fn with_state_dir(dir: &std::path::Path) -> Self {
+        Self {
+            state: Arc::new(HostState::with_state_dir(dir)),
+        }
     }
 
     /// Installs the route, replacing one this agent added earlier so the call
@@ -95,7 +103,7 @@ impl ExitHostRules for MacosHostRules {
     fn apply<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, ExitHostReport> {
         Box::pin(async move {
             let job_plan = plan.clone();
-            let token = Arc::clone(&self.pf_token);
+            let token = Arc::clone(&self.state);
             tokio::task::spawn_blocking(move || apply_plan(&run_tool, &token, &job_plan))
                 .await
                 .unwrap_or_else(|err| {
@@ -113,10 +121,23 @@ impl ExitHostRules for MacosHostRules {
         })
     }
 
+    fn refresh<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, Option<RuleOutcome>> {
+        Box::pin(async move {
+            if !plan.client {
+                return None;
+            }
+            let state = Arc::clone(&self.state);
+            let plan = plan.clone();
+            tokio::task::spawn_blocking(move || refresh_client(&run_tool, &state, &plan))
+                .await
+                .unwrap_or_else(|err| Some(RuleOutcome::Failed(err.to_string())))
+        })
+    }
+
     fn clear<'a>(&'a self, interface: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let name = interface.to_string();
-            let token = Arc::clone(&self.pf_token);
+            let token = Arc::clone(&self.state);
             let _ = tokio::task::spawn_blocking(move || clear_all(&run_tool, &token, &name)).await;
         })
     }

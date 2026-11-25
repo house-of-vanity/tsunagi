@@ -28,6 +28,10 @@
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 use crate::BoxFuture;
+use std::collections::{BTreeMap, HashMap};
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::exit::{ExitHostPlan, ExitHostReport, ExitHostRules};
 use super::windows_exit;
@@ -119,7 +123,7 @@ fn run_powershell(script: &str) -> Result<(), String> {
 }
 
 /// Runs a script and returns what it printed, or what it said on failure.
-fn run_powershell_output(script: &str) -> Result<String, String> {
+pub(super) fn run_powershell_output(script: &str) -> Result<String, String> {
     let output = std::process::Command::new(powershell_path())
         .args([
             "-NoProfile",
@@ -153,12 +157,61 @@ async fn step(what: &'static str, script: String) -> RuleOutcome {
 
 /// The Windows implementation, through PowerShell.
 #[derive(Debug, Default)]
-pub struct WindowsHostRules;
+pub struct WindowsHostRules {
+    relay_cache: Arc<Mutex<RelayCache>>,
+}
 
 impl WindowsHostRules {
     /// Creates it. Nothing is run until [`BroadcastHostRules::apply`].
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+}
+
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const DNS_GRACE: Duration = Duration::from_secs(120);
+const MAX_RELAY_ADDRESSES: usize = 16;
+
+/// DNS may rotate while the old relay connection is still carrying packets.
+/// Keep recent answers for the relays still in use, with a fixed expiry and cap.
+#[derive(Debug, Default)]
+struct RelayCache {
+    hosts: HashMap<String, BTreeMap<Ipv4Addr, Instant>>,
+    last_refresh: Option<Instant>,
+}
+
+impl RelayCache {
+    fn lookup(
+        &mut self,
+        hosts: &[String],
+        now: Instant,
+        resolve: windows_exit::Resolve<'_>,
+    ) -> HashMap<String, Vec<Ipv4Addr>> {
+        self.hosts.retain(|host, _| hosts.contains(host));
+        let due = self
+            .last_refresh
+            .is_none_or(|last| now.duration_since(last) >= REFRESH_INTERVAL);
+        for host in hosts {
+            let known = self.hosts.entry(host.clone()).or_default();
+            known.retain(|_, seen| now.duration_since(*seen) < DNS_GRACE);
+            if due || known.is_empty() {
+                for address in resolve(host).into_iter().take(MAX_RELAY_ADDRESSES) {
+                    known.insert(address, now);
+                }
+                while known.len() > MAX_RELAY_ADDRESSES {
+                    if let Some((&oldest, _)) = known.iter().min_by_key(|(_, seen)| **seen) {
+                        known.remove(&oldest);
+                    }
+                }
+            }
+        }
+        if due {
+            self.last_refresh = Some(now);
+        }
+        self.hosts
+            .iter()
+            .map(|(host, addresses)| (host.clone(), addresses.keys().copied().collect()))
+            .collect()
     }
 }
 
@@ -173,6 +226,7 @@ fn resolve_host(host: &str) -> Vec<std::net::Ipv4Addr> {
                     IpAddr::V4(ip) => Some(ip),
                     IpAddr::V6(_) => None,
                 })
+                .take(MAX_RELAY_ADDRESSES)
                 .collect()
         })
         .unwrap_or_default()
@@ -186,10 +240,16 @@ impl ExitHostRules for WindowsHostRules {
     fn apply<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, ExitHostReport> {
         Box::pin(async move {
             let job = plan.clone();
+            let cache = Arc::clone(&self.relay_cache);
             tokio::task::spawn_blocking(move || {
+                let hosts = cache.lock().unwrap_or_else(|p| p.into_inner()).lookup(
+                    &job.bypass_hosts,
+                    Instant::now(),
+                    &resolve_host,
+                );
                 windows_exit::apply_plan(
                     &|script| run_powershell_output(script),
-                    &resolve_host,
+                    &|host| hosts.get(host).cloned().unwrap_or_default(),
                     &job,
                 )
             })
@@ -209,10 +269,46 @@ impl ExitHostRules for WindowsHostRules {
         })
     }
 
+    fn refresh<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, Option<RuleOutcome>> {
+        Box::pin(async move {
+            if !plan.client {
+                return None;
+            }
+            let job = plan.clone();
+            let cache = Arc::clone(&self.relay_cache);
+            tokio::task::spawn_blocking(move || {
+                let now = Instant::now();
+                let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+                if cache
+                    .last_refresh
+                    .is_some_and(|last| now.duration_since(last) < REFRESH_INTERVAL)
+                {
+                    return None;
+                }
+                let hosts = cache.lookup(&job.bypass_hosts, now, &resolve_host);
+                drop(cache);
+                Some(
+                    match windows_exit::refresh_bypass(
+                        &run_powershell_output,
+                        &|host| hosts.get(host).cloned().unwrap_or_default(),
+                        &job,
+                    ) {
+                        Ok(()) => RuleOutcome::Applied,
+                        Err(reason) => RuleOutcome::Failed(reason),
+                    },
+                )
+            })
+            .await
+            .unwrap_or_else(|err| Some(RuleOutcome::Failed(format!("the task failed: {err}"))))
+        })
+    }
+
     fn clear<'a>(&'a self, interface: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let name = interface.to_string();
+            let cache = Arc::clone(&self.relay_cache);
             let _ = tokio::task::spawn_blocking(move || {
+                *cache.lock().unwrap_or_else(|p| p.into_inner()) = RelayCache::default();
                 windows_exit::clear_all(&|script| run_powershell_output(script), &name)
             })
             .await;
@@ -258,6 +354,29 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn relay_dns_survives_a_transient_failure_and_retires_rotated_addresses() {
+        use std::time::{Duration, Instant};
+        let mut cache = RelayCache::default();
+        let hosts = vec!["relay.example".into()];
+        let old = [192, 0, 2, 1].into();
+        let new = [192, 0, 2, 2].into();
+        let now = Instant::now();
+        assert_eq!(cache.lookup(&hosts, now, &|_| vec![old])[&hosts[0]], [old]);
+        let later = |secs| now + Duration::from_secs(secs);
+        assert_eq!(
+            cache.lookup(&hosts, later(32), &|_| Vec::new())[&hosts[0]],
+            [old]
+        );
+        let rotated = cache.lookup(&hosts, later(64), &|_| vec![new]);
+        assert!(rotated[&hosts[0]].contains(&old) && rotated[&hosts[0]].contains(&new));
+        assert_eq!(
+            cache.lookup(&hosts, later(121), &|_| vec![new])[&hosts[0]],
+            [new]
+        );
+        assert!(cache.lookup(&[], later(122), &|_| Vec::new()).is_empty());
+    }
     use std::net::Ipv4Addr;
 
     fn plan() -> BroadcastRulesPlan {

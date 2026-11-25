@@ -14,7 +14,9 @@ set -euo pipefail
 
 binary="$1"
 arch="$2"
-version="$3"
+# Debian treats a hyphen as a packaging revision. A tilde orders an upstream
+# prerelease before the corresponding final version (1.0.3~rc1 < 1.0.3).
+version=$(printf '%s' "$3" | sed 's/-/~/')
 output="$4"
 tray="${5:-}"
 

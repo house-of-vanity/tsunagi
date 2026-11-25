@@ -236,6 +236,54 @@ struct DialState {
     source: CandidateSource,
 }
 
+/// Keep only paths that this runtime verified, long enough to reconnect when
+/// a session goes away while the host sends its default traffic into the mesh.
+#[derive(Default)]
+struct VerifiedUnderlay {
+    peers: HashMap<EndpointId, (Instant, Vec<PathAddr>)>,
+}
+
+impl VerifiedUnderlay {
+    fn record(
+        &mut self,
+        peer: EndpointId,
+        paths: impl IntoIterator<Item = PathAddr>,
+        now: Instant,
+        limit: usize,
+    ) {
+        let paths: Vec<_> = paths
+            .into_iter()
+            .filter(|p| {
+                matches!(
+                    p,
+                    PathAddr::Ip(std::net::SocketAddr::V4(_)) | PathAddr::Relay(_)
+                )
+            })
+            .take(limit)
+            .collect();
+        if !paths.is_empty() {
+            self.peers.insert(peer, (now, paths));
+        }
+    }
+
+    fn prune(&mut self, now: Instant, limit: usize, retired: impl Fn(EndpointId) -> bool) {
+        self.peers.retain(|peer, (seen, _)| {
+            !retired(*peer) && now.duration_since(*seen) < Duration::from_secs(120)
+        });
+        if self.peers.len() > limit {
+            let mut oldest: Vec<_> = self
+                .peers
+                .iter()
+                .map(|(peer, (seen, _))| (*seen, *peer))
+                .collect();
+            oldest.sort_unstable();
+            for (_, peer) in oldest.into_iter().take(self.peers.len() - limit) {
+                self.peers.remove(&peer);
+            }
+        }
+    }
+}
+
 impl DialState {
     fn new(source: CandidateSource) -> Self {
         Self {
@@ -313,6 +361,7 @@ struct Runtime {
     local_id: EndpointId,
     shutdown: Shutdown,
     sessions: HashMap<EndpointId, Session>,
+    verified_underlay: VerifiedUnderlay,
     dial_states: HashMap<EndpointId, DialState>,
     candidate_addrs: HashMap<EndpointId, iroh::EndpointAddr>,
     metrics: NetworkMetrics,
@@ -441,6 +490,7 @@ impl Runtime {
             local_id,
             shutdown,
             sessions: HashMap::new(),
+            verified_underlay: VerifiedUnderlay::default(),
             dial_states: HashMap::new(),
             candidate_addrs: HashMap::new(),
             metrics: NetworkMetrics::default(),
@@ -902,7 +952,7 @@ impl Runtime {
     /// on: the verified direct IPv4 paths of every control connection, and
     /// the relays in use. Only hosts that cannot exempt the agent from an
     /// exit node's default route read it.
-    async fn refresh_underlay(&self) {
+    async fn refresh_underlay(&mut self) {
         let Some(interface) = self
             .params
             .interface
@@ -913,17 +963,38 @@ impl Runtime {
         };
         let mut addresses = Vec::new();
         let mut hosts = Vec::new();
-        for session in self.sessions.values() {
-            for path in snapshot_connection(&session.conn).paths {
-                match path.remote {
-                    PathAddr::Ip(std::net::SocketAddr::V4(socket)) => addresses.push(*socket.ip()),
-                    PathAddr::Relay(url) => hosts.extend(relay_host(&url)),
-                    _ => {}
-                }
+        let now = Instant::now();
+        for (peer, session) in &self.sessions {
+            let mut paths = snapshot_connection(&session.conn).paths;
+            paths.sort_by_key(|path| !path.is_selected);
+            self.verified_underlay.record(
+                *peer,
+                paths.into_iter().map(|p| p.remote),
+                now,
+                self.params.limits.max_hints_per_peer,
+            );
+        }
+        self.verified_underlay
+            .prune(now, self.params.limits.max_sessions_per_network, |peer| {
+                self.state.is_retired(&peer)
+            });
+        for path in self
+            .verified_underlay
+            .peers
+            .values()
+            .flat_map(|(_, paths)| paths)
+        {
+            match path {
+                PathAddr::Ip(std::net::SocketAddr::V4(socket)) => addresses.push(*socket.ip()),
+                PathAddr::Relay(url) => hosts.extend(relay_host(url)),
+                _ => {}
             }
         }
-        for url in self.params.adapter.snapshot().relay_urls {
-            hosts.extend(relay_host(&url));
+        // The endpoint stops advertising a disconnected relay, but still
+        // attempts to reconnect to it through the physical network.
+        use iroh::Watcher;
+        for relay in self.params.adapter.endpoint().home_relay_status().get() {
+            hosts.extend(relay_host(relay.url().as_str()));
         }
         interface
             .set_underlay(self.network_id, addresses, hosts)
@@ -3433,6 +3504,28 @@ fn without_overlay_addresses(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+
+    #[test]
+    fn verified_reconnect_paths_expire_and_are_replaced_without_admitting_candidates() {
+        let peer = crate::identity::DeviceIdentity::generate().endpoint_id();
+        let addr = |last| PathAddr::Ip(([192, 0, 2, last], 7777).into());
+        let now = Instant::now();
+        let mut paths = VerifiedUnderlay::default();
+        paths.record(peer, [addr(1), addr(2)], now, 1);
+        assert_eq!(paths.peers[&peer].1, [addr(1)]);
+        paths.record(peer, [addr(3)], now, 1);
+        paths.prune(now + Duration::from_secs(30), 1, |_| false);
+        assert_eq!(paths.peers[&peer].1, [addr(3)]);
+        let other = crate::identity::DeviceIdentity::generate().endpoint_id();
+        paths.record(other, [addr(4)], now + Duration::from_secs(31), 1);
+        paths.prune(now + Duration::from_secs(32), 1, |_| false);
+        assert!(!paths.peers.contains_key(&peer));
+        paths.prune(now + Duration::from_secs(32), 1, |p| p == other);
+        assert!(paths.peers.is_empty());
+        paths.record(peer, [addr(5)], now, 1);
+        paths.prune(now + Duration::from_secs(121), 1, |_| false);
+        assert!(paths.peers.is_empty());
+    }
 
     #[test]
     fn underlay_hints_exclude_overlay_subnets_but_preserve_lan_and_relay_candidates() {
