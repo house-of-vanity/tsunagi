@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-tray"
-version = "1.0.5"
+version = "1.0.6"
 description = "Tray application to manage a running tsunagi agent."
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,7 @@ tsunagi-ui = { path = "../tsunagi-ui" }
 # The agent control client and the report types: the GUI is a thin client over
 # the same local control interface the CLI uses, so it reuses these directly
 # and never re-implements the protocol.
-tsunagi-core = { path = "../tsunagi-core", version = "1.0.5" }
+tsunagi-core = { path = "../tsunagi-core", version = "1.0.6" }
 # Native, lightweight GUI — no web engine. eframe re-exports egui.
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 # Cross-platform tray icon + menu (Windows tray, macOS menu bar, Linux SNI).

@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-core"
-version = "1.0.5"
+version = "1.0.6"
 description = "Small private mesh networks: persistent agent identity, deterministic network spaces, an iroh control plane, signed state and a local DNS view."
 readme = "../../README.md"
 keywords = ["mesh", "p2p", "iroh", "networking"]
