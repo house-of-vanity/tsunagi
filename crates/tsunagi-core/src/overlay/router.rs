@@ -21,9 +21,11 @@
 //! one is in use.
 
 use super::broadcast::{BroadcastPolicy, BroadcastTable};
-use arc_swap::ArcSwap;
+use super::exit::ExitTraffic;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use iroh::EndpointId;
@@ -43,7 +45,19 @@ pub struct Route {
 /// An internet source is valid only for a reply to our address in the exit's network.
 pub(super) enum PacketSource {
     Member,
-    ExitReply { local: Option<Ipv4Addr> },
+    ExitReply {
+        local: Option<Ipv4Addr>,
+        exit: Arc<SelectedExit>,
+    },
+}
+
+/// A packet holds its selection until delivery finishes, even if the operator
+/// switches to another exit in the meantime.
+#[derive(Debug)]
+pub(super) struct SelectedExit {
+    route: Route,
+    pub(super) tx_bytes: AtomicU64,
+    pub(super) rx_bytes: AtomicU64,
 }
 
 /// A network's exit-node settings, as far as packets are concerned.
@@ -97,6 +111,7 @@ pub enum RouteError {
 pub struct RoutingTable {
     pub(crate) vips: Arc<crate::vip::VipRouter>,
     broadcast: ArcSwap<BroadcastTable>,
+    selected_exit: ArcSwapOption<SelectedExit>,
     networks: RwLock<HashMap<NetworkId, NetworkRoutes>>,
 }
 
@@ -171,6 +186,7 @@ impl RoutingTable {
             clear_other_exits(networks, network);
         }
         networks.insert(network, routes);
+        self.refresh_exit(networks);
         self.broadcast
             .store(Arc::new(BroadcastTable::build(networks)));
         Ok(())
@@ -181,6 +197,7 @@ impl RoutingTable {
         self.vips.remove_network(network);
         let mut networks = self.write();
         networks.remove(&network);
+        self.refresh_exit(&networks);
         self.broadcast
             .store(Arc::new(BroadcastTable::build(&networks)));
     }
@@ -213,7 +230,33 @@ impl RoutingTable {
             if routes.exit.via.is_some() {
                 clear_other_exits(&mut networks, network);
             }
+            self.refresh_exit(&networks);
         }
+    }
+
+    /// Publish the current choice under the same write lock as the route edits.
+    fn refresh_exit(&self, networks: &HashMap<NetworkId, NetworkRoutes>) {
+        let route = exit_via(networks).map(|(network, peer)| Route { network, peer });
+        if self.selected_exit.load().as_ref().map(|exit| exit.route) != route {
+            self.selected_exit.store(route.map(|route| {
+                Arc::new(SelectedExit {
+                    route,
+                    tx_bytes: AtomicU64::default(),
+                    rx_bytes: AtomicU64::default(),
+                })
+            }));
+        }
+    }
+
+    pub(crate) fn exit_traffic(&self, network: NetworkId, peer: EndpointId) -> Option<ExitTraffic> {
+        let current = self.selected_exit.load();
+        let exit = current
+            .as_ref()
+            .filter(|e| e.route == Route { network, peer })?;
+        Some(ExitTraffic {
+            tx_bytes: exit.tx_bytes.load(Ordering::Relaxed),
+            rx_bytes: exit.rx_bytes.load(Ordering::Relaxed),
+        })
     }
 
     /// Recognizes limited and configured subnet broadcasts before unicast lookup.
@@ -249,6 +292,13 @@ impl RoutingTable {
     /// unicast destination, goes to this device's exit node when it has one:
     /// that is what sending *all* traffic through a member means.
     pub fn route(&self, destination: Ipv4Addr) -> Option<Route> {
+        self.packet_route(destination).map(|(route, _)| route)
+    }
+
+    pub(super) fn packet_route(
+        &self,
+        destination: Ipv4Addr,
+    ) -> Option<(Route, Option<Arc<SelectedExit>>)> {
         let networks = self.read();
         for (network, routes) in networks.iter() {
             if routes.local == Some(destination) {
@@ -259,10 +309,13 @@ impl RoutingTable {
                 .iter()
                 .find(|(address, _)| *address == destination)
             {
-                return Some(Route {
-                    network: *network,
-                    peer: *peer,
-                });
+                return Some((
+                    Route {
+                        network: *network,
+                        peer: *peer,
+                    },
+                    None,
+                ));
             }
         }
         // Inside an overlay range, an unowned address is nobody's, not the
@@ -270,7 +323,8 @@ impl RoutingTable {
         if !is_internet_destination(destination) || in_any_range(&networks, destination) {
             return None;
         }
-        exit_via(&networks).map(|(network, peer)| Route { network, peer })
+        let exit = self.selected_exit.load_full()?;
+        Some((exit.route, Some(exit)))
     }
 
     /// Whether a peer may send from a source address.
@@ -298,11 +352,14 @@ impl RoutingTable {
         {
             return Some(PacketSource::Member);
         }
-        (exit_via(&networks) == Some((network, peer))
+        let current = self.selected_exit.load();
+        let exit = current.as_ref()?;
+        (exit.route == Route { network, peer }
             && is_internet_destination(source)
             && !in_any_range(&networks, source))
-        .then_some(PacketSource::ExitReply {
+        .then(|| PacketSource::ExitReply {
             local: routes.local,
+            exit: Arc::clone(exit),
         })
     }
 

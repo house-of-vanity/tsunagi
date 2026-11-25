@@ -162,8 +162,8 @@ impl App {
                 .with_title(devices::title(network))
                 .with_app_id(crate::icon::APP_ID)
                 .with_icon(crate::icon::window())
-                .with_inner_size([1440.0, 640.0])
-                .with_min_inner_size([800.0, 400.0]);
+                .with_inner_size([1000.0, 640.0])
+                .with_min_inner_size([560.0, 400.0]);
             let agent = &self.agent;
             let traffic = &self.traffic;
             // The window shares the single unit setting, so its toggle and the

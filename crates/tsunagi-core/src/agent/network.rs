@@ -2810,6 +2810,7 @@ impl Runtime {
             exit_node,
             hostname: self.params.hostname.clone(),
             capabilities,
+            agent_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         }
     }
 
@@ -2999,6 +3000,9 @@ impl Runtime {
                 }
                 if let Some(session) = self.sessions.get_mut(&peer) {
                     session.hostname = Some(announcement.hostname.clone());
+                    session
+                        .agent_version
+                        .clone_from(&announcement.agent_version);
                     session.broadcast = announcement.broadcast;
                     session.exit_node = announcement.exit_node;
                     session.capabilities = capabilities.clone();
@@ -3260,6 +3264,7 @@ impl Runtime {
                     exit_node: session.exit_node,
                     endpoint_id: session.peer,
                     role: session.role,
+                    agent_version: session.agent_version.clone(),
                     hostname: session
                         .hostname
                         .clone()
@@ -3348,6 +3353,12 @@ impl Runtime {
             exit_offer: exit.offer,
             exit_via: exit.via,
             exit_via_online: exit.via.is_some_and(|via| self.exit_node_online(via)),
+            exit_traffic: self
+                .params
+                .interface
+                .as_ref()
+                .and(exit.via)
+                .and_then(|peer| self.params.routes.exit_traffic(self.network_id, peer)),
             exit_rules: self
                 .params
                 .interface

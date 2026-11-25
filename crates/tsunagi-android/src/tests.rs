@@ -480,7 +480,7 @@ async fn tun_reader_survives_address_changes_failed_establish_and_last_network_l
 }
 
 #[tokio::test]
-async fn phone_metadata_rows_use_text_line_height_in_a_portrait_view() {
+async fn network_cards_start_closed_and_keep_exit_traffic_visible_when_folded() {
     use crate::{
         service::{State, report},
         view::{Phone, configure},
@@ -500,37 +500,102 @@ async fn phone_metadata_rows_use_text_line_height_in_a_portrait_view() {
         address: Some("10.1.2.3".into()),
         ..Default::default()
     });
+    let mut other = sample.networks[0].clone();
+    other.network_id = "another-network".into();
+    sample.networks.push(other);
+    sample.networks[0].peers.push(tsunagi::ipc::PeerReport {
+        endpoint_id: "exit-endpoint-id".into(),
+        hostname: Some("gateway".into()),
+        ..Default::default()
+    });
+    sample.networks[0].exit = tsunagi::ipc::ExitReport {
+        via: Some("exit-endpoint-id".into()),
+        via_online: true,
+        traffic: Some(tsunagi::overlay::exit::ExitTraffic {
+            tx_bytes: 2048,
+            rx_bytes: 512,
+        }),
+        client_rules: Some(tsunagi::ipc::RuleSetReport {
+            ok: true,
+            detail: String::new(),
+        }),
+        ..Default::default()
+    };
     let state = State::Ready(Arc::new(sample), Instant::now());
     let ctx = egui::Context::default();
     configure(&ctx);
     let mut phone = Phone::default();
-    let frame = ctx.run(
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(360., 720.),
-            )),
-            ..Default::default()
-        },
-        |ctx| {
-            phone.draw(ctx, &state, |_| {
-                panic!("drawing the overview issued a command")
-            });
-        },
-    );
-    let y = |label: &str| {
+    let mut frame = |events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360., 720.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                phone.draw(ctx, &state, |_| {
+                    panic!("drawing the overview issued a command")
+                });
+            },
+        )
+    };
+    let positions = |frame: &egui::FullOutput, label: &str| {
         frame
             .shapes
             .iter()
-            .find_map(|shape| match &shape.shape {
-                Shape::Text(text) if text.galley.text() == label => Some(text.pos.y),
+            .filter_map(|shape| match &shape.shape {
+                Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.rect.center().to_vec2())
+                }
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("missing label {label}"))
+            .collect::<Vec<_>>()
     };
+    frame(vec![]);
+    let closed = frame(vec![]);
+    let titles = positions(&closed, name.as_str());
+    assert_eq!(titles.len(), 2);
+    assert!(positions(&closed, "Show devices").is_empty());
+    use egui_phosphor::regular::{ARROW_DOWN, ARROW_UP};
+    let font = egui::TextStyle::Body.resolve(&ctx.style());
+    for icon in [ARROW_UP, ARROW_DOWN] {
+        assert!(ctx.fonts(|fonts| fonts.has_glyphs(&font, icon)));
+    }
+    for label in [
+        "Exit via gateway".to_owned(),
+        format!("{ARROW_UP} 2.0 kB"),
+        format!("{ARROW_DOWN} 512 B"),
+    ] {
+        assert_eq!(positions(&closed, &label).len(), 1, "missing {label}");
+    }
+    let mut click = |pos| {
+        for pressed in [true, false] {
+            frame(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]);
+        }
+        frame(vec![])
+    };
+    let opened = click(titles[0]);
+    assert_eq!(positions(&opened, "Show devices").len(), 1);
+    let y = |label| positions(&opened, label)[0].y;
     assert!((0.0..=26.0).contains(&(y("host") - y("device"))));
     assert!((0.0..=26.0).contains(&(y("range") - y("id"))));
     assert!((0.0..=26.0).contains(&(y("peers") - y("addr"))));
+    assert!((y("VIP") - y("Show devices")).abs() < 2.0);
+    assert!((y("VIP") - y(&format!("{} Copy secret", egui_phosphor::regular::COPY))).abs() < 2.0);
+    let folded = click(positions(&opened, name.as_str())[0]);
+    assert!(positions(&folded, "Show devices").is_empty());
+    assert_eq!(positions(&folded, "Exit via gateway").len(), 1);
     agent.shutdown().await;
 }
 
@@ -631,6 +696,7 @@ fn portrait_navigation_opens_the_tray_vip_overview_and_draft_without_writing() {
         }
         frame(vec![])
     };
+    click("lab");
     let live = click("VIP");
     for label in ["Overview", "Configuration", "Next new flow", "node:8080"] {
         let p = position(&live, label);

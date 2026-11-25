@@ -90,6 +90,23 @@ pub struct Announcement {
     pub hostname: String,
     /// Announced IP plugin capabilities. Opaque to the core.
     pub capabilities: Vec<PluginCapability>,
+    /// Software release reported by this peer for display after authentication.
+    /// Keep this trailer last: original v8 readers stop after the capabilities.
+    #[serde(default, deserialize_with = "read_agent_version")]
+    pub agent_version: Option<String>,
+}
+
+fn read_agent_version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    // A frame contains exactly one envelope. EOF here is a legacy announcement.
+    // An unreadable display hint can also be discarded without losing the
+    // hostname or capabilities. Borrow the frame until the label is bounded.
+    let version = Option::<&str>::deserialize(d).ok().flatten().filter(|s| {
+        !s.is_empty()
+            && s.len() <= crate::config::MAX_AGENT_VERSION_LEN
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
+    });
+    Ok(version.map(str::to_owned))
 }
 
 /// Opens a data channel, sent by the initiator right after the membership
@@ -393,5 +410,43 @@ pub fn kind(message: &ControlMessage) -> &'static str {
         ControlMessage::Reachable { .. } => "reachable",
         ControlMessage::Peers { .. } => "peers",
         ControlMessage::Bye { .. } => "bye",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    #[test]
+    fn v8_announcements_interoperate_with_and_without_a_software_version() {
+        // The original v8 frame ends with the capability list. Decode the
+        // new frame using exactly those fields as an older receiver would.
+        type OldFrame = ([u8; 32], u8, bool, bool, String, Vec<PluginCapability>);
+        let old: OldFrame = ([7; 32], 1, true, false, "lab".into(), vec![]);
+        let legacy = encode(&old).unwrap();
+        assert!(decode::<Envelope>(&legacy[..legacy.len() - 1]).is_err());
+        let read = |bytes: &[u8]| match decode::<Envelope>(bytes).unwrap().message {
+            ControlMessage::Announce(a) => a,
+            _ => panic!("expected announcement"),
+        };
+        let mut a = read(&legacy);
+        assert_eq!(a.agent_version, None);
+        a.agent_version = Some("2.1.0-rc.2+android".into());
+        let wire = encode(&Envelope {
+            network_id: old.0,
+            message: ControlMessage::Announce(a.clone()),
+        })
+        .unwrap();
+        assert_eq!(decode::<OldFrame>(&wire).unwrap(), old);
+        assert_eq!(read(&wire), a);
+
+        for invalid in ["", "1.2.3\nforged", &"1".repeat(256)] {
+            let mut wire = legacy.clone();
+            wire.extend(encode(&Some(invalid)).unwrap());
+            let a = read(&wire);
+            assert_eq!(a.agent_version, None);
+            assert_eq!(a.hostname, "lab");
+        }
     }
 }

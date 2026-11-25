@@ -16,7 +16,7 @@ cd android
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Open **tsunagi**, tap **Start VPN**, accept Android’s VPN prompt, then join with the existing network name and secret. Android keeps the established VPN service bound when the activity closes. **About → Stop VPN** disconnects it. The app-private state directory holds the device identity and its saved networks.
+Open **tsunagi** to start the agent. On first launch, accept Android’s VPN permission prompt so the agent can create its mesh interface. Join with the existing network name and secret. The service continues when the activity closes. **About → Stop Tsunagi Agent** keeps it stopped across launches. After stopping or declining consent, tap **Start Tsunagi Agent** to enable automatic startup again. The app-private state directory holds the device identity and its saved networks.
 
 The Rust agent owns one interface across the active networks. The Android service establishes the TUN and supplies its descriptor when addresses or exit routes change. Discovery and transport sockets use the selected physical network. TCP health checks bind to the VPN and the address of their own mesh network. The per-network transport selector offers `wg`, `awg`, `wg-quic` and `tcp-tls` in the same default order as the desktop. Each network retains its saved selection and priority. An advertised remote exit can carry the phone’s IPv4 internet traffic.
 
@@ -26,7 +26,7 @@ Applications using Android’s system resolver can connect to `<member>.<network
 
 The tray and Android use the same egui network tiles, join form, device list, VIP editor and live traffic diagram from `crates/tsunagi-ui`. On Android, the Rust activity view opens each form in the current viewport. Kotlin handles the service, connectivity, rendering surface, input and clipboard.
 
-Open **Exit node…** on a network tile to compare remote gateways by measured data RTT and data path. Tap a row and confirm to route IPv4 internet traffic through it. The selected exit has an ongoing notification, including when the peer is offline. **Disconnect exit node** restores the ordinary internet route and keeps mesh access and DNS active. Mesh-only mode has no persistent app notification. Android controls the system VPN indicator. Android 13 and later request notification permission for the exit notice. Starting with Android 14, an unlocked device allows an individual swipe to dismiss an ongoing VPN notification. [Android notification behavior](https://developer.android.com/about/versions/14/behavior-changes-all#non-dismissable-notifications)
+Tap the network name to expand its card, then open **Exit node…** to compare remote gateways by measured data RTT and data path. Tap a row and confirm to route IPv4 internet traffic through it. The selected exit has an ongoing notification, including when the peer is offline. **Disconnect exit node** restores the ordinary internet route and keeps mesh access and DNS active. Mesh-only mode has no persistent app notification. Android controls the system VPN indicator. Android 13 and later request notification permission for the exit notice. Starting with Android 14, an unlocked device allows an individual swipe to dismiss an ongoing VPN notification. [Android notification behavior](https://developer.android.com/about/versions/14/behavior-changes-all#non-dismissable-notifications)
 
 ## Check two networks on an emulator
 

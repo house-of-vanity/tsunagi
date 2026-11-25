@@ -27,6 +27,8 @@ class MeshVpn : VpnService() {
         private const val DISCONNECT_EXIT = "cy.hexor.tsunagi.DISCONNECT_EXIT"
         private const val NOTIFICATION_ID = 1
         private const val EXIT_CHANNEL = "exit-node"
+        @Volatile var started = false
+            private set
     }
     private val main = Handler(Looper.getMainLooper())
     private val notifications by lazy { getSystemService(NotificationManager::class.java) }
@@ -34,7 +36,6 @@ class MeshVpn : VpnService() {
     private var closed = false
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
     @Volatile private var upstream: Network? = null
-    private var watching = false
     private val changes = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = useUnderlay(network)
         override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
@@ -77,15 +78,15 @@ class MeshVpn : VpnService() {
             STOP_VPN -> { shutdown(); stopSelf(startId); return START_NOT_STICKY }
             DISCONNECT_EXIT -> {
                 val ids = intent.data?.pathSegments.orEmpty()
-                if (watching && ids.size == 2 && intent.getLongExtra("instance", 0) == instance) {
+                if (started && ids.size == 2 && intent.getLongExtra("instance", 0) == instance) {
                     if (!Native.disconnectExit(instance, ids[0], ids[1])) {
                         android.widget.Toast.makeText(this, "Exit node is busy. Try again.", android.widget.Toast.LENGTH_SHORT).show()
                     }
-                } else if (!watching) stopSelf(startId)
+                } else if (!started) stopSelf(startId)
                 return START_NOT_STICKY
             }
         }
-        if (watching) {
+        if (started) {
             if (Native.failed(instance)) {
                 Native.stop(instance)
                 instance = 0
@@ -93,12 +94,13 @@ class MeshVpn : VpnService() {
             }
             return START_NOT_STICKY
         }
-        notifications.createNotificationChannel(NotificationChannel("vpn", "VPN", NotificationManager.IMPORTANCE_LOW))
+        closed = false
+        notifications.createNotificationChannel(NotificationChannel("vpn", "Tsunagi Agent", NotificationManager.IMPORTANCE_LOW))
         notifications.createNotificationChannel(NotificationChannel(EXIT_CHANNEL, "Exit node", NotificationManager.IMPORTANCE_LOW))
-        val startup = notification("vpn").setContentTitle("Starting mesh VPN")
+        val startup = notification("vpn").setContentTitle("Starting Tsunagi Agent")
         if (Build.VERSION.SDK_INT >= 31) startup.setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_DEFERRED)
         startForeground(NOTIFICATION_ID, startup.build())
-        watching = true
+        started = true
         connectivity.requestNetwork(NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN).build(), changes, Handler(Looper.getMainLooper()))
@@ -189,8 +191,12 @@ class MeshVpn : VpnService() {
     @Synchronized private fun shutdown() {
         if (closed) return
         closed = true
-        if (watching) connectivity.unregisterNetworkCallback(changes)
+        if (started) connectivity.unregisterNetworkCallback(changes)
+        started = false
         if (instance != 0L) Native.stop(instance)
+        instance = 0L
+        upstream = null
+        physicalAddresses = ""
         connectivity.bindProcessToNetwork(null)
         stopForeground(STOP_FOREGROUND_REMOVE)
     }

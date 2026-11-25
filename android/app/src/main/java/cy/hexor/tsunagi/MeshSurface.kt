@@ -34,7 +34,7 @@ class MeshSurface(private val activity: MainActivity) : GLSurfaceView(activity),
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) = Native.surface()
     override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) { widthPx = w; heightPx = h }
     override fun onDrawFrame(gl: GL10?) {
-        val delay = Native.draw(this, widthPx, heightPx, density)
+        val delay = Native.draw(this, widthPx, heightPx, density, MeshVpn.started)
         removeCallbacks(repaint)
         postDelayed(repaint, delay.coerceAtLeast(16))
     }
@@ -58,8 +58,8 @@ class MeshSurface(private val activity: MainActivity) : GLSurfaceView(activity),
         return true
     }
 
-    fun startVpn() { post { activity.requestVpn() } }
-    fun stopVpn() { post { activity.startService(Intent(activity, MeshVpn::class.java).setAction(MeshVpn.STOP_VPN)) } }
+    fun startAgent() { post { activity.requestAgent() } }
+    fun stopAgent() { post { activity.stopAgent() } }
     fun requestExitNotifications() { post { activity.requestExitNotifications() } }
     fun closeScreen() { post { activity.finish() } }
     fun openUrl(url: String) { post {

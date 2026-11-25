@@ -141,7 +141,7 @@ fn agent_table(ui: &mut egui::Ui, socket: Option<&str>, report: &StatusReport) {
                 ui.label(if socket.is_some() {
                     "can be managed (CAP_NET_ADMIN)"
                 } else {
-                    "Android VPN service"
+                    "Android foreground service"
                 });
             }
             PrivilegeReport::Missing(_) => {

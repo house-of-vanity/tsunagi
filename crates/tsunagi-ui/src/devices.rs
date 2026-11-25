@@ -44,6 +44,7 @@ struct Device<'a> {
     name_taken: Option<(&'a str, String)>,
     /// The last hostname seen for it, kept while it is offline.
     hostname: Option<&'a str>,
+    agent_version: Option<&'a str>,
     /// What clicking the hostname copies: `hostname.network`, so it resolves.
     copy: Option<String>,
     /// The full endpoint id, which clicking the short form copies.
@@ -104,6 +105,11 @@ impl Device<'_> {
     fn sort_key(&self) -> String {
         self.hostname.unwrap_or(self.id).to_lowercase()
     }
+
+    fn version_label(&self) -> String {
+        self.agent_version
+            .map_or_else(|| "v?".into(), |v| format!("v{}", format::short(v)))
+    }
 }
 
 /// The first characters of an endpoint id, enough to tell devices apart.
@@ -122,6 +128,11 @@ fn name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
         }
         _ => format::copy_field(ui, &short_id(device.id), device.id),
     }
+    ui.label(egui::RichText::new(device.version_label()).small().weak())
+        .on_hover_text(format!(
+            "Tsunagi {}",
+            device.agent_version.unwrap_or("version unknown")
+        ));
     if let Some((name, holder)) = &device.name_taken {
         ui.label(egui::RichText::new(egui_phosphor::regular::WARNING).color(AMBER))
             .on_hover_text(format!(
@@ -170,23 +181,23 @@ pub fn show(
                 });
             return;
         }
-        summary(ui, network);
-        ui.add_space(6.0);
-
-        ui.label(egui::RichText::new("traffic").strong());
-        format::sparkline(ui, traffic.network(&network.network_id), unit, 48.0);
-        ui.add_space(8.0);
-
         let devices = devices(network, own_id);
         let online = devices.iter().filter(|d| d.online).count();
-        ui.label(
-            egui::RichText::new(format!(
-                "devices ({} online / {} known)",
-                online,
+        ui.columns(2, |columns| {
+            columns[0].strong(format!(
+                "devices ({online} online / {} known)",
                 devices.len()
-            ))
-            .strong(),
-        );
+            ));
+            columns[0].collapsing("Network details", |ui| summary(ui, network));
+            let plot = &mut columns[1];
+            plot.label("Network traffic");
+            let width = plot.available_width().min(440.0);
+            plot.scope(|ui| {
+                ui.set_max_width(width);
+                format::sparkline(ui, traffic.network(&network.network_id), unit, 48.0);
+            });
+        });
+        ui.add_space(8.0);
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -335,7 +346,9 @@ fn summary(ui: &mut egui::Ui, network: &NetworkReport) {
         .spacing([12.0, 3.0])
         .show(ui, |ui| {
             ui.weak("id");
-            let id = if ui.ctx().os() == egui::os::OperatingSystem::Android {
+            let id = if ui.ctx().os() == egui::os::OperatingSystem::Android
+                || ui.available_width() < 440.0
+            {
                 format::short(&network.network_id)
             } else {
                 network.network_id.clone()
@@ -460,6 +473,7 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
                 via_name,
                 name_taken,
                 hostname,
+                agent_version: peer.and_then(|p| p.agent_version.as_deref()),
                 copy: hostname.map(|h| format!("{h}.{}", network.name)),
                 id,
                 data_error: peer.and_then(|p| p.data_error.as_deref()),
@@ -484,32 +498,43 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
     devices
 }
 
-const COLUMN_HEADERS: [&str; 10] = [
-    "device",
-    "exit",
-    "data",
-    "RTT data / control",
-    "address",
-    "data path",
-    "pkts",
-    "bytes",
-    "rate",
-    "plot",
-];
+fn column_headers(unit: Unit) -> [&'static str; 9] {
+    [
+        "device",
+        "exit",
+        "data",
+        "RTT data / control",
+        "address",
+        "data path",
+        match unit {
+            Unit::Bytes => "bytes (TX / RX)",
+            Unit::Packets => "pkts (TX / RX)",
+        },
+        "rate",
+        "plot",
+    ]
+}
 
 /// Initial column floors; actual headers, values and totals can grow them.
-const COLUMN_SAMPLES: [&str; 10] = [
+const COLUMN_SAMPLES: [&str; 9] = [
     "device",
     "exit",
     "data",
     "9999 ms",
     "255.255.255.255",
     "data path",
-    "99999/99999",
     "1023.9 MB / 1023.9 MB",
     "1023.9 kB/s",
     "plot",
 ];
+
+fn traffic_pair(tx: u64, rx: u64, unit: Unit) -> String {
+    format!(
+        "{} / {}",
+        format::amount(tx, unit),
+        format::amount(rx, unit)
+    )
+}
 
 /// Column widths that only ever grow, kept across frames.
 ///
@@ -517,11 +542,11 @@ const COLUMN_SAMPLES: [&str; 10] = [
 /// gets shorter — `14.4 MB/s` giving way to `382 pkt/s` — would pull the
 /// column in and push every cell after it. Remembering the widest seen keeps
 /// the table where it is.
-fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 10] {
-    let stored: Option<[f32; 10]> = ui.memory(|m| m.data.get_temp(id));
+fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 9] {
+    let stored: Option<[f32; 9]> = ui.memory(|m| m.data.get_temp(id));
     stored.unwrap_or_else(|| {
         let font = egui::FontSelection::Default.resolve(ui.style());
-        let mut widths = [0.0; 10];
+        let mut widths = [0.0; 9];
         for (width, sample) in widths.iter_mut().zip(COLUMN_SAMPLES) {
             if !sample.is_empty() {
                 *width = ui.fonts(|fonts| {
@@ -536,10 +561,9 @@ fn column_widths(ui: &egui::Ui, id: egui::Id) -> [f32; 10] {
     })
 }
 
-fn stretch_columns(mut widths: [f32; 10], available: f32) -> [f32; 10] {
-    let gaps = 10.0 * (widths.len() - 1) as f32;
-    widths[9] = widths[9].max(100.0);
-    widths[9] += (available - gaps - widths.iter().sum::<f32>()).max(0.0);
+fn stretch_columns(mut widths: [f32; 9], available: f32) -> [f32; 9] {
+    let gaps = crate::table::GAP * (widths.len() - 1) as f32;
+    widths[8] = (available - gaps - widths[..8].iter().sum::<f32>()).clamp(100.0, 180.0);
     widths
 }
 
@@ -618,16 +642,17 @@ fn device_table(
                 .x
         })
     };
-    for (column, header) in COLUMN_HEADERS.into_iter().enumerate() {
-        widths[column] = widths[column].max(measure(header.to_owned()));
+    let headers = column_headers(unit);
+    for (column, header) in headers.iter().enumerate() {
+        widths[column] = widths[column].max(measure((*header).to_owned()));
     }
-    let (mut tx_packets, mut rx_packets, mut tx_bytes, mut rx_bytes): (u64, u64, u64, u64) =
-        (0, 0, 0, 0);
+    let (mut tx_total, mut rx_total) = (0_u64, 0_u64);
     for device in devices {
         let name = format!(
-            "{} ({}){}",
+            "{} ({}) {}{}",
             device.name(),
             short_id(device.id),
+            device.version_label(),
             if !device.online { " Forget" } else { "" }
         );
         widths[0] = widths[0].max(measure(name) + 24.0);
@@ -641,59 +666,36 @@ fn device_table(
             widths[column] = widths[column].max(measure(text));
         }
         if let Some(peer) = device.overlay {
-            tx_packets = tx_packets.saturating_add(peer.tx_packets);
-            rx_packets = rx_packets.saturating_add(peer.rx_packets);
-            tx_bytes = tx_bytes.saturating_add(peer.tx_bytes);
-            rx_bytes = rx_bytes.saturating_add(peer.rx_bytes);
-            for (column, text) in [
-                (6, format!("{}/{}", peer.tx_packets, peer.rx_packets)),
-                (
-                    7,
-                    format!(
-                        "{} / {}",
-                        format::bytes(peer.tx_bytes as f64),
-                        format::bytes(peer.rx_bytes as f64)
-                    ),
-                ),
-                (
-                    8,
-                    format::series_rate(traffic.peer(network_id, &peer.public_key), unit),
-                ),
-            ] {
-                widths[column] = widths[column].max(measure(text));
-            }
+            let (tx, rx) = unit.counters(peer);
+            tx_total = tx_total.saturating_add(tx);
+            rx_total = rx_total.saturating_add(rx);
+            widths[6] = widths[6].max(measure(traffic_pair(tx, rx, unit)));
+            widths[7] = widths[7].max(measure(format::series_rate(
+                traffic.peer(network_id, &peer.public_key),
+                unit,
+            )));
         }
     }
-    for (column, text) in [
-        (6, format!("{tx_packets}/{rx_packets}")),
-        (
-            7,
-            format!(
-                "{} / {}",
-                format::bytes(tx_bytes as f64),
-                format::bytes(rx_bytes as f64)
-            ),
-        ),
-        (8, format::series_rate(traffic.network(network_id), unit)),
-    ] {
-        widths[column] = widths[column].max(measure(text));
-    }
+    let total = traffic_pair(tx_total, rx_total, unit);
+    let rate = format::series_rate(traffic.network(network_id), unit);
+    widths[6] = widths[6].max(measure(total.clone()));
+    widths[7] = widths[7].max(measure(rate.clone()));
     if widths != previous_widths {
         ui.ctx().request_repaint();
     }
     ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
     let widths = stretch_columns(widths, ui.available_width());
     crate::table::row(ui, "device headers", &widths, false, |column, ui| {
-        let response = ui.weak(COLUMN_HEADERS[column]);
+        let response = ui.weak(headers[column]);
         match column {
             2 => {
                 response.on_hover_text("Encrypted data channel readiness.");
             }
             3 => {
-                response.on_hover_text("Control-connection round-trip time.");
+                response.on_hover_text("Data-link and control-connection round-trip times.");
             }
-            7 => {
-                response.on_hover_text("Plaintext IP bytes accepted by the encrypted channel in this counter lifetime; excludes relay transit, transport overhead and delivery probes.");
+            6 => {
+                response.on_hover_text("Sent / received IP traffic in the selected unit. Excludes relay transit and transport overhead.");
             }
             5 => {
                 response.on_hover_text("External data transport or relay route.");
@@ -731,16 +733,10 @@ fn device_table(
                         let series = traffic.peer(network_id, &peer.public_key);
                         match column {
                             6 => {
-                                ui.label(format!("{}/{}", peer.tx_packets, peer.rx_packets));
+                                let (tx, rx) = unit.counters(peer);
+                                ui.label(traffic_pair(tx, rx, unit));
                             }
                             7 => {
-                                ui.label(format!(
-                                    "{} / {}",
-                                    format::bytes(peer.tx_bytes as f64),
-                                    format::bytes(peer.rx_bytes as f64)
-                                ));
-                            }
-                            8 => {
                                 ui.label(format::series_rate(series, unit));
                             }
                             _ => format::sparkline(ui, series, unit, 24.0),
@@ -762,17 +758,10 @@ fn device_table(
                 ui.strong("total");
             }
             6 => {
-                ui.strong(format!("{tx_packets}/{rx_packets}"));
+                ui.strong(&total);
             }
             7 => {
-                ui.strong(format!(
-                    "{} / {}",
-                    format::bytes(tx_bytes as f64),
-                    format::bytes(rx_bytes as f64)
-                ));
-            }
-            8 => {
-                ui.strong(format::series_rate(traffic.network(network_id), unit));
+                ui.strong(&rate);
             }
             _ => {}
         },
@@ -903,17 +892,18 @@ mod tests {
         }
     }
 
+    struct ReadOnly;
+    impl Client for ReadOnly {
+        fn send(&self, _: Command) {
+            panic!("reading the devices view issued an action");
+        }
+        fn busy(&self) -> bool {
+            false
+        }
+    }
+
     #[test]
     fn phone_roster_fits_each_width_and_expands_only_the_tapped_member() {
-        struct ReadOnly;
-        impl Client for ReadOnly {
-            fn send(&self, _: Command) {
-                panic!("reading a row issued an action");
-            }
-            fn busy(&self) -> bool {
-                false
-            }
-        }
         let mut network = NetworkReport {
             network_id: "a".repeat(60),
             name: "lab".into(),
@@ -933,9 +923,24 @@ mod tests {
             m.overlay_address_v4 = Some(format!("192.168.254.{}", 240 + i));
             network.members.push(m);
         }
+        network.peers.push(tsunagi::ipc::PeerReport {
+            endpoint_id: "alpha".into(),
+            agent_version: Some("2.0.0-rc.1".into()),
+            ..Default::default()
+        });
+        network.overlay = Some(tsunagi::ipc::OverlayReport {
+            peers: vec![OverlayPeerReport {
+                endpoint_id: "alpha".into(),
+                tx_bytes: 1024,
+                rx_bytes: 512,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
         for width in [320.0, 360.0, 430.0, 870.0] {
             let ctx = egui::Context::default();
             ctx.set_os(egui::os::OperatingSystem::Android);
+            ctx.set_fonts(crate::app_fonts());
             let frame = |events| {
                 ctx.run(
                     egui::RawInput {
@@ -950,7 +955,7 @@ mod tests {
                         show(
                             ctx,
                             &ReadOnly,
-                            &mut Unit::Packets,
+                            &mut Unit::Bytes,
                             (&mut None, &mut None),
                             &network,
                             "self",
@@ -999,8 +1004,22 @@ mod tests {
             };
             let expanded = click(a);
             assert_eq!(positions(&expanded, "Endpoint ID").len(), 1);
+            assert_eq!(positions(&expanded, "2.0.0-rc.1").len(), 1);
+            let up = positions(&expanded, "1.0 kB")[0];
+            let down = positions(&expanded, "512 B")[0];
+            assert!(down.x - up.x > width * 0.25 && (up.y - down.y).abs() < 2.0);
+            for (arrow, caption, value) in [
+                (icon::ARROW_UP, "Sent", up),
+                (icon::ARROW_DOWN, "Received", down),
+            ] {
+                let arrow = positions(&expanded, arrow)[0];
+                let caption = positions(&expanded, caption)[0];
+                assert!(arrow.x < caption.x && arrow.y < value.y);
+                assert!((arrow.x - value.x).abs() < 35.0);
+            }
             let switched = click(positions(&expanded, "bravo")[0]);
             assert_eq!(positions(&switched, "Endpoint ID").len(), 1);
+            assert_eq!(positions(&switched, "Unknown").len(), 1);
             let closed = click(positions(&switched, "bravo")[0]);
             assert!(positions(&closed, "Endpoint ID").is_empty());
         }
@@ -1133,11 +1152,11 @@ mod tests {
     }
 
     #[test]
-    fn resized_table_fills_the_window_without_growing_fixed_columns() {
-        let minimum = [100.0; 10];
+    fn wider_windows_keep_a_compact_plot_and_narrow_windows_preserve_column_floors() {
+        let minimum = [100.0; 9];
         let wide = stretch_columns(minimum, 1440.0);
-        assert!((wide.iter().sum::<f32>() + 90.0 - 1440.0).abs() < 0.1);
-        assert_eq!(&wide[..9], &minimum[..9]);
+        assert!((100.0..=190.0).contains(&wide[8]));
+        assert_eq!(&wide[..8], &minimum[..8]);
         let narrow = stretch_columns(minimum, 800.0);
         assert_eq!(
             narrow, minimum,
@@ -1148,6 +1167,39 @@ mod tests {
             wide,
             "a resize does not accumulate padding"
         );
+
+        let ctx = egui::Context::default();
+        for window_width in [800.0, 1000.0, 1440.0] {
+            let frame = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(window_width, 640.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    show(
+                        ctx,
+                        &ReadOnly,
+                        &mut Unit::Bytes,
+                        (&mut None, &mut None),
+                        &NetworkReport::default(),
+                        "self",
+                        &Traffic::default(),
+                    );
+                },
+            );
+            let chart = frame
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.rect.height() == 48.0 => Some(r.rect),
+                    _ => None,
+                })
+                .expect("network traffic chart");
+            assert!((300.0..=440.0).contains(&chart.width()), "{chart:?}");
+        }
     }
 
     #[test]
@@ -1168,18 +1220,19 @@ mod tests {
         }
 
         let context = egui::Context::default();
-        for (width, packets, age) in [
-            (1600.0, 1569, 56),
-            (1600.0, 55_555, 172_800),
-            (1600.0, 137_245, 172_800),
-            (900.0, 9_876_543_210, 172_800),
-            (1600.0, 42, 56),
+        for (width, packets, age, unit) in [
+            (1600.0, 1569, 56, crate::home::UiState::default().unit),
+            (1600.0, 55_555, 172_800, Unit::Packets),
+            (1600.0, 137_245, 172_800, Unit::Bytes),
+            (900.0, 9_876_543_210, 172_800, Unit::Packets),
+            (1600.0, 42, 56, Unit::Bytes),
         ] {
             let network = NetworkReport {
                 network_id: "network".into(),
                 peers: ["peer", "other"]
                     .into_iter()
                     .map(|id| PeerReport {
+                        agent_version: (id == "peer").then(|| "2.0.0-rc.1".into()),
                         data_error: None,
                         endpoint_id: id.into(),
                         rtt_ms: Some(12_345),
@@ -1220,7 +1273,7 @@ mod tests {
                             ui.allocate_ui(egui::vec2(width, 480.0), |ui| {
                                 device_table(
                                     ui,
-                                    Unit::Packets,
+                                    unit,
                                     &network,
                                     &rows,
                                     &Traffic::default(),
@@ -1234,11 +1287,36 @@ mod tests {
                 let shapes: Vec<_> = output.shapes.into_iter().map(|s| s.shape).collect();
                 let mut texts = Vec::new();
                 collect_text(&shapes, &mut texts);
+                let visible = |value: &str| texts.iter().any(|t| t.galley.text() == value);
+                assert!(visible("v2.0.0-rc.1"));
+                assert!(visible("v?"));
+                let packet_counts = format!("{packets} / {}", packets + 1);
+                let byte_counts = "117.7 MB / 941.9 MB";
+                if packets == 1569 {
+                    assert!(visible("bytes (TX / RX)"));
+                    assert!(visible(byte_counts));
+                }
+                assert_eq!(visible(&packet_counts), unit == Unit::Packets);
+                assert_eq!(visible(byte_counts), unit == Unit::Bytes);
                 for (label, next_column) in [
                     ("RTT data / control".to_string(), "address"),
                     (rtt_pair(&rows[0]), "address"),
-                    (format!("{packets}/{}", packets + 1), "bytes"),
-                    (format!("{}/{}", packets * 2, (packets + 1) * 2), "bytes"),
+                    (
+                        if unit == Unit::Packets {
+                            packet_counts
+                        } else {
+                            byte_counts.into()
+                        },
+                        "rate",
+                    ),
+                    (
+                        if unit == Unit::Packets {
+                            format!("{} / {}", packets * 2, (packets + 1) * 2)
+                        } else {
+                            "235.5 MB / 1.8 GB".into()
+                        },
+                        "rate",
+                    ),
                 ] {
                     let right = texts
                         .iter()
@@ -1403,7 +1481,7 @@ mod tests {
                     &mut None,
                     &mut None,
                 );
-                let stored: [f32; 10] = ui
+                let stored: [f32; 9] = ui
                     .memory(|memory| {
                         memory
                             .data

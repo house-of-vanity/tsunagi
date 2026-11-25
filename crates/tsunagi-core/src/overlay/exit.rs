@@ -5,6 +5,15 @@
 //! system sees. It is kept apart from the broadcast rules, which have a
 //! different lifetime and different tags.
 
+/// Plaintext IP bytes carried through the client's currently selected internet exit.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExitTraffic {
+    /// Bytes accepted by the carrier for off-mesh destinations.
+    pub tx_bytes: u64,
+    /// Internet reply bytes delivered to the local interface.
+    pub rx_bytes: u64,
+}
+
 /// How one set of host rules went.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuleSetReport {

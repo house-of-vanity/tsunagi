@@ -162,7 +162,7 @@ impl Phone {
         let outcome = match pending.result.try_recv() {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                Err("VPN service stopped".to_owned())
+                Err("Tsunagi Agent stopped".to_owned())
             }
             Ok(v) => v,
         };
@@ -239,8 +239,9 @@ impl Phone {
                     });
                 } else if self.page == Page::About
                     && !matches!(state, State::Off)
-                    && ui.button("Stop VPN").clicked()
+                    && ui.button("Stop Tsunagi Agent").clicked()
                 {
+                    self.home();
                     system = Some(SystemAction::Stop);
                 }
             });
@@ -278,10 +279,10 @@ impl Phone {
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         let Some(report) = report else {
                             match state {
-                                State::Starting => {ui.spinner(); ui.label("Starting VPN…");}
+                                State::Starting => {ui.spinner(); ui.label("Starting Tsunagi Agent…");}
                                 _ => {
-                                    if let State::Error(e) = state {ui.colored_label(BAD, e);} else {ui.weak("VPN is stopped");}
-                                    if ui.button("Start VPN").clicked() {system = Some(SystemAction::Start);}
+                                    if let State::Error(e) = state {ui.colored_label(BAD, e);} else {ui.weak("Tsunagi Agent is stopped");}
+                                    if ui.button("Start Tsunagi Agent").clicked() {self.error = None; system = Some(SystemAction::Start);}
                                 }
                             }
                             return;

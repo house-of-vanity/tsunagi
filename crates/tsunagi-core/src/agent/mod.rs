@@ -1309,6 +1309,7 @@ impl Agent {
                     .exit_via
                     .and_then(|bytes| EndpointId::from_bytes(&bytes).ok()),
                 exit_via_online: false,
+                exit_traffic: None,
                 exit_rules: Default::default(),
                 descriptor: keys.descriptor(),
                 name: stored.name,

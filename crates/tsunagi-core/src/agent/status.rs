@@ -152,6 +152,8 @@ pub struct PeerStatus {
     ///
     /// A mutable binding, not an identity.
     pub hostname: Option<String>,
+    /// Software version in the peer's latest authenticated announcement.
+    pub agent_version: Option<String>,
     /// Protocols agreed with this peer: both sides have them at the same
     /// version.
     ///
@@ -247,6 +249,8 @@ pub struct NetworkStatus {
     pub exit_via: Option<EndpointId>,
     /// Whether that member is connected and still offering to be one.
     pub exit_via_online: bool,
+    /// IP byte totals since this exit route was selected.
+    pub exit_traffic: Option<crate::overlay::exit::ExitTraffic>,
     /// What the host rules for the exit settings are doing.
     pub exit_rules: crate::overlay::ExitRulesReport,
     /// Immutable deterministic description of the network space.

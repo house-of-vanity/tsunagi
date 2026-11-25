@@ -23,6 +23,15 @@ pub enum Unit {
     Bytes,
 }
 
+impl Unit {
+    pub(crate) fn counters(self, peer: &OverlayPeerReport) -> (u64, u64) {
+        match self {
+            Self::Packets => (peer.tx_packets, peer.rx_packets),
+            Self::Bytes => (peer.tx_bytes, peer.rx_bytes),
+        }
+    }
+}
+
 /// One series' rolling packet and byte rates.
 #[derive(Default)]
 pub struct Series {

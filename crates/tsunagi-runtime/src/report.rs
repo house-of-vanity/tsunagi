@@ -102,6 +102,7 @@ pub fn networks(
                     .peers
                     .iter()
                     .map(|peer| PeerReport {
+                        agent_version: peer.agent_version.clone(),
                         data_error: peer.data_error.clone(),
                         endpoint_id: peer.endpoint_id.to_string(),
                         hostname: peer.hostname.clone(),
@@ -193,6 +194,7 @@ fn exit_report(network: &tsunagi::agent::NetworkStatus) -> tsunagi::ipc::ExitRep
         })
     };
     tsunagi::ipc::ExitReport {
+        traffic: network.exit_traffic,
         offering: network.exit_offer,
         offer_rules: rules(&network.exit_rules.offer),
         forwarding: network.exit_rules.forwarding,

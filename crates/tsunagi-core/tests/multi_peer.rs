@@ -43,15 +43,19 @@ async fn four_agents_form_a_mesh_and_exchange_distinguishable_messages() {
     // A peer counts as connected as soon as its session is authenticated, which
     // can be a round before its announcement carrying the hostname arrives, so
     // this waits for the hostnames rather than reading them straight away.
-    let hostnames: HashSet<String> = wait_until("three distinct peer hostnames", || async {
-        let status = agents[0].agent.network_status(network_id).await.ok()?;
-        let hostnames: HashSet<String> = status
-            .peers
-            .iter()
-            .filter_map(|peer| peer.hostname.clone())
-            .collect();
-        (hostnames.len() >= 3).then_some(hostnames)
-    })
+    let hostnames: HashSet<String> = wait_until(
+        "three peers announce their hostname and release",
+        || async {
+            let status = agents[0].agent.network_status(network_id).await.ok()?;
+            let hostnames: HashSet<String> = status
+                .peers
+                .iter()
+                .filter(|peer| peer.agent_version.as_deref() == Some(env!("CARGO_PKG_VERSION")))
+                .filter_map(|peer| peer.hostname.clone())
+                .collect();
+            (hostnames.len() >= 3).then_some(hostnames)
+        },
+    )
     .await;
     assert_eq!(
         hostnames.len(),

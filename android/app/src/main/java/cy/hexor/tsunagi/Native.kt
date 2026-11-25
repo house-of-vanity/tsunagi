@@ -13,7 +13,7 @@ internal object Native {
     external fun networkChanged(instance: Long, addresses: String)
 
     external fun surface()
-    external fun draw(host: MeshSurface, width: Int, height: Int, density: Float): Long
+    external fun draw(host: MeshSurface, width: Int, height: Int, density: Float, serviceStarted: Boolean): Long
     external fun touch(action: Int, id: Int, x: Float, y: Float)
     external fun input(kind: Int, value: String)
     external fun key(key: Int)

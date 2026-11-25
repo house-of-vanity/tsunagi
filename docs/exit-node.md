@@ -30,6 +30,10 @@ tsng exit-node off
 
 The tray does the same: a checkbox on the network tile to offer, and an icon on
 each device in the devices window that offers one, with a confirmation.
+The network card shows the selected peer even when folded. The up arrow counts
+IP bytes sent through the exit and the down arrow counts reply bytes delivered
+to this device. Traffic addressed to the peer within the mesh is counted only
+in the devices window. The exit totals start over on a new selection or restart.
 
 An agent uses **one exit node across all active networks**. Choosing another
 replaces the previous selection and survives restart. Internet packets use

@@ -48,10 +48,10 @@ fn send(cmd: tsunagi_ui::client::Command) -> Result<Response, String> {
     let (reply, result) = oneshot::channel();
     current()
         .as_ref()
-        .ok_or("VPN service stopped")?
+        .ok_or("Tsunagi Agent stopped")?
         .commands
         .try_send((Request::Action(cmd), reply))
-        .map_err(|_| "VPN service is busy or stopped".to_owned())?;
+        .map_err(|_| "Tsunagi Agent is busy or stopped".to_owned())?;
     Ok(result)
 }
 

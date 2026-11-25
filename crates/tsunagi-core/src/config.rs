@@ -21,6 +21,9 @@ use crate::error::Result;
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 const APP_NAME: &str = "tsunagi";
 
+/// Maximum length of the optional software release label in a peer announcement.
+pub const MAX_AGENT_VERSION_LEN: usize = 64;
+
 /// Rendezvous slots per network; this bounds a discovery sample, not membership.
 pub const DHT_SLOTS: u8 = 16;
 /// BEP44 permits 1000 bencoded bytes; a 996-byte string has a four-byte prefix.

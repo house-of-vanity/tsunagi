@@ -130,74 +130,102 @@ fn details(
     exit: &mut Option<ExitConfirm>,
     forget: &mut Option<ForgetConfirm>,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        ui.weak(if member.online { "online" } else { "offline" });
-        if let Some(name) = &member.copy {
-            format::copy_field(ui, &member.name(), name);
-        }
-        if let Some(address) = &member.address {
-            format::copy_field(ui, address, address);
-        }
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.weak("Endpoint ID");
-        format::copy_field(ui, &format::short(member.id), member.id);
-    });
-    let (path, _) = data_path_text(member.path, member.via_name.as_deref(), member.online);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(path);
-        tunnel_cell(ui, member);
-    });
-    if member.online {
-        if let Some(path) = member.data_transport_detail {
-            ui.label(path);
-        }
-        ui.label(format!(
-            "Data RTT {} · Control RTT {}",
-            rtt_text(member.data_rtt_ms),
-            rtt_text(member.control_rtt_ms)
-        ));
-    }
-    if let Some(error) = member.data_error {
-        ui.colored_label(AMBER, error);
-    }
-    if let Some((taken, holder)) = &member.name_taken {
-        ui.colored_label(AMBER, format!("Name {taken} belongs to {holder}."));
-    }
-    if let Some(peer) = member.overlay {
-        let series = traffic.peer(&network.network_id, &peer.public_key);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!(
-                "TX {} · {} pkts",
-                format::bytes(peer.tx_bytes as f64),
-                peer.tx_packets
-            ));
-            ui.label(format!(
-                "RX {} · {} pkts",
-                format::bytes(peer.rx_bytes as f64),
-                peer.rx_packets
-            ));
-            ui.weak(format::series_rate(series, unit));
+    egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.columns(2, |cols| {
+                cols[0].small("Data path");
+                let (path, _) =
+                    data_path_text(member.path, member.via_name.as_deref(), member.online);
+                cols[0].horizontal_wrapped(|ui| {
+                    ui.label(path);
+                    if member.online {
+                        tunnel_cell(ui, member);
+                    }
+                });
+                cols[1].small("Tsunagi version");
+                cols[1].label(member.agent_version.unwrap_or("Unknown"));
+            });
+            if let Some(path) = member.data_transport_detail {
+                ui.add(egui::Label::new(path).wrap());
+            }
+            if member.online {
+                ui.columns(2, |cols| {
+                    cols[0].small("Data RTT");
+                    cols[0].label(rtt_text(member.data_rtt_ms));
+                    cols[1].small("Control RTT");
+                    cols[1].label(rtt_text(member.control_rtt_ms));
+                });
+            }
+            if let Some(peer) = member.overlay.filter(|_| member.online) {
+                ui.separator();
+                let (tx, rx) = unit.counters(peer);
+                let sent_color = ui.visuals().hyperlink_color;
+                ui.columns(2, |cols| {
+                    for (col, arrow, caption, count, color) in [
+                        (0, icon::ARROW_UP, "Sent", tx, sent_color),
+                        (1, icon::ARROW_DOWN, "Received", rx, exit::GOOD),
+                    ] {
+                        cols[col].horizontal(|ui| {
+                            ui.colored_label(color, arrow);
+                            ui.label(caption);
+                        });
+                        let value = format::amount(count, unit);
+                        let value = match unit {
+                            Unit::Packets => format!("{value} pkts"),
+                            Unit::Bytes => value,
+                        };
+                        let size = cols[col].text_style_height(&egui::TextStyle::Body) + 2.0;
+                        cols[col].label(egui::RichText::new(value).size(size).strong());
+                    }
+                });
+                format::sparkline(
+                    ui,
+                    traffic.peer(&network.network_id, &peer.public_key),
+                    unit,
+                    28.0,
+                );
+            }
+            ui.separator();
+            ui.columns(2, |cols| {
+                cols[0].small("Endpoint ID");
+                format::copy_field(&mut cols[0], &format::short(member.id), member.id);
+                cols[1].small("IPv4");
+                if let Some(address) = &member.address {
+                    format::copy_field(&mut cols[1], address, address);
+                } else {
+                    cols[1].weak("—");
+                }
+            });
+            if let Some(name) = &member.copy {
+                format::copy_field(ui, name, name);
+            }
+            if let Some(error) = member.data_error {
+                ui.colored_label(AMBER, error);
+            }
+            if let Some((taken, holder)) = &member.name_taken {
+                ui.colored_label(AMBER, format!("Name {taken} belongs to {holder}."));
+            }
+            if (member.exit_node || member.in_use)
+                && ui
+                    .button(if member.in_use {
+                        "Stop using exit node"
+                    } else {
+                        "Use exit node"
+                    })
+                    .clicked()
+            {
+                *exit = Some(ExitConfirm {
+                    network_id: network.network_id.clone(),
+                    peer_id: member.id.into(),
+                    name: member.name(),
+                    stop: member.in_use,
+                    main: false,
+                });
+            }
+            forget_button(ui, member, network, forget);
         });
-        format::sparkline(ui, series, unit, 22.);
-    }
-    if (member.exit_node || member.in_use)
-        && ui
-            .button(if member.in_use {
-                "Stop using exit node"
-            } else {
-                "Use exit node"
-            })
-            .clicked()
-    {
-        *exit = Some(ExitConfirm {
-            network_id: network.network_id.clone(),
-            peer_id: member.id.into(),
-            name: member.name(),
-            stop: member.in_use,
-            main: false,
-        });
-    }
-    forget_button(ui, member, network, forget);
-    ui.separator();
 }

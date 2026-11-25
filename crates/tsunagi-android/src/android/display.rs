@@ -7,7 +7,7 @@ use egui_glow::{Painter, glow};
 use jni::{
     JNIEnv,
     objects::{JObject, JString, JValue},
-    sys::{jfloat, jint, jlong},
+    sys::{jboolean, jfloat, jint, jlong},
 };
 use std::{
     cell::RefCell,
@@ -75,6 +75,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_draw(
     w: jint,
     h: jint,
     scale: jfloat,
+    service_started: jboolean,
 ) -> jlong {
     with_display(|d| {
         let size = egui::vec2(w as f32, h as f32) / scale;
@@ -88,19 +89,22 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_draw(
             info.native_pixels_per_point = Some(scale);
         }
         let mut action = None;
-        let state = super::status();
+        let state = match super::status() {
+            crate::service::State::Off if service_started != 0 => crate::service::State::Starting,
+            state => state,
+        };
         let exit_active = matches!(&state, crate::service::State::Ready(report, _) if report.networks.iter().any(|n| n.active && n.exit.via.is_some()));
         if exit_active && !d.exit_active {
             let _ = env.call_method(&host, "requestExitNotifications", "()V", &[]);
         }
         d.exit_active = exit_active;
         let output = d.ctx.run(input, |ctx| {
-            action = d.ui.draw(ctx, &state, super::send);
+            action = d.ui.draw(ctx, &state, super::send).or(action);
         });
         if let Some(action) = action {
             let method = match action {
-                SystemAction::Start => "startVpn",
-                SystemAction::Stop => "stopVpn",
+                SystemAction::Start => "startAgent",
+                SystemAction::Stop => "stopAgent",
                 SystemAction::PasteSecret => "pasteSecret",
                 SystemAction::Finish => "closeScreen",
             };

@@ -359,6 +359,15 @@ async fn selecting_a_shared_peer_uses_only_the_chosen_membership_for_exit() {
         let reply = ipv4_packet(INTERNET, chosen.client_addr, b"reply");
         chosen.peer_tun.push_from_os(reply.clone());
         assert_eq!(next(&tun).await, reply);
+        let expected = tsunagi::overlay::exit::ExitTraffic {
+            tx_bytes: request.len() as u64,
+            rx_bytes: reply.len() as u64,
+        };
+        wait_until("exit totals for the selected membership", || async {
+            (client.status(chosen.id).await.exit_traffic == Some(expected)).then_some(())
+        })
+        .await;
+        assert_eq!(client.status(other.id).await.exit_traffic, None);
     }
     peer.agent.shutdown().await;
     client.agent.shutdown().await;

@@ -38,6 +38,14 @@ pub fn bytes(n: f64) -> String {
     }
 }
 
+/// A cumulative amount in the selected unit.
+pub(crate) fn amount(value: u64, unit: Unit) -> String {
+    match unit {
+        Unit::Bytes => bytes(value as f64),
+        Unit::Packets => value.to_string(),
+    }
+}
+
 /// A rate in the chosen unit, per second.
 pub fn rate(value: f32, unit: Unit) -> String {
     match unit {

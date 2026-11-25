@@ -320,11 +320,19 @@ impl Interface {
                         tally.multicast.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    let Some(route) = routes.route_v4(destination) else {
+                    let selected = match destination {
+                        IpAddr::V4(address) => routes.packet_route(address),
+                        IpAddr::V6(_) => None,
+                    };
+                    let Some((route, exit)) = selected else {
                         tally.note_unroutable(destination);
                         continue;
                     };
+                    let len = packet.len() as u64;
                     if carrier.carry(route, packet) {
+                        if let Some(exit) = exit {
+                            exit.tx_bytes.fetch_add(len, Ordering::Relaxed);
+                        }
                         tally.sent.fetch_add(1, Ordering::Relaxed);
                     } else {
                         tally.undeliverable.fetch_add(1, Ordering::Relaxed);
@@ -840,12 +848,14 @@ impl Interface {
             self.tally.wrong_source.fetch_add(1, Ordering::Relaxed);
             return Err(Rejected::WrongSource);
         };
-        let broadcast = match (origin, header.destination()) {
-            (PacketSource::ExitReply { local: Some(local) }, IpAddr::V4(destination))
-                if destination == local =>
-            {
-                false
-            }
+        let (broadcast, exit) = match (origin, header.destination()) {
+            (
+                PacketSource::ExitReply {
+                    local: Some(local),
+                    exit,
+                },
+                IpAddr::V4(destination),
+            ) if destination == local => (false, Some(exit)),
             (PacketSource::Member, IpAddr::V4(destination))
                 if self.routes.is_broadcast(destination) =>
             {
@@ -855,13 +865,13 @@ impl Interface {
                     self.tally.broadcast_dropped.fetch_add(1, Ordering::Relaxed);
                     return Err(Rejected::BroadcastDenied);
                 }
-                true
+                (true, None)
             }
             (PacketSource::Member, IpAddr::V4(destination))
                 if self.routes.is_local_destination(network, destination)
                     || self.routes.accepts_exit_traffic(network, destination) =>
             {
-                false
+                (false, None)
             }
             _ => {
                 self.tally.wrong_destination.fetch_add(1, Ordering::Relaxed);
@@ -887,7 +897,11 @@ impl Interface {
             crate::vip::router::Decision::Pass => packet,
         };
         // Remote broadcasts terminate here. Only local TUN ingress can fan out.
+        let len = packet.len() as u64;
         if self.device.send(packet).await.is_ok() {
+            if let Some(exit) = exit {
+                exit.rx_bytes.fetch_add(len, Ordering::Relaxed);
+            }
             if broadcast {
                 self.tally
                     .broadcast_received
@@ -922,18 +936,6 @@ impl Drop for Interface {
             && let Some(task) = guard.take()
         {
             task.abort();
-        }
-    }
-}
-
-impl RoutingTable {
-    /// The route for a destination, when it is one the overlay carries.
-    fn route_v4(&self, destination: IpAddr) -> Option<Route> {
-        match destination {
-            IpAddr::V4(address) => self.route(address),
-            // The overlay is IPv4. An IPv6 packet has no owner here, and
-            // counting it as unroutable is the truth rather than a fault.
-            IpAddr::V6(_) => None,
         }
     }
 }
@@ -1528,6 +1530,57 @@ mod tests {
             offer: false,
             via: Some(exit),
         }
+    }
+
+    #[tokio::test]
+    async fn exit_totals_count_only_accepted_internet_packets_for_the_current_choice() {
+        let (interface, device, routes, _, id) = interface(false).await;
+        let totals = |p| {
+            routes
+                .exit_traffic(id, peer(p))
+                .map(|t| (t.tx_bytes, t.rx_bytes))
+        };
+        assert_eq!(totals(2), None);
+        routes.set_exit(id, using(peer(2)));
+        let outgoing = ipv4(addr(1), INTERNET, b"request");
+        device.push_from_os(outgoing.clone());
+        device.push_from_os(ipv4(addr(1), addr(2), b"ordinary mesh traffic"));
+        wait_for(&interface, |c| c.sent.saturating_sub(1)).await;
+        let incoming = ipv4(INTERNET, addr(1), b"reply");
+        interface
+            .deliver(id, peer(2), incoming.clone())
+            .await
+            .unwrap();
+        interface
+            .deliver(id, peer(2), ipv4(addr(2), addr(1), b"mesh"))
+            .await
+            .unwrap();
+        assert!(
+            interface
+                .deliver(id, peer(3), incoming.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            interface
+                .deliver(id, peer(2), ipv4(INTERNET, addr(3), b"wrong host"))
+                .await
+                .is_err()
+        );
+
+        routes.set_exit(id, using(peer(2)));
+        assert_eq!(
+            totals(2),
+            Some((outgoing.len() as u64, incoming.len() as u64))
+        );
+        routes.set_exit(id, using(peer(3)));
+        assert_eq!(totals(2), None);
+        assert_eq!(totals(3), Some((0, 0)));
+        routes.set_exit(id, ExitPolicy::default());
+        assert_eq!(totals(3), None);
+        routes.set_exit(id, using(peer(2)));
+        assert_eq!(totals(2), Some((0, 0)));
+        interface.remove().await;
     }
 
     #[tokio::test]

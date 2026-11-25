@@ -5206,6 +5206,7 @@ mod status_tests {
             relay_sent_via: 0,
             relay_received_via: 0,
             peers: vec![PeerReport {
+                agent_version: None,
                 data_error: None,
                 endpoint_id: ONLINE.into(),
                 hostname: Some("music".into()),

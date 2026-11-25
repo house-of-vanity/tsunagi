@@ -72,6 +72,7 @@ pub(crate) struct Session {
     /// number of control bytes it queues.
     pub(crate) outbound: mpsc::Sender<zeroize::Zeroizing<Vec<u8>>>,
     pub(crate) hostname: Option<String>,
+    pub(crate) agent_version: Option<String>,
     pub(crate) capabilities: Vec<PluginCapability>,
     pub(crate) broadcast: bool,
     /// The peer offers itself as an exit node in this network.
@@ -228,6 +229,7 @@ pub(crate) fn spawn(
         conn,
         outbound: outbound_tx,
         hostname: None,
+        agent_version: None,
         capabilities: Vec::new(),
         broadcast: false,
         exit_node: false,

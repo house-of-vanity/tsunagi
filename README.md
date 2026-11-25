@@ -141,8 +141,11 @@ tsng protocols home none                # control plane only
 
 Exact network names, full ids and unique id prefixes work here. The choice is
 local to this device, saved per network and applied immediately; an offline
-change applies on the next start. In the tray, expand **data transports** on a network
-tile to enable transports and set their initial preference order. Adjacent peers need a common external transport at the same wire version.
+change applies on the next start. In the tray or on Android, click the network
+name to expand its card. Open **data transports** to enable transports and set
+their initial preference order. **Show devices** lists peers and their reported
+Tsunagi versions. On Android, tap a device to see its version and traffic.
+Adjacent peers need a common external transport at the same wire version.
 Peers that both support link comparison probe another mutually enabled transport
 while traffic continues on the current one. They can switch to a faster healthy link.
 `tsng status` and the tray show the direct data link's measured RTT separately

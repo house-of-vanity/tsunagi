@@ -830,6 +830,8 @@ pub struct MemberReport {
 /// One control plane peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReport {
+    /// The software version reported by this authenticated peer, when available.
+    pub agent_version: Option<String>,
     /// Actionable carrier failure or policy mismatch; absent for a usable route.
     pub data_error: Option<String>,
     /// The peer's endpoint id.
@@ -893,6 +895,8 @@ pub struct RuleSetReport {
 /// One network's exit-node settings and what they are doing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExitReport {
+    /// IP bytes carried through this exit since selection, when locally observed.
+    pub traffic: Option<crate::overlay::exit::ExitTraffic>,
     /// This agent offers itself as an exit node in this network.
     pub offering: bool,
     /// Masquerading and forwarding rules for members' traffic, when offering.
@@ -1141,7 +1145,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 24]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 25]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///
