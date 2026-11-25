@@ -24,6 +24,7 @@ import java.util.concurrent.TimeUnit
 class MeshVpn : VpnService() {
     companion object {
         const val STOP_VPN = "cy.hexor.tsunagi.STOP_VPN"
+        const val RESTORE_EXIT = "cy.hexor.tsunagi.RESTORE_EXIT"
         private const val DISCONNECT_EXIT = "cy.hexor.tsunagi.DISCONNECT_EXIT"
         private const val NOTIFICATION_ID = 1
         private const val EXIT_CHANNEL = "exit-node"
@@ -34,6 +35,7 @@ class MeshVpn : VpnService() {
     private val notifications by lazy { getSystemService(NotificationManager::class.java) }
     @Volatile private var instance = 0L
     private var closed = false
+    private var restore: ExitTile.Target? = null
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
     @Volatile private var upstream: Network? = null
     private val changes = object : ConnectivityManager.NetworkCallback() {
@@ -76,6 +78,10 @@ class MeshVpn : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             STOP_VPN -> { shutdown(); stopSelf(startId); return START_NOT_STICKY }
+            RESTORE_EXIT -> {
+                restore = ExitTile.last(this)
+                restore?.let { if (ExitTile.restoreIfReady(this, it)) restore = null }
+            }
             DISCONNECT_EXIT -> {
                 val ids = intent.data?.pathSegments.orEmpty()
                 if (started && ids.size == 2 && intent.getLongExtra("instance", 0) == instance) {
@@ -118,9 +124,12 @@ class MeshVpn : VpnService() {
     // Rust publishes a change even when the activity is closed. Android holds its
     // own service binding for an established TUN, so mesh-only mode can leave
     // foreground promotion and remove the app's notification.
-    fun updateExitNotification(session: Long, network: String, peer: String, title: String, text: String) {
+    fun updateExitNotification(session: Long, network: String, peer: String, title: String, text: String, name: String, online: Boolean) {
         main.post {
             if (closed || session != instance) return@post
+            val selected = if (peer.isEmpty()) null else ExitTile.Target(network, peer, name)
+            ExitTile.publish(this, session, selected, online)
+            restore?.let { if (ExitTile.restoreIfReady(this, it)) restore = null }
             if (peer.isEmpty()) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 return@post
@@ -191,6 +200,8 @@ class MeshVpn : VpnService() {
     @Synchronized private fun shutdown() {
         if (closed) return
         closed = true
+        restore = null
+        ExitTile.reset(this)
         if (started) connectivity.unregisterNetworkCallback(changes)
         started = false
         if (instance != 0L) Native.stop(instance)

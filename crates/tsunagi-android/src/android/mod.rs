@@ -265,9 +265,10 @@ fn update_exit_notification(
     let Ok(mut env) = vm.attach_current_thread() else {
         return;
     };
-    let _ = env.with_local_frame(6, |env| -> jni::errors::Result<()> {
+    let _ = env.with_local_frame(8, |env| -> jni::errors::Result<()> {
         let network = env.new_string(notice.map_or("", |n| &n.network))?;
         let peer = env.new_string(notice.map_or("", |n| &n.peer))?;
+        let name = env.new_string(notice.map_or("", |n| &n.name))?;
         let title = env.new_string(
             notice
                 .map(|n| format!("Exit node · {}", n.name))
@@ -290,13 +291,15 @@ fn update_exit_notification(
         env.call_method(
             service,
             "updateExitNotification",
-            "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V",
             &[
                 JValue::Long(id),
                 JValue::Object(&network),
                 JValue::Object(&peer),
                 JValue::Object(&title),
                 JValue::Object(&text),
+                JValue::Object(&name),
+                JValue::Bool(notice.is_some_and(|n| n.online).into()),
             ],
         )?;
         Ok(())
@@ -332,6 +335,53 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_disconnectExit(
                 .is_ok()
         })
         .into()
+}
+#[unsafe(no_mangle)]
+extern "system" fn Java_cy_hexor_tsunagi_Native_tileExit(
+    mut env: JNIEnv,
+    _: JObject,
+    id: jlong,
+    network: JString,
+    peer: JString,
+    connect: jni::sys::jboolean,
+    wait_for_discovery: jni::sys::jboolean,
+) -> jni::sys::jstring {
+    // Called on the tile's background worker. Never hold the session lock while awaiting the agent.
+    let mut run = || -> Result<(), String> {
+        let network: String = env.get_string(&network).map_err(|e| e.to_string())?.into();
+        let peer: String = env.get_string(&peer).map_err(|e| e.to_string())?.into();
+        let (commands, mut state) = current()
+            .as_ref()
+            .filter(|s| s.id == id)
+            .map(|s| (s.commands.clone(), s.state.clone()))
+            .ok_or("Tsunagi Agent stopped")?;
+        if connect != 0 && wait_for_discovery != 0 {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .map_err(|e| e.to_string())?
+                .block_on(crate::service::wait_for_exit_offer(
+                    &mut state, &network, &peer,
+                ))?;
+        }
+        let request = if connect != 0 {
+            Request::RestoreExit { network, peer }
+        } else {
+            Request::DisconnectExit { network, peer }
+        };
+        let (reply, result) = oneshot::channel();
+        commands
+            .try_send((request, reply))
+            .map_err(|_| "Tsunagi Agent is busy or stopped")?;
+        result
+            .blocking_recv()
+            .map_err(|_| "Tsunagi Agent stopped")??;
+        Ok(())
+    };
+    run()
+        .err()
+        .and_then(|e| env.new_string(e).ok())
+        .map_or(std::ptr::null_mut(), JString::into_raw)
 }
 #[unsafe(no_mangle)]
 extern "system" fn Java_cy_hexor_tsunagi_Native_failed(

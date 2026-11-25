@@ -10,10 +10,11 @@ internal object Native {
     external fun failed(instance: Long): Boolean
     external fun stop(instance: Long)
     external fun disconnectExit(instance: Long, network: String, peer: String): Boolean
+    external fun tileExit(instance: Long, network: String, peer: String, connect: Boolean, waitForDiscovery: Boolean): String?
     external fun networkChanged(instance: Long, addresses: String)
 
     external fun surface()
-    external fun draw(host: MeshSurface, width: Int, height: Int, density: Float, serviceStarted: Boolean): Long
+    external fun draw(host: MeshSurface, width: Int, height: Int, density: Float, serviceStarted: Boolean, landscape: Boolean): Long
     external fun touch(action: Int, id: Int, x: Float, y: Float)
     external fun input(kind: Int, value: String)
     external fun key(key: Int)

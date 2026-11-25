@@ -93,8 +93,16 @@ pub fn show(
     let mut close = state.close_after_save && !state.dirty();
     let mut discard_new = false;
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading(format!("VIP · {}", n.name));
-        ui.weak("Configuration is shared with every member. Changes take effect only after Save.");
+        let wide = ui.available_width() >= 580.;
+        ui.horizontal_wrapped(|ui| {
+            ui.heading(format!("VIP · {}", n.name));
+            crate::widgets::field(
+                ui,
+                egui_phosphor::regular::INFO,
+                "",
+                "Configuration is shared with every member. Changes take effect only after Save.",
+            );
+        });
         if state.close_question {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Unsaved changes.");
@@ -176,7 +184,15 @@ pub fn show(
             );
         }
         let busy = state.pending.is_some();
+        let tabs = |ui: &mut egui::Ui, configure: &mut bool| {
+            ui.selectable_value(configure, false, "Overview");
+            ui.selectable_value(configure, true, "Configuration");
+        };
         ui.horizontal_wrapped(|ui| {
+            if wide {
+                tabs(ui, &mut state.configure);
+                ui.separator();
+            }
             let valid = draft.config.validate(&tsunagi::Limits::default());
             if !n.active {
                 ui.weak("Start the network to save changes.");
@@ -224,10 +240,9 @@ pub fn show(
             }
         });
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut state.configure, false, "Overview");
-            ui.selectable_value(&mut state.configure, true, "Configuration");
-        });
+        if !wide {
+            ui.horizontal(|ui| tabs(ui, &mut state.configure));
+        }
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {

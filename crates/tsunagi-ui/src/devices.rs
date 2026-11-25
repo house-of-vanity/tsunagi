@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 mod compact;
 mod exit_picker;
+mod status;
 pub use crate::exit::name_of;
 pub use exit_picker::choose_exit;
 
@@ -19,9 +20,9 @@ use crate::client::{Client, Command};
 use crate::exit;
 use crate::format;
 use crate::stats::{Traffic, Unit};
+use crate::widgets;
 
-/// A device that works but not as well as it could: reached through others,
-/// or with a name somebody else holds.
+/// A hostname that another peer already holds.
 const AMBER: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa4, 0x2c);
 
 /// A readable title for a network's window.
@@ -121,6 +122,9 @@ fn short_id(id: &str) -> String {
 /// Clicking either copies its own full value.
 fn name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
     ui.spacing_mut().item_spacing.x = 4.0;
+    let (rect, r) = ui.allocate_exact_size(egui::Vec2::splat(16.), egui::Sense::click());
+    device.channel().paint(ui, rect);
+    widgets::hint(r, device.channel_hint());
     match (device.hostname, &device.copy) {
         (Some(hostname), Some(copy)) => {
             format::copy_field(ui, hostname, copy);
@@ -134,10 +138,14 @@ fn name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
             device.agent_version.unwrap_or("version unknown")
         ));
     if let Some((name, holder)) = &device.name_taken {
-        ui.label(egui::RichText::new(egui_phosphor::regular::WARNING).color(AMBER))
-            .on_hover_text(format!(
-                "Name `{name}` belongs to {holder}. Use this device's address."
-            ));
+        let warning = ui.add(
+            egui::Label::new(egui::RichText::new(icon::WARNING).color(AMBER))
+                .sense(egui::Sense::click()),
+        );
+        widgets::hint(
+            warning,
+            &format!("Name `{name}` belongs to {holder}. Use this device's address."),
+        );
     }
 }
 
@@ -154,11 +162,16 @@ pub fn show(
     let (confirm, forget_confirm) = confirmations;
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.horizontal(|ui| {
-            ui.heading(&network.name);
+            // Reserve the unit switch even when a network name fills the viewport.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.selectable_value(unit, Unit::Bytes, "bytes");
                 ui.selectable_value(unit, Unit::Packets, "pkts");
                 ui.label("show:");
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&network.name).heading()).truncate(),
+                    );
+                });
             });
         });
         // A copy of the chosen unit for the read-only rendering below.
@@ -169,7 +182,13 @@ pub fn show(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.collapsing("Network details", |ui| summary(ui, network));
-                    format::sparkline(ui, traffic.network(&network.network_id), unit, 34.0);
+                    if widgets::landscape(ctx) {
+                        ui.collapsing("Network traffic", |ui| {
+                            format::sparkline(ui, traffic.network(&network.network_id), unit, 34.0)
+                        });
+                    } else {
+                        format::sparkline(ui, traffic.network(&network.network_id), unit, 34.0);
+                    }
                     compact::roster(
                         ui,
                         network,
@@ -345,7 +364,7 @@ fn summary(ui: &mut egui::Ui, network: &NetworkReport) {
         .num_columns(2)
         .spacing([12.0, 3.0])
         .show(ui, |ui| {
-            ui.weak("id");
+            widgets::network_id(ui);
             let id = if ui.ctx().os() == egui::os::OperatingSystem::Android
                 || ui.available_width() < 440.0
             {
@@ -356,33 +375,53 @@ fn summary(ui: &mut egui::Ui, network: &NetworkReport) {
             format::copy_field(ui, &id, &network.network_id);
             ui.end_row();
 
-            ui.weak("active");
+            widgets::field(ui, icon::POWER, "Active", "Network active on this device");
             ui.label(yes_no(network.active));
             ui.end_row();
-            ui.weak("broadcast");
+            widgets::field(
+                ui,
+                icon::BROADCAST,
+                "Broadcast",
+                "Local broadcast participation",
+            );
             ui.label(yes_no(network.broadcast));
             ui.end_row();
 
             if let Some(range) = &network.range {
-                ui.weak("range");
+                widgets::range(ui);
                 format::copy_field(ui, range, range);
                 ui.end_row();
             }
             if let Some(address) = network.overlay.as_ref().and_then(|o| o.address.as_ref()) {
-                ui.weak("this device");
+                widgets::device_address(ui);
                 format::copy_field(ui, address, address);
                 ui.end_row();
             }
-            ui.weak("candidates");
+            widgets::field(
+                ui,
+                icon::MAGNIFYING_GLASS,
+                "Candidates",
+                "Unverified discovery candidates",
+            );
             ui.label(network.candidates.to_string());
             ui.end_row();
-            ui.weak("relay fwd/via/recv");
+            widgets::field(
+                ui,
+                icon::FLOW_ARROW,
+                "Relay fwd / via / recv",
+                "Datagrams forwarded / sent via relay / received via relay",
+            );
             ui.label(format!(
                 "{} / {} / {}",
                 network.relay_forwarded, network.relay_sent_via, network.relay_received_via
             ));
             ui.end_row();
-            ui.weak("dial/handshake fails");
+            widgets::field(
+                ui,
+                icon::WARNING,
+                "Dial / handshake failures",
+                "Failed connection attempts / failed membership handshakes",
+            );
             ui.label(format!(
                 "{} / {}",
                 network.dial_failures, network.handshake_failures
@@ -601,9 +640,8 @@ fn exit_cell(
             )
             .sense(egui::Sense::click()),
         )
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(hint);
-    if response.clicked() {
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if widgets::hint(response, hint).clicked() {
         *confirm = Some(ExitConfirm {
             network_id: network_id.to_string(),
             peer_id: device.id.to_string(),
@@ -655,10 +693,10 @@ fn device_table(
             device.version_label(),
             if !device.online { " Forget" } else { "" }
         );
-        widths[0] = widths[0].max(measure(name) + 24.0);
-        let (path, _) = data_path_text(device.path, device.via_name.as_deref(), device.online);
+        widths[0] = widths[0].max(measure(name) + 44.0);
+        let path = data_path_text(device.path, device.via_name.as_deref(), device.online);
         for (column, text) in [
-            (2, "waiting".to_owned()),
+            (2, device.channel().label().to_owned()),
             (3, rtt_pair(device)),
             (4, device.address.clone().unwrap_or_default()),
             (5, path),
@@ -781,71 +819,51 @@ fn rtt_pair(device: &Device<'_>) -> String {
 }
 
 fn tunnel_cell(ui: &mut egui::Ui, device: &Device<'_>) {
-    let ready = device.overlay.is_some_and(|peer| peer.is_up())
-        && !matches!(device.path, None | Some(DataPathReport::None));
-    let text = if !device.online {
-        "—"
-    } else if ready {
-        "ready"
-    } else {
-        "waiting"
-    };
-    let error = device.data_error.unwrap_or({
-        if ready {
-            "Encrypted data channel ready"
-        } else {
-            "Encrypted data channel is not ready"
-        }
-    });
-    ui.label(text).on_hover_text(error);
+    let state = device.channel();
+    let r = ui.add(
+        egui::Label::new(egui::RichText::new(state.label()).color(state.color(ui)))
+            .sense(egui::Sense::click()),
+    );
+    widgets::hint(r, device.channel_hint());
 }
 
-/// Compact route label and whether that route is the preferred direct form.
+/// Compact route label for either client.
 /// The icon font is embedded by egui-phosphor and installed in `App::new`.
-fn data_path_text(
-    path: Option<&DataPathReport>,
-    via_name: Option<&str>,
-    online: bool,
-) -> (String, bool) {
+fn data_path_text(path: Option<&DataPathReport>, via_name: Option<&str>, online: bool) -> String {
     if !online {
-        return ("offline".into(), false);
+        return "offline".into();
     }
     match path {
-        Some(DataPathReport::Direct { transport }) => (format!("{} {transport}", icon::LINK), true),
-        Some(DataPathReport::Relayed { hops, .. }) => (
-            format!(
-                "{} {} · {hops} hops",
-                icon::SHARE_NETWORK,
-                via_name.unwrap_or("another device")
-            ),
-            false,
+        Some(DataPathReport::Direct { transport }) => format!("{} {transport}", icon::LINK),
+        Some(DataPathReport::Relayed { hops, .. }) => format!(
+            "{} {} · {hops} hops",
+            icon::SHARE_NETWORK,
+            via_name.unwrap_or("another device")
         ),
-        Some(DataPathReport::None) | None => ("no data path yet".into(), false),
+        Some(DataPathReport::None) | None => "no data path yet".into(),
     }
 }
 
 /// How a device is reached right now.
 ///
-/// A device reached through others is online, over a longer path, and says
-/// so: the colour is the only difference in how it is treated.
 fn data_path_cell(ui: &mut egui::Ui, device: &Device<'_>) {
-    let (text, good) = data_path_text(device.path, device.via_name.as_deref(), device.online);
-    let response = if good {
-        ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend))
-    } else {
-        ui.add(
-            egui::Label::new(egui::RichText::new(text).color(AMBER))
-                .wrap_mode(egui::TextWrapMode::Extend),
-        )
-    };
-    response.on_hover_text(match device.path {
-        Some(DataPathReport::Direct { .. }) => device
-            .data_transport_detail
-            .unwrap_or("Direct link to this member."),
-        Some(DataPathReport::Relayed { .. }) => "Traffic forwarded through another device.",
-        _ if device.online => "Control connected; data transport unavailable.",
-        _ => "Unreachable.",
-    });
+    let text = data_path_text(device.path, device.via_name.as_deref(), device.online);
+    let mut text = egui::RichText::new(text);
+    if !device.online {
+        text = text.weak();
+    }
+    let response = ui.add(egui::Label::new(text).extend().sense(egui::Sense::click()));
+    widgets::hint(
+        response,
+        match device.path {
+            Some(DataPathReport::Direct { .. }) => device
+                .data_transport_detail
+                .unwrap_or("Direct link to this member."),
+            Some(DataPathReport::Relayed { .. }) => "Traffic forwarded through another device.",
+            _ if device.online => "Control connected; data transport unavailable.",
+            _ => "Unreachable.",
+        },
+    );
 }
 
 fn forget_button(
@@ -1093,7 +1111,7 @@ mod tests {
                 None,
                 true,
             ),
-            (format!("{} tcp-tls", icon::LINK), true)
+            format!("{} tcp-tls", icon::LINK)
         );
     }
 
@@ -1109,13 +1127,13 @@ mod tests {
                 Some("iris"),
                 true,
             ),
-            (format!("{} iris · 2 hops", icon::SHARE_NETWORK), false)
+            format!("{} iris · 2 hops", icon::SHARE_NETWORK)
         );
         assert_eq!(
             data_path_text(Some(&DataPathReport::None), None, true),
-            ("no data path yet".into(), false)
+            "no data path yet"
         );
-        assert_eq!(data_path_text(None, None, false), ("offline".into(), false));
+        assert_eq!(data_path_text(None, None, false), "offline");
     }
 
     #[test]
@@ -1465,7 +1483,7 @@ mod tests {
         };
         let rows = devices(&network, "own");
         let far = rows.iter().find(|device| device.id == "far").unwrap();
-        let (label, _) = data_path_text(far.path, far.via_name.as_deref(), far.online);
+        let label = data_path_text(far.path, far.via_name.as_deref(), far.online);
         let context = egui::Context::default();
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);

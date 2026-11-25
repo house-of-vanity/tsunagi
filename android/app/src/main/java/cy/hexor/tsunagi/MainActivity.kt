@@ -12,6 +12,7 @@ class MainActivity : Activity() {
     private val settings by lazy { getSharedPreferences("agent", MODE_PRIVATE) }
     private var checkedAutoStart = false
     private var consentPending = false
+    private var tileRequested = false
     private var askedForNotifications = false
     internal fun requestExitNotifications() {
         if (Build.VERSION.SDK_INT >= 33 && !askedForNotifications &&
@@ -24,6 +25,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         consentPending = savedInstanceState?.getBoolean("consent_pending") == true
+        tileRequested = savedInstanceState?.getBoolean("exit_tile") ?: (intent.component == ExitTile.entry(this))
         surface = MeshSurface(this)
         val root = FrameLayout(this)
         if (Build.VERSION.SDK_INT >= 30) {
@@ -39,6 +41,11 @@ class MainActivity : Activity() {
     }
     override fun onPostResume() {
         super.onPostResume()
+        if (tileRequested && !consentPending) {
+            checkedAutoStart = true
+            requestAgent()
+            return
+        }
         if (checkedAutoStart) return
         checkedAutoStart = true
         if (!MeshVpn.started && settings.getBoolean("auto_start", true)) requestAgent()
@@ -46,6 +53,11 @@ class MainActivity : Activity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean("consent_pending", consentPending)
+        outState.putBoolean("exit_tile", tileRequested)
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.component == ExitTile.entry(this)) tileRequested = true
     }
     internal fun requestAgent() {
         if (consentPending) return
@@ -58,6 +70,11 @@ class MainActivity : Activity() {
     private fun startAgent() {
         settings.edit().putBoolean("auto_start", true).apply()
         val service = Intent(this, MeshVpn::class.java)
+        if (tileRequested) {
+            tileRequested = false
+            if (ExitTile.last(this) != null) service.action = MeshVpn.RESTORE_EXIT
+            else surface.openExitPicker()
+        }
         // A retry of an existing service may already have left foreground mode.
         if (MeshVpn.started) startService(service) else startForegroundService(service)
     }
@@ -71,6 +88,7 @@ class MainActivity : Activity() {
         if (request == 1) {
             consentPending = false
             if (result == RESULT_OK) startAgent() else {
+                tileRequested = false
                 settings.edit().putBoolean("auto_start", false).apply()
                 surface.input(5, "Android VPN permission was declined")
             }

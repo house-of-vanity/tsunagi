@@ -54,7 +54,16 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_surface(mut env: JNIEnv, _: JObj
     crate::view::configure(&ctx);
     DISPLAY.with_borrow_mut(|d| {
         // If Android discarded the old EGL context, its GPU resources are already gone.
-        let ui = d.take().map(|old| old.ui).unwrap_or_default();
+        let ui = d
+            .take()
+            .map(|old| {
+                // A rotation can recreate EGL. Keep expanded peers and scroll positions
+                // while the new context uploads its own font atlas.
+                let data = old.ctx.data_mut(std::mem::take);
+                ctx.data_mut(|current| *current = data);
+                old.ui
+            })
+            .unwrap_or_default();
         *d = Some(Display {
             painter,
             ctx,
@@ -76,8 +85,10 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_draw(
     h: jint,
     scale: jfloat,
     service_started: jboolean,
+    landscape: jboolean,
 ) -> jlong {
     with_display(|d| {
+        tsunagi_ui::widgets::set_landscape(&d.ctx, landscape != 0);
         let size = egui::vec2(w as f32, h as f32) / scale;
         let mut input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
@@ -231,6 +242,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_input(
         }
         4 => d.ui.paste_secret(text),
         5 => d.ui.error(text),
+        6 => d.ui.request_exit_picker(),
         _ => {}
     });
 }

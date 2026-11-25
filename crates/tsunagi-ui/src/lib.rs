@@ -6,10 +6,13 @@ mod exit;
 pub mod format;
 pub mod home;
 pub mod listeners;
+#[cfg(test)]
+mod presentation_tests;
 pub mod stats;
 mod table;
 pub mod vip;
 mod vip_status;
+pub mod widgets;
 
 /// Install the Phosphor icons and bold network title face for both egui clients.
 pub fn app_fonts() -> egui::FontDefinitions {

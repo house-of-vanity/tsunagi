@@ -1,11 +1,99 @@
-//! One line per member and one expanded detail block, with no horizontal scroller.
+//! A width-constrained device table for touch. Optional columns move into the
+//! expanded row before any essential columns run out of space.
 use super::{
     AMBER, Device, ExitConfirm, ForgetConfirm, NetworkReport, Traffic, Unit, data_path_text,
-    devices, exit, forget_button, format, icon, rtt_text, tunnel_cell,
+    devices, exit, forget_button, format, icon, rtt_text, traffic_pair, tunnel_cell,
 };
+use crate::widgets;
+use egui::{Align2, Color32, FontId, Rect, Sense, Ui, Vec2, pos2, vec2};
+
+#[derive(Clone, Copy)]
+enum Column {
+    Device,
+    State,
+    Address,
+    Rtt,
+    Traffic,
+    Version,
+    Path,
+    Plot,
+}
+
+impl Column {
+    fn title(self, unit: Unit) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::State => "State",
+            Self::Address => "IPv4",
+            Self::Rtt => "Data RTT",
+            Self::Traffic if unit == Unit::Bytes => "bytes (TX / RX)",
+            Self::Traffic => "pkts (TX / RX)",
+            Self::Version => "Version",
+            Self::Path => "Data path",
+            Self::Plot => "Traffic / s",
+        }
+    }
+}
+
+fn columns(ui: &Ui, width: f32, landscape: bool, unit: Unit) -> Vec<(Column, f32)> {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let measure = |s: &str| {
+        ui.painter()
+            .layout_no_wrap(s.into(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+            + 10.
+    };
+    let mut cols = vec![(Column::Device, 0.)];
+    if landscape && width >= 510. {
+        cols.push((Column::State, measure("Control only").min(width * 0.16)));
+    }
+    cols.push((
+        Column::Address,
+        measure("255.255.255.255").min(width * if landscape { 0.27 } else { 0.35 }),
+    ));
+    cols.push((
+        Column::Rtt,
+        measure("9999 ms").min(width * if landscape { 0.15 } else { 0.22 }),
+    ));
+    if landscape {
+        cols.push((
+            Column::Traffic,
+            measure(Column::Traffic.title(unit))
+                .max(measure("999 MB / 999 MB"))
+                .min(width * 0.29),
+        ));
+        let mut spare = width - cols.iter().map(|c| c.1).sum::<f32>() - 122.;
+        for (column, desire) in [
+            (Column::Version, measure("v1.0.4-rc.1")),
+            (Column::Path, measure("tcp-tls direct")),
+            (Column::Plot, 110.),
+        ] {
+            if spare < desire {
+                break;
+            }
+            cols.push((column, desire));
+            spare -= desire;
+        }
+    }
+    let other: f32 = cols.iter().map(|c| c.1).sum();
+    // Reserve the disclosure arrow at the end, including on small split screens.
+    cols[0].1 = (width - other - 16.).max(0.);
+    cols
+}
+
+fn text_cell(ui: &Ui, rect: Rect, text: &str, font: &FontId, color: Color32) {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.into(), font.clone(), color);
+    job.wrap.max_rows = 1;
+    job.wrap.max_width = (rect.width() - 3.).max(0.);
+    job.wrap.break_anywhere = true;
+    let galley = ui.painter().layout_job(job);
+    let pos = pos2(rect.left(), rect.center().y - galley.size().y / 2.);
+    ui.painter_at(rect).galley(pos, galley, color);
+}
 
 pub(super) fn roster(
-    ui: &mut egui::Ui,
+    ui: &mut Ui,
     network: &NetworkReport,
     own_id: &str,
     traffic: &Traffic,
@@ -15,46 +103,61 @@ pub(super) fn roster(
     let members = devices(network, own_id);
     let online = members.iter().filter(|m| m.online).count();
     ui.strong(format!(
-        "devices ({} online / {} known)",
-        online,
+        "devices ({online} online / {} known)",
         members.len()
     ));
-    let id = ui.make_persistent_id(("expanded device", &network.network_id));
+    // An Android rotation changes the surrounding scroll area but not the selected peer.
+    let id = egui::Id::new(("expanded device", &network.network_id));
     let mut selected = ui.data(|d| d.get_temp::<String>(id));
     let width = ui.available_width();
+    let columns = columns(ui, width, widgets::landscape(ui.ctx()), unit);
     let font = egui::TextStyle::Body.resolve(ui.style());
-    let measure = |s: &str| {
-        ui.painter()
-            .layout_no_wrap(s.to_owned(), font.clone(), ui.visuals().text_color())
-            .size()
-            .x
-    };
-    let rtt_x = width - (measure("9999 ms") + 18.0).min(width * 0.25);
-    let ip_x = rtt_x - (measure("255.255.255.255") + 14.0).min(width * 0.40);
-    let offsets = [16.0, ip_x, rtt_x];
-    let size = egui::vec2(width, ui.text_style_height(&egui::TextStyle::Body) + 8.0);
-    ui.spacing_mut().item_spacing.y = 1.0;
-    let (header, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    for (x, title) in offsets.into_iter().zip(["device", "IPv4", "Data RTT"]) {
-        ui.painter().text(
-            header.left_center() + egui::vec2(x, 0.),
-            egui::Align2::LEFT_CENTER,
-            title,
-            font.clone(),
-            ui.visuals().weak_text_color(),
+    let size = vec2(width, ui.text_style_height(&egui::TextStyle::Body) + 9.);
+    ui.spacing_mut().item_spacing.y = 1.;
+    let (header, _) = ui.allocate_exact_size(size, Sense::hover());
+    let mut x = header.left();
+    for &(column, w) in &columns {
+        let mut rect = Rect::from_min_size(pos2(x, header.top()), vec2(w, size.y));
+        if matches!(column, Column::Device) {
+            rect.min.x += 20.;
+        }
+        text_cell(
+            ui,
+            rect,
+            column.title(unit),
+            &font,
+            ui.visuals().text_color(),
         );
+        x += w;
     }
     for (index, member) in members.iter().enumerate() {
-        let (row, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        let response = ui.interact(row, id.with(member.id), egui::Sense::click());
-        if response.clicked() {
+        let (row, _) = ui.allocate_exact_size(size, Sense::hover());
+        let response = ui.interact(row, id.with(member.id), Sense::click());
+        let clicked = response.clicked();
+        let exit_hint = if member.in_use {
+            " · Selected internet exit"
+        } else if member.exit_node {
+            " · Offers an exit node"
+        } else {
+            ""
+        };
+        let description = format!("{} · {}{exit_hint}", member.name(), member.channel_hint());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::SelectableLabel,
+                response.enabled(),
+                &description,
+            )
+        });
+        widgets::hint(response, &description);
+        if clicked {
             selected = (selected.as_deref() != Some(member.id)).then(|| member.id.to_owned());
         }
         let open = selected.as_deref() == Some(member.id);
         if open || index % 2 == 0 {
             ui.painter().rect_filled(
                 row,
-                2.0,
+                2.,
                 if open {
                     ui.visuals().widgets.hovered.weak_bg_fill
                 } else {
@@ -62,52 +165,88 @@ pub(super) fn roster(
                 },
             );
         }
-        let dot = row.left_center() + egui::vec2(6., 0.);
-        if member.online {
-            ui.painter().circle_filled(dot, 3., exit::GOOD);
-        } else {
-            ui.painter().circle_stroke(
-                dot,
-                3.,
-                egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
-            );
-        }
-        let name = member.name();
-        let rtt = rtt_text(member.data_rtt_ms);
-        let labels = [
-            name.as_str(),
-            member.address.as_deref().unwrap_or("—"),
-            rtt.as_str(),
-        ];
-        let color = if member.online {
+        let channel = member.channel();
+        let normal = if member.online {
             ui.visuals().text_color()
         } else {
-            ui.visuals().weak_text_color()
+            channel.color(ui)
         };
-        for ((x, end), label) in offsets
-            .into_iter()
-            .zip([ip_x, rtt_x, width - 13.0])
-            .zip(labels)
-        {
-            let mut job =
-                egui::text::LayoutJob::simple_singleline(label.into(), font.clone(), color);
-            job.wrap.max_rows = 1;
-            job.wrap.max_width = (end - x - 4.0).max(0.0);
-            job.wrap.break_anywhere = true;
-            let galley = ui.painter().layout_job(job);
-            let origin = row.left_center() + egui::vec2(x, -galley.size().y * 0.5);
-            ui.painter().galley(origin, galley, color);
+        let mut x = row.left();
+        for &(column, w) in &columns {
+            let mut rect = Rect::from_min_size(pos2(x, row.top()), vec2(w, row.height()));
+            x += w;
+            let text = match column {
+                Column::Device => {
+                    channel.paint(
+                        ui,
+                        Rect::from_center_size(rect.left_center() + vec2(9., 0.), Vec2::splat(16.)),
+                    );
+                    rect.min.x += 20.;
+                    if member.in_use || member.exit_node {
+                        ui.painter_at(rect).text(
+                            rect.left_center(),
+                            Align2::LEFT_CENTER,
+                            icon::SIGN_OUT,
+                            font.clone(),
+                            if member.in_use { exit::GOOD } else { normal },
+                        );
+                        rect.min.x += font.size + 3.;
+                    }
+                    member.name()
+                }
+                Column::State => channel.label().into(),
+                Column::Address => member.address.as_deref().unwrap_or("—").into(),
+                Column::Rtt => rtt_text(member.data_rtt_ms),
+                Column::Version => member.version_label(),
+                Column::Path => {
+                    data_path_text(member.path, member.via_name.as_deref(), member.online)
+                }
+                Column::Traffic => member.overlay.filter(|_| member.online).map_or_else(
+                    || "—".into(),
+                    |peer| {
+                        let (tx, rx) = unit.counters(peer);
+                        traffic_pair(tx, rx, unit)
+                    },
+                ),
+                Column::Plot => {
+                    if let Some(peer) = member.overlay.filter(|_| member.online) {
+                        let mut plot = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(rect.shrink2(vec2(2., 2.)))
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                        );
+                        format::sparkline(
+                            &mut plot,
+                            traffic.peer(&network.network_id, &peer.public_key),
+                            unit,
+                            rect.height() - 4.,
+                        );
+                    }
+                    continue;
+                }
+            };
+            text_cell(
+                ui,
+                rect,
+                &text,
+                &font,
+                if matches!(column, Column::State) {
+                    channel.color(ui)
+                } else {
+                    normal
+                },
+            );
         }
         ui.painter().text(
             row.right_center(),
-            egui::Align2::RIGHT_CENTER,
+            Align2::RIGHT_CENTER,
             if open {
                 icon::CARET_DOWN
             } else {
                 icon::CARET_RIGHT
             },
             font.clone(),
-            ui.visuals().weak_text_color(),
+            ui.visuals().text_color(),
         );
         if open {
             ui.push_id(member.id, |ui| {
@@ -138,8 +277,7 @@ fn details(
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.columns(2, |cols| {
                 cols[0].small("Data path");
-                let (path, _) =
-                    data_path_text(member.path, member.via_name.as_deref(), member.online);
+                let path = data_path_text(member.path, member.via_name.as_deref(), member.online);
                 cols[0].horizontal_wrapped(|ui| {
                     ui.label(path);
                     if member.online {
@@ -204,7 +342,7 @@ fn details(
                 format::copy_field(ui, name, name);
             }
             if let Some(error) = member.data_error {
-                ui.colored_label(AMBER, error);
+                ui.colored_label(member.channel().color(ui), error);
             }
             if let Some((taken, holder)) = &member.name_taken {
                 ui.colored_label(AMBER, format!("Name {taken} belongs to {holder}."));

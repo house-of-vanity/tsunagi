@@ -16,6 +16,11 @@ use crate::net::{ConnectionCounters, PathAddr, PathInfo, TransportKind};
 use crate::proto::handshake::Role;
 use crate::storage::CacheOutcome;
 
+/// Informational data-channel diagnostics shared by the status UI and runtime.
+pub const DATA_CONNECTING: &str = "establishing external data transport";
+/// Data transport was disabled by local policy.
+pub const DATA_DISABLED: &str = "data transports disabled locally";
+
 /// Whether a configured network is running locally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkState {

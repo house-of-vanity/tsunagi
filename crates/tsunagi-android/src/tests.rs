@@ -65,8 +65,8 @@ async fn a_hidden_service_waits_for_mesh_changes_and_visible_stats_are_on_demand
 
 #[tokio::test]
 async fn notification_tracks_the_selected_exit_and_a_stale_disconnect_keeps_the_current_route() {
-    use crate::service::{ExitNotice, State, disconnect_exit, serve};
-    use tokio::sync::{mpsc, watch};
+    use crate::service::{ExitNotice, Request, State, disconnect_exit, serve, wait_for_exit_offer};
+    use tokio::sync::{mpsc, oneshot, watch};
     use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
     async fn notice_matching(
         notices: &mut watch::Receiver<Option<ExitNotice>>,
@@ -117,11 +117,11 @@ async fn notification_tracks_the_selected_exit_and_a_stale_disconnect_keeps_the_
         .await
         .unwrap();
     let agent = phone.agent.clone();
-    let (_commands, requests) = mpsc::channel(4);
+    let (commands, requests) = mpsc::channel(4);
     let (stop, stopped) = watch::channel(false);
     let (published, mut notices) = watch::channel(None);
+    let (state, mut live) = watch::channel(State::Starting);
     let task = tokio::spawn(async move {
-        let (state, _) = watch::channel(State::Starting);
         serve(
             agent,
             wg,
@@ -142,6 +142,66 @@ async fn notification_tracks_the_selected_exit_and_a_stale_disconnect_keeps_the_
     assert_eq!(notice.name, "gateway");
     assert_eq!(notice.network_name, "travel");
     assert!(notice.online);
+    let restore = |peer: String| {
+        let commands = commands.clone();
+        let network = notice.network.clone();
+        async move {
+            let (reply, result) = oneshot::channel();
+            commands
+                .send((Request::RestoreExit { network, peer }, reply))
+                .await
+                .unwrap();
+            result.await.unwrap()
+        }
+    };
+    disconnect_exit(&phone.agent, &notice.network, &notice.peer)
+        .await
+        .unwrap();
+    notice_matching(&mut notices, Option::is_none).await;
+    assert!(
+        restore(phone.agent.endpoint_id().to_string())
+            .await
+            .is_err()
+    );
+    assert!(
+        phone
+            .agent
+            .network_status(id)
+            .await
+            .unwrap()
+            .exit_via
+            .is_none()
+    );
+    // A cold service can publish its first status before the gateway advertises.
+    // Keep the command loop available while waiting for this exact peer.
+    exit.agent.set_exit_offer(id, false).await.unwrap();
+    drop(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            live.wait_for(|s| {
+                matches!(s, State::Ready(report, _) if
+            report.networks[0].peers.iter().any(|p| p.endpoint_id == notice.peer && !p.exit_node))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    let waiting = wait_for_exit_offer(&mut live, &notice.network, &notice.peer);
+    tokio::pin!(waiting);
+    tokio::select! {
+        biased;
+        _ = &mut waiting => panic!("restored before the peer offered an exit"),
+        result = exit.agent.set_exit_offer(id, true) => result.unwrap(),
+    }
+    waiting.await.unwrap();
+    assert!(restore(notice.peer.clone()).await.is_ok());
+    notice_matching(&mut notices, |n| n.as_ref().is_some_and(|n| n.online)).await;
+    assert!(
+        restore(phone.agent.endpoint_id().to_string())
+            .await
+            .is_err()
+    );
     disconnect_exit(
         &phone.agent,
         &id.to_string(),
@@ -678,12 +738,14 @@ async fn network_cards_start_closed_and_keep_exit_traffic_visible_when_folded() 
     };
     let opened = click(titles[0]);
     assert_eq!(positions(&opened, "Show devices").len(), 1);
-    let y = |label| positions(&opened, label)[0].y;
-    assert!((0.0..=26.0).contains(&(y("host") - y("device"))));
-    assert!((0.0..=26.0).contains(&(y("range") - y("id"))));
-    assert!((0.0..=26.0).contains(&(y("peers") - y("addr"))));
-    assert!((y("VIP") - y("Show devices")).abs() < 2.0);
-    assert!((y("VIP") - y(&format!("{} Copy secret", egui_phosphor::regular::COPY))).abs() < 2.0);
+    use egui_phosphor::regular as icon;
+    let vip = format!("{} VIP", icon::NETWORK);
+    let y = |label: &str| positions(&opened, label)[0].y;
+    assert!((0.0..=26.0).contains(&(y(icon::DESKTOP_TOWER) - y(icon::FINGERPRINT))));
+    assert!((0.0..=26.0).contains(&(y(icon::TREE_STRUCTURE) - y(icon::HASH))));
+    assert!((0.0..=26.0).contains(&(y(icon::DEVICES) - y(icon::DEVICE_MOBILE))));
+    assert!((y(&vip) - y("Show devices")).abs() < 2.0);
+    assert!((y(&vip) - y(&format!("{} Copy secret", egui_phosphor::regular::COPY))).abs() < 2.0);
     let folded = click(positions(&opened, name.as_str())[0]);
     assert!(positions(&folded, "Show devices").is_empty());
     assert_eq!(positions(&folded, "Exit via gateway").len(), 1);
@@ -691,7 +753,55 @@ async fn network_cards_start_closed_and_keep_exit_traffic_visible_when_folded() 
 }
 
 #[test]
-fn portrait_navigation_opens_the_tray_vip_overview_and_draft_without_writing() {
+fn the_system_tile_waits_for_the_agent_and_distinguishes_networks_with_the_same_name() {
+    use crate::{
+        service::State,
+        view::{Phone, configure},
+    };
+    use std::{sync::Arc, time::Instant};
+    use tsunagi::ipc::{NetworkReport, StatusReport};
+    let ctx = egui::Context::default();
+    configure(&ctx);
+    let mut phone = Phone::default();
+    let draw = |phone: &mut Phone, state: &State| {
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            phone.draw(ctx, state, |_| panic!("opening the tile selected a route"));
+        });
+        out.shapes
+            .into_iter()
+            .filter_map(|s| match s.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    phone.request_exit_picker();
+    draw(&mut phone, &State::Starting);
+    let networks =
+        [("alpha", true), ("bravo", true), ("paused", false)].map(|(id, active)| NetworkReport {
+            network_id: id.into(),
+            name: "home".into(),
+            active,
+            ..Default::default()
+        });
+    let state = State::Ready(
+        Arc::new(StatusReport {
+            networks: networks.into(),
+            ..Default::default()
+        }),
+        Instant::now(),
+    );
+    draw(&mut phone, &state);
+    let chooser = draw(&mut phone, &state);
+    assert!(chooser.iter().any(|s| s == "home · alpha"));
+    assert!(chooser.iter().any(|s| s == "home · bravo"));
+    assert!(!chooser.iter().any(|s| s.contains("paused")));
+    assert!(phone.back().is_none());
+    assert!(draw(&mut phone, &state).iter().any(|s| s == "tsunagi"));
+}
+
+#[test]
+fn rotating_the_phone_keeps_the_selected_network_and_unsaved_vip_draft() {
     use crate::service::State;
     use crate::view::{Phone, configure};
     use egui::{Event, PointerButton, Pos2, RawInput, Rect, Shape};
@@ -708,6 +818,7 @@ fn portrait_navigation_opens_the_tray_vip_overview_and_draft_without_writing() {
         port: 8080,
     };
     let mut config = VipConfig::new("web");
+    let name_field = egui::Id::new(("vip-name", &config.id));
     let mut listener = Listener::new(Protocol::Tcp, 80);
     listener.backends.push(backend.clone());
     config.listeners.push(listener);
@@ -747,10 +858,11 @@ fn portrait_navigation_opens_the_tray_vip_overview_and_draft_without_writing() {
     let ctx = egui::Context::default();
     configure(&ctx);
     let mut phone = Phone::default();
+    let size = std::cell::Cell::new(egui::vec2(360., 800.));
     let mut frame = |events| {
         ctx.run(
             RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(360., 800.))),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size.get())),
                 events,
                 ..Default::default()
             },
@@ -788,21 +900,30 @@ fn portrait_navigation_opens_the_tray_vip_overview_and_draft_without_writing() {
         frame(vec![])
     };
     click("lab");
-    let live = click("VIP");
-    for label in ["Overview", "Configuration", "Next new flow", "node:8080"] {
+    size.set(egui::vec2(800., 360.));
+    let live = click(&format!("{} VIP", egui_phosphor::regular::NETWORK));
+    for label in ["Overview", "Configuration", "web.lab", "node:8080"] {
         let p = position(&live, label);
         assert!(
-            (0.0..360.0).contains(&p.x),
-            "{label} is outside the portrait view"
+            (0.0..800.0).contains(&p.x),
+            "{label} is outside the landscape view"
         );
     }
     let editor = click("Configuration");
+    position(&editor, "Name");
+    ctx.memory_mut(|m| m.request_focus(name_field));
+    frame(vec![Event::Text("-draft".into())]);
+    size.set(egui::vec2(360., 800.));
+    let editor_portrait = frame(vec![]);
+    position(&editor_portrait, "Unsaved changes");
+    assert!(editor_portrait.shapes.iter().any(|s| matches!(&s.shape,
+        Shape::Text(t) if t.galley.text().contains("-draft"))));
     for label in [
         "Active TCP port checks",
         "Checks and flow expiry",
         "+ Backend",
         "+ Listener",
     ] {
-        position(&editor, label);
+        position(&editor_portrait, label);
     }
 }

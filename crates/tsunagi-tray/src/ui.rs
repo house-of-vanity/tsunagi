@@ -38,7 +38,7 @@ pub(crate) fn draw(
                     .weak(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(icon::INFO).on_hover_text("About").clicked() {
+                if tsunagi_ui::widgets::icon_button(ui, icon::INFO, "About Tsunagi").clicked() {
                     state.about_open = true;
                 }
                 if snapshot.busy {

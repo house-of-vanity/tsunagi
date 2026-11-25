@@ -26,8 +26,9 @@ mod status;
 
 pub use events::Event;
 pub use status::{
-    AgentStatus, CandidateStatus, DataPath, HostnameConflict, MemberStatus, NetworkMetrics,
-    NetworkState, NetworkStatus, OverlayStatus, PeerStatus, RangeConflict,
+    AgentStatus, CandidateStatus, DATA_CONNECTING, DATA_DISABLED, DataPath, HostnameConflict,
+    MemberStatus, NetworkMetrics, NetworkState, NetworkStatus, OverlayStatus, PeerStatus,
+    RangeConflict,
 };
 
 use std::collections::HashMap;
@@ -709,7 +710,7 @@ impl Agent {
         self.inner.events.subscribe()
     }
 
-    /// Subscribe to changes affecting the mesh DNS roster or selected exit.
+    /// Subscribe to changes affecting the mesh DNS roster, exit offers or selected exit.
     /// Changes coalesce. Read the current status after subscribing and again on
     /// notification. Packet counters and routine control traffic do not wake subscribers.
     pub fn watch_roster(&self) -> watch::Receiver<()> {

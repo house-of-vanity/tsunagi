@@ -25,6 +25,13 @@ pub enum Request {
         /// Endpoint id captured at the same time.
         peer: String,
     },
+    /// Restore a remembered network/peer pair only while no other exit is selected.
+    RestoreExit {
+        /// Network saved at the last successful selection.
+        network: String,
+        /// Peer used in that network.
+        peer: String,
+    },
 }
 
 /// A configured default route stays visible if its remote peer goes offline.
@@ -70,6 +77,66 @@ pub async fn disconnect_exit(
         agent.set_exit_via(network, None).await?;
     }
     Ok(())
+}
+
+async fn restore_exit(agent: &Agent, network: &str, peer: &str) -> Result<Outcome, String> {
+    let network = network.parse().map_err(|_| "Invalid saved network ID")?;
+    let peer = peer.parse().map_err(|_| "Invalid saved peer ID")?;
+    let status = agent.status().await.map_err(|e| e.to_string())?;
+    for n in &status.networks {
+        if n.state == tsunagi::agent::NetworkState::Active
+            && let Some(current) = n.exit_via
+        {
+            return if n.network_id == network && current == peer {
+                Ok(Outcome::Applied)
+            } else {
+                Err("Another exit is already selected".into())
+            };
+        }
+    }
+    agent
+        .set_exit_via(network, Some(peer))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Outcome::Applied)
+}
+
+// On cold start the first snapshot often precedes peer discovery. Wait on the
+// service's roster notifications, outside the command loop, then let the usual
+// serialized command validate the selection again before touching the route.
+#[cfg(any(target_os = "android", test))]
+pub(crate) async fn wait_for_exit_offer(
+    state: &mut watch::Receiver<State>,
+    network: &str,
+    peer: &str,
+) -> Result<(), String> {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            match &*state.borrow_and_update() {
+                State::Ready(report, _) => {
+                    let n = report
+                        .networks
+                        .iter()
+                        .find(|n| n.network_id == network && n.active)
+                        .ok_or("The saved exit network is no longer active")?;
+                    if report
+                        .networks
+                        .iter()
+                        .any(|n| n.active && n.exit.via.is_some())
+                        || n.peers.iter().any(|p| p.endpoint_id == peer && p.exit_node)
+                    {
+                        return Ok(());
+                    }
+                }
+                State::Off => return Err("Tsunagi Agent stopped".into()),
+                State::Error(error) => return Err(error.clone()),
+                State::Starting => {}
+            }
+            state.changed().await.map_err(|_| "Tsunagi Agent stopped")?;
+        }
+    })
+    .await
+    .map_err(|_| "The saved peer is offline or no longer offers an exit")?
 }
 
 /// Private reply delivered only to the UI that requested the action.
@@ -256,6 +323,7 @@ pub async fn serve(
                     }
                     Request::DisconnectExit {network, peer} => disconnect_exit(&agent, &network, &peer).await
                         .map(|()| Outcome::Applied).map_err(|e| e.to_string()),
+                    Request::RestoreExit {network, peer} => restore_exit(&agent, &network, &peer).await,
                 };
                 (Some((reply, result)), refresh_zones)
             }

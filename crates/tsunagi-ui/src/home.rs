@@ -3,6 +3,7 @@ use crate::{
     client::{Client, Command},
     devices, exit, format,
     stats::{Traffic, Unit},
+    widgets,
 };
 use egui_phosphor::regular as icon;
 use std::collections::BTreeSet;
@@ -20,6 +21,7 @@ pub struct JoinForm {
     pub name: String,
     /// User-entered network secret.
     pub secret: Zeroizing<String>,
+    revealed: bool,
 }
 
 /// Local UI state kept across frames.
@@ -30,6 +32,8 @@ pub struct UiState {
     pub unit: Unit,
     /// Network details opened during this run, keyed by identity even for namesakes.
     expanded_networks: BTreeSet<String>,
+    /// The network whose settings occupy the detail pane on a landscape phone.
+    pub selected_network: Option<String>,
     /// An in-progress hostname edit (`None` when not editing).
     pub host_edit: Option<String>,
     /// Network ids whose devices window is open.
@@ -50,6 +54,7 @@ impl Default for UiState {
             join: JoinForm::default(),
             unit: Unit::Bytes,
             expanded_networks: BTreeSet::new(),
+            selected_network: None,
             host_edit: None,
             open_devices: BTreeSet::new(),
             vip_windows: Default::default(),
@@ -69,21 +74,17 @@ pub fn draw_header(
 ) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        ui.weak("device");
+        widgets::field(ui, icon::FINGERPRINT, "", "Device endpoint ID");
         // Clicking the shortened id copies the full one.
         format::copy_field(ui, &format::short(&report.endpoint_id), &report.endpoint_id);
     });
 
     ui.horizontal(|ui| {
-        ui.weak("host");
+        widgets::field(ui, icon::DESKTOP_TOWER, "", "Device hostname");
         match &mut state.host_edit {
             None => {
                 ui.label(&report.hostname);
-                if ui
-                    .small_button(icon::PENCIL_SIMPLE)
-                    .on_hover_text("rename")
-                    .clicked()
-                {
+                if widgets::icon_button(ui, icon::PENCIL_SIMPLE, "Rename this device").clicked() {
                     state.host_edit = Some(report.hostname.clone());
                 }
             }
@@ -91,11 +92,11 @@ pub fn draw_header(
                 let response = ui.add(egui::TextEdit::singleline(buffer).desired_width(150.0));
                 let submit = (response.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                    || ui.small_button(icon::CHECK).on_hover_text("save").clicked();
+                    || widgets::icon_button(ui, icon::CHECK, "Save hostname").clicked();
                 if submit {
                     agent.send(Command::SetHostname(buffer.trim().to_string()));
                     state.host_edit = None;
-                } else if ui.small_button(icon::X).on_hover_text("cancel").clicked() {
+                } else if widgets::icon_button(ui, icon::X, "Cancel hostname edit").clicked() {
                     state.host_edit = None;
                 }
             }
@@ -128,66 +129,133 @@ pub fn draw_network(
     ui.push_id(&network.network_id, |ui| {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            let mut open = state.expanded_networks.contains(&network.network_id);
-            let status = if network.active {
-                format!(
-                    "{} online",
-                    devices::online_count(network, &report.endpoint_id)
-                )
-            } else {
-                "Stopped".to_owned()
-            };
-            if network_header(ui, &network.name, &status, open).clicked() {
-                open = !open;
-                if open {
-                    state.expanded_networks.insert(network.network_id.clone());
-                } else {
-                    state.expanded_networks.remove(&network.network_id);
-                }
+            let open = state.expanded_networks.contains(&network.network_id);
+            if overview(ui, network, report, state, open) {
+                state.toggle_network(&network.network_id, !open);
             }
-            if let Some(via) = &network.exit.via {
-                draw_selected_exit(ui, network, via, state);
+            if state.expanded_networks.contains(&network.network_id) {
+                ui.separator();
+                pick_exit =
+                    draw_network_details(ui, agent, state, traffic, network, report, offer_exit);
             }
-            for warning in exit::warnings(network) {
-                draw_exit_warning(ui, &warning);
-            }
-            if !network.range_conflicts.is_empty() {
-                ui.colored_label(BAD, "Stopped: overlapping network ranges");
-            }
-            if !open {
-                return;
-            }
-
-            ui.separator();
-            draw_metadata(ui, network, &report.endpoint_id);
-            draw_protocols(ui, agent, network, &report.available_protocols);
-            format::sparkline(ui, traffic.network(&network.network_id), state.unit, 34.0);
-
-            pick_exit = network_settings(ui, agent, network, offer_exit);
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .button(format!("{} Copy secret", icon::COPY))
-                    .on_hover_text("Copy this network's secret to the clipboard")
-                    .clicked()
-                {
-                    agent.send(Command::CopySecret {
-                        network_id: network.network_id.clone(),
-                    });
-                }
-                if ui.button("Show devices").clicked() {
-                    state.open_devices.insert(network.network_id.clone());
-                }
-                if ui.button("VIP").clicked() {
-                    state
-                        .vip_windows
-                        .entry(network.network_id.clone())
-                        .or_default();
-                }
-            });
         });
     });
     pick_exit
+}
+
+impl UiState {
+    fn toggle_network(&mut self, id: &str, open: bool) {
+        if open {
+            self.expanded_networks.insert(id.to_owned());
+            self.selected_network = Some(id.to_owned());
+        } else {
+            self.expanded_networks.remove(id);
+            if self.selected_network.as_deref() == Some(id) {
+                self.selected_network = None;
+            }
+        }
+    }
+
+    /// Close the landscape detail pane and fold that card when rotated back.
+    pub fn close_selection(&mut self) -> bool {
+        if let Some(id) = self.selected_network.take() {
+            self.expanded_networks.remove(&id);
+            return true;
+        }
+        false
+    }
+}
+
+fn overview(
+    ui: &mut egui::Ui,
+    network: &NetworkReport,
+    report: &StatusReport,
+    state: &mut UiState,
+    open: bool,
+) -> bool {
+    let status = if network.active {
+        format!(
+            "{} online",
+            devices::online_count(network, &report.endpoint_id)
+        )
+    } else {
+        "Stopped".into()
+    };
+    let clicked = network_header(ui, &network.name, &status, open).clicked();
+    if let Some(via) = &network.exit.via {
+        draw_selected_exit(ui, network, via, state);
+    }
+    for warning in exit::warnings(network) {
+        draw_exit_warning(ui, &warning);
+    }
+    if !network.range_conflicts.is_empty() {
+        ui.colored_label(BAD, "Stopped: overlapping network ranges");
+    }
+    clicked
+}
+
+/// One network in the landscape selector. Exit status stays visible beside its network.
+pub fn draw_network_selector(
+    ui: &mut egui::Ui,
+    network: &NetworkReport,
+    report: &StatusReport,
+    state: &mut UiState,
+) {
+    let open = state.selected_network.as_deref() == Some(&network.network_id);
+    ui.push_id(&network.network_id, |ui| {
+        let mut frame = egui::Frame::group(ui.style());
+        if open {
+            frame = frame.stroke(ui.visuals().selection.stroke);
+        }
+        frame.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            if overview(ui, network, report, state, open) {
+                state.toggle_network(&network.network_id, !open);
+            }
+        });
+    });
+}
+
+/// Actions and settings shared by a folded card and the landscape detail pane.
+pub fn draw_network_details(
+    ui: &mut egui::Ui,
+    agent: &dyn Client,
+    state: &mut UiState,
+    traffic: &Traffic,
+    network: &NetworkReport,
+    report: &StatusReport,
+    offer_exit: bool,
+) -> bool {
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button(format!("{} Copy secret", icon::COPY))
+            .on_hover_text("Copy this network's secret to the clipboard")
+            .clicked()
+        {
+            agent.send(Command::CopySecret {
+                network_id: network.network_id.clone(),
+            });
+        }
+        if ui.button("Show devices").clicked() {
+            state.open_devices.insert(network.network_id.clone());
+        }
+        if widgets::hint(
+            ui.button(format!("{} VIP", icon::NETWORK)),
+            "Manage virtual IP services",
+        )
+        .clicked()
+        {
+            state
+                .vip_windows
+                .entry(network.network_id.clone())
+                .or_default();
+        }
+    });
+    ui.separator();
+    draw_metadata(ui, network, &report.endpoint_id);
+    draw_protocols(ui, agent, network, &report.available_protocols);
+    format::sparkline(ui, traffic.network(&network.network_id), state.unit, 34.0);
+    network_settings(ui, agent, network, offer_exit)
 }
 
 fn draw_metadata(ui: &mut egui::Ui, network: &NetworkReport, own_id: &str) {
@@ -195,24 +263,28 @@ fn draw_metadata(ui: &mut egui::Ui, network: &NetworkReport, own_id: &str) {
         .num_columns(2)
         .spacing([10.0, 3.0])
         .show(ui, |ui| {
-            ui.weak("name");
+            widgets::field(ui, icon::TAG, "", "Network name");
             format::copy_field(ui, &network.name, &network.name);
             ui.end_row();
-            ui.weak("id");
+            widgets::network_id(ui);
             format::copy_field(ui, &format::short(&network.network_id), &network.network_id);
             ui.end_row();
             if let Some(range) = &network.range {
-                ui.weak("range");
+                widgets::range(ui);
                 format::copy_field(ui, range, range);
                 ui.end_row();
             }
             if let Some(address) = network.overlay.as_ref().and_then(|o| o.address.as_ref()) {
-                ui.weak("addr");
+                widgets::device_address(ui);
                 format::copy_field(ui, address, address);
                 ui.end_row();
             }
-            ui.weak("peers");
-            ui.label(format!("{} known", devices::known_count(network, own_id)));
+            widgets::field(ui, icon::DEVICES, "", "Online and known peers");
+            ui.label(format!(
+                "{} online · {} known",
+                devices::online_count(network, own_id),
+                devices::known_count(network, own_id)
+            ));
             ui.end_row();
         });
 }
@@ -339,9 +411,10 @@ fn network_header(ui: &mut egui::Ui, name: &str, status: &str, open: bool) -> eg
         title,
         visuals.text_color(),
     );
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(name)
+    widgets::hint(
+        response.on_hover_cursor(egui::CursorIcon::PointingHand),
+        name,
+    )
 }
 
 fn draw_selected_exit(ui: &mut egui::Ui, network: &NetworkReport, via: &str, state: &mut UiState) {
@@ -352,31 +425,29 @@ fn draw_selected_exit(ui: &mut egui::Ui, network: &NetworkReport, via: &str, sta
             exit::LOUD
         };
         let name = exit::name_of(network, via);
-        let clicked = ui
-            .add(egui::Button::new(egui::RichText::new(icon::SIGN_OUT).color(color)).frame(false))
-            .on_hover_text("Stop using this exit node")
-            .clicked();
-        if ui
-            .link(format!("Exit via {name}"))
-            .on_hover_text("Stop using this exit node")
-            .clicked()
+        let button = ui
+            .add(egui::Button::new(egui::RichText::new(icon::SIGN_OUT).color(color)).frame(false));
+        let clicked = widgets::hint(button, "Stop using this exit node").clicked();
+        if widgets::hint(
+            ui.link(format!("Exit via {name}")),
+            "Stop using this exit node",
+        )
+        .clicked()
             || clicked
         {
             state.exit_confirm = Some(devices::ExitConfirm::stop_from_tile(network, via));
         }
         if let Some(t) = network.exit.traffic {
-            ui.label(format!(
-                "{} {}",
-                icon::ARROW_UP,
-                format::bytes(t.tx_bytes as f64)
-            ))
-            .on_hover_text("Sent through this exit");
-            ui.label(format!(
-                "{} {}",
-                icon::ARROW_DOWN,
-                format::bytes(t.rx_bytes as f64)
-            ))
-            .on_hover_text("Received through this exit");
+            for (glyph, bytes, hint) in [
+                (icon::ARROW_UP, t.tx_bytes, "Sent through this exit"),
+                (icon::ARROW_DOWN, t.rx_bytes, "Received through this exit"),
+            ] {
+                let text = format!("{glyph} {}", format::bytes(bytes as f64));
+                widgets::hint(
+                    ui.add(egui::Label::new(text).sense(egui::Sense::click())),
+                    hint,
+                );
+            }
         }
     });
 }
@@ -423,21 +494,16 @@ fn draw_protocols(
                             changed = true;
                         }
                         if let Some(index) = selected.iter().position(|p| p == &protocol.name) {
-                            if ui
-                                .add_enabled(index > 0, egui::Button::new(icon::ARROW_UP))
-                                .on_hover_text("prefer earlier")
-                                .clicked()
+                            if widgets::hint(ui.add_enabled(index > 0, egui::Button::new(icon::ARROW_UP)),
+                                "Move transport up in preference order").clicked()
                             {
                                 selected.swap(index, index - 1);
                                 changed = true;
                             }
-                            if ui
-                                .add_enabled(
+                            if widgets::hint(ui.add_enabled(
                                     index + 1 < selected.len(),
                                     egui::Button::new(icon::ARROW_DOWN),
-                                )
-                                .on_hover_text("prefer later")
-                                .clicked()
+                                ), "Move transport down in preference order").clicked()
                             {
                                 selected.swap(index, index + 1);
                                 changed = true;
@@ -498,18 +564,47 @@ pub fn draw_join(ui: &mut egui::Ui, agent: &dyn Client, join: &mut JoinForm) {
 
             ui.label("secret");
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut *join.secret)
-                        .id("join-secret".into())
-                        .desired_width(INPUT_WIDTH - 26.0)
-                        .password(true),
-                );
-                if ui
-                    .button(icon::SHUFFLE)
-                    .on_hover_text("Generate a new random secret")
-                    .clicked()
+                let visuals = ui.visuals().widgets.inactive;
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .stroke(visuals.bg_stroke)
+                    .corner_radius(visuals.corner_radius)
+                    .inner_margin(egui::Margin::symmetric(3, 1))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            let input = ui.add(
+                                egui::TextEdit::singleline(&mut *join.secret)
+                                    .id("join-secret".into())
+                                    .frame(false)
+                                    .desired_width(INPUT_WIDTH - 65.0)
+                                    .password(!join.revealed),
+                            );
+                            let (glyph, label) = if join.revealed {
+                                (icon::EYE_SLASH, "Hide secret")
+                            } else {
+                                (icon::EYE, "Show secret")
+                            };
+                            let eye = ui.add(egui::Button::new(glyph).frame(false));
+                            eye.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    eye.enabled(),
+                                    label,
+                                )
+                            });
+                            if widgets::hint(eye, label).clicked() {
+                                join.revealed = !join.revealed;
+                                if input.lost_focus() {
+                                    input.request_focus();
+                                }
+                            }
+                        });
+                    });
+                if widgets::icon_button(ui, icon::SHUFFLE, "Generate a new random secret").clicked()
                 {
                     join.secret = tsunagi::identity::NetworkSecret::generate().encode();
+                    join.revealed = false;
                 }
             });
             ui.end_row();
@@ -525,5 +620,6 @@ pub fn draw_join(ui: &mut egui::Ui, agent: &dyn Client, join: &mut JoinForm) {
             secret: Zeroizing::new(join.secret.trim().to_owned()),
         });
         join.secret.zeroize();
+        join.revealed = false;
     }
 }

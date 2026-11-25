@@ -7,7 +7,8 @@
 use tsunagi::ipc::{PrivilegeReport, StatusReport};
 
 use crate::client::Snapshot;
-use crate::format;
+use crate::{format, widgets};
+use egui_phosphor::regular as icon;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const AUTHOR: &str = "AB <tsunagi@hexor.cy>";
@@ -177,7 +178,21 @@ fn grid(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 /// One label/value line of a table.
 fn row(ui: &mut egui::Ui, label: &str, value: impl FnOnce(&mut egui::Ui)) {
-    ui.weak(label);
+    match label {
+        "repository" => widgets::field(ui, icon::GITHUB_LOGO, "", "Source code repository"),
+        "license" => widgets::field(ui, icon::SCALES, "", "Software license"),
+        "build" => widgets::field(
+            ui,
+            icon::CPU,
+            "Build",
+            "Platform, architecture and build profile",
+        ),
+        "version" => widgets::field(ui, icon::TAG, "Version", "Tsunagi Agent software version"),
+        "endpoint id" => widgets::field(ui, icon::FINGERPRINT, "", "Device endpoint ID"),
+        _ => {
+            ui.weak(label);
+        }
+    }
     value(ui);
     ui.end_row();
 }

@@ -26,7 +26,11 @@ Applications using Android’s system resolver can connect to `<member>.<network
 
 The tray and Android use the same egui network tiles, join form, device list, VIP editor and live traffic diagram from `crates/tsunagi-ui`. On Android, the Rust activity view opens each form in the current viewport. Kotlin handles the service, connectivity, rendering surface, input and clipboard.
 
+Rotate the phone to select a network on the left and see its settings on the right. **Show devices** opens a table sized to the screen. Tap a peer for its version, data path and traffic. A green check marks a ready data channel, an amber spinning arc indicates a pending connection, and a red warning opens the error details. Hold an icon for its label. Rotating the phone keeps the selected peer and any edits in the VIP editor.
+
 Tap the network name to expand its card, then open **Exit node…** to compare remote gateways by measured data RTT and data path. Tap a row and confirm to route IPv4 internet traffic through it. The selected exit has an ongoing notification, including when the peer is offline. **Disconnect exit node** restores the ordinary internet route and keeps mesh access and DNS active. Mesh-only mode has no persistent app notification. Android controls the system VPN indicator. Android 13 and later request notification permission for the exit notice. Starting with Android 14, an unlocked device allows an individual swipe to dismiss an ongoing VPN notification. [Android notification behavior](https://developer.android.com/about/versions/14/behavior-changes-all#non-dismissable-notifications)
+
+To switch the exit from the notification shade, edit Android Quick Settings and add **Tsunagi Exit**. The first tap opens the exit chooser if you have never used one. Subsequent taps disconnect the selected exit or reconnect the last peer in its original network. The tile shows the peer name and whether the selected peer is offline. Mesh access stays available when the exit is off.
 
 ## Check two networks on an emulator
 

@@ -229,12 +229,15 @@ pub(crate) fn show(ui: &mut egui::Ui, v: &VipStatus, n: &NetworkReport, view: &m
                     ui.separator();
                     diagram(ui, v, l, n, view);
                     ui.add_space(6.0);
-                    egui::ScrollArea::horizontal()
-                        .id_salt("backend table scroll")
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            backend_table(ui, v, l, n, view);
-                        });
+                    let phone = ui.ctx().os() == egui::os::OperatingSystem::Android;
+                    if phone {
+                        backend_table(ui, v, l, n, view, true);
+                    } else {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("backend table scroll")
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| backend_table(ui, v, l, n, view, false));
+                    }
                     if let Some(b) = l
                         .backends
                         .iter()
@@ -271,6 +274,23 @@ pub(crate) fn show(ui: &mut egui::Ui, v: &VipStatus, n: &NetworkReport, view: &m
                                     format::copy_field(ui, address, address);
                                 }
                             });
+                            if phone {
+                                let rates = view.backends.get(&key(v, l, &b.backend));
+                                ui.horizontal_wrapped(|ui| {
+                                    metric(ui, "TX", &format::bytes(b.counters.tx_bytes as f64));
+                                    metric(ui, "RX", &format::bytes(b.counters.rx_bytes as f64));
+                                    metric(
+                                        ui,
+                                        "TX rate",
+                                        &format::series_rate(rates.map(|r| &r.tx), view.unit),
+                                    );
+                                    metric(
+                                        ui,
+                                        "RX rate",
+                                        &format::series_rate(rates.map(|r| &r.rx), view.unit),
+                                    );
+                                });
+                            }
                         });
                     }
                 });
@@ -307,6 +327,7 @@ fn backend_table(
     l: &ListenerStatus,
     n: &NetworkReport,
     view: &mut View,
+    fit: bool,
 ) {
     let headers = [
         "Backend",
@@ -365,17 +386,40 @@ fn backend_table(
             );
         }
     }
-    let widths_id = ui.id().with("backend column widths");
-    if let Some(previous) = ui.memory(|memory| memory.data.get_temp::<[f32; 8]>(widths_id)) {
-        for (width, previous) in widths.iter_mut().zip(previous) {
-            *width = width.max(previous);
+    let columns: Vec<usize> = if fit {
+        let mut columns = vec![0, 1, 3];
+        let free = ui.available_width();
+        // Keep health and RTT visible even on a portrait phone. Secondary values
+        // also live in the selected backend's details.
+        widths[1] = 90.0_f32.min(free * 0.30);
+        widths[3] = 65.0_f32.min(free * 0.21);
+        let mut reserved = widths[1] + widths[3] + 2. * table::GAP;
+        for column in [2, 4, 5, 6, 7] {
+            let next = reserved + widths[column] + table::GAP;
+            if free - next < 115. {
+                break;
+            }
+            columns.push(column);
+            reserved = next;
         }
-    }
-    ui.memory_mut(|memory| memory.data.insert_temp(widths_id, widths));
-    let fixed = widths.iter().sum::<f32>() + table::GAP * 7.0;
-    widths[7] += (ui.available_width() - fixed).max(0.0);
-    table::row(ui, "backend headers", &widths, false, |column, ui| {
-        ui.weak(headers[column]);
+        widths[0] = (free - reserved).max(0.);
+        columns.sort_unstable();
+        columns
+    } else {
+        let widths_id = ui.id().with("backend column widths");
+        if let Some(previous) = ui.memory(|memory| memory.data.get_temp::<[f32; 8]>(widths_id)) {
+            for (width, previous) in widths.iter_mut().zip(previous) {
+                *width = width.max(previous);
+            }
+        }
+        ui.memory_mut(|memory| memory.data.insert_temp(widths_id, widths));
+        let fixed = widths.iter().sum::<f32>() + table::GAP * 7.0;
+        widths[7] += (ui.available_width() - fixed).max(0.0);
+        (0..widths.len()).collect()
+    };
+    let visible: Vec<_> = columns.iter().map(|&i| widths[i]).collect();
+    table::row(ui, "backend headers", &visible, false, |column, ui| {
+        ui.weak(headers[columns[column]]);
     });
     for (index, b) in l.backends.iter().enumerate() {
         let key = key(v, l, &b.backend);
@@ -383,9 +427,9 @@ fn backend_table(
         table::row(
             ui,
             &key,
-            &widths,
+            &visible,
             index % 2 == 0,
-            |column, ui| match column {
+            |column, ui| match columns[column] {
                 0 => {
                     if ui
                         .selectable_label(view.selected.as_ref() == Some(&key), &values[index][0])
@@ -416,7 +460,7 @@ fn backend_table(
                     );
                 }
                 3..=6 => {
-                    ui.label(&values[index][column]);
+                    ui.label(&values[index][columns[column]]);
                 }
                 _ => format::sparkline(ui, rates.map(|r| &r.total), view.unit, 24.0),
             },

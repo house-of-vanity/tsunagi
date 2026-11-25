@@ -87,9 +87,8 @@ pub fn copy_field(ui: &mut egui::Ui, display: &str, value: &str) {
     };
     let response = ui
         .add(egui::Label::new(text).sense(egui::Sense::click()))
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("click to copy");
-    if response.clicked() {
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if crate::widgets::hint(response, "Copy to clipboard").clicked() {
         ui.ctx().copy_text(value.to_owned());
         ui.memory_mut(|memory| memory.data.insert_temp(id, Instant::now()));
     }

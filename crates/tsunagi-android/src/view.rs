@@ -24,6 +24,7 @@ enum Page {
     Devices(String),
     Vips(String),
     Exit(String),
+    ExitNetworks,
     Leave(String),
 }
 impl Page {
@@ -40,7 +41,7 @@ impl Page {
             Self::Join => "Join a network",
             Self::Devices(_) => "Devices",
             Self::Vips(_) => "VIP",
-            Self::Exit(_) => "Exit node",
+            Self::Exit(_) | Self::ExitNetworks => "Exit node",
             Self::Leave(_) => "Leave network",
         }
     }
@@ -90,10 +91,14 @@ pub struct Phone {
     pending: Option<Pending>,
     error: Option<String>,
     clipboard: Option<Zeroizing<String>>,
+    landscape: bool,
+    pick_exit: bool,
+    before_picker: Option<Page>,
 }
 
 /// Keep reads at tray density. Extra hit area is reserved for the navigation bar.
 pub fn configure(ctx: &Context) {
+    ctx.set_os(egui::os::OperatingSystem::Android);
     ctx.set_fonts(tsunagi_ui::app_fonts());
     ctx.style_mut(|style| {
         style.spacing.interact_size.y = 19.0;
@@ -104,11 +109,15 @@ pub fn configure(ctx: &Context) {
 
 impl Phone {
     fn home(&mut self) {
+        if let Some(previous) = self.before_picker.take() {
+            self.forms.exit_confirm = None;
+            self.page = previous;
+            return;
+        }
         if let Page::Vips(id) = &self.page {
             self.forms.vip_windows.remove(id);
         }
-        self.forms.join.name.clear();
-        self.forms.join.secret.zeroize();
+        self.forms.join = Default::default();
         self.forms.exit_confirm = None;
         self.forms.forget_confirm = None;
         self.page = Page::Home;
@@ -127,6 +136,8 @@ impl Phone {
             && editor.dirty()
         {
             editor.request_close();
+        } else if self.page == Page::Home && self.landscape && self.forms.close_selection() {
+            return None;
         } else if self.page == Page::Home {
             return Some(SystemAction::Finish);
         } else {
@@ -148,6 +159,99 @@ impl Phone {
     /// Present an error from an Android operation.
     pub fn error(&mut self, message: String) {
         self.error = Some(message);
+    }
+
+    /// The first tile tap opens the chooser once the agent is ready.
+    pub fn request_exit_picker(&mut self) {
+        self.pick_exit = true;
+    }
+
+    fn exit_networks(&mut self, ui: &mut egui::Ui, networks: &[tsunagi::ipc::NetworkReport]) {
+        if networks.is_empty() {
+            ui.label("Join a network to choose an exit node.");
+            if ui.button("Join or create a network").clicked() {
+                self.page = Page::Join;
+            }
+            return;
+        }
+        if !networks.iter().any(|n| n.active) {
+            ui.label("Start a network to choose an exit node.");
+            if ui.button("Show networks").clicked() {
+                self.home();
+            }
+            return;
+        }
+        ui.label("Choose a network for the exit node");
+        for n in networks.iter().filter(|n| n.active) {
+            let ambiguous = networks.iter().any(|other| {
+                other.active && other.name == n.name && other.network_id != n.network_id
+            });
+            let label = if ambiguous {
+                format!("{} · {}", n.name, tsunagi_ui::format::short(&n.network_id))
+            } else {
+                n.name.clone()
+            };
+            if ui.button(label).clicked() {
+                self.page = Page::Exit(n.network_id.clone());
+            }
+        }
+    }
+
+    fn landscape_home(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &Actions,
+        report: &tsunagi::ipc::StatusReport,
+    ) {
+        let width = (ui.available_width() / 3.)
+            .clamp(146., 300.)
+            .min(ui.available_width() * 0.45);
+        egui::SidePanel::left("network selector")
+            .resizable(false)
+            .exact_width(width)
+            .show_inside(ui, |ui| {
+                if ui.button("Join or create a network").clicked() {
+                    self.page = Page::Join;
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("network list")
+                    .show(ui, |ui| {
+                        for network in &report.networks {
+                            home::draw_network_selector(ui, network, report, &mut self.forms);
+                        }
+                    });
+            });
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            let selected = report
+                .networks
+                .iter()
+                .find(|n| self.forms.selected_network.as_deref() == Some(&n.network_id));
+            egui::ScrollArea::vertical()
+                .id_salt(("network settings", selected.map(|n| &n.network_id)))
+                .show(ui, |ui| {
+                    if let Some(n) = selected {
+                        ui.heading(&n.name);
+                        ui.push_id(&n.network_id, |ui| {
+                            if home::draw_network_details(
+                                ui,
+                                actions,
+                                &mut self.forms,
+                                &self.traffic,
+                                n,
+                                report,
+                                false,
+                            ) {
+                                self.page = Page::Exit(n.network_id.clone());
+                            }
+                        });
+                    } else {
+                        ui.heading("This device");
+                        ui.label("Tsunagi Agent is running");
+                        home::draw_header(ui, actions, &mut self.forms, report);
+                    }
+                });
+        });
     }
 
     /// Take a secret once for the platform’s sensitive clipboard.
@@ -191,6 +295,7 @@ impl Phone {
         mut submit: impl FnMut(Command) -> Result<Response, String>,
     ) -> Option<SystemAction> {
         self.acknowledge();
+        self.landscape = tsunagi_ui::widgets::landscape(ctx);
         let report = if let State::Ready(report, at) = state {
             if self.snapshot.at != Some(*at) {
                 self.snapshot.generation = self.snapshot.generation.wrapping_add(1);
@@ -204,6 +309,25 @@ impl Phone {
                 .is_some_and(|id| !report.networks.iter().any(|n| n.network_id == id))
             {
                 self.home();
+            }
+            if self
+                .forms
+                .selected_network
+                .as_ref()
+                .is_some_and(|id| !report.networks.iter().any(|n| &n.network_id == id))
+            {
+                self.forms.close_selection();
+            }
+            if self.pick_exit && self.pending.is_none() {
+                self.pick_exit = false;
+                let mut active = report.networks.iter().filter(|n| n.active);
+                let picker = match (active.next(), active.next()) {
+                    (Some(n), None) => Page::Exit(n.network_id.clone()),
+                    _ => Page::ExitNetworks,
+                };
+                if !matches!(self.page, Page::Exit(_) | Page::ExitNetworks) {
+                    self.before_picker = Some(std::mem::replace(&mut self.page, picker));
+                }
             }
             Some(report)
         } else {
@@ -222,14 +346,18 @@ impl Phone {
         egui::TopBottomPanel::top("navigation").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().interact_size.y = 32.0;
-                if self.page != Page::Home && ui.button(icon::ARROW_LEFT).clicked() {
+                if self.page != Page::Home
+                    && tsunagi_ui::widgets::icon_button(ui, icon::ARROW_LEFT, "Back").clicked()
+                {
                     system = self.back();
                 }
                 ui.heading(self.page.title());
                 if self.page == Page::Home {
                     ui.weak(env!("CARGO_PKG_VERSION"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(icon::INFO).clicked() {
+                        if tsunagi_ui::widgets::icon_button(ui, icon::INFO, "About Tsunagi")
+                            .clicked()
+                        {
                             self.page = Page::About;
                         }
                         if report.is_some() {
@@ -276,6 +404,10 @@ impl Phone {
             }
             _ => {
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(report) = report && self.page == Page::Home && self.landscape {
+                        self.landscape_home(ui, &actions, report);
+                        return;
+                    }
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         let Some(report) = report else {
                             match state {
@@ -294,8 +426,6 @@ impl Phone {
                                 if ui.button("Join or create a network").clicked() {self.page = Page::Join;}
                                 for n in &report.networks {
                                     if home::draw_network(ui, &actions, &mut self.forms, &self.traffic, n, report, false) {self.page = Page::Exit(n.network_id.clone());}
-                                    if self.forms.open_devices.remove(&n.network_id) {self.page = Page::Devices(n.network_id.clone());}
-                                    if self.forms.vip_windows.contains_key(&n.network_id) {self.page = Page::Vips(n.network_id.clone());}
                                 }
                             }
                             Page::Join => {
@@ -307,6 +437,7 @@ impl Phone {
                                     self.forms.exit_confirm = Some(choice);
                                 }
                             }
+                            Page::ExitNetworks => self.exit_networks(ui, &report.networks),
                             Page::Leave(id) => {
                                 if let Some(n) = selected {
                                     ui.label(format!("Leave {} on this phone? You will need its secret to join again.", n.name));
@@ -318,6 +449,20 @@ impl Phone {
                         }
                     });
                 });
+                if let Some(report) = report
+                    && self.page == Page::Home
+                {
+                    for n in &report.networks {
+                        if self.forms.open_devices.remove(&n.network_id) {
+                            self.page = Page::Devices(n.network_id.clone());
+                            break;
+                        }
+                        if self.forms.vip_windows.contains_key(&n.network_id) {
+                            self.page = Page::Vips(n.network_id.clone());
+                            break;
+                        }
+                    }
+                }
                 devices::confirm_exit(ctx, &actions, &mut self.forms.exit_confirm, None);
             }
         }

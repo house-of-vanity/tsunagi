@@ -23,6 +23,8 @@ class MeshSurface(private val activity: MainActivity) : GLSurfaceView(activity),
     private var widthPx = 0
     private var heightPx = 0
     private val repaint = Runnable { requestRender() }
+    private val pickExit = java.util.concurrent.atomic.AtomicBoolean()
+    fun openExitPicker() { pickExit.set(true); requestRender() }
     init {
         setEGLContextClientVersion(3)
         preserveEGLContextOnPause = true
@@ -34,7 +36,9 @@ class MeshSurface(private val activity: MainActivity) : GLSurfaceView(activity),
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) = Native.surface()
     override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) { widthPx = w; heightPx = h }
     override fun onDrawFrame(gl: GL10?) {
-        val delay = Native.draw(this, widthPx, heightPx, density, MeshVpn.started)
+        if (pickExit.getAndSet(false)) Native.input(6, "")
+        val landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        val delay = Native.draw(this, widthPx, heightPx, density, MeshVpn.started, landscape)
         removeCallbacks(repaint)
         postDelayed(repaint, delay.coerceAtLeast(16))
     }

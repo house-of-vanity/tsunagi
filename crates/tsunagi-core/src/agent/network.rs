@@ -2990,7 +2990,10 @@ impl Runtime {
                         .agent_version
                         .clone_from(&announcement.agent_version);
                     session.broadcast = announcement.broadcast;
-                    session.exit_node = announcement.exit_node;
+                    if session.exit_node != announcement.exit_node {
+                        session.exit_node = announcement.exit_node;
+                        self.params.roster_changed.send_replace(());
+                    }
                     session.capabilities = capabilities.clone();
                 }
                 self.remember_hostname(peer, &announcement.hostname);
@@ -3178,7 +3181,12 @@ impl Runtime {
 
     fn data_error(&self, session: &Session) -> Option<String> {
         if self.params.carriers.is_empty() {
-            return Some("data transports disabled locally".into());
+            return Some(super::DATA_DISABLED.into());
+        }
+        // Capabilities arrive in the first authenticated announcement, after
+        // the session is already visible in status.
+        if session.hostname.is_none() {
+            return Some(super::DATA_CONNECTING.into());
         }
         if self.params.tunnel.is_some() && self.tunnel_protocol(session).is_none() {
             return Some(
@@ -3226,7 +3234,7 @@ impl Runtime {
         self.data_errors
             .get(&session.peer)
             .cloned()
-            .or_else(|| Some("establishing external data transport".into()))
+            .or_else(|| Some(super::DATA_CONNECTING.into()))
     }
 
     fn status(&self) -> NetworkStatus {
