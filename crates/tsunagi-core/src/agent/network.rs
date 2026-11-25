@@ -2855,13 +2855,18 @@ impl Runtime {
             SessionEvent::Closed {
                 session_id,
                 peer,
-                reason,
+                mut reason,
             } => {
                 let current = self.sessions.get(&peer).map(|session| session.id);
                 if current != Some(session_id) {
                     return;
                 }
                 if let Some(session) = self.sessions.remove(&peer) {
+                    // Read the cause before local cleanup closes a still-open connection.
+                    if let Some(cause) = session.conn.close_reason() {
+                        reason =
+                            format!("{reason} ({})", super::session::describe_quic_close(cause));
+                    }
                     session.abort();
                     session.conn.close(0u32.into(), b"session ended");
                 }
@@ -2885,7 +2890,13 @@ impl Runtime {
                 self.params.roster_changed.send_replace(());
                 self.emit(Event::PeerDisconnected {
                     network: self.network_id,
+                    network_name: self.params.keys.name().clone(),
                     peer,
+                    hostname: self
+                        .known_hostnames
+                        .get(&peer)
+                        .cloned()
+                        .or_else(|| self.state.hostname_of(&peer).map(str::to_owned)),
                     reason,
                 });
             }

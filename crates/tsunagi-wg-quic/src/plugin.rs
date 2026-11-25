@@ -180,7 +180,6 @@ struct NetworkState {
     key: WgSecretKey,
     device: Option<Arc<WireguardDevice>>,
     announcements: HashMap<EndpointId, ValidatedAnnouncement>,
-    links: HashMap<EndpointId, SharedLink>,
     /// What the network agreed, pushed in by the agent. Authoritative.
     allocations: HashMap<EndpointId, Ipv4Addr>,
     /// The range those allocations came from.
@@ -190,17 +189,15 @@ struct NetworkState {
 #[derive(Debug, Default)]
 struct Shared {
     networks: HashMap<NetworkId, NetworkState>,
+    // A channel can arrive before the network key is loaded. Keep the latest
+    // handle here so a full notification queue only delays reconciliation.
+    links: HashMap<(NetworkId, EndpointId), SharedLink>,
 }
 
 #[derive(Debug)]
 enum Command {
     Prepare(NetworkId),
     Sync(NetworkId),
-    Link {
-        network: NetworkId,
-        peer: EndpointId,
-        link: SharedLink,
-    },
     Teardown(NetworkId),
     Stop(oneshot::Sender<()>),
 }
@@ -348,7 +345,7 @@ impl WireguardPlugin {
                 endpoint_id: *endpoint_id,
                 public_key: announcement.public_key,
                 overlay_address_v4: state.allocations.get(endpoint_id).copied(),
-                has_link: state.links.contains_key(endpoint_id),
+                has_link: shared.links.contains_key(&(network, *endpoint_id)),
                 tunnel: tunnels.get(&announcement.public_key).cloned(),
             })
             .collect();
@@ -440,7 +437,6 @@ impl Worker {
                 key,
                 device: None,
                 announcements: HashMap::new(),
-                links: HashMap::new(),
                 allocations: HashMap::new(),
                 ipv4_range: None,
             });
@@ -488,25 +484,34 @@ impl Worker {
     /// A peer gets a tunnel once both halves have arrived: its announcement,
     /// which says who it is, and a link, which says packets can reach it.
     fn sync(&self, network: NetworkId) {
-        let mut shared = self.lock_shared();
-        let Some(state) = shared.networks.get_mut(&network) else {
+        let shared = self.lock_shared();
+        let Some(state) = shared.networks.get(&network) else {
             return;
         };
         let Some(device) = state.device.clone() else {
             return;
         };
 
-        let allocations = state.allocations.clone();
-        let mut wanted: Vec<WgPublicKey> = Vec::new();
+        // Carrier changes keep the same logical link. A new control session
+        // gets a different link even when the peer advertises the same WG key.
+        device.retain_links(|peer, key, installed| {
+            state
+                .announcements
+                .get(&peer)
+                .is_some_and(|a| a.public_key == *key)
+                && shared
+                    .links
+                    .get(&(network, peer))
+                    .is_some_and(|current| Arc::ptr_eq(installed, current) && !current.is_closed())
+        });
         let mut too_small: Vec<(usize, usize)> = Vec::new();
         for (endpoint_id, announcement) in &state.announcements {
-            let Some(link) = state.links.get(endpoint_id) else {
+            let Some(link) = shared.links.get(&(network, *endpoint_id)) else {
                 continue;
             };
             if link.is_closed() {
                 continue;
             }
-            wanted.push(announcement.public_key);
             if device.has_peer(&announcement.public_key) {
                 continue;
             }
@@ -523,7 +528,7 @@ impl Worker {
             // The address comes from the agreed signed state, not from
             // anything this peer said and not from a derivation: that is what
             // makes it survive the peer being away.
-            let peer_v4 = allocations.get(endpoint_id).copied();
+            let peer_v4 = state.allocations.get(endpoint_id).copied();
 
             if let Err(err) = device.add_peer(
                 *endpoint_id,
@@ -535,8 +540,6 @@ impl Worker {
                 tracing::debug!(%err, "cannot start a WireGuard tunnel");
             }
         }
-        device.retain_peers(&wanted);
-
         drop(shared);
 
         for (available, needed) in too_small {
@@ -597,21 +600,13 @@ async fn run(worker: Arc<Worker>, mut commands: mpsc::Receiver<Command>) {
                     Command::Sync(network) => {
                         pending.insert(network);
                     }
-                    Command::Link { network, peer, link } => {
-                        {
-                            let mut shared = worker.lock_shared();
-                            if let Some(state) = shared.networks.get_mut(&network) {
-                                state.links.insert(peer, link);
-                            }
-                        }
-                        pending.insert(network);
-                    }
                     Command::Teardown(network) => {
                         pending.remove(&network);
                         worker.teardown(network).await;
                         continue;
                     }
                     Command::Stop(reply) => {
+                        worker.lock_shared().links.clear();
                         for network in worker.known_networks() {
                             worker.teardown(network).await;
                         }
@@ -765,23 +760,23 @@ impl IpPlugin for WireguardPlugin {
     }
 
     fn on_peer_link(&self, network: NetworkId, peer: EndpointId, link: SharedLink) {
-        self.nudge(Command::Link {
-            network,
-            peer,
-            link,
-        });
+        self.worker
+            .lock_shared()
+            .links
+            .insert((network, peer), link);
+        self.nudge(Command::Sync(network));
     }
 
     fn on_peer_gone(&self, network: NetworkId, peer: EndpointId) {
         let removed = {
             let mut shared = self.worker.lock_shared();
-            match shared.networks.get_mut(&network) {
-                Some(state) => {
-                    let had_link = state.links.remove(&peer).is_some();
-                    state.announcements.remove(&peer).is_some() || had_link
-                }
-                None => false,
-            }
+            let had_link = shared.links.remove(&(network, peer)).is_some();
+            shared
+                .networks
+                .get_mut(&network)
+                .and_then(|state| state.announcements.remove(&peer))
+                .is_some()
+                || had_link
         };
         if removed {
             self.nudge(Command::Sync(network));
@@ -789,6 +784,10 @@ impl IpPlugin for WireguardPlugin {
     }
 
     fn on_network_deactivated(&self, network: NetworkId) {
+        self.worker
+            .lock_shared()
+            .links
+            .retain(|(net, _), _| *net != network);
         self.nudge(Command::Teardown(network));
     }
 
@@ -838,5 +837,60 @@ impl Drop for WireguardPlugin {
         {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use tsunagi::dataplane::relay::RelayHub;
+
+    #[tokio::test]
+    async fn a_burst_of_notifications_keeps_the_latest_logical_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = WireguardPlugin::open(WireguardConfig::new(dir.path()))
+            .await
+            .unwrap();
+        let id = NetworkId::from_bytes([9; 32]);
+        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let hub = RelayHub::new(id, local);
+        let cap = PluginCapability {
+            protocol: WIREGUARD_PROTOCOL.to_string(),
+            version: crate::ANNOUNCEMENT_VERSION,
+            enabled: true,
+            data: WgAnnouncement::new(id, &WgSecretKey::generate().public())
+                .encode()
+                .unwrap(),
+        };
+        // No yield: the worker cannot drain notifications or reconcile between callbacks.
+        for _ in 0..plugin.commands.max_capacity() {
+            plugin.on_network_activated(id);
+        }
+        let first = hub.link(peer, WIREGUARD_PROTOCOL);
+        plugin.on_peer_link(id, peer, first.clone());
+        plugin.worker.prepare(id).await.unwrap();
+        plugin.on_peer_capability(id, peer, &cap).unwrap();
+        let epoch = || {
+            plugin.worker.sync(id);
+            plugin.overview(id).unwrap().peers[0]
+                .tunnel
+                .as_ref()
+                .unwrap()
+                .stats
+                .counter_epoch
+        };
+        let original = epoch();
+        plugin.on_peer_link(id, peer, first);
+        assert_eq!(epoch(), original, "the same logical link keeps its session");
+
+        plugin.on_peer_gone(id, peer);
+        hub.remove_peer(peer);
+        plugin.on_peer_capability(id, peer, &cap).unwrap();
+        plugin.on_peer_link(id, peer, hub.link(peer, WIREGUARD_PROTOCOL));
+        assert_ne!(epoch(), original, "reconnect within one reconcile window");
+        hub.close();
+        plugin.shutdown().await;
     }
 }

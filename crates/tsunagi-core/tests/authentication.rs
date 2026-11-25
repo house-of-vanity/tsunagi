@@ -47,6 +47,79 @@ async fn open_control_stream(
 
 const LIMIT: usize = 64 * 1024;
 
+#[tokio::test]
+async fn an_authenticated_disconnect_reports_the_quic_close_code() {
+    let agent = TestAgent::spawn(&SharedMemoryDiscovery::new())
+        .await
+        .unwrap();
+    let (name, secret) = network("disconnect-diagnostics");
+    let id = agent.agent.join_network(&name, &secret).await.unwrap();
+    let member = raw_endpoint().await;
+    let (conn, mut send, mut recv) = open_control_stream(&member, agent.agent.local_addr()).await;
+    let mut events = agent.agent.subscribe();
+    tsunagi::proto::handshake::initiate(
+        &conn,
+        &mut send,
+        &mut recv,
+        member.id(),
+        &NetworkKeys::derive(&name, &secret),
+        &tsunagi::Limits::default(),
+    )
+    .await
+    .unwrap();
+    let message = ControlMessage::Announce(tsunagi::proto::message::Announcement {
+        broadcast: true,
+        exit_node: false,
+        hostname: "returning-peer".into(),
+        capabilities: Vec::new(),
+        agent_version: None,
+    });
+    write_frame(
+        &mut send,
+        &encode(&Envelope {
+            network_id: *id.as_bytes(),
+            message,
+        })
+        .unwrap(),
+        LIMIT,
+    )
+    .await
+    .unwrap();
+    tsunagi::testing::wait_until("peer hostname is known", || async {
+        agent
+            .agent
+            .network_status(id)
+            .await
+            .ok()?
+            .peers
+            .into_iter()
+            .find(|p| {
+                p.endpoint_id == member.id() && p.hostname.as_deref() == Some("returning-peer")
+            })
+    })
+    .await;
+    conn.close(42u32.into(), b"private remote text\nsecond line");
+    let (reported_network, hostname, reason) = wait_event(&mut events, |event| match event {
+        Event::PeerDisconnected {
+            network,
+            network_name,
+            peer,
+            hostname,
+            reason,
+        } if *network == id && *peer == member.id() => {
+            Some((network_name.clone(), hostname.clone(), reason.clone()))
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(reported_network, name);
+    assert_eq!(hostname.as_deref(), Some("returning-peer"));
+    assert!(reason.contains("application code 42"), "{reason}");
+    assert!(!reason.contains("private remote text"));
+    member.close().await;
+    agent.agent.shutdown().await;
+}
+
 /// Sends `Hello` and reads the responder's `HelloAck`.
 async fn exchange_hellos(
     send: &mut SendStream,

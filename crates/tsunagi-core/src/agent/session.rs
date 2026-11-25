@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use iroh::EndpointId;
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -58,6 +58,22 @@ pub(crate) enum SessionEvent {
         /// Why it ended.
         reason: String,
     },
+}
+
+/// The transport category and code are useful in logs. Remote close text is
+/// arbitrary peer-supplied data and may contain secrets or control characters.
+pub(super) fn describe_quic_close(cause: ConnectionError) -> String {
+    match cause {
+        ConnectionError::ApplicationClosed(close) => {
+            format!("QUIC closed by peer, application code {}", close.error_code)
+        }
+        ConnectionError::ConnectionClosed(close) => {
+            format!("QUIC closed by peer, transport code {}", close.error_code)
+        }
+        ConnectionError::TransportError(error) => format!("QUIC transport error {}", error.code),
+        ConnectionError::LocallyClosed => "QUIC closed locally".to_owned(),
+        other => format!("QUIC: {other}"),
+    }
 }
 
 /// A live session, as held by the network runtime.

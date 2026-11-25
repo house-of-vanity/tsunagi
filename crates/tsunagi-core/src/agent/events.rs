@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use iroh::EndpointId;
 
-use crate::identity::NetworkId;
+use crate::identity::{NetworkId, NetworkName};
 use crate::net::TransportKind;
 use crate::proto::ControlMessage;
 use crate::proto::handshake::Role;
@@ -48,8 +48,12 @@ pub enum Event {
     PeerDisconnected {
         /// The network the session belonged to.
         network: NetworkId,
+        /// Its locally configured name.
+        network_name: NetworkName,
         /// The peer.
         peer: EndpointId,
+        /// Last known name of the authenticated peer, when available.
+        hostname: Option<String>,
         /// Why the session ended. Free of secrets.
         reason: String,
     },

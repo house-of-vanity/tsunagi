@@ -264,17 +264,18 @@ impl std::fmt::Debug for Peer {
     }
 }
 
-impl Drop for Peer {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.task.lock()
-            && let Some(task) = guard.take()
+impl Peer {
+    fn stop_reader(&self) {
+        if let Some(task) = self
+            .task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take()
         {
             task.abort();
         }
     }
-}
 
-impl Peer {
     fn stats(&self) -> PeerStats {
         PeerStats {
             counter_epoch: self.counters.epoch,
@@ -479,7 +480,9 @@ impl WireguardDevice {
             *guard = Some(task);
         }
 
-        write_lock(&self.inner.peers).insert(public_key, Arc::clone(&peer));
+        if let Some(old) = write_lock(&self.inner.peers).insert(public_key, Arc::clone(&peer)) {
+            old.stop_reader();
+        }
 
         // Start the handshake now instead of waiting for the next timer tick,
         // so the tunnel is usable as soon as the link exists.
@@ -489,21 +492,28 @@ impl WireguardDevice {
 
     /// Removes a peer and stops its tunnel.
     pub fn remove_peer(&self, public_key: &WgPublicKey) {
-        // Dropping it stops the task and closes the link; there is no route
-        // to withdraw, because routes are not kept here.
-        write_lock(&self.inner.peers).remove(public_key);
+        if let Some(peer) = write_lock(&self.inner.peers).remove(public_key) {
+            peer.stop_reader();
+        }
     }
 
     /// Removes every peer whose key is not in `keep`.
     pub fn retain_peers(&self, keep: &[WgPublicKey]) {
-        let stale: Vec<WgPublicKey> = read_lock(&self.inner.peers)
-            .keys()
-            .filter(|key| !keep.contains(key))
-            .copied()
-            .collect();
-        for key in stale {
-            self.remove_peer(&key);
-        }
+        self.retain_links(|_, key, _| keep.contains(key));
+    }
+
+    pub(crate) fn retain_links(
+        &self,
+        keep: impl Fn(EndpointId, &WgPublicKey, &SharedLink) -> bool,
+    ) {
+        write_lock(&self.inner.peers).retain(|key, peer| {
+            let current = keep(peer.endpoint_id, key, &peer.link);
+            if !current {
+                // The reader owns an Arc to the peer while waiting on the link.
+                peer.stop_reader();
+            }
+            current
+        });
     }
 
     /// Whether a peer's tunnel exists.
@@ -542,6 +552,7 @@ impl Drop for WireguardDevice {
         for task in &self.tasks {
             task.abort();
         }
+        self.retain_peers(&[]);
     }
 }
 

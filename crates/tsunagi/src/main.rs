@@ -5043,12 +5043,16 @@ fn log_event(event: &Event) {
         }
         Event::PeerDisconnected {
             network,
+            network_name,
             peer,
+            hostname,
             reason,
         } => {
             tracing::info!(
                 network = %network.fmt_short(),
+                network_name = network_name.as_str(),
                 peer = %peer.fmt_short(),
+                hostname = hostname.as_deref().map(tracing::field::debug),
                 "Peer disconnected: {reason}"
             );
         }

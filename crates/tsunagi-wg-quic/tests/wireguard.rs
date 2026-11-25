@@ -1023,6 +1023,73 @@ async fn a_mesh_of_three_establishes_every_tunnel() {
 }
 
 #[tokio::test]
+async fn a_quick_reconnect_with_the_same_key_restores_packet_delivery() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-quick-return");
+    // Let the disconnect and the next link arrive in the same reconcile window.
+    let a = WgAgent::spawn_with(&discovery, "ta", |config| {
+        config.with_reconcile(Duration::from_secs(2), Duration::from_secs(60))
+    })
+    .await;
+    let b = WgAgent::spawn(&discovery, "tb").await;
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(id, 1).await;
+    b.wait_for_tunnels(id, 1).await;
+    let before = a.plugin.overview(id).unwrap().peers.remove(0);
+    let epoch = before.tunnel.unwrap().stats.counter_epoch;
+
+    let mut events = a.agent.subscribe();
+    b.agent.deactivate_network(id).await.unwrap();
+    wait_event(&mut events, |event| match event {
+        Event::PeerDisconnected { network, peer, .. }
+            if *network == id && *peer == b.endpoint_id() =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    b.agent.activate_network(id).await.unwrap();
+    wait_until(
+        "the same WG key handshakes on the replacement channel",
+        || async {
+            let overview = a.plugin.overview(id)?;
+            let peer = overview
+                .peers
+                .iter()
+                .find(|p| p.endpoint_id == b.endpoint_id())?;
+            let tunnel = peer.tunnel.as_ref()?;
+            (peer.public_key == before.public_key
+                && tunnel.stats.counter_epoch != epoch
+                && peer.is_up())
+            .then_some(())
+        },
+    )
+    .await;
+    b.wait_for_tunnels(id, 1).await;
+
+    for (sender, receiver) in [(&a, &b), (&b, &a)] {
+        let packet = ipv4_packet(
+            sender.overlay(id).await,
+            receiver.overlay(id).await,
+            b"after reconnect",
+        );
+        sender.tun(id).await.push_from_os(packet.clone());
+        let received = tokio::time::timeout(
+            tsunagi::testing::DEADLINE,
+            receiver.tun(id).await.pop_to_os(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, packet);
+    }
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_departing_peer_loses_its_tunnel() {
     let discovery = SharedMemoryDiscovery::new();
     let (name, secret) = network("wg-departure");
