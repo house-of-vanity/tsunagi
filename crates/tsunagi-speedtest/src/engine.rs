@@ -14,7 +14,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout
 const TOTAL_TIME: Duration = Duration::from_secs(5);
 const DIRECTION_TIME: Duration = Duration::from_millis(1900);
 const FEEDBACK_TICK: Duration = Duration::from_millis(25);
-const PACE_TICK: Duration = Duration::from_millis(2);
+const PACE_TICK: Duration = Duration::from_millis(1);
 
 /// Parameters for one locally admitted, authenticated peer.
 #[derive(Debug, Clone, Copy)]
@@ -318,15 +318,20 @@ impl Session {
                         break;
                     }
                     let emit = pacer.packets(now, search.target).min(limit - packets);
-                    let elapsed_us = now.duration_since(start).as_micros() as u32;
                     for index in 0..emit {
-                        // A full tunnel queue is part of the observed data path. Charging
-                        // attempted probes bounds work during overload and preserves sequence gaps.
-                        if !io.packet(builder.packet(search.stage, packets + index, elapsed_us)) {
+                        if index > 0 && index.is_multiple_of(64) {
+                            tokio::task::yield_now().await;
+                        }
+                        let elapsed_us = start.elapsed().as_micros() as u32;
+                        let packet = builder.packet(search.stage, packets, elapsed_us);
+                        // A tunnel waiting for a handshake can retain a submitted
+                        // packet. Charge that attempt, then release the unissued
+                        // part of this batch for a later tick if the tunnel is full.
+                        packets += 1;
+                        if !io.packet(packet) {
                             break;
                         }
                     }
-                    packets += emit;
                 }
             }
         }
@@ -403,25 +408,7 @@ impl Session {
         if rx.count > packets {
             return Err(State::Failed);
         }
-        // A short final burst can never establish a rate on its own. Only complete
-        // receiver windows are eligible, even if the sender reports a higher value.
-        let bps = estimate
-            .bps
-            .filter(|_| rx.best > 0)
-            .map(|v| v.min(rx.best))
-            .or_else(|| (rx.best > 0).then_some(rx.best));
-        let quality = if bps.is_none() {
-            Quality::Insufficient
-        } else if estimate.quality == Quality::Measured {
-            Quality::Measured
-        } else {
-            Quality::AtLeast
-        };
-        let reading = Reading {
-            bps,
-            bytes: rx.bytes(),
-            quality,
-        };
+        let reading = rx.finish(estimate);
         send(
             io,
             Control::Report {

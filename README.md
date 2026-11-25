@@ -150,13 +150,16 @@ Select a peer’s speedometer in **Devices** to measure download and upload
 through its current encrypted mesh path. The cell shows live rates in Mbit/s.
 Select the result to test again, or use **Test exits** to check the network’s
 online, compatible exit nodes one at a time. The test ends at the peer, so its
-Internet uplink beyond that peer is outside the measurement. A **≥** result is a
-sustained lower bound when the time or traffic budget runs out. A missing
-direction means the sample was too short. Both peers need speed-test support.
+Internet uplink beyond that peer is outside the measurement. Hover or long-press
+the result for details. “At least” means the receiver sustained that rate and
+the test ended before it could confirm the limit. A missing direction means
+the sample was too short. Both peers need speed-test support.
 
 A test runs for up to five seconds. It raises the offered rate in steps and
-counts unique payload bytes at the receiver. The traffic ceiling is 96 MiB per
-direction for one peer, or 8 MiB when either endpoint reports a metered link.
+tries a higher rate again after a slow start. The receiver counts unique payload
+bytes across sustained trains of packets, including the last train before the
+traffic budget runs out. The traffic ceiling is 96 MiB per direction for one
+peer, or 8 MiB when either endpoint reports a metered link.
 A batch shares 128 MiB per direction among its exits, or 16 MiB on a metered
 initiator. These ceilings count probe IP packets before tunnel overhead.
 

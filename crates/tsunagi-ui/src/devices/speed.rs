@@ -217,27 +217,25 @@ fn activity(ui: &Ui, rect: Rect, color: Color32) {
 
 // Round positive lower bounds down so the displayed minimum is supported by
 // the measurement, including near a precision or unit boundary.
-fn rate_number(rate: SpeedRate, divisor: f64, precision: usize) -> String {
-    let mut value = rate.bps as f64 / divisor;
+fn detailed_rate(rate: SpeedRate, divisor: f64) -> String {
+    let value = rate.bps as f64 / divisor;
     if rate.lower_bound {
-        let scale = 10_f64.powi(precision as i32);
-        value = (value * scale).floor() / scale;
+        format!("at least {:.2}", (value * 100.).floor() / 100.)
+    } else {
+        format!("{value:.2}")
     }
-    format!("{value:.precision$}")
 }
 
 fn compact_rate(rate: SpeedRate) -> String {
-    let bound = if rate.lower_bound { "≥" } else { "" };
     let (unit, precision, suffix) = match rate.bps {
         0 => return "0".into(),
-        1..10_000 if rate.lower_bound => return ">0".into(),
         1..10_000 => return "<0.01".into(),
         10_000..1_000_000 => (1e6, 2, ""),
         1_000_000..10_000_000 => (1e6, 1, ""),
         10_000_000..10_000_000_000 => (1e6, 0, ""),
         _ => (1e9, 0, "k"),
     };
-    format!("{bound}{}{suffix}", rate_number(rate, unit, precision))
+    format!("{:.precision$}{suffix}", rate.bps as f64 / unit)
 }
 
 fn tooltip(
@@ -265,10 +263,9 @@ fn tooltip(
                 } else {
                     (1e6, "Mbit/s")
                 };
-                let bound = if rate.lower_bound { "at least " } else { "" };
                 hint.push_str(&format!(
-                    "\n{label}  {bound}{} {suffix}",
-                    rate_number(rate, divisor, 2)
+                    "\n{label}  {} {suffix}",
+                    detailed_rate(rate, divisor)
                 ));
             }
         }

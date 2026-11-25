@@ -14,6 +14,7 @@ struct Link {
     remote: Handle,
     start: Instant,
     rate: u64,
+    warmup: Option<(Duration, u64)>,
     control_delay: Duration,
     drop_every: u32,
     state: Arc<Mutex<Delivery>>,
@@ -45,11 +46,14 @@ impl Io for Link {
     fn packet(&self, packet: Bytes) -> bool {
         let probe = decode_packet(&packet).unwrap();
         let tick = self.start.elapsed().as_millis() as u64;
+        let rate = self
+            .warmup
+            .filter(|(until, _)| self.start.elapsed() < *until)
+            .map_or(self.rate, |(_, rate)| rate);
         let mut state = self.state.lock().unwrap();
         if state.tick != tick {
             let elapsed = tick - state.tick;
-            state.credit =
-                (state.credit + self.rate * elapsed / 8000).min(self.rate * 4 / 8000 + 1300);
+            state.credit = (state.credit + rate * elapsed / 8000).min(rate * 4 / 8000 + 1300);
             state.tick = tick;
         }
         state.bytes += packet.len() as u64;
@@ -83,7 +87,7 @@ fn config(local: u8, remote: u8, bytes: u32) -> Config {
 }
 
 async fn measure(down: u64, up: u64, budget: u32) -> (Progress, Progress, Link, Link) {
-    shaped(down, up, budget, Duration::ZERO, 0).await
+    shaped(down, up, budget, Duration::ZERO, 0, None).await
 }
 
 async fn shaped(
@@ -92,6 +96,7 @@ async fn shaped(
     budget: u32,
     control_delay: Duration,
     drop_every: u32,
+    warmup: Option<(Duration, u64)>,
 ) -> (Progress, Progress, Link, Link) {
     let cfg = |a, b| Config {
         rtt: control_delay.max(Duration::from_millis(20)),
@@ -105,7 +110,8 @@ async fn shaped(
     };
     let (b, responder) = respond(cfg(2, 1), start);
     let now = Instant::now();
-    let link = |remote, rate| Link {
+    let link = |remote, rate, warmup| Link {
+        warmup,
         remote,
         start: now,
         rate,
@@ -114,9 +120,13 @@ async fn shaped(
         state: Default::default(),
         samples: Default::default(),
     };
-    let ab = link(b, up);
-    let ba = link(a, down);
+    let ab = link(b, up, None);
+    let ba = link(a, down, warmup);
     let (a, b) = tokio::join!(initiator.run(ab.clone()), responder.run(ba.clone()));
+    println!(
+        "Shaped path {down}/{up} bit/s, receiver readings {:?}/{:?}",
+        a.down.bps, a.up.bps
+    );
     assert!(now.elapsed() <= Duration::from_secs(5));
     assert!(ab.state.lock().unwrap().bytes <= u64::from(budget));
     assert!(ba.state.lock().unwrap().bytes <= u64::from(budget));
@@ -173,6 +183,7 @@ async fn persistent_random_loss_does_not_masquerade_as_a_slow_link() {
         NORMAL_BYTES,
         Duration::from_millis(45),
         20,
+        None,
     )
     .await;
     assert_eq!(a.state, State::Complete);
@@ -299,6 +310,7 @@ async fn slower_control_feedback_leaves_time_for_both_directions() {
         NORMAL_BYTES,
         Duration::from_millis(130),
         0,
+        None,
     )
     .await;
     assert_eq!(a, b);
@@ -329,10 +341,22 @@ async fn slow_links_accumulate_enough_arrivals_for_a_rate() {
 
 #[tokio::test(start_paused = true)]
 async fn persistent_heavy_loss_reports_only_sustained_lower_bounds() {
-    let (a, _, _, _) = shaped(50_000_000, 50_000_000, NORMAL_BYTES, Duration::ZERO, 3).await;
+    let (a, _, _, _) = shaped(
+        50_000_000,
+        50_000_000,
+        NORMAL_BYTES,
+        Duration::ZERO,
+        3,
+        None,
+    )
+    .await;
     for r in [a.down, a.up] {
         assert_eq!(r.quality, Quality::AtLeast, "{r:?}");
-        assert!(r.bps.is_some_and(|v| (100_000..=33_500_000).contains(&v)));
+        assert!(
+            r.bps
+                .is_some_and(|v| (28_000_000..=36_000_000).contains(&v)),
+            "{r:?}"
+        );
     }
 }
 
@@ -350,4 +374,110 @@ fn a_finished_rate_requires_evidence_of_delivered_payload() {
         };
         assert!(Control::decode(&message.encode().unwrap()).is_none());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cold_download_reprobes_after_the_path_warms_up() {
+    let (result, _, _, _) = shaped(
+        300_000_000,
+        250_000_000,
+        NORMAL_BYTES,
+        Duration::ZERO,
+        0,
+        Some((Duration::from_millis(850), 60_000_000)),
+    )
+    .await;
+    for (reading, expected) in [(result.down, 300_000_000), (result.up, 250_000_000)] {
+        assert!(
+            reading
+                .bps
+                .is_some_and(|rate| (expected * 8 / 10..=expected * 11 / 10).contains(&rate)),
+            "{result:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn delayed_feedback_does_not_hide_the_metered_receivers_last_sustained_rate() {
+    let (result, _, _, _) = shaped(
+        350_000_000,
+        200_000_000,
+        METERED_BYTES,
+        Duration::from_millis(95),
+        0,
+        None,
+    )
+    .await;
+    for (reading, expected) in [(result.down, 350_000_000), (result.up, 200_000_000)] {
+        assert!(
+            reading
+                .bps
+                .is_some_and(|rate| (expected * 75 / 100..=expected * 11 / 10).contains(&rate)),
+            "{result:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_tunnel_charges_only_packets_actually_submitted_to_it() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    struct BusyQueue {
+        other: Handle,
+        start: Instant,
+        stalled: AtomicBool,
+        submitted: AtomicU32,
+    }
+
+    impl Io for BusyQueue {
+        async fn control(&self, message: Control) -> bool {
+            if let Control::End { packets, .. } = message {
+                assert!(self.stalled.load(Ordering::Relaxed));
+                assert_eq!(packets, self.submitted.load(Ordering::Relaxed));
+            }
+            if !matches!(message, Control::Start(_)) {
+                self.other.control(message);
+            }
+            true
+        }
+
+        fn packet(&self, packet: Bytes) -> bool {
+            let count = self.submitted.fetch_add(1, Ordering::Relaxed);
+            let full = self.start.elapsed() > Duration::from_millis(180) && count.is_multiple_of(3);
+            if full {
+                self.stalled.store(true, Ordering::Relaxed);
+            }
+            // A backpressured tunnel may drop the packet or retain it for a
+            // pending handshake. Either outcome must respect the byte budget.
+            if !full || count.is_multiple_of(2) {
+                self.other.data(decode_packet(&packet).unwrap());
+            }
+            !full
+        }
+
+        fn progress(&self, _: Progress) {}
+    }
+
+    let budget = 2 * 1024 * 1024;
+    let (a, outgoing) = initiate(config(1, 2, budget));
+    let (b, incoming) = respond(
+        config(2, 1, budget),
+        Start {
+            id: 7,
+            byte_limit: budget,
+            mtu: 1280,
+        },
+    );
+    let queue = |other| BusyQueue {
+        other,
+        start: Instant::now(),
+        stalled: AtomicBool::new(false),
+        submitted: AtomicU32::new(0),
+    };
+    let (initiator, responder) = tokio::join!(
+        outgoing.run(queue(b.clone())),
+        incoming.run(queue(a.clone()))
+    );
+    assert_eq!(initiator.state, State::Complete);
+    assert_eq!(initiator, responder);
 }

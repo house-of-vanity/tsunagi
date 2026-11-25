@@ -178,15 +178,17 @@ fn live_and_completed_readings_keep_the_same_row_and_tapping_retests_a_non_exit_
             );
         }
         let done = s.frame(&n, vec![]);
-        for value in ["125", "≥35"] {
-            let lines = positions(&done, |s| s.ends_with(value));
+        let down_text = format!("{} 125", icon::ARROW_DOWN);
+        let up_text = format!("{} 36", icon::ARROW_UP);
+        for value in [&down_text, &up_text] {
+            let lines = positions(&done, |s| s == value);
             assert_eq!(lines.len(), 1);
             assert!((lines[0].x - button.x).abs() < 31.);
             assert!((lines[0].y - button.y).abs() < 12.);
             assert!(lines[0].x < width);
         }
-        let down = positions(&done, |s| s.ends_with("125"))[0];
-        let up = positions(&done, |s| s.ends_with("≥35"))[0];
+        let down = positions(&done, |s| s == down_text)[0];
+        let up = positions(&done, |s| s == up_text)[0];
         if width > 650. {
             assert!(
                 (down.y - up.y).abs() < 1. && down.x < up.x,

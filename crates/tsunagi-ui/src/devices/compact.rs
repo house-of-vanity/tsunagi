@@ -37,45 +37,82 @@ impl Column {
     }
 }
 
-fn columns(ui: &Ui, width: f32, landscape: bool, unit: Unit) -> Vec<(Column, f32)> {
+fn columns(
+    ui: &Ui,
+    width: f32,
+    landscape: bool,
+    unit: Unit,
+    members: &[Device<'_>],
+) -> Vec<(Column, f32)> {
     let font = egui::TextStyle::Body.resolve(ui.style());
-    let measure = |s: &str| {
+    let text_width = |s: &str| {
         ui.painter()
             .layout_no_wrap(s.into(), font.clone(), Color32::WHITE)
             .size()
             .x
-            + 10.
     };
-    let mut cols = vec![
-        (Column::Device, 0.),
-        (
-            Column::Speed,
-            if landscape {
-                speed::WIDTH.min(width * 0.28)
-            } else {
-                speed::PORTRAIT_WIDTH.min(width * 0.18)
-            },
-        ),
-    ];
-    if landscape && width >= 510. {
-        cols.push((Column::State, measure("Control only").min(width * 0.16)));
+    let measure = |s: &str| text_width(s) + 10.;
+    let disclosure = text_width(icon::CARET_RIGHT) + 3.;
+    let name = 20. + text_width("device") + 3.;
+    let available = width - name - disclosure;
+    let small_speed = speed::PORTRAIT_WIDTH.min(width * 0.18);
+    let address = measure("255.255.255.255").min(width * if landscape { 0.27 } else { 0.35 });
+    let rtt = measure("Data RTT")
+        .max(measure("9999 ms"))
+        .min(width * if landscape { 0.15 } else { 0.22 });
+    let traffic = (landscape && width >= 420.)
+        .then(|| {
+            // Account for both rounded values (up to 1024.0) and the unit
+            // suffixes in the actual body font, independently of the live bytes.
+            let digit = ui.fonts(|fonts| {
+                ('0'..='9')
+                    .max_by(|a, b| {
+                        fonts
+                            .glyph_width(&font, *a)
+                            .total_cmp(&fonts.glyph_width(&font, *b))
+                    })
+                    .unwrap_or('0')
+            });
+            let number = format!("{digit}{digit}{digit}{digit}.{digit}");
+            let bytes_width = format::BYTE_UNITS.iter().fold(0.0_f32, |w, suffix| {
+                w.max(measure(&format!("{number} {suffix} / {number} {suffix}")))
+            });
+            let floor = bytes_width.max(measure(Column::Traffic.title(unit)));
+            match unit {
+                Unit::Bytes => floor,
+                Unit::Packets => members
+                    .iter()
+                    .filter(|m| m.online)
+                    .filter_map(|m| m.overlay)
+                    .fold(floor, |w, p| {
+                        w.max(measure(&traffic_pair(p.tx_packets, p.rx_packets, unit)))
+                    }),
+            }
+        })
+        // An unusually long packet count can use the end of the device name,
+        // but always leave room for its status icon and disclosure.
+        .filter(|w| w + small_speed + 20. + text_width("…") + 3. + disclosure <= width);
+    let mut spare = available - traffic.unwrap_or_default();
+    let state = (landscape && width >= 510.).then(|| measure("Control only"));
+    let speed = if landscape && speed::WIDTH + address + rtt + state.unwrap_or_default() <= spare {
+        speed::WIDTH
+    } else {
+        small_speed
+    };
+    spare -= speed;
+    let mut cols = vec![(Column::Device, 0.), (Column::Speed, speed)];
+    for (column, want) in [(Column::Address, address), (Column::Rtt, rtt)] {
+        if spare >= want {
+            cols.push((column, want));
+            spare -= want;
+        }
     }
-    cols.push((
-        Column::Address,
-        measure("255.255.255.255").min(width * if landscape { 0.27 } else { 0.35 }),
-    ));
-    cols.push((
-        Column::Rtt,
-        measure("9999 ms").min(width * if landscape { 0.15 } else { 0.22 }),
-    ));
-    if landscape && width >= 420. {
-        cols.push((
-            Column::Traffic,
-            measure(Column::Traffic.title(unit))
-                .max(measure("999 MB / 999 MB"))
-                .min(width * 0.29),
-        ));
-        let mut spare = width - cols.iter().map(|c| c.1).sum::<f32>() - 122.;
+    if let Some(w) = state.filter(|w| *w <= spare) {
+        cols.insert(2, (Column::State, w));
+        spare -= w;
+    }
+    if let Some(w) = traffic {
+        cols.push((Column::Traffic, w));
         for (column, desire) in [
             (Column::Version, measure("v1.0.4-rc.1")),
             (Column::Path, measure("tcp-tls direct")),
@@ -90,7 +127,7 @@ fn columns(ui: &Ui, width: f32, landscape: bool, unit: Unit) -> Vec<(Column, f32
     }
     let other: f32 = cols.iter().map(|c| c.1).sum();
     // Reserve the disclosure arrow at the end, including on small split screens.
-    cols[0].1 = (width - other - 16.).max(0.);
+    cols[0].1 = (width - other - disclosure).max(0.);
     cols
 }
 
@@ -117,7 +154,7 @@ pub(super) fn roster(
     let id = egui::Id::new(("expanded device", &network.network_id));
     let mut selected = ui.data(|d| d.get_temp::<String>(id));
     let width = ui.available_width();
-    let columns = columns(ui, width, widgets::landscape(ui.ctx()), unit);
+    let columns = columns(ui, width, widgets::landscape(ui.ctx()), unit, members);
     let font = egui::TextStyle::Body.resolve(ui.style());
     let size = vec2(width, ui.text_style_height(&egui::TextStyle::Body) + 9.);
     ui.spacing_mut().item_spacing.y = 1.;

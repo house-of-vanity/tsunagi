@@ -2220,3 +2220,37 @@ async fn peer_speed_measures_both_wireguard_directions_and_can_be_repeated() {
     a.shutdown().await;
     b.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "throughput varies with CPU and runner load; run with --nocapture"]
+async fn sample_encrypted_loopback_speed() {
+    use tsunagi::ipc::SpeedPhase;
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("loopback-speed-sample");
+    let a = WgAgent::spawn(&discovery, "speeda").await;
+    let b = WgAgent::spawn(&discovery, "speedb").await;
+    let net = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(net, 1).await;
+    b.wait_for_tunnels(net, 1).await;
+    let peer = b.agent.endpoint_id();
+    for metered in [false, true, false, true] {
+        a.agent
+            .start_speed_test(net, Some(peer), metered)
+            .await
+            .unwrap();
+        let report = wait_until("both directions completed", || async {
+            let status = a.agent.network_status(net).await.ok()?.speed;
+            let p = status.peers.get(&peer.to_string())?;
+            matches!(p.phase, SpeedPhase::Done | SpeedPhase::Failed(_)).then(|| p.clone())
+        })
+        .await;
+        println!(
+            "metered={metered} down={:?} up={:?} bytes={} time={}ms",
+            report.down, report.up, report.bytes, report.elapsed_ms
+        );
+        assert_eq!(report.phase, SpeedPhase::Done);
+    }
+    a.shutdown().await;
+    b.shutdown().await;
+}

@@ -22,19 +22,21 @@ pub fn short(id: &str) -> String {
     }
 }
 
+/// Display units for the whole range of the agent's 64-bit byte counters.
+pub(crate) const BYTE_UNITS: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
+
 /// A byte count in binary units.
 pub fn bytes(n: f64) -> String {
-    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
     let mut value = n.max(0.0);
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
+    while value >= 1024.0 && unit < BYTE_UNITS.len() - 1 {
         value /= 1024.0;
         unit += 1;
     }
     if unit == 0 {
         format!("{} B", value as u64)
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        format!("{value:.1} {}", BYTE_UNITS[unit])
     }
 }
 

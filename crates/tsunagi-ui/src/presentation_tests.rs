@@ -260,3 +260,109 @@ fn rotating_the_devices_view_keeps_the_peer_and_fits_traffic_and_states_on_scree
     }
     assert!(label(&draw(portrait, 4., vec![]), "Endpoint ID").is_some());
 }
+
+#[test]
+fn compact_roster_reserves_the_full_tx_rx_pair_as_counters_grow() {
+    use egui::os::OperatingSystem::{Android, Mac};
+
+    for (os, width, font_size, density) in [
+        (Android, 480., 13., 1.),
+        (Mac, 600., 13., 2.),
+        (Mac, 740., 13., 1.),
+        (Android, 800., 19., 2.625),
+    ] {
+        let ctx = Context::default();
+        ctx.set_os(os);
+        ctx.set_fonts(crate::app_fonts());
+        ctx.style_mut(|style| {
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(font_size));
+        });
+        let mut net = NetworkReport {
+            name: "lab".into(),
+            peers: vec![PeerReport {
+                endpoint_id: "alpha".into(),
+                hostname: Some("alpha".into()),
+                agent_version: Some("1.0.6".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(width, 320.))),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .native_pixels_per_point = Some(density);
+        let mut first_cell = None;
+        for (mut unit, tx, rx, expected) in [
+            (Unit::Bytes, 0, 0, "0 B / 0 B"),
+            (Unit::Bytes, 293_069, 294_400, "286.2 kB / 287.5 kB"),
+            (
+                Unit::Bytes,
+                (1 << 30) - 1,
+                (1 << 20) - 1,
+                "1024.0 MB / 1024.0 kB",
+            ),
+            (Unit::Bytes, u64::MAX, 1 << 50, "16.0 EB / 1.0 PB"),
+            (Unit::Packets, 1_234_567, 7_654_321, "1234567 / 7654321"),
+            (
+                Unit::Packets,
+                u64::MAX,
+                u64::MAX - 1,
+                "18446744073709551615 / 18446744073709551614",
+            ),
+        ] {
+            net.overlay = Some(OverlayReport {
+                peers: vec![OverlayPeerReport {
+                    endpoint_id: "alpha".into(),
+                    tx_bytes: tx,
+                    rx_bytes: rx,
+                    tx_packets: tx,
+                    rx_packets: rx,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let output = ctx.run(input.clone(), |ctx| {
+                devices::show(
+                    ctx,
+                    &ReadOnly,
+                    &mut unit,
+                    (&mut None, &mut None),
+                    &net,
+                    "self",
+                    &Traffic::default(),
+                );
+            });
+            let (text, cell) = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == expected => Some((t, s.clip_rect)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing {expected} at {width}"));
+            assert!(!text.galley.elided, "{expected} truncated at {width}");
+            assert!(
+                cell.contains_rect(text.visual_bounding_rect()),
+                "{expected} clipped"
+            );
+            assert!(cell.left() >= 0. && cell.right() <= width);
+            if unit == Unit::Bytes {
+                let bounds = (cell.left(), cell.right());
+                assert_eq!(*first_cell.get_or_insert(bounds), bounds);
+            }
+            assert!(label(&output, "alpha").unwrap().right() <= cell.left());
+            let disclosure = label(&output, icon::CARET_RIGHT).unwrap();
+            assert!(cell.right() <= disclosure.left() && disclosure.right() <= width);
+            if let Some(version) = label(&output, "v1.0.6") {
+                assert!(cell.right() <= version.left() && version.right() <= disclosure.left());
+            }
+        }
+    }
+}

@@ -3,7 +3,7 @@ name = "tsunagi-wg-quic"
 # Its own version, and deliberately separate from the wire version it
 # negotiates: a release here does not stop it talking to a peer on an older
 # build, because what peers compare is `ANNOUNCEMENT_VERSION`.
-version = "1.0.6"
+version = "1.0.7"
 description = "The single internal WireGuard tunnel for tsunagi, independent of external carriers."
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tsunagi-core = { path = "../tsunagi-core", version = "1.0.6" }
+tsunagi-core = { path = "../tsunagi-core", version = "1.0.7" }
 iroh.workspace = true
 tokio.workspace = true
 serde.workspace = true
