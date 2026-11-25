@@ -310,22 +310,106 @@ async fn switching_the_exit_between_networks_keeps_both_overlays_reachable() {
     live.peer.agent.shutdown().await;
 }
 
-#[tokio::test]
-async fn selecting_a_shared_peer_uses_only_the_chosen_membership_for_exit() {
+async fn shared_nodes() -> (Node, Node) {
     let discovery = SharedMemoryDiscovery::new();
     let client = Node::open(TempDir::new().unwrap(), &discovery, "client", None).await;
     let dir = TempDir::new().unwrap();
     let config = tsunagi::testing::config_with(dir.path(), &discovery);
     let peer = Node::start(dir, "shared", config).await;
+    (client, peer)
+}
+
+async fn shared_networks<'a>(client: &Node, peer: &'a Node) -> [ExitNetwork<'a>; 2] {
     // Fixed credentials keep the two automatically derived /24s distinct.
-    let mut meshes = Vec::new();
-    for (name, secret) in [("shared-left", [1; 32]), ("shared-right", [2; 32])] {
+    let join = |name, secret| {
         let credentials = (
             NetworkName::new(name).unwrap(),
             NetworkSecret::from_bytes(secret).unwrap(),
         );
-        meshes.push(ExitNetwork::join(&client, &peer, credentials).await);
-    }
+        ExitNetwork::join(client, peer, credentials)
+    };
+    [
+        join("shared-left", [1; 32]).await,
+        join("shared-right", [2; 32]).await,
+    ]
+}
+
+#[tokio::test]
+#[ignore = "observes a full 180-second WireGuard key lifetime on real clocks"]
+async fn only_the_selected_exit_stays_keyed_through_idle_expiry() {
+    let (client, peer) = shared_nodes().await;
+    let [chosen, other] = shared_networks(&client, &peer).await;
+    client
+        .agent
+        .set_exit_via(chosen.id, Some(peer.id()))
+        .await
+        .unwrap();
+    let tunnel = |network| {
+        client
+            .plugin
+            .overview(network)
+            .unwrap()
+            .peers
+            .into_iter()
+            .find(|p| p.endpoint_id == peer.id())
+            .unwrap()
+            .tunnel
+            .unwrap()
+    };
+    let epoch = tunnel(chosen.id).stats.counter_epoch;
+    let mut old_key_seen = false;
+    tokio::time::timeout(Duration::from_secs(210), async {
+        let mut poll = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            poll.tick().await;
+            let warm = tunnel(chosen.id);
+            let cold = tunnel(other.id);
+            assert_eq!(warm.stats.counter_epoch, epoch);
+            let warm_age = warm
+                .health
+                .since_handshake
+                .expect("usable exit key throughout idle");
+            assert_eq!((warm.stats.tx_bytes, warm.stats.rx_bytes), (0, 0));
+            assert_eq!((cold.stats.tx_bytes, cold.stats.rx_bytes), (0, 0));
+            if cold
+                .health
+                .since_handshake
+                .is_some_and(|age| age >= Duration::from_secs(150))
+            {
+                old_key_seen = true;
+            }
+            if old_key_seen && !cold.health.is_up() {
+                assert!(
+                    warm_age < Duration::from_secs(90),
+                    "exit key renewed before expiry"
+                );
+                assert!(warm.health.idle && cold.health.idle);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("unselected peer's unused session expired");
+
+    let packet = ipv4_packet(chosen.client_addr, INTERNET, b"first IP packet after idle");
+    client.tun().await.push_from_os(packet.clone());
+    assert_eq!(next(&chosen.peer_tun).await, packet);
+    assert!(!tunnel(chosen.id).health.idle);
+    client
+        .agent
+        .set_exit_via(other.id, Some(peer.id()))
+        .await
+        .unwrap();
+    client.wait_for_tunnels(other.id, 1).await;
+    assert!(tunnel(other.id).health.idle, "warming sends no IP payload");
+    client.agent.shutdown().await;
+    peer.agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn selecting_a_shared_peer_uses_only_the_chosen_membership_for_exit() {
+    let (client, peer) = shared_nodes().await;
+    let meshes = shared_networks(&client, &peer).await;
     let tun = client.tun().await;
     for (chosen, other) in [(&meshes[0], &meshes[1]), (&meshes[1], &meshes[0])] {
         client

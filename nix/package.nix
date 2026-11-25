@@ -34,7 +34,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = if withTray then "tsunagi" else "tsunagi-cli";
-  version = "1.0.4";
+  version = "1.0.5";
 
   src = lib.cleanSource ../.;
   cargoLock.lockFile = ../Cargo.lock;

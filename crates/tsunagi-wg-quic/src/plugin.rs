@@ -35,7 +35,6 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use tsunagi::BoxFuture;
-use tsunagi::dataplane::PacketSink;
 use tsunagi::dataplane::transport::SharedLink;
 use tsunagi::dataplane::{IpPlugin, PluginCapability, PluginContext, PluginError};
 use tsunagi::identity::NetworkId;
@@ -213,8 +212,6 @@ struct Worker {
     store: WgKeyStore,
     shared: Mutex<Shared>,
     context: OnceLock<PluginContext>,
-    /// Where decrypted packets go, once the agent has attached one.
-    sink: OnceLock<Arc<dyn PacketSink>>,
 }
 
 impl std::fmt::Debug for Worker {
@@ -315,7 +312,6 @@ impl WireguardPlugin {
             store,
             shared: Mutex::new(Shared::default()),
             context: OnceLock::new(),
-            sink: OnceLock::new(),
         });
 
         let (commands, receiver) = mpsc::channel(64);
@@ -473,13 +469,12 @@ impl Worker {
             }
         };
 
-        let sink = match self.sink.get() {
-            Some(sink) => Arc::clone(sink),
-            // Not attached to an agent: the protocol still runs, and its
-            // packets have nowhere to go.
-            None => Arc::new(tsunagi::dataplane::DiscardPackets) as Arc<dyn PacketSink>,
-        };
-        let device = Arc::new(WireguardDevice::start(network, key, sink));
+        let context = self
+            .context
+            .get()
+            .cloned()
+            .unwrap_or_else(PluginContext::detached);
+        let device = Arc::new(WireguardDevice::start_with_context(network, key, context));
 
         let mut shared = self.lock_shared();
         if let Some(state) = shared.networks.get_mut(&network) {
@@ -668,7 +663,6 @@ impl IpPlugin for WireguardPlugin {
         if let Some(local) = context.local_endpoint_id() {
             let _ = self.worker.local_id.set(local);
         }
-        let _ = self.worker.sink.set(context.packet_sink());
         let _ = self.worker.context.set(context);
     }
 

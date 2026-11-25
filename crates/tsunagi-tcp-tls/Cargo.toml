@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-tcp-tls"
-version = "1.0.4"
+version = "1.0.5"
 description = "TCP TLS carrier for independently encrypted tsunagi mesh traffic."
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tsunagi-core = { path = "../tsunagi-core", version = "1.0.4" }
+tsunagi-core = { path = "../tsunagi-core", version = "1.0.5" }
 iroh.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros"] }
 rustls = "0.23"

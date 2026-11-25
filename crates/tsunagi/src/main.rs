@@ -3884,12 +3884,17 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
         ),
         Some(DataPathReport::None) | None => ("connected · no data path yet".to_string(), false),
     };
+    let idle = data_path_good && row.data_error.is_none() && row.tunnel.is_some_and(|t| t.idle);
+    let show_counters = tunnel_up || idle;
 
     let mut detail = String::new();
     if let Some(v4) = row.overlay_address_v4 {
         detail.push_str(&format!("{v4:<15}  "));
     }
     detail.push_str(&path);
+    if idle {
+        detail.push_str("  ·  idle");
+    }
     if let Some(rtt) = row.data_rtt_ms {
         detail.push_str(&format!("  data RTT {rtt}ms"));
     }
@@ -3906,7 +3911,7 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     }
     detail.extend(taken);
 
-    let health = if !data_path_good || row.data_error.is_some() || (has_overlay && !tunnel_up) {
+    let health = if !data_path_good || row.data_error.is_some() || (has_overlay && !show_counters) {
         Health::Degraded
     } else {
         Health::Good
@@ -3916,12 +3921,12 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     if let Some(reason) = row.data_error {
         out = out.with_note(reason.to_owned());
     }
-    if !tunnel_up && let Some(path) = row.data_transport_detail {
+    if !show_counters && let Some(path) = row.data_transport_detail {
         out = out.with_note(path.to_owned());
     }
     if let Some(tunnel) = row.tunnel {
-        out = out.with_note(match tunnel.handshake_secs_ago {
-            Some(_) => format!(
+        out = out.with_note(if show_counters {
+            format!(
                 "tx {} rx {} · IP bytes ↑{} ↓{}{} · {}",
                 tunnel.tx_packets,
                 tunnel.rx_packets,
@@ -3933,8 +3938,9 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
                     String::new()
                 },
                 row.data_transport_detail.unwrap_or(&tunnel.path)
-            ),
-            None => "encrypted data channel is not ready yet".into(),
+            )
+        } else {
+            "encrypted data channel is not ready yet".into()
         });
     }
     out
@@ -5771,6 +5777,36 @@ mod status_tests {
             text.contains("encrypted data channel is not ready yet"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_idle_peer_keeps_its_counters_and_a_missing_route_is_still_degraded() {
+        let mut network = network_after_a_peer_returned();
+        let mut quiet = tunnel(ONLINE, None);
+        quiet.idle = true;
+        network.overlay = Some(overlay(vec![quiet]));
+        for (path, health) in [
+            (
+                tsunagi::ipc::DataPathReport::Direct {
+                    transport: "wg".into(),
+                },
+                Health::Good,
+            ),
+            (tsunagi::ipc::DataPathReport::None, Health::Degraded),
+        ] {
+            network.peers[0].path = path.clone();
+            network.members[1].path = path;
+            let mut report = report::Report::new();
+            report.push(network_section(&network, OWN, false));
+            let text = report.render(false);
+            assert_eq!(report.worst(), health, "{text}");
+            if health == Health::Good {
+                assert!(
+                    text.contains("idle") && text.contains("tx 32 rx 887"),
+                    "{text}"
+                );
+            }
+        }
     }
 
     #[test]

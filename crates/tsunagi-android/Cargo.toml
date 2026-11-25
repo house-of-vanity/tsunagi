@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-android"
-version = "1.0.4"
+version = "1.0.5"
 description = "Android VPN client and egui views for tsunagi."
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,7 @@ name = "vpn_source_probe"
 crate-type = ["cdylib"]
 
 [dependencies]
-tsunagi-runtime = { path = "../tsunagi-runtime", version = "1.0.4" }
+tsunagi-runtime = { path = "../tsunagi-runtime", version = "1.0.5" }
 tsunagi-ui = { path = "../tsunagi-ui" }
 tsunagi-core = { path = "../tsunagi-core" }
 tsunagi-wg-quic = { path = "../tsunagi-wg-quic" }

@@ -35,6 +35,7 @@ pub fn networks(
                             address: peer.overlay_address_v4.map(|a| a.to_string()),
                             handshake_secs_ago: tunnel
                                 .and_then(|t| t.health.since_handshake.map(|s| s.as_secs())),
+                            idle: tunnel.is_some_and(|t| t.health.idle),
                             tx_packets: tunnel.map_or(0, |t| t.stats.tx_packets),
                             rx_packets: tunnel.map_or(0, |t| t.stats.rx_packets),
                             tx_bytes: tunnel.map_or(0, |t| t.stats.tx_bytes),

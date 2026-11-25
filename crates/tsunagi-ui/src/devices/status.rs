@@ -4,6 +4,7 @@ use tsunagi::agent::{DATA_CONNECTING, DATA_DISABLED};
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum Channel {
     Ready,
+    Idle,
     Waiting,
     Error,
     Offline,
@@ -19,11 +20,9 @@ impl Device<'_> {
             Some(DATA_DISABLED) => Channel::Disabled,
             Some(DATA_CONNECTING) => Channel::Waiting,
             Some(_) => Channel::Error,
-            None if self.overlay.is_some_and(|p| p.is_up())
-                && !matches!(self.path, None | Some(DataPathReport::None)) =>
-            {
-                Channel::Ready
-            }
+            None if matches!(self.path, None | Some(DataPathReport::None)) => Channel::Waiting,
+            None if self.overlay.is_some_and(|p| p.idle) => Channel::Idle,
+            None if self.overlay.is_some_and(|p| p.is_up()) => Channel::Ready,
             None => Channel::Waiting,
         }
     }
@@ -31,6 +30,7 @@ impl Device<'_> {
         match self.channel() {
             Channel::Offline => "Offline · peer unreachable",
             Channel::Ready => "Ready · encrypted data channel available",
+            Channel::Idle => "Idle · online, no recent IP traffic",
             Channel::Waiting => "Waiting for the encrypted data channel",
             Channel::Disabled => "Control only · data transports disabled locally",
             Channel::Error => self.data_error.unwrap_or("Data channel error"),
@@ -41,6 +41,7 @@ impl Channel {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Ready => "Ready",
+            Self::Idle => "Idle",
             Self::Waiting => "Waiting",
             Self::Error => "Error",
             Self::Offline => "Offline",
@@ -52,6 +53,8 @@ impl Channel {
         match (self, ui.visuals().dark_mode) {
             (Self::Ready, true) => Color32::from_rgb(100, 210, 136),
             (Self::Ready, false) => Color32::from_rgb(25, 120, 61),
+            (Self::Idle, true) => Color32::from_rgb(145, 176, 200),
+            (Self::Idle, false) => Color32::from_rgb(64, 99, 125),
             (Self::Waiting, true) => Color32::from_rgb(244, 190, 85),
             (Self::Waiting, false) => Color32::from_rgb(150, 94, 8),
             (Self::Error, true) => Color32::from_rgb(255, 129, 116),
@@ -67,6 +70,7 @@ impl Channel {
         let color = self.color(ui);
         let glyph = match self {
             Self::Ready => icon::CHECK_CIRCLE,
+            Self::Idle => icon::MOON,
             Self::Error => icon::WARNING,
             Self::Offline => icon::MINUS_CIRCLE,
             Self::Disabled => icon::PAUSE_CIRCLE,

@@ -940,10 +940,12 @@ pub struct OverlayPeerReport {
     pub public_key: String,
     /// The overlay address the network agreed it holds.
     pub address: Option<String>,
-    /// Seconds since the last WireGuard handshake.
-    ///
-    /// `None` means the tunnel has never handshaken and cannot carry traffic.
+    /// Seconds since the last WireGuard handshake while its session key is usable.
     pub handshake_secs_ago: Option<u64>,
+    /// An established tunnel has no recent or pending IP traffic. An expired
+    /// key on a tunnel required to stay warm is reported as waiting instead.
+    #[serde(default)]
+    pub idle: bool,
     /// Packets encrypted and sent to this peer.
     pub tx_packets: u64,
     /// Packets decrypted from this peer.
@@ -1145,7 +1147,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 25]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 26]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///

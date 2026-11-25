@@ -29,6 +29,7 @@ fn keyboard_focus_explains_an_icon_and_the_shared_font_contains_the_status_glyph
                     icon::WARNING,
                     icon::MINUS_CIRCLE,
                     icon::PAUSE_CIRCLE,
+                    icon::MOON,
                     icon::SIGN_OUT,
                     icon::FINGERPRINT,
                     icon::HASH,
@@ -163,6 +164,7 @@ fn rotating_the_devices_view_keeps_the_peer_and_fits_traffic_and_states_on_scree
         ("charlie", "error"),
         ("delta", "offline"),
         ("echo", "control only"),
+        ("foxtrot", "idle"),
     ] {
         net.members.push(MemberReport {
             endpoint_id: id.into(),
@@ -189,14 +191,24 @@ fn rotating_the_devices_view_keeps_the_peer_and_fits_traffic_and_states_on_scree
             });
         }
     }
-    net.overlay = Some(OverlayReport {
-        peers: vec![OverlayPeerReport {
-            endpoint_id: "alpha".into(),
-            handshake_secs_ago: Some(2),
-            tx_bytes: 2048,
-            rx_bytes: 512,
+    let mut overlay_peers = vec![OverlayPeerReport {
+        endpoint_id: "alpha".into(),
+        handshake_secs_ago: Some(2),
+        tx_bytes: 2048,
+        rx_bytes: 512,
+        ..Default::default()
+    }];
+    // Only the reachable peer with a healthy path may show Idle. A problem
+    // or an offline observation takes precedence over quiet IP counters.
+    overlay_peers.extend(["bravo", "charlie", "delta", "echo", "foxtrot"].map(|id| {
+        OverlayPeerReport {
+            endpoint_id: id.into(),
+            idle: true,
             ..Default::default()
-        }],
+        }
+    }));
+    net.overlay = Some(OverlayReport {
+        peers: overlay_peers,
         ..Default::default()
     });
     let draw = |size, time, events| {
@@ -232,6 +244,7 @@ fn rotating_the_devices_view_keeps_the_peer_and_fits_traffic_and_states_on_scree
             "bytes (TX / RX)",
             "2.0 kB / 512 B",
             "Ready",
+            "Idle",
             "Waiting",
             "Error",
             "Offline",

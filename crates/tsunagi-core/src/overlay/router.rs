@@ -383,7 +383,10 @@ impl RoutingTable {
     ///
     /// Choosing another exit replaces the previous one under the table's write lock.
     pub fn exit_via(&self) -> Option<(NetworkId, EndpointId)> {
-        exit_via(&self.read())
+        self.selected_exit
+            .load()
+            .as_ref()
+            .map(|exit| (exit.route.network, exit.route.peer))
     }
 
     /// Whether a default route is selected and the local source valid in that network.
@@ -856,6 +859,32 @@ mod tests {
     }
 
     const INTERNET: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
+
+    #[test]
+    fn tunnel_warming_follows_the_selected_membership_on_restore_switch_and_off() {
+        let table = Arc::new(RoutingTable::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let context = crate::dataplane::PluginContext::new(tx, peer(1), None, &table);
+        let (a, b) = (network("left"), network("right"));
+        let exit = peer(2);
+        table.set_network(a, with_exit(false, Some(exit))).unwrap();
+        table.set_network(b, NetworkRoutes::default()).unwrap();
+        assert_eq!(context.warm_peer(a), Some(exit));
+        assert_eq!(context.warm_peer(b), None);
+        let select = |via| ExitPolicy { offer: true, via };
+        table.set_exit(b, select(Some(exit)));
+        assert_eq!(context.warm_peer(a), None);
+        assert_eq!(context.warm_peer(b), Some(exit));
+        table.set_exit(b, select(None));
+        assert_eq!(
+            context.warm_peer(b),
+            None,
+            "offering an exit does not select one"
+        );
+        table.set_exit(a, select(Some(exit)));
+        table.remove_network(a);
+        assert_eq!(context.warm_peer(a), None);
+    }
 
     #[test]
     fn refreshing_either_networks_addresses_preserves_the_last_exit_choice() {

@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use boringtun::noise::{Tunn, TunnResult};
 use bytes::Bytes;
@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 
 use tsunagi::dataplane::routing::{FlowId, flow::ip_flow};
 use tsunagi::dataplane::transport::{SharedLink, TransportError};
-use tsunagi::dataplane::{PacketSink, PluginError};
+use tsunagi::dataplane::{PacketSink, PluginContext, PluginError};
 use tsunagi::identity::NetworkId;
 
 use crate::keys::{WgPublicKey, WgSecretKey};
@@ -52,6 +52,11 @@ use crate::keys::{WgPublicKey, WgSecretKey};
 /// drives handshakes, rekeying and keepalives.
 const TIMER_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Start renewing the selected exit at WireGuard's normal rekey age. The
+/// current key can still carry data for a minute while its successor is agreed.
+const WARM_REKEY_AFTER: Duration = Duration::from_secs(120);
+const IDLE_AFTER: Duration = Duration::from_secs(30);
+
 /// Scratch space for one encapsulate or decapsulate call.
 const SCRATCH: usize = 4096;
 
@@ -60,10 +65,13 @@ const SCRATCH: usize = 4096;
 struct FlowTunnel {
     tunn: Tunn,
     queued: VecDeque<(FlowId, usize)>,
+    /// First usable session or most recent IP payload. Keepalives and later
+    /// handshakes leave this alone, including when the current key expires.
+    last_activity: Option<Instant>,
 }
 
-fn is_data(result: &TunnResult<'_>) -> bool {
-    matches!(result, TunnResult::WriteToNetwork(bytes) if bytes.starts_with(&[4, 0, 0, 0]))
+fn carries_ip(frame: &[u8]) -> bool {
+    frame.len() > crate::plugin::WIREGUARD_OVERHEAD as usize && frame.starts_with(&[4, 0, 0, 0])
 }
 
 impl FlowTunnel {
@@ -74,7 +82,11 @@ impl FlowTunnel {
         flow: FlowId,
     ) -> (TunnResult<'a>, FlowId) {
         let result = self.tunn.encapsulate(packet, scratch);
-        if is_data(&result) {
+        if packet.is_empty() {
+            return (result, 0);
+        }
+        if matches!(&result, TunnResult::WriteToNetwork(out) if carries_ip(out)) {
+            self.last_activity = Some(Instant::now());
             return (result, flow);
         }
         // MAX_QUEUE_DEPTH in boringtun 0.7: the newest packet is dropped at 256.
@@ -89,32 +101,83 @@ impl FlowTunnel {
         packet: &[u8],
         scratch: &'a mut [u8],
     ) -> (TunnResult<'a>, FlowId, Option<usize>) {
+        // Empty input asks BoringTun to drain its FIFO. Wait for a usable key
+        // so a failed drain cannot reorder IP packets among queued keepalives.
+        if packet.is_empty() && self.tunn.time_since_last_handshake().is_none() {
+            return (TunnResult::Done, 0, None);
+        }
         let result = self.tunn.decapsulate(None, packet, scratch);
         let (mut flow, mut plaintext_len) = (0, None);
         if packet.is_empty() {
-            if is_data(&result) {
-                if let Some((tag, len)) = self.queued.pop_front() {
-                    flow = tag;
-                    plaintext_len = Some(len);
+            match &result {
+                TunnResult::WriteToNetwork(out) if carries_ip(out) => {
+                    if let Some((tag, len)) = self.queued.pop_front() {
+                        flow = tag;
+                        plaintext_len = Some(len);
+                    }
                 }
-            } else if let Some(pending) = self.queued.pop_front() {
-                // Without a session, draining pops the oldest IP packet and
-                // encapsulate queues it again at the back.
-                self.queued.push_back(pending);
+                // An internal keepalive may occupy a slot in the bounded
+                // FIFO. Discard tags for IP packets BoringTun could not queue.
+                TunnResult::Done => self.queued.clear(),
+                _ => {}
             }
+        }
+        if matches!(
+            result,
+            TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..)
+        ) || plaintext_len.is_some()
+            || (self.last_activity.is_none() && self.tunn.time_since_last_handshake().is_some())
+        {
+            self.last_activity = Some(Instant::now());
         }
         (result, flow, plaintext_len)
     }
 
-    fn update_timers<'a>(&mut self, scratch: &'a mut [u8]) -> TunnResult<'a> {
-        let result = self.tunn.update_timers(scratch);
-        if matches!(
-            result,
-            TunnResult::Err(boringtun::noise::errors::WireGuardError::ConnectionExpired)
-        ) {
-            self.queued.clear();
+    fn health(&self, now: Instant, keep_warm: bool) -> PeerHealth {
+        let since_handshake = self.tunn.time_since_last_handshake();
+        let idle = self.queued.is_empty()
+            && (!keep_warm || since_handshake.is_some())
+            && self
+                .last_activity
+                .is_some_and(|at| now.duration_since(at) >= IDLE_AFTER);
+        PeerHealth {
+            since_handshake,
+            idle,
         }
-        result
+    }
+
+    fn update_timers(
+        &mut self,
+        scratch: &mut [u8],
+        refresh_after: Option<Duration>,
+    ) -> Option<usize> {
+        match self.tunn.update_timers(scratch) {
+            TunnResult::WriteToNetwork(out) => return Some(out.len()),
+            TunnResult::Err(boringtun::noise::errors::WireGuardError::ConnectionExpired) => {
+                if !self.queued.is_empty() {
+                    // BoringTun gave up on pending IP packets. Keep reporting
+                    // a waiting tunnel until a new session actually succeeds.
+                    self.last_activity = None;
+                    self.queued.clear();
+                }
+            }
+            TunnResult::Err(err) => tracing::trace!(?err, "wireguard timer produced an error"),
+            _ => {}
+        }
+        let after = refresh_after?;
+        if self
+            .tunn
+            .time_since_last_handshake()
+            .is_some_and(|age| age < after)
+        {
+            return None;
+        }
+        // An in-flight exchange and its retries remain under BoringTun's
+        // timers. Asking without forcing never restarts one.
+        match self.tunn.format_handshake_initiation(scratch, false) {
+            TunnResult::WriteToNetwork(out) => Some(out.len()),
+            _ => None,
+        }
     }
 }
 
@@ -164,15 +227,14 @@ pub struct PeerStats {
 /// Whether a peer's tunnel has completed a handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerHealth {
-    /// Time since the last successful WireGuard handshake.
-    ///
-    /// `None` means no handshake has completed yet, so the tunnel is not
-    /// carrying traffic. This is reported as it is, never guessed.
+    /// Age of the last handshake while a usable WireGuard session exists.
     pub since_handshake: Option<Duration>,
+    /// A previously established tunnel with no recent or queued IP traffic.
+    pub idle: bool,
 }
 
 impl PeerHealth {
-    /// Whether the tunnel has ever completed a handshake.
+    /// Whether the tunnel currently has a usable session key.
     pub fn is_up(&self) -> bool {
         self.since_handshake.is_some()
     }
@@ -227,14 +289,12 @@ impl Peer {
         }
     }
 
-    fn health(&self) -> PeerHealth {
+    fn health(&self, keep_warm: bool) -> PeerHealth {
         let guard = match self.tunn.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        PeerHealth {
-            since_handshake: guard.tunn.time_since_last_handshake(),
-        }
+        guard.health(Instant::now(), keep_warm)
     }
 }
 
@@ -259,6 +319,7 @@ pub struct PeerSummary {
 
 struct Inner {
     network: NetworkId,
+    context: PluginContext,
     private_key: WgSecretKey,
     peers: RwLock<HashMap<WgPublicKey, Arc<Peer>>>,
     /// Where decrypted packets go.
@@ -292,11 +353,20 @@ impl WireguardDevice {
     /// leave through the sink. Which address belongs to whom, and therefore
     /// where a packet should go, is decided above this.
     pub fn start(network: NetworkId, private_key: WgSecretKey, sink: Arc<dyn PacketSink>) -> Self {
+        Self::start_with_context(network, private_key, PluginContext::with_sink(sink))
+    }
+
+    pub(crate) fn start_with_context(
+        network: NetworkId,
+        private_key: WgSecretKey,
+        context: PluginContext,
+    ) -> Self {
         let inner = Arc::new(Inner {
             network,
             private_key,
             peers: RwLock::new(HashMap::new()),
-            sink,
+            sink: context.packet_sink(),
+            context,
             next_index: AtomicU32::new(1),
         });
 
@@ -336,7 +406,7 @@ impl WireguardDevice {
             let (result, selected_flow) = tunn.encapsulate(packet, &mut scratch, flow);
             match result {
                 TunnResult::WriteToNetwork(out) => {
-                    Some((out.len(), selected_flow, out.starts_with(&[4, 0, 0, 0])))
+                    Some((out.len(), selected_flow, carries_ip(out)))
                 }
                 // No session yet, so nothing to send. Counted as dropped
                 // rather than reported: the handshake is in flight and the
@@ -394,6 +464,7 @@ impl WireguardDevice {
             tunn: Mutex::new(FlowTunnel {
                 tunn,
                 queued: VecDeque::new(),
+                last_activity: None,
             }),
             link,
             counters: Arc::new(PeerCounters {
@@ -442,6 +513,7 @@ impl WireguardDevice {
 
     /// A snapshot of every peer.
     pub fn peers(&self) -> Vec<PeerSummary> {
+        let warm_peer = self.inner.context.warm_peer(self.inner.network);
         let mut peers: Vec<PeerSummary> = read_lock(&self.inner.peers)
             .values()
             .map(|peer| {
@@ -453,7 +525,7 @@ impl WireguardDevice {
                     endpoint_id: peer.endpoint_id,
                     public_key: peer.public_key,
                     overlay_address_v4: overlay_v4,
-                    health: peer.health(),
+                    health: peer.health(warm_peer == Some(peer.endpoint_id)),
                     stats: peer.stats(),
                     path: peer.link.path_description(),
                     max_datagram: peer.link.max_datagram_size(),
@@ -546,14 +618,14 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
         // any packets that were queued while the session was coming up.
         let mut input: Option<&[u8]> = Some(&datagram);
         loop {
-            let outcome = {
+            let (outcome, drain_pending) = {
                 let mut tunn = match peer.tunn.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 let (result, flow, plaintext_len) =
                     tunn.decapsulate(input.unwrap_or(&[]), &mut scratch);
-                match result {
+                let outcome = match result {
                     TunnResult::WriteToNetwork(out) => {
                         Outcome::ToNetwork(out.len(), flow, plaintext_len)
                     }
@@ -567,7 +639,8 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                         tracing::trace!(?err, "wireguard decapsulation failed");
                         Outcome::Failed
                     }
-                }
+                };
+                (outcome, input.is_some() && !tunn.queued.is_empty())
             };
 
             match outcome {
@@ -595,7 +668,6 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                     peer.counters
                         .rx_bytes
                         .fetch_add(len as u64, Ordering::Relaxed);
-                    break;
                 }
                 Outcome::Failed => {
                     peer.counters
@@ -603,8 +675,14 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                         .fetch_add(1, Ordering::Relaxed);
                     break;
                 }
-                Outcome::Done => break,
+                Outcome::Done => {}
             }
+            // A responder can first confirm its key on an incoming keepalive
+            // or IP packet. Flush waiting application traffic on that path too.
+            if !drain_pending {
+                break;
+            }
+            input = None;
         }
     }
 }
@@ -620,24 +698,20 @@ enum Outcome {
 async fn drive_timers(inner: Arc<Inner>) {
     let mut ticker = tokio::time::interval(TIMER_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut scratch = vec![0u8; SCRATCH];
     loop {
         ticker.tick().await;
+        let warm_peer = inner.context.warm_peer(inner.network);
         let peers: Vec<Arc<Peer>> = read_lock(&inner.peers).values().cloned().collect();
         for peer in peers {
-            let mut scratch = vec![0u8; SCRATCH];
             let len = {
                 let mut tunn = match peer.tunn.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                match tunn.update_timers(&mut scratch) {
-                    TunnResult::WriteToNetwork(out) => Some(out.len()),
-                    TunnResult::Err(err) => {
-                        tracing::trace!(?err, "wireguard timer produced an error");
-                        None
-                    }
-                    _ => None,
-                }
+                let refresh_after =
+                    (warm_peer == Some(peer.endpoint_id)).then_some(WARM_REKEY_AFTER);
+                tunn.update_timers(&mut scratch, refresh_after)
             };
             if let Some(len) = len {
                 send_to_peer(&peer, &scratch[..len]);
@@ -662,6 +736,7 @@ mod flow_tests {
                 None,
             ),
             queued: VecDeque::new(),
+            last_activity: None,
         }
     }
     fn wire(result: TunnResult<'_>) -> Vec<u8> {
@@ -669,6 +744,123 @@ mod flow_tests {
             TunnResult::WriteToNetwork(bytes) => bytes.to_vec(),
             _ => panic!("expected WireGuard frame"),
         }
+    }
+
+    fn establish(a: &mut FlowTunnel, b: &mut FlowTunnel, scratch: &mut [u8]) {
+        let hello = wire(a.tunn.format_handshake_initiation(scratch, false));
+        let response = wire(b.decapsulate(&hello, scratch).0);
+        let confirmation = wire(a.decapsulate(&response, scratch).0);
+        let _ = b.decapsulate(&confirmation, scratch);
+    }
+
+    #[test]
+    fn only_a_due_warm_tunnel_rekeys_and_the_old_key_carries_data_during_the_exchange() {
+        let ak = WgSecretKey::from_bytes(&[1; 32]);
+        let bk = WgSecretKey::from_bytes(&[2; 32]);
+        let (mut a, mut b) = (tunnel(&ak, &bk), tunnel(&bk, &ak));
+        let mut scratch = [0u8; SCRATCH];
+        establish(&mut a, &mut b, &mut scratch);
+        assert!(a.update_timers(&mut scratch, None).is_none());
+        assert!(
+            a.update_timers(&mut scratch, Some(WARM_REKEY_AFTER))
+                .is_none()
+        );
+
+        // Make the renewal due now, then withhold its response. BoringTun still
+        // owns both generations of keys and its normal retry timer.
+        let len = a.update_timers(&mut scratch, Some(Duration::ZERO)).unwrap();
+        let hello = scratch[..len].to_vec();
+        assert_eq!(&hello[..4], &[1, 0, 0, 0]);
+        assert!(
+            a.update_timers(&mut scratch, Some(Duration::ZERO))
+                .is_none()
+        );
+        let mut ip = [0u8; 20];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&20u16.to_be_bytes());
+        for generation in 0..2 {
+            ip[19] = generation;
+            let ciphertext = wire(a.encapsulate(&ip, &mut scratch, 7).0);
+            assert!(matches!(b.decapsulate(&ciphertext, &mut scratch).0,
+                TunnResult::WriteToTunnelV4(bytes, _) if bytes == ip));
+            if generation == 0 {
+                let reply = wire(b.decapsulate(&hello, &mut scratch).0);
+                let confirmation = wire(a.decapsulate(&reply, &mut scratch).0);
+                let _ = b.decapsulate(&confirmation, &mut scratch);
+            }
+        }
+        assert!(a.queued.is_empty());
+    }
+
+    #[test]
+    fn idle_survives_background_handshakes_but_never_hides_pending_ip_or_a_cold_exit() {
+        let ak = WgSecretKey::from_bytes(&[1; 32]);
+        let bk = WgSecretKey::from_bytes(&[2; 32]);
+        let (mut a, mut b) = (tunnel(&ak, &bk), tunnel(&bk, &ak));
+        let mut scratch = [0u8; SCRATCH];
+        assert!(!a.health(Instant::now() + IDLE_AFTER, false).idle);
+        establish(&mut a, &mut b, &mut scratch);
+        assert!(!a.health(Instant::now(), false).idle);
+        let activity = (a.last_activity, b.last_activity);
+        let idle_at = Instant::now() + IDLE_AFTER;
+        assert!(a.health(idle_at, true).idle);
+        establish(&mut a, &mut b, &mut scratch);
+        assert_eq!((a.last_activity, b.last_activity), activity);
+        assert!(a.health(idle_at, true).idle);
+        assert!(b.health(idle_at, false).idle);
+
+        let mut ip = [0u8; 20];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&20u16.to_be_bytes());
+        let ciphertext = wire(a.encapsulate(&ip, &mut scratch, 7).0);
+        let _ = b.decapsulate(&ciphertext, &mut scratch);
+        assert!(!a.health(Instant::now(), false).idle);
+        assert!(!b.health(Instant::now(), false).idle);
+        assert!(a.last_activity > activity.0 && b.last_activity > activity.1);
+
+        // Discard BoringTun's session keys to exercise an idle tunnel with no
+        // usable key and the first IP packet that has to wait for a new one.
+        a.tunn
+            .set_static_private(ak.to_static_secret(), ak.public().into_x25519(), None);
+        let idle_at = Instant::now() + IDLE_AFTER;
+        assert!(a.health(idle_at, false).idle);
+        assert!(!a.health(idle_at, true).idle);
+        let _ = a.encapsulate(&ip, &mut scratch, 7);
+        assert!(!a.health(idle_at, false).idle);
+    }
+
+    #[test]
+    fn draining_a_queued_keepalive_preserves_ip_flow_tags_and_eventually_goes_idle() {
+        let ak = WgSecretKey::from_bytes(&[1; 32]);
+        let bk = WgSecretKey::from_bytes(&[2; 32]);
+        let (mut a, mut b) = (tunnel(&ak, &bk), tunnel(&bk, &ak));
+        let mut scratch = [0u8; SCRATCH];
+        // This is what BoringTun's persistent keepalive timer does with no key.
+        let hello = wire(a.tunn.encapsulate(&[], &mut scratch));
+        let mut ip = [0u8; 20];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&20u16.to_be_bytes());
+        for flow in 1..=256 {
+            let _ = a.encapsulate(&ip, &mut scratch, flow);
+        }
+        let reply = wire(b.decapsulate(&hello, &mut scratch).0);
+        let _ = a.decapsulate(&reply, &mut scratch);
+        let (keepalive, flow, bytes) = a.decapsulate(&[], &mut scratch);
+        assert_eq!(
+            wire(keepalive).len(),
+            crate::plugin::WIREGUARD_OVERHEAD as usize
+        );
+        assert_eq!((flow, bytes), (0, None));
+        for expected in 1..=255 {
+            let (data, flow, bytes) = a.decapsulate(&[], &mut scratch);
+            assert!(carries_ip(&wire(data)));
+            assert_eq!((flow, bytes), (expected, Some(ip.len())));
+        }
+        assert!(matches!(
+            a.decapsulate(&[], &mut scratch).0,
+            TunnResult::Done
+        ));
+        assert!(a.health(Instant::now() + IDLE_AFTER, false).idle);
     }
 
     #[test]
@@ -716,7 +908,7 @@ mod flow_tests {
             TunnResult::Done
         ));
         let (result, flow) = a.encapsulate(&packet, &mut scratch, 12345);
-        assert!(is_data(&result));
+        assert!(carries_ip(&wire(result)));
         assert_eq!(flow, 12345);
     }
 }

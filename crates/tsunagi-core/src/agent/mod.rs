@@ -511,7 +511,8 @@ impl Agent {
                 .tun_factory
                 .as_ref()
                 .map(|_| Arc::new(Sink(Arc::downgrade(&inner))) as Arc<dyn PacketSink>);
-            let context = PluginContext::new(plugin_tx, inner.identity.endpoint_id(), sink);
+            let context =
+                PluginContext::new(plugin_tx, inner.identity.endpoint_id(), sink, &inner.routes);
             if let Some(tunnel) = &inner.config.tunnel {
                 tunnel.attach(context);
             }

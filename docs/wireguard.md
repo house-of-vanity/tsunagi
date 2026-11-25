@@ -238,6 +238,15 @@ modifying the source files. Corrupt legacy databases are hard errors. Old
 internal channel; contradictory values are rejected. Interface MTU is selected
 once with `--mtu`, independent of carrier selection.
 
+The client renews the selected exit peer's session key at 120 seconds, even
+when no IP traffic is flowing. The current key can carry packets during the
+exchange. Changing the exit moves this behavior to the new network and peer.
+
+The device list shows **Idle** after an established tunnel has had 30 seconds
+without IP traffic. Handshakes and keepalives do not restart this interval.
+Pending IP packets, a missing path, or a selected exit waiting for a usable
+key still show **Waiting**. A reported transport failure shows **Error**.
+
 User traffic counters count original IP bytes once when the encrypted frame is
 accepted by the logical transport, and once when decrypted on receipt. They do
 not promise remote delivery. They exclude carrier overhead, handshakes,

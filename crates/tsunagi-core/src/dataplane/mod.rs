@@ -15,7 +15,7 @@ pub mod relay;
 pub mod routing;
 pub mod transport;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use iroh::EndpointId;
 use tokio::sync::mpsc;
@@ -176,6 +176,7 @@ pub struct PluginContext {
     /// Where decrypted packets go. Absent when nothing is carrying traffic,
     /// in which case a protocol still runs and its packets are discarded.
     sink: Option<Arc<dyn PacketSink>>,
+    routes: Weak<crate::overlay::RoutingTable>,
 }
 
 impl PluginContext {
@@ -183,12 +184,21 @@ impl PluginContext {
         sender: mpsc::Sender<PluginRequest>,
         local: EndpointId,
         sink: Option<Arc<dyn PacketSink>>,
+        routes: &Arc<crate::overlay::RoutingTable>,
     ) -> Self {
         Self {
             sender: Some(sender),
             local: Some(local),
             sink,
+            routes: Arc::downgrade(routes),
         }
+    }
+
+    /// The peer whose tunnel should stay ready for traffic even while idle.
+    /// Only the locally selected internet exit in its own network qualifies.
+    pub fn warm_peer(&self, network: NetworkId) -> Option<EndpointId> {
+        let (selected, peer) = self.routes.upgrade()?.exit_via()?;
+        (selected == network).then_some(peer)
     }
 
     /// Where to hand a decrypted packet.
@@ -208,15 +218,15 @@ impl PluginContext {
             sender: None,
             local: None,
             sink: None,
+            routes: Weak::new(),
         }
     }
 
     /// A context configured with a custom packet sink.
     pub fn with_sink(sink: Arc<dyn PacketSink>) -> Self {
         Self {
-            sender: None,
-            local: None,
             sink: Some(sink),
+            ..Self::detached()
         }
     }
 
@@ -231,6 +241,7 @@ impl PluginContext {
             sender: Some(sender),
             local: Some(local),
             sink,
+            ..Self::detached()
         }
     }
 
