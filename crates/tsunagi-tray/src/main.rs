@@ -12,6 +12,7 @@
 use tsunagi_ui::about;
 mod agent;
 mod app;
+mod monitor;
 use tsunagi_ui::devices;
 mod icon;
 use tsunagi_ui::stats;

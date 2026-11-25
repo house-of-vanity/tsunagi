@@ -193,6 +193,24 @@ when they reconnect. It does not ban the device: a newer signed claim can return
 Online nodes and the currently selected exit node cannot be forgotten.
 [State and limits](docs/sync-model.md#offline-node-cleanup).
 
+### Traffic monitor
+
+Open **Traffic monitor** (the pulse icon in the tray window or Android header) to
+start an empty live capture. **IP flows** groups both directions of a TCP or UDP
+address/port pair and repeated ICMP echoes for an address pair into one row. Select a network and peer, protocol or
+role to narrow it down. **Via exit node** shows your outgoing internet traffic.
+**Serving exit** shows traffic your device forwards for another peer.
+
+**Transport** shows authenticated control sessions and encrypted datagrams
+forwarded between two other endpoints. For relay rows the arrows follow the
+two displayed endpoints in order. Rates update once per second. Select a row
+to see its packet counts. The monitor records header metadata and counters only.
+
+Inactive rows expire after 60 seconds. **Keep until close** retains flows in a
+private temporary table owned by the window. Closing it discards the table and
+ends collection. Android pauses collection while the activity is in the background.
+Under heavy load the monitor displays the number of missed observations.
+
 ## Platforms
 
 | Platform                  | Build        | CLI `tsng` | Tray | Exit node: offer / use | Packages                            |

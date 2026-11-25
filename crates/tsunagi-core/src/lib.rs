@@ -51,6 +51,7 @@ pub mod storage;
 pub mod task;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod traffic;
 pub mod vip;
 
 pub use agent::{Agent, AgentStatus, Event, NetworkStatus, PeerStatus};

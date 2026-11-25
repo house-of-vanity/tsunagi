@@ -463,7 +463,11 @@ impl Runtime {
         let (link_results_tx, link_results_rx) = mpsc::channel(64);
         let (candidate_tx, discovery_candidates) =
             mpsc::channel(params.limits.max_discovery_candidates.max(1));
-        let hub = crate::dataplane::relay::RelayHub::new(network_id, local_id);
+        let hub = crate::dataplane::relay::RelayHub::with_monitor(
+            network_id,
+            local_id,
+            params.routes.traffic.clone(),
+        );
         // The order the protocols were configured in is also how links are
         // preferred when a neighbour can be reached over more than one.
         hub.set_priority(
@@ -872,6 +876,12 @@ impl Runtime {
 
         match session.outbound.try_send(zeroize::Zeroizing::new(encoded)) {
             Ok(()) => {
+                self.params.routes.traffic.control(
+                    network,
+                    peer,
+                    crate::traffic::Direction::Tx,
+                    bytes,
+                );
                 session.messages_sent += 1;
                 session.bytes_sent += bytes;
                 self.metrics.control_messages_sent += 1;
@@ -2838,6 +2848,12 @@ impl Runtime {
                 if current != Some(session_id) {
                     return;
                 }
+                self.params.routes.traffic.control(
+                    self.network_id,
+                    peer,
+                    crate::traffic::Direction::Rx,
+                    bytes as u64,
+                );
                 self.metrics.control_messages_received += 1;
                 self.metrics.control_bytes_received += bytes as u64;
                 if let Some(session) = self.sessions.get_mut(&peer) {

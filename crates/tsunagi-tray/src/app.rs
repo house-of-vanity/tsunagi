@@ -20,6 +20,8 @@ use tsunagi_ui::app_fonts;
 /// The window's state.
 pub(crate) struct App {
     agent: AgentClient,
+    runtime: tokio::runtime::Handle,
+    monitor: Option<crate::monitor::Monitor>,
     state: UiState,
     /// Traffic rates derived from successive snapshots.
     traffic: Traffic,
@@ -41,6 +43,8 @@ impl App {
         let agent = AgentClient::spawn(&runtime, ctx);
         Ok(Self {
             agent,
+            runtime,
+            monitor: None,
             state: UiState::default(),
             traffic: Traffic::default(),
             sampled: 0,
@@ -59,6 +63,15 @@ impl eframe::App for App {
         }
 
         ui::draw(ctx, &self.agent, &mut self.state, &snapshot, &self.traffic);
+        if self.state.monitor_open {
+            let monitor = self.monitor.get_or_insert_with(|| {
+                crate::monitor::Monitor::new(&self.runtime, self.agent.socket())
+            });
+            if !monitor.show(ctx, &snapshot) {
+                self.monitor = None;
+                self.state.monitor_open = false;
+            }
+        }
         self.show_devices_windows(ctx, &snapshot);
         self.show_vip_windows(ctx, &snapshot);
         self.show_about_window(ctx, &snapshot);

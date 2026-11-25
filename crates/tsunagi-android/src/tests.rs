@@ -44,6 +44,28 @@ async fn a_hidden_service_waits_for_mesh_changes_and_visible_stats_are_on_demand
         .unwrap()
         .unwrap();
     assert!(matches!(*snapshots.borrow_and_update(), State::Ready(..)));
+    // Occupy the other reader slots so this test observes the real service subscription
+    // being acquired on screen open and released on both background and close.
+    let other_windows: Vec<_> = (0..3)
+        .map(|_| phone.agent.subscribe_traffic().unwrap())
+        .collect();
+    let mut monitor = crate::monitor::Monitor::new(None);
+    for _ in 0..2 {
+        monitor.poll(|| {
+            let (tx, rx) = oneshot::channel();
+            commands.try_send((Request::WatchTraffic, tx)).unwrap();
+            Ok(rx)
+        });
+        tsunagi::testing::wait_until("the visible Android monitor subscribed", || async {
+            phone.agent.subscribe_traffic().is_err().then_some(())
+        })
+        .await;
+        monitor.poll(|| panic!("a visible monitor must reuse its subscription"));
+        monitor.pause();
+        assert!(phone.agent.subscribe_traffic().is_ok());
+    }
+    drop((monitor, other_windows));
+
     assert!(
         tokio::time::timeout(Duration::from_millis(2200), snapshots.changed())
             .await

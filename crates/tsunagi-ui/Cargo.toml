@@ -9,6 +9,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+postcard.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile.workspace = true
 egui = "0.31"
 egui-phosphor = "0.9"
 zeroize = "1.9"

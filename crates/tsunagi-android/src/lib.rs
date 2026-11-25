@@ -1,6 +1,7 @@
 //! The Android application. Mesh state belongs to one service-owned Rust agent.
 
 pub mod dns;
+mod monitor;
 pub mod plan;
 
 #[cfg(target_os = "android")]

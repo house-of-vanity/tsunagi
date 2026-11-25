@@ -306,6 +306,13 @@ impl TransportContext for TransportCtx {
 }
 
 impl Agent {
+    /// Start a fresh, independent observation interval for one local window.
+    pub fn subscribe_traffic(
+        &self,
+    ) -> std::result::Result<crate::traffic::TrafficSubscription, String> {
+        self.inner.routes.traffic.subscribe()
+    }
+
     /// Atomically saves or removes a version-checked shared VIP draft.
     /// Every authenticated network member may edit any service.
     pub async fn save_vip(

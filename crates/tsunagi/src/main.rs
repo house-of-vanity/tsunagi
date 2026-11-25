@@ -1539,6 +1539,9 @@ struct AgentControl {
 }
 
 impl tsunagi::ipc::ReportSource for AgentControl {
+    fn subscribe_traffic(&self) -> Result<tsunagi::traffic::TrafficSubscription, String> {
+        self.agent.subscribe_traffic()
+    }
     fn save_vip(
         &self,
         network: String,

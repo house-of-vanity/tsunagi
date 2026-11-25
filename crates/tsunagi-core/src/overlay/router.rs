@@ -109,6 +109,7 @@ pub enum RouteError {
 /// Address ownership across every network this agent is in.
 #[derive(Debug, Default)]
 pub struct RoutingTable {
+    pub(crate) traffic: Arc<crate::traffic::TrafficMonitor>,
     pub(crate) vips: Arc<crate::vip::VipRouter>,
     broadcast: ArcSwap<BroadcastTable>,
     selected_exit: ArcSwapOption<SelectedExit>,

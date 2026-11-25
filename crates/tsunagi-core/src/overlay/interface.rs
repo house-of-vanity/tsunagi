@@ -28,6 +28,7 @@ use iroh::EndpointId;
 use tokio::task::JoinHandle;
 
 use crate::identity::NetworkId;
+use crate::traffic::{Direction, Role};
 
 use super::exit::{ExitRulesReport, RuleSetReport};
 use super::hostrules::{
@@ -252,7 +253,16 @@ impl Interface {
                         Some(PacketSource::Member)
                     )
                 {
-                    carrier.carry(route, packet);
+                    let obs = routes.traffic.packet(
+                        route.network,
+                        route.peer,
+                        Direction::Tx,
+                        &packet,
+                        || Role::ServeExit,
+                    );
+                    if carrier.carry(route, packet) {
+                        obs.record();
+                    }
                 }
             })
         });
@@ -268,7 +278,10 @@ impl Interface {
                     tokio::select! {
                         _=interval.tick()=>{
                             let (probes,jobs)=routes.vips.tick(routes.vips.check_capacity().saturating_sub(checks.len()));
-                            for (route,packet) in probes {carrier.carry(route,packet);}
+                            for (route,packet) in probes {
+                                let obs = routes.traffic.packet(route.network,route.peer,Direction::Tx,&packet,||Role::Vip);
+                                if carrier.carry(route,packet) {obs.record();}
+                            }
                             for job in jobs {
                                 let factory = Arc::clone(&factory);
                                 checks.spawn(job.run(move |socket, source| factory.bind_overlay_socket(socket, source)));
@@ -294,8 +307,14 @@ impl Interface {
                     };
                     match routes.vips.outgoing(packet.clone()) {
                         crate::vip::router::Decision::Send(route, packet) => {
+                            let obs =
+                                routes
+                                    .vips
+                                    .observe_outgoing(&routes.traffic, Some(route), &packet);
                             for part in crate::vip::packet::fragments(packet, mtu) {
+                                let len = part.len();
                                 if carrier.carry(route, part) {
+                                    obs.record_fragment(len);
                                     tally.sent.fetch_add(1, Ordering::Relaxed);
                                 } else {
                                     tally.undeliverable.fetch_add(1, Ordering::Relaxed);
@@ -303,13 +322,22 @@ impl Interface {
                             }
                             continue;
                         }
-                        crate::vip::router::Decision::Local(packet) => {
-                            for part in crate::vip::packet::fragments(packet, mtu) {
-                                let _ = device.send(part).await;
+                        crate::vip::router::Decision::Local(translated)
+                        | crate::vip::router::Decision::Reassembled(translated) => {
+                            let obs =
+                                routes
+                                    .vips
+                                    .observe_outgoing(&routes.traffic, None, &translated);
+                            for part in crate::vip::packet::fragments(translated, mtu) {
+                                let len = part.len();
+                                if device.send(part).await.is_ok() {
+                                    obs.record_fragment(len);
+                                }
                             }
                             continue;
                         }
-                        crate::vip::router::Decision::Drop => continue,
+                        crate::vip::router::Decision::Drop
+                        | crate::vip::router::Decision::ProbeReceived => continue,
                         crate::vip::router::Decision::Pass => {}
                     }
                     let destination = header.destination();
@@ -322,7 +350,15 @@ impl Interface {
                             .flatten();
                         if let Some(recipients) = recipients {
                             for &route in recipients.iter() {
+                                let obs = routes.traffic.packet(
+                                    route.network,
+                                    route.peer,
+                                    Direction::Tx,
+                                    &packet,
+                                    || Role::Broadcast,
+                                );
                                 if carrier.carry(route, packet.clone()) {
+                                    obs.record();
                                     tally.sent.fetch_add(1, Ordering::Relaxed);
                                     tally.broadcast_sent.fetch_add(1, Ordering::Relaxed);
                                 } else {
@@ -352,7 +388,25 @@ impl Interface {
                         continue;
                     };
                     let len = packet.len() as u64;
+                    let obs = routes.traffic.packet(
+                        route.network,
+                        route.peer,
+                        Direction::Tx,
+                        &packet,
+                        || {
+                            if exit.is_some() {
+                                Role::ViaExit
+                            } else if let IpAddr::V4(src) = header.source()
+                                && routes.accepts_exit_traffic(route.network, src)
+                            {
+                                Role::ServeExit
+                            } else {
+                                Role::Mesh
+                            }
+                        },
+                    );
                     if carrier.carry(route, packet) {
+                        obs.record();
                         if let Some(exit) = exit {
                             exit.tx_bytes.fetch_add(len, Ordering::Relaxed);
                         }
@@ -937,39 +991,101 @@ impl Interface {
         };
         // Source ownership was checked before any VIP reverse translation.
         let packet = match self.routes.vips.incoming(network, peer, packet.clone()) {
-            crate::vip::router::Decision::Send(route, packet) => {
+            crate::vip::router::Decision::Send(route, reply) => {
+                self.routes
+                    .traffic
+                    .packet(network, peer, Direction::Rx, &packet, || Role::Vip)
+                    .record();
+                let packet = reply;
                 // Probe replies use the ordinary peer carrier, never the TUN.
-                self.carrier.carry(route, packet);
+                let tx = self.routes.traffic.packet(
+                    route.network,
+                    route.peer,
+                    Direction::Tx,
+                    &packet,
+                    || Role::Vip,
+                );
+                if self.carrier.carry(route, packet) {
+                    tx.record();
+                }
                 return Ok(());
             }
-            crate::vip::router::Decision::Local(packet) => {
-                for part in crate::vip::packet::fragments(packet, self.mtu) {
+            crate::vip::router::Decision::Local(translated) => {
+                let obs =
+                    self.routes
+                        .traffic
+                        .packet(network, peer, Direction::Rx, &translated, || Role::Vip);
+                for part in crate::vip::packet::fragments(translated, self.mtu) {
+                    let len = part.len();
                     if self.device.send(part).await.is_ok() {
+                        obs.record_fragment(len);
                         self.tally.received.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 return Ok(());
             }
+            crate::vip::router::Decision::Reassembled(reassembled) => {
+                for part in crate::vip::packet::fragments(reassembled, self.mtu) {
+                    self.deliver_admitted(network, peer, part, broadcast, exit.as_ref(), forwarded)
+                        .await;
+                }
+                return Ok(());
+            }
+            crate::vip::router::Decision::ProbeReceived => {
+                self.routes
+                    .traffic
+                    .packet(network, peer, Direction::Rx, &packet, || Role::Vip)
+                    .record();
+                return Ok(());
+            }
             crate::vip::router::Decision::Drop => return Ok(()),
             crate::vip::router::Decision::Pass => packet,
         };
+        self.deliver_admitted(network, peer, packet, broadcast, exit.as_ref(), forwarded)
+            .await;
+        Ok(())
+    }
+
+    async fn deliver_admitted(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+        packet: Bytes,
+        broadcast: bool,
+        exit: Option<&Arc<super::router::SelectedExit>>,
+        forwarded: bool,
+    ) {
+        let obs = self
+            .routes
+            .traffic
+            .packet(network, peer, Direction::Rx, &packet, || {
+                if forwarded {
+                    Role::ServeExit
+                } else if exit.is_some() {
+                    Role::ViaExit
+                } else if broadcast {
+                    Role::Broadcast
+                } else {
+                    Role::Mesh
+                }
+            });
         // Only authenticated member traffic admitted by the exit policy can
         // open a physical socket. A rejected allocation never falls through
         // to Wintun, where the local upstream's split routes might recapture it.
-        #[cfg(not(windows))]
-        let _ = forwarded;
         #[cfg(windows)]
         if forwarded && let Some(gateway) = &self.forwarding {
             if gateway.forward(Route { network, peer }, packet) {
+                obs.record();
                 self.tally.received.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.tally.undeliverable.fetch_add(1, Ordering::Relaxed);
             }
-            return Ok(());
+            return;
         }
         // Remote broadcasts terminate here. Only local TUN ingress can fan out.
         let len = packet.len() as u64;
         if self.device.send(packet).await.is_ok() {
+            obs.record();
             if let Some(exit) = exit {
                 exit.rx_bytes.fetch_add(len, Ordering::Relaxed);
             }
@@ -980,7 +1096,6 @@ impl Interface {
             }
             self.tally.received.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(())
     }
 
     /// The addresses the interface should be carrying, from the table.

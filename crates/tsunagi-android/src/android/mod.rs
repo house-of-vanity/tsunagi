@@ -62,12 +62,15 @@ fn status() -> State {
     state
 }
 fn send(cmd: tsunagi_ui::client::Command) -> Result<Response, String> {
+    submit(Request::Action(cmd))
+}
+fn submit(request: Request) -> Result<Response, String> {
     let (reply, result) = oneshot::channel();
     current()
         .as_ref()
         .ok_or("Tsunagi Agent stopped")?
         .commands
-        .try_send((Request::Action(cmd), reply))
+        .try_send((request, reply))
         .map_err(|_| "Tsunagi Agent is busy or stopped".to_owned())?;
     Ok(result)
 }

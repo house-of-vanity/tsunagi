@@ -14,7 +14,8 @@ internal object Native {
     external fun networkChanged(instance: Long, addresses: String)
     external fun setMetered(instance: Long, metered: Boolean)
 
-    external fun surface()
+    external fun surface(cacheDir: String)
+    external fun pauseTraffic()
     external fun draw(host: MeshSurface, width: Int, height: Int, density: Float, serviceStarted: Boolean, landscape: Boolean): Long
     external fun touch(action: Int, id: Int, x: Float, y: Float)
     external fun input(kind: Int, value: String)

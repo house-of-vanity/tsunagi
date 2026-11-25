@@ -25,6 +25,8 @@
 //! rather than the crate's internal structures, so internal refactors do not
 //! silently change what a client sees.
 
+mod traffic;
+pub use traffic::TrafficStream;
 mod speed;
 pub use speed::{SpeedBatchReport, SpeedPeerReport, SpeedPhase, SpeedRate, SpeedReport};
 
@@ -174,6 +176,8 @@ pub fn default_control_socket_path() -> PathBuf {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Request {
+    /// Open a dedicated, window-scoped local monitor connection.
+    WatchTraffic,
     /// Save a complete version-checked service draft or its deletion.
     SaveVip {
         /// Exact network id.
@@ -326,6 +330,7 @@ impl std::fmt::Debug for Request {
                 "StartSpeedTest {{ {network_id}, peer: {peer:?}, metered: {metered} }}"
             ),
             Request::StopSpeedTest { network_id } => write!(f, "StopSpeedTest({network_id})"),
+            Request::WatchTraffic => f.write_str("WatchTraffic"),
             Request::Status => f.write_str("Status"),
             Request::SetBroadcast {
                 network_id,
@@ -357,6 +362,8 @@ impl std::fmt::Debug for Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Response {
+    /// The connection now accepts interval polls.
+    TrafficReady,
     /// A speed-test action was accepted.
     SpeedTestAccepted,
     /// Accepted configuration with fresh local routing observations.
@@ -1022,6 +1029,12 @@ impl OverlayPeerReport {
 /// running and what they can report or change. That is what keeps this module
 /// free of any knowledge of them.
 pub trait ReportSource: Send + Sync + 'static {
+    /// Start a new independent interval subscription, when supported by the source.
+    fn subscribe_traffic(
+        &self,
+    ) -> std::result::Result<crate::traffic::TrafficSubscription, String> {
+        Err("Traffic monitoring is unavailable".into())
+    }
     /// Atomically saves a complete VIP draft using its original revision.
     fn save_vip(
         &self,
@@ -1196,13 +1209,17 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 27]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 28]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///
 /// The per-platform adapters call this for every connection they accept, so
 /// the request handling is identical on every transport.
-pub(crate) async fn serve_connection<S>(mut stream: S, source: Arc<dyn ReportSource>) -> Result<()>
+pub(crate) async fn serve_connection<S>(
+    mut stream: S,
+    source: Arc<dyn ReportSource>,
+    mut stopped: tokio::sync::watch::Receiver<()>,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1220,6 +1237,16 @@ where
             }
         };
     let response = match request {
+        Request::WatchTraffic => match source.subscribe_traffic() {
+            Ok(sub) => {
+                drop(source);
+                return tokio::select! {
+                    _ = stopped.changed() => Ok(()),
+                    result = traffic::serve(stream,sub) => result,
+                };
+            }
+            Err(reason) => Response::Error(reason),
+        },
         Request::SaveVip {
             network_id,
             config,

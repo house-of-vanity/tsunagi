@@ -148,13 +148,15 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 }
 
 async fn serve(listener: UnixListener, source: Arc<dyn ReportSource>) {
+    let (_lifetime, stopped) = tokio::sync::watch::channel(());
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
         let source = Arc::clone(&source);
+        let stopped = stopped.clone();
         tokio::spawn(async move {
-            if let Err(err) = super::serve_connection(stream, source).await {
+            if let Err(err) = super::serve_connection(stream, source, stopped).await {
                 tracing::debug!(%err, "local control request failed");
             }
         });

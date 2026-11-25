@@ -134,6 +134,8 @@ struct ForwardingTable {
 
 #[derive(Debug)]
 struct Plane {
+    network: NetworkId,
+    traffic: Arc<crate::traffic::TrafficMonitor>,
     local: PeerId,
     table: ArcSwap<ForwardingTable>,
     tally: Arc<Tally>,
@@ -176,7 +178,15 @@ impl Plane {
             self.tally.dropped_no_link.fetch_add(1, Ordering::Relaxed);
             return;
         };
+        let len = frame.len();
         if hop.send(envelope::decrement(frame)).is_ok() {
+            self.traffic.relay(
+                self.network,
+                header.source,
+                header.destination,
+                header.protocol,
+                len,
+            );
             self.tally.forwarded.fetch_add(1, Ordering::Relaxed);
         } else {
             self.tally.dropped_no_link.fetch_add(1, Ordering::Relaxed);
@@ -324,11 +334,21 @@ pub struct RelayHub {
 impl RelayHub {
     /// Creates the router at this network's local endpoint.
     pub fn new(network: NetworkId, local: EndpointId) -> Arc<Self> {
+        Self::with_monitor(network, local, Arc::default())
+    }
+
+    pub(crate) fn with_monitor(
+        network: NetworkId,
+        local: EndpointId,
+        traffic: Arc<crate::traffic::TrafficMonitor>,
+    ) -> Arc<Self> {
         let tally = Arc::new(Tally::default());
         Arc::new(Self {
             network,
             state: Mutex::new(State {
                 plane: Arc::new(Plane {
+                    network,
+                    traffic,
                     local: *local.as_bytes(),
                     table: ArcSwap::from_pointee(ForwardingTable::default()),
                     tally: tally.clone(),

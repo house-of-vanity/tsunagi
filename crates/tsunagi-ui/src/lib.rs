@@ -6,6 +6,7 @@ mod exit;
 pub mod format;
 pub mod home;
 pub mod listeners;
+pub mod monitor;
 #[cfg(test)]
 mod presentation_tests;
 pub mod stats;

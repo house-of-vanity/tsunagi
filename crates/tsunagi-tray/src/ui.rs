@@ -41,6 +41,12 @@ pub(crate) fn draw(
                 if tsunagi_ui::widgets::icon_button(ui, icon::INFO, "About Tsunagi").clicked() {
                     state.about_open = true;
                 }
+                if matches!(&snapshot.status, Some(Ok(_)))
+                    && tsunagi_ui::widgets::icon_button(ui, icon::PULSE, "Traffic monitor")
+                        .clicked()
+                {
+                    state.monitor_open = true;
+                }
                 if snapshot.busy {
                     ui.add(egui::Spinner::new());
                 }

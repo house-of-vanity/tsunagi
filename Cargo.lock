@@ -6467,6 +6467,9 @@ version = "1.0.6"
 dependencies = [
  "egui",
  "egui-phosphor",
+ "postcard",
+ "rusqlite",
+ "tempfile",
  "tsunagi-core",
  "zeroize",
 ]

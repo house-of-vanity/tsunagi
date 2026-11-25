@@ -12,6 +12,8 @@ use zeroize::Zeroizing;
 
 /// A platform notification or user gesture.
 pub enum Request {
+    /// A visible monitor requested its own fresh observation interval.
+    WatchTraffic,
     /// A command from the same form used by the tray.
     Action(Command),
     /// The visible activity requested current counters.
@@ -150,6 +152,8 @@ pub(crate) async fn wait_for_exit_offer(
 
 /// Private reply delivered only to the UI that requested the action.
 pub enum Outcome {
+    /// Owned by one traffic screen and dropped when capture stops.
+    Traffic(tsunagi::traffic::TrafficSubscription),
     /// The agent has applied the action.
     Applied,
     /// Revisions returned by a successful signed write.
@@ -346,6 +350,10 @@ pub async fn serve(
                 let Some((request, reply)) = command else { break };
                 let refresh_zones = !matches!(request, Request::Refresh);
                 let result = match request {
+                    Request::WatchTraffic => {
+                        let _ = reply.send(agent.subscribe_traffic().map(Outcome::Traffic));
+                        continue;
+                    }
                     Request::Refresh => Ok(Outcome::Applied),
                     Request::Action(cmd) => {
                         if matches!(cmd, Command::Join { .. } | Command::Leave { .. } | Command::SetActive { .. }) {

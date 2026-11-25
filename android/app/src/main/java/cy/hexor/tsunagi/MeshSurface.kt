@@ -19,6 +19,7 @@ import javax.microedition.khronos.opengles.GL10
 class MeshSurface(private val activity: MainActivity) : GLSurfaceView(activity), GLSurfaceView.Renderer {
     private val density get() = resources.displayMetrics.density
     private val imm = activity.getSystemService(InputMethodManager::class.java)
+    @Volatile private var paused = false
     private var imeMode = 0
     private var widthPx = 0
     private var heightPx = 0
@@ -33,16 +34,23 @@ class MeshSurface(private val activity: MainActivity) : GLSurfaceView(activity),
         isFocusableInTouchMode = true
         requestFocus()
     }
-    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) = Native.surface()
+    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) = Native.surface(context.cacheDir.absolutePath)
     override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) { widthPx = w; heightPx = h }
     override fun onDrawFrame(gl: GL10?) {
+        if (paused) return
         if (pickExit.getAndSet(false)) Native.input(6, "")
         val landscape = resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
         val delay = Native.draw(this, widthPx, heightPx, density, MeshVpn.started, landscape)
         removeCallbacks(repaint)
         postDelayed(repaint, delay.coerceAtLeast(16))
     }
-    override fun onPause() { super.onPause(); removeCallbacks(repaint) }
+    override fun onPause() {
+        paused = true
+        queueEvent { Native.pauseTraffic() }
+        super.onPause()
+        removeCallbacks(repaint)
+    }
+    override fun onResume() { paused = false; super.onResume(); requestRender() }
     override fun onTouchEvent(e: MotionEvent): Boolean {
         val phase = when (e.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> 0

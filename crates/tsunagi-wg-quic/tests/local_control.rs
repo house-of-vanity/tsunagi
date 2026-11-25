@@ -256,6 +256,9 @@ fn the_socket_path_is_derived_and_short_enough() {
 struct Control(Agent);
 
 impl tsunagi::ipc::ReportSource for Control {
+    fn subscribe_traffic(&self) -> Result<tsunagi::traffic::TrafficSubscription, String> {
+        self.0.subscribe_traffic()
+    }
     fn report(&self) -> BoxFuture<'_, StatusReport> {
         Box::pin(async move { StatusReport::default() })
     }
@@ -427,5 +430,40 @@ async fn a_client_can_add_a_network_to_a_running_agent() {
     assert_eq!(agent.list_networks().await.unwrap().len(), 2);
 
     control.shutdown().await;
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_monitor_connection_has_an_empty_start_and_releases_its_reader_on_disconnect() {
+    use tsunagi::ipc::TrafficStream;
+    let dir = TempDir::new().unwrap();
+    let discovery = SharedMemoryDiscovery::new();
+    let agent = Agent::spawn(config_with(dir.path(), &discovery))
+        .await
+        .unwrap();
+    let path = control_socket_path(dir.path());
+    let listener = ControlSocket::bind(
+        &path,
+        Arc::new(Control(agent.clone())),
+        ControlSocketAccess::Private,
+    )
+    .await
+    .unwrap();
+    let mut window = TrafficStream::open(&path).await.unwrap();
+    assert!(window.snapshot().await.unwrap().flows.is_empty());
+    let remaining: Vec<_> = (0..3).map(|_| agent.subscribe_traffic().unwrap()).collect();
+    assert!(TrafficStream::open(&path).await.is_err());
+    assert!(request_status(&path).await.is_ok());
+    drop(window);
+    wait_until(
+        "closing the window released the agent subscription",
+        || async { agent.subscribe_traffic().ok() },
+    )
+    .await;
+    let mut next = TrafficStream::open(&path).await.unwrap();
+    assert!(next.snapshot().await.unwrap().flows.is_empty());
+    listener.shutdown().await;
+    assert!(next.snapshot().await.is_err());
+    drop(remaining);
     agent.shutdown().await;
 }

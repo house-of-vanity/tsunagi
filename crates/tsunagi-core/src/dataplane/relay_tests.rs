@@ -175,7 +175,10 @@ async fn ecmp_is_per_flow_direct_wins_and_existing_tunnel_survives_changes() {
 
 #[tokio::test]
 async fn transport_reader_forwards_without_any_plugin_reader_and_isolates_protocols() {
-    let hub = RelayHub::new(network(), peer(2));
+    use crate::traffic::{Flow, Role, TrafficMonitor};
+    let monitor = Arc::new(TrafficMonitor::default());
+    let window = monitor.subscribe().unwrap();
+    let hub = RelayHub::with_monitor(network(), peer(2), monitor);
     let a = Wire::new(1, true);
     let c = Wire::new(3, true);
     hub.set_direct(peer(1), "ip", a.clone());
@@ -199,6 +202,20 @@ async fn transport_reader_forwards_without_any_plugin_reader_and_isolates_protoc
     );
     assert_eq!(&sent[0][RELAY_OVERHEAD..], b"end-to-end encrypted");
     assert_eq!(hub.counters().forwarded, 1);
+    let observed = window.snapshot();
+    assert_eq!(observed.flows.len(), 1);
+    let row = &observed.flows[0];
+    assert_eq!(row.key.role, Role::Relay);
+    assert_eq!(row.key.peer, id(1).min(id(4)));
+    assert_eq!(
+        row.key.flow,
+        Flow::Relay {
+            other: id(1).max(id(4)),
+            wire_protocol: tag()
+        }
+    );
+    assert_eq!(row.tx_bytes + row.rx_bytes, sent[0].len() as u64);
+    assert_eq!(row.tx_packets + row.rx_packets, 1);
     hub.close();
 }
 

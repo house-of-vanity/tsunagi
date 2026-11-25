@@ -15,6 +15,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The local traffic monitor could not start or poll its subscription.
+    #[error("{0}")]
+    TrafficMonitor(String),
     /// A requested mesh throughput test cannot run.
     #[error("{0}")]
     SpeedTest(String),

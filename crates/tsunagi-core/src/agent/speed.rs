@@ -201,6 +201,13 @@ pub(super) fn receive_packet(
         && data.id == channel.id
         && inner.routes.peer_addresses(network, peer) == Some((data.destination, data.source))
     {
+        inner
+            .routes
+            .traffic
+            .packet(network, peer, crate::traffic::Direction::Rx, packet, || {
+                crate::traffic::Role::SpeedTest
+            })
+            .record();
         channel.handle.data(data);
     }
     true
@@ -308,11 +315,22 @@ impl wire::Io for TestIo {
 
     fn packet(&self, packet: Bytes) -> bool {
         self.inner.upgrade().is_some_and(|inner| {
-            inner
+            let observation = inner.routes.traffic.packet(
+                self.key.0,
+                self.key.1,
+                crate::traffic::Direction::Tx,
+                &packet,
+                || crate::traffic::Role::SpeedTest,
+            );
+            let sent = inner
                 .config
                 .tunnel
                 .as_ref()
-                .is_some_and(|t| t.carry(self.key.0, self.key.1, packet))
+                .is_some_and(|t| t.carry(self.key.0, self.key.1, packet));
+            if sent {
+                observation.record();
+            }
+            sent
         })
     }
 

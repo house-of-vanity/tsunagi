@@ -38,7 +38,15 @@ fn with_display<T: Default>(f: impl FnOnce(&mut Display) -> T) -> T {
 }
 
 #[unsafe(no_mangle)]
-extern "system" fn Java_cy_hexor_tsunagi_Native_surface(mut env: JNIEnv, _: JObject) {
+extern "system" fn Java_cy_hexor_tsunagi_Native_pauseTraffic(_: JNIEnv, _: JObject) {
+    with_display(|d| d.ui.pause_monitor());
+}
+#[unsafe(no_mangle)]
+extern "system" fn Java_cy_hexor_tsunagi_Native_surface(
+    mut env: JNIEnv,
+    _: JObject,
+    cache: JString,
+) {
     // SAFETY: GLSurfaceView invokes this callback on the GL thread with its ES3 context current.
     let gl = unsafe {
         glow::Context::from_loader_function_cstr(|name| eglGetProcAddress(name.as_ptr()))
@@ -52,9 +60,10 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_surface(mut env: JNIEnv, _: JObj
     };
     let ctx = egui::Context::default();
     crate::view::configure(&ctx);
+    let cache = env.get_string(&cache).ok().map(String::from);
     DISPLAY.with_borrow_mut(|d| {
         // If Android discarded the old EGL context, its GPU resources are already gone.
-        let ui = d
+        let mut ui = d
             .take()
             .map(|old| {
                 // A rotation can recreate EGL. Keep expanded peers and scroll positions
@@ -64,6 +73,9 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_surface(mut env: JNIEnv, _: JObj
                 old.ui
             })
             .unwrap_or_default();
+        if let Some(cache) = cache {
+            ui.set_cache_dir(cache.into());
+        }
         *d = Some(Display {
             painter,
             ctx,
@@ -112,6 +124,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_draw(
         let output = d.ctx.run(input, |ctx| {
             action = d.ui.draw(ctx, &state, super::send).or(action);
         });
+        d.ui.poll_monitor(|| super::submit(crate::service::Request::WatchTraffic));
         if let Some(action) = action {
             let method = match action {
                 SystemAction::Start => "startAgent",

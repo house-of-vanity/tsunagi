@@ -582,3 +582,8 @@ impl std::fmt::Debug for AgentConfig {
 }
 /// Maximum number of transport links a routed datagram may traverse.
 pub const ROUTING_HOP_LIMIT: u8 = 16;
+
+/// Maximum distinct flows per local reader between polls (fits one IPC frame).
+pub(crate) const MAX_INTERVAL_FLOWS: usize = 2048;
+/// Independent local monitor windows per agent.
+pub(crate) const MAX_TRAFFIC_READERS: usize = 4;

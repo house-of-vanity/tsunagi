@@ -217,6 +217,7 @@ async fn serve(
     first: tokio::net::windows::named_pipe::NamedPipeServer,
     source: Arc<dyn ReportSource>,
 ) {
+    let (_lifetime, stopped) = tokio::sync::watch::channel(());
     let mut server = first;
     loop {
         if server.connect().await.is_err() {
@@ -235,15 +236,17 @@ async fn serve(
                 // Nothing left to accept the next client on, but the one in
                 // hand is still answered before the loop ends.
                 let source = Arc::clone(&source);
+                let stopped = stopped.clone();
                 tokio::spawn(async move {
-                    let _ = super::serve_connection(connected, source).await;
+                    let _ = super::serve_connection(connected, source, stopped).await;
                 });
                 return;
             }
         }
         let source = Arc::clone(&source);
+        let stopped = stopped.clone();
         tokio::spawn(async move {
-            if let Err(err) = super::serve_connection(connected, source).await {
+            if let Err(err) = super::serve_connection(connected, source, stopped).await {
                 tracing::debug!(%err, "local control request failed");
             }
         });

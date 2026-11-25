@@ -20,6 +20,7 @@ enum Page {
     #[default]
     Home,
     About,
+    Monitor,
     Join,
     Devices(String),
     Vips(String),
@@ -38,6 +39,7 @@ impl Page {
         match self {
             Self::Home => "tsunagi",
             Self::About => "About",
+            Self::Monitor => "Traffic monitor",
             Self::Join => "Join a network",
             Self::Devices(_) => "Devices",
             Self::Vips(_) => "VIP",
@@ -85,6 +87,8 @@ struct Pending {
 #[derive(Default)]
 pub struct Phone {
     page: Page,
+    monitor: Option<crate::monitor::Monitor>,
+    cache_dir: Option<std::path::PathBuf>,
     forms: UiState,
     traffic: Traffic,
     snapshot: Snapshot,
@@ -108,7 +112,24 @@ pub fn configure(ctx: &Context) {
 }
 
 impl Phone {
+    /// Private directory available to a window's temporary SQLite database.
+    pub fn set_cache_dir(&mut self, path: std::path::PathBuf) {
+        self.cache_dir = Some(path);
+    }
+    /// Release the agent subscription immediately when the activity goes into the background.
+    pub fn pause_monitor(&mut self) {
+        if let Some(m) = &mut self.monitor {
+            m.pause();
+        }
+    }
+    /// Poll the service only while a traffic screen is visible.
+    pub fn poll_monitor(&mut self, open: impl FnOnce() -> Result<Response, String>) {
+        if let Some(m) = &mut self.monitor {
+            m.poll(open);
+        }
+    }
     fn home(&mut self) {
+        self.monitor = None;
         if let Some(previous) = self.before_picker.take() {
             self.forms.exit_confirm = None;
             self.page = previous;
@@ -331,7 +352,7 @@ impl Phone {
             }
             Some(report)
         } else {
-            if self.page.network().is_some() || self.page == Page::Join {
+            if self.page.network().is_some() || matches!(self.page, Page::Join | Page::Monitor) {
                 self.home();
             }
             self.snapshot = Snapshot::default();
@@ -361,6 +382,11 @@ impl Phone {
                             self.page = Page::About;
                         }
                         if report.is_some() {
+                            if tsunagi_ui::widgets::icon_button(ui, icon::PULSE, "Traffic monitor")
+                                .clicked()
+                            {
+                                self.page = Page::Monitor;
+                            }
                             ui.selectable_value(&mut self.forms.unit, Unit::Bytes, "bytes");
                             ui.selectable_value(&mut self.forms.unit, Unit::Packets, "pkts");
                         }
@@ -381,7 +407,19 @@ impl Phone {
             .page
             .network()
             .and_then(|id| report?.networks.iter().find(|n| n.network_id == id));
+        if self.page != Page::Monitor {
+            self.monitor = None;
+        }
         match (&self.page, selected) {
+            (Page::Monitor, _) => {
+                let m = self
+                    .monitor
+                    .get_or_insert_with(|| crate::monitor::Monitor::new(self.cache_dir.clone()));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    m.view
+                        .show(ui, report.map(|r| r.as_ref()), self.snapshot.generation)
+                });
+            }
             (Page::About, _) => about::show(ctx, None, &self.snapshot),
             (Page::Vips(id), Some(network)) => {
                 let editor = self.forms.vip_windows.entry(id.clone()).or_default();

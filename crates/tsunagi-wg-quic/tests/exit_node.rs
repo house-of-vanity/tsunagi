@@ -584,6 +584,8 @@ async fn a_member_sends_its_internet_traffic_through_an_exit_node_and_gets_the_a
             .client
     );
 
+    let server_window = server.agent.subscribe_traffic().unwrap();
+    let client_window = client.agent.subscribe_traffic().unwrap();
     // An ordinary packet for the internet leaves the client's interface and
     // arrives on the server's, from the client's overlay address.
     client_tun.push_from_os(ipv4_packet(client_addr, INTERNET, b"GET /"));
@@ -604,6 +606,34 @@ async fn a_member_sends_its_internet_traffic_through_an_exit_node_and_gets_the_a
     let direct = next(&server_tun).await;
     assert_eq!(&direct[12..16], &client_addr.octets());
     assert_eq!(&direct[16..20], &server_addr.octets());
+
+    // Both endpoints see one conversation in opposite directions, attributed to
+    // the authenticated membership. The direct mesh packet is a separate row.
+    use tsunagi::traffic::Role;
+    for (window, role, peer, tx, rx) in [
+        (
+            server_window,
+            Role::ServeExit,
+            client.id(),
+            reply.len(),
+            request.len(),
+        ),
+        (
+            client_window,
+            Role::ViaExit,
+            server.id(),
+            request.len(),
+            reply.len(),
+        ),
+    ] {
+        let snap = window.snapshot();
+        let flow = snap.flows.iter().find(|r| r.key.role == role).unwrap();
+        assert_eq!((flow.tx_packets, flow.rx_packets), (1, 1));
+        assert_eq!((flow.tx_bytes, flow.rx_bytes), (tx as u64, rx as u64));
+        assert_eq!(flow.key.peer, *peer.as_bytes());
+        assert_eq!(flow.key.network, *id.as_bytes());
+        assert!(snap.flows.iter().any(|r| r.key.role == Role::Mesh));
+    }
 
     // Stopping puts everything back, and the choice is gone.
     client.agent.set_exit_via(id, None).await.unwrap();

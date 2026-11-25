@@ -15,6 +15,8 @@ pub(crate) enum Decision {
     Pass,
     Send(Route, Bytes),
     Local(Bytes),
+    Reassembled(Bytes),
+    ProbeReceived,
     Drop,
 }
 #[derive(Debug)]
@@ -452,6 +454,69 @@ impl VipRouter {
             }
         }
     }
+    /// Identify an outgoing VIP datagram on the client-facing side of NAT. Called
+    /// once on the reassembled datagram; only accepted fragments contribute bytes.
+    pub(crate) fn observe_outgoing(
+        &self,
+        monitor: &crate::traffic::TrafficMonitor,
+        route: Option<Route>,
+        bytes: &[u8],
+    ) -> crate::traffic::Observation {
+        use crate::traffic::{Direction, Flow as ObservedFlow, FlowKey, IpDetail, Role};
+        monitor.prepare(|| {
+            let state = self.lock();
+            let reverse = packet::tuple(bytes).map(Tuple::reverse);
+            let (route, dir, client) = if let Some(route) = route {
+                let original = reverse
+                    .and_then(|t| state.reverse.get(&(route.network, route.peer, t)))
+                    .copied();
+                (route, Direction::Tx, original)
+            } else {
+                // A local backend both receives requests and returns replies through this TUN.
+                let source = packet::addresses(bytes)?.0;
+                state.networks.iter().find_map(|(id, n)| {
+                    let route = Route {
+                        network: *id,
+                        peer: n.local,
+                    };
+                    if let Some(t) = reverse.and_then(|t| state.reverse.get(&(*id, n.local, t))) {
+                        return Some((route, Direction::Tx, Some(*t)));
+                    }
+                    let reply = reverse
+                        .and_then(|t| state.flows.get(&t))
+                        .is_some_and(|f| f.local && f.key.network == *id);
+                    (reply || n.vips.iter().any(|v| v.address == Some(source))).then_some((
+                        route,
+                        Direction::Rx,
+                        None,
+                    ))
+                })?
+            };
+            let flow = match client {
+                Some(t) => ObservedFlow::Ip {
+                    near: t.src.octets(),
+                    far: t.dst.octets(),
+                    protocol: match t.protocol {
+                        Protocol::Tcp => 6,
+                        Protocol::Udp => 17,
+                    },
+                    detail: IpDetail::Ports(t.sport, t.dport),
+                },
+                None => ObservedFlow::ip(bytes, dir)?,
+            };
+            Some((
+                FlowKey {
+                    network: *route.network.as_bytes(),
+                    peer: *route.peer.as_bytes(),
+                    role: Role::Vip,
+                    flow,
+                },
+                dir,
+                bytes.len() as u64,
+            ))
+        })
+    }
+
     pub fn outgoing(&self, packet: Bytes) -> Decision {
         let mut s = self.lock();
         let Some((src, dst)) = packet::addresses(&packet) else {
@@ -716,6 +781,7 @@ impl VipRouter {
                 p.heard = Some(Instant::now());
                 p.pending = None;
                 p.misses = 0;
+                return Decision::ProbeReceived;
             }
             return Decision::Drop;
         }
@@ -763,7 +829,7 @@ impl VipRouter {
             return packet::rewrite_icmp(&packet, original).map_or(Decision::Drop, Decision::Local);
         }
         if was_fragmented {
-            Decision::Local(packet)
+            Decision::Reassembled(packet)
         } else {
             Decision::Pass
         }
@@ -1021,6 +1087,9 @@ mod tests {
         };
         assert_eq!(route.peer, a);
         let wire = packet::tuple(&out).unwrap();
+        let monitor = std::sync::Arc::new(crate::traffic::TrafficMonitor::default());
+        let capture = monitor.subscribe().unwrap();
+        r.observe_outgoing(&monitor, Some(route), &out).record();
         assert_eq!(wire.dport, 6443);
         assert_ne!(wire.sport, t.sport);
         let reply = packet(wire.reverse(), 0x12);
@@ -1028,6 +1097,17 @@ mod tests {
             panic!("reverse NAT expected")
         };
         assert_eq!(packet::tuple(&reply), Some(t.reverse()));
+        monitor
+            .packet(n, a, crate::traffic::Direction::Rx, &reply, || {
+                crate::traffic::Role::Vip
+            })
+            .record();
+        let sample = capture.snapshot();
+        assert_eq!(sample.flows.len(), 1);
+        assert_eq!(
+            (sample.flows[0].tx_packets, sample.flows[0].rx_packets),
+            (1, 1)
+        );
         assert_eq!(packet::checksum(&reply[..20]), 0);
         {
             r.lock().networks.get_mut(&n).unwrap().vips.clear();
@@ -1073,6 +1153,9 @@ mod tests {
         let Decision::Local(out) = r.outgoing(packet(t, 0)) else {
             panic!("local delivery expected")
         };
+        let monitor = std::sync::Arc::new(crate::traffic::TrafficMonitor::default());
+        let capture = monitor.subscribe().unwrap();
+        r.observe_outgoing(&monitor, None, &out).record();
         let wire = packet::tuple(&out).unwrap();
         assert_eq!(wire.src, t.dst);
         assert_eq!(wire.dst, t.src);
@@ -1080,6 +1163,13 @@ mod tests {
         let Decision::Local(reply) = r.outgoing(packet(wire.reverse(), 0)) else {
             panic!("local reverse NAT expected")
         };
+        r.observe_outgoing(&monitor, None, &reply).record();
+        let sample = capture.snapshot();
+        assert_eq!(sample.flows.len(), 1);
+        assert_eq!(
+            (sample.flows[0].tx_packets, sample.flows[0].rx_packets),
+            (1, 1)
+        );
         assert_eq!(packet::tuple(&reply), Some(t.reverse()));
     }
     #[tokio::test]
