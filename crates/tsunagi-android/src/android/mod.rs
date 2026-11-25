@@ -4,7 +4,7 @@ mod display;
 mod dns;
 use crate::{
     plan::VpnPlan,
-    service::{Reply, Request, Response, State},
+    service::{Reply, Request, Response, ServiceSignals, State},
     tun::AndroidTun,
 };
 use jni::{
@@ -29,7 +29,7 @@ struct Session {
     commands: mpsc::Sender<(Request, Reply)>,
     state: watch::Receiver<State>,
     underlay: watch::Sender<Vec<std::net::IpAddr>>,
-    stop: watch::Sender<bool>,
+    signals: watch::Sender<ServiceSignals>,
 }
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 // Stop/start can cross on the Android main thread. The previous agent closes
@@ -44,9 +44,14 @@ fn status() -> State {
     let Some(session) = current.as_mut() else {
         return State::Off;
     };
+    let state = session.state.borrow().clone();
+    let report = match &state {
+        State::Ready(report, _) => Some(report.as_ref()),
+        _ => None,
+    };
     if session
         .last_refresh
-        .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(2))
+        .is_none_or(|last| last.elapsed() >= tsunagi_ui::client::status_poll_interval(report))
         && session
             .commands
             .try_send((Request::Refresh, oneshot::channel().0))
@@ -54,7 +59,7 @@ fn status() -> State {
     {
         session.last_refresh = Some(std::time::Instant::now());
     }
-    session.state.borrow().clone()
+    state
 }
 fn send(cmd: tsunagi_ui::client::Command) -> Result<Response, String> {
     let (reply, result) = oneshot::channel();
@@ -131,6 +136,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_start(
     state_dir: JString,
     cache_dir: JString,
     addresses: JString,
+    metered: jni::sys::jboolean,
 ) -> jlong {
     let result = (|| -> Result<i64, Box<dyn std::error::Error>> {
         // Keep the application (never an activity) alive for DNS throughout the process.
@@ -188,18 +194,21 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_start(
         let (underlay, physical) = watch::channel(underlay_ips(&addresses));
         let (commands, rx) = mpsc::channel(16);
         let (state, state_rx) = watch::channel(State::Starting);
-        let (stop, stopped) = watch::channel(false);
+        let (signals, updates) = watch::channel(ServiceSignals {
+            stopped: false,
+            metered: metered != 0,
+        });
         static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut slot = current();
         if let Some(old) = slot.as_ref() {
-            old.stop.send_replace(true);
+            old.signals.send_modify(|s| s.stopped = true);
         }
         std::thread::Builder::new()
             .name("tsunagi-agent".into())
             .spawn(move || {
                 let _lifetime = LIFETIME.lock().unwrap_or_else(|e| e.into_inner());
-                if *stopped.borrow() {
+                if updates.borrow().stopped {
                     return;
                 }
                 let run = || -> Result<(), Box<dyn std::error::Error>> {
@@ -226,7 +235,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_start(
                         .await?;
                         let agent = Agent::spawn(config).await?;
                         let _listeners = carriers.listen(&agent);
-                        crate::service::serve(agent, wg, dns, rx, &state, stopped, |notice| {
+                        crate::service::serve(agent, wg, dns, rx, &state, updates, |notice| {
                             update_exit_notification(&notice_vm, &notice_service, id, notice);
                         })
                         .await;
@@ -243,7 +252,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_start(
             commands,
             state: state_rx,
             underlay,
-            stop,
+            signals,
         });
         Ok(id)
     })();
@@ -400,7 +409,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_stop(_: JNIEnv, _: JObject, id: 
     if slot.as_ref().is_some_and(|s| s.id == id)
         && let Some(session) = slot.take()
     {
-        session.stop.send_replace(true);
+        session.signals.send_modify(|s| s.stopped = true);
     }
 }
 fn underlay_ips(addresses: &str) -> Vec<std::net::IpAddr> {
@@ -409,6 +418,21 @@ fn underlay_ips(addresses: &str) -> Vec<std::net::IpAddr> {
         .take(32)
         .filter_map(|s| s.parse().ok())
         .collect()
+}
+#[unsafe(no_mangle)]
+extern "system" fn Java_cy_hexor_tsunagi_Native_setMetered(
+    _: JNIEnv,
+    _: JObject,
+    id: jlong,
+    metered: jni::sys::jboolean,
+) {
+    if let Some(s) = current().as_ref().filter(|s| s.id == id) {
+        s.signals.send_if_modified(|signals| {
+            let changed = signals.metered != (metered != 0);
+            signals.metered = metered != 0;
+            changed
+        });
+    }
 }
 #[unsafe(no_mangle)]
 extern "system" fn Java_cy_hexor_tsunagi_Native_networkChanged(

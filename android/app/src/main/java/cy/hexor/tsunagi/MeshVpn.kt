@@ -40,6 +40,9 @@ class MeshVpn : VpnService() {
     @Volatile private var upstream: Network? = null
     private val changes = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = useUnderlay(network)
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            if (network == upstream && !closed) Native.setMetered(instance, isMetered(capabilities))
+        }
         override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) {
             if (network == upstream && !closed) updateAddresses(properties)
         }
@@ -50,11 +53,15 @@ class MeshVpn : VpnService() {
             // Falling back to the default network here could send iroh into its own TUN.
             setUnderlyingNetworks(emptyArray())
             physicalAddresses = ""
+            Native.setMetered(instance, true)
             Native.networkChanged(instance, "")
         }
     }
 
     private var physicalAddresses = ""
+    // Query the network the agent actually uses, even while its VPN is the app default.
+    private fun isMetered(capabilities: NetworkCapabilities?) =
+        capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) != true
     private fun addresses(properties: LinkProperties?) = properties?.linkAddresses.orEmpty()
         .mapNotNull { it.address.hostAddress?.substringBefore('%') }.distinct().take(32).joinToString(",")
     private fun updateAddresses(properties: LinkProperties) {
@@ -69,10 +76,14 @@ class MeshVpn : VpnService() {
         upstream = network
         setUnderlyingNetworks(arrayOf(network))
         physicalAddresses = addresses(connectivity.getLinkProperties(network))
+        val metered = isMetered(connectivity.getNetworkCapabilities(network))
         if (instance == 0L) {
             Native.trust(applicationContext)
-            instance = Native.start(this, applicationContext, noBackupFilesDir.absolutePath, cacheDir.absolutePath, physicalAddresses)
-        } else Native.networkChanged(instance, physicalAddresses)
+            instance = Native.start(this, applicationContext, noBackupFilesDir.absolutePath, cacheDir.absolutePath, physicalAddresses, metered)
+        } else {
+            Native.setMetered(instance, metered)
+            Native.networkChanged(instance, physicalAddresses)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

@@ -87,6 +87,7 @@ pub fn networks(
             };
 
             NetworkReport {
+                speed: network.speed.clone(),
                 vips: network.vips.clone(),
                 protocols: network.protocols.clone(),
                 auto_start: network.auto_start,

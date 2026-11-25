@@ -35,6 +35,7 @@ dns-publish = ["dep:zbus"]
 testing = ["dep:tempfile", "dep:tracing-subscriber"]
 
 [dependencies]
+tsunagi-speedtest = { path = "../tsunagi-speedtest", version = "0.1.0" }
 arc-swap = "1.9"
 iroh.workspace = true
 # `net` for the local control interface: a Unix socket on Unix, a named pipe

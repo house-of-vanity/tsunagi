@@ -2118,3 +2118,105 @@ async fn vip_udp_reaches_another_backend_after_the_selected_agent_stops() {
     a.shutdown().await;
     alive.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_speed_measures_both_wireguard_directions_and_can_be_repeated() {
+    use tsunagi::ipc::SpeedPhase;
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("wg-speed");
+    let a = WgAgent::spawn(&discovery, "speeda").await;
+    let b = WgAgent::spawn(&discovery, "speedb").await;
+    let net = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    a.wait_for_tunnels(net, 1).await;
+    b.wait_for_tunnels(net, 1).await;
+    let remote = b.agent.endpoint_id();
+    let key = remote.to_string();
+    assert!(
+        a.agent.start_speed_test(net, None, true).await.is_err(),
+        "a non-exit peer is skipped by the batch"
+    );
+    let legacy = tsunagi::testing::TestAgent::spawn(&discovery)
+        .await
+        .unwrap();
+    legacy.agent.join_network(&name, &secret).await.unwrap();
+    wait_for_peers(&a.agent, net, 2).await;
+    let status = a.agent.network_status(net).await.unwrap();
+    assert!(
+        !status
+            .speed
+            .capable
+            .contains(&legacy.agent.endpoint_id().to_string())
+    );
+    assert!(
+        a.agent
+            .start_speed_test(net, Some(legacy.agent.endpoint_id()), true)
+            .await
+            .is_err()
+    );
+    b.agent.set_speed_test_metered(true);
+    a.agent
+        .start_speed_test(net, Some(remote), false)
+        .await
+        .unwrap();
+    assert!(
+        a.agent
+            .start_speed_test(net, Some(remote), false)
+            .await
+            .is_err()
+    );
+    wait_until("live receiver feedback during a peer test", || async {
+        let s = a.agent.network_status(net).await.ok()?.speed;
+        let p = s.peers.get(&key)?;
+        (matches!(p.phase, SpeedPhase::Download | SpeedPhase::Upload) && p.bytes > 0).then_some(())
+    })
+    .await;
+    let result = wait_until("both data directions have finished", || async {
+        let s = a.agent.network_status(net).await.ok()?.speed;
+        let p = s.peers.get(&key)?;
+        (p.phase == SpeedPhase::Done).then(|| p.clone())
+    })
+    .await;
+    assert!(
+        result.down.is_some_and(|r| r.bps > 0) && result.up.is_some_and(|r| r.bps > 0),
+        "{result:?}"
+    );
+    assert!(
+        result.bytes > 0 && result.bytes <= 16 * 1024 * 1024,
+        "the responder's metered limit applies"
+    );
+    assert!(result.path.is_some());
+    a.agent
+        .start_speed_test(net, Some(remote), true)
+        .await
+        .unwrap();
+    wait_until("the repeated download has a provisional rate", || async {
+        let s = a.agent.network_status(net).await.ok()?.speed;
+        let p = s.peers.get(&key)?;
+        (p.phase == SpeedPhase::Download && p.down.is_some()).then_some(())
+    })
+    .await;
+    a.agent.stop_speed_test(net);
+    wait_until("a repeated test can be stopped", || async {
+        let s = a.agent.network_status(net).await.ok()?.speed;
+        let p = s.peers.get(&key)?;
+        (p.phase == SpeedPhase::Cancelled && p.down.is_none() && p.up.is_none()).then_some(())
+    })
+    .await;
+    // No diagnostic was delivered as application traffic on either host.
+    let tun = b.tun(net).await;
+    let src = a.overlay(net).await;
+    let dst = b.overlay(net).await;
+    let ordinary = ipv4_packet(src, dst, b"ordinary overlay application");
+    a.tun(net).await.push_from_os(ordinary.clone());
+    assert_eq!(
+        tokio::time::timeout(tsunagi::testing::DEADLINE, tun.pop_to_os())
+            .await
+            .unwrap()
+            .unwrap(),
+        ordinary
+    );
+    legacy.stop().await;
+    a.shutdown().await;
+    b.shutdown().await;
+}

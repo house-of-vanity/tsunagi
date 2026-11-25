@@ -599,3 +599,76 @@ async fn an_agent_that_is_not_offering_drops_a_members_internet_packets() {
     client.agent.shutdown().await;
     server.agent.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_speed_batch_runs_one_peer_at_a_time_and_stop_preserves_finished_results() {
+    use tsunagi::ipc::SpeedPhase;
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("exit-speed-batch");
+    let a = Node::spawn(&discovery, "speed-client").await;
+    let b = Node::spawn(&discovery, "exit-one").await;
+    let c = Node::spawn(&discovery, "exit-two").await;
+    let net = a.agent.join_network(&name, &secret).await.unwrap();
+    for node in [&b, &c] {
+        node.agent.join_network(&name, &secret).await.unwrap();
+        node.agent.set_exit_offer(net, true).await.unwrap();
+    }
+    wait_until("two capable exit nodes", || async {
+        let status = a.status(net).await;
+        (status.peers.iter().filter(|p| p.exit_node).count() == 2
+            && status.speed.capable.len() == 2)
+            .then_some(())
+    })
+    .await;
+    a.wait_for_tunnels(net, 2).await;
+    a.agent.start_speed_test(net, None, true).await.unwrap();
+    let first = wait_until(
+        "one exit is being tested and the next is queued",
+        || async {
+            let speed = a.status(net).await.speed;
+            assert!(
+                speed
+                    .peers
+                    .values()
+                    .filter(|p| matches!(
+                        p.phase,
+                        SpeedPhase::Preparing | SpeedPhase::Download | SpeedPhase::Upload
+                    ))
+                    .count()
+                    <= 1
+            );
+            let batch = speed.batch?;
+            let (id, _) = speed
+                .peers
+                .iter()
+                .find(|(_, p)| matches!(p.phase, SpeedPhase::Download | SpeedPhase::Upload))?;
+            (batch.total == 2
+                && batch.done == 0
+                && speed.peers.values().any(|p| p.phase == SpeedPhase::Queued))
+            .then(|| id.clone())
+        },
+    )
+    .await;
+    wait_until(
+        "the first result remains visible while the next exit is tested",
+        || async {
+            let speed = a.status(net).await.speed;
+            (speed.batch?.done == 1 && speed.peers.get(&first)?.phase == SpeedPhase::Done)
+                .then_some(())
+        },
+    )
+    .await;
+    a.agent.stop_speed_test(net);
+    let speed = a.status(net).await.speed;
+    assert!(speed.batch.is_none());
+    assert_eq!(speed.peers[&first].phase, SpeedPhase::Done);
+    assert!(
+        speed
+            .peers
+            .values()
+            .any(|r| r.phase == SpeedPhase::Cancelled)
+    );
+    a.agent.shutdown().await;
+    b.agent.shutdown().await;
+    c.agent.shutdown().await;
+}

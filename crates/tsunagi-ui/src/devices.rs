@@ -8,6 +8,9 @@
 use std::collections::HashMap;
 mod compact;
 mod exit_picker;
+mod speed;
+#[cfg(test)]
+mod speed_tests;
 mod status;
 pub use crate::exit::name_of;
 pub use exit_picker::choose_exit;
@@ -160,6 +163,7 @@ pub fn show(
     traffic: &Traffic,
 ) {
     let (confirm, forget_confirm) = confirmations;
+    let speed = speed::Controls::new(network, agent);
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.horizontal(|ui| {
             // Reserve the unit switch even when a network name fills the viewport.
@@ -176,6 +180,17 @@ pub fn show(
         });
         // A copy of the chosen unit for the read-only rendering below.
         let unit = *unit;
+        let devices = devices(network, own_id);
+        let roster_tools = |ui: &mut egui::Ui| {
+            let online = devices.iter().filter(|d| d.online).count();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!(
+                    "devices ({online} online / {} known)",
+                    devices.len()
+                ));
+                speed.toolbar(ui);
+            });
+        };
 
         if ctx.os() == egui::os::OperatingSystem::Android || ui.available_width() < 620.0 {
             egui::ScrollArea::vertical()
@@ -189,24 +204,21 @@ pub fn show(
                     } else {
                         format::sparkline(ui, traffic.network(&network.network_id), unit, 34.0);
                     }
+                    roster_tools(ui);
                     compact::roster(
                         ui,
                         network,
-                        own_id,
+                        &devices,
                         traffic,
                         unit,
                         (confirm, forget_confirm),
+                        &speed,
                     );
                 });
             return;
         }
-        let devices = devices(network, own_id);
-        let online = devices.iter().filter(|d| d.online).count();
         ui.columns(2, |columns| {
-            columns[0].strong(format!(
-                "devices ({online} online / {} known)",
-                devices.len()
-            ));
+            roster_tools(&mut columns[0]);
             columns[0].collapsing("Network details", |ui| summary(ui, network));
             let plot = &mut columns[1];
             plot.label("Network traffic");
@@ -217,18 +229,32 @@ pub fn show(
             });
         });
         ui.add_space(8.0);
-        egui::ScrollArea::both()
+        egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                device_table(
-                    ui,
-                    unit,
-                    network,
-                    &devices,
-                    traffic,
-                    confirm,
-                    forget_confirm,
-                );
+                let table = desktop_columns(ui, unit, network, &devices, traffic);
+                let required = table.widths.iter().sum::<f32>() + crate::table::GAP * 8.;
+                if required <= ui.available_width() {
+                    device_table(
+                        ui,
+                        network,
+                        &devices,
+                        (traffic, unit),
+                        (confirm, forget_confirm),
+                        &speed,
+                        &table,
+                    );
+                } else {
+                    compact::roster(
+                        ui,
+                        network,
+                        &devices,
+                        traffic,
+                        unit,
+                        (confirm, forget_confirm),
+                        &speed,
+                    );
+                }
             });
     });
     confirm_exit(ctx, agent, confirm, Some(&network.network_id));
@@ -652,22 +678,20 @@ fn exit_cell(
     }
 }
 
-/// One table of all devices: online rows carry live counters and a plot,
-/// offline rows show what is known (name and address) and dashes.
-fn device_table(
-    ui: &mut egui::Ui,
+struct DesktopColumns {
+    widths: [f32; 9],
+    total: String,
+    rate: String,
+}
+
+fn desktop_columns(
+    ui: &egui::Ui,
     unit: Unit,
     network: &NetworkReport,
     devices: &[Device<'_>],
     traffic: &Traffic,
-    confirm: &mut Option<ExitConfirm>,
-    forget_confirm: &mut Option<ForgetConfirm>,
-) {
+) -> DesktopColumns {
     let network_id = network.network_id.as_str();
-    if devices.is_empty() {
-        ui.weak("none");
-        return;
-    }
     let widths_id = egui::Id::new(("devices column widths", network_id));
     let mut widths = column_widths(ui, widths_id);
     let previous_widths = widths;
@@ -684,6 +708,7 @@ fn device_table(
     for (column, header) in headers.iter().enumerate() {
         widths[column] = widths[column].max(measure((*header).to_owned()));
     }
+    widths[1] = widths[1].max(measure("exit".into()) + 4. + speed::WIDTH);
     let (mut tx_total, mut rx_total) = (0_u64, 0_u64);
     for device in devices {
         let name = format!(
@@ -723,9 +748,51 @@ fn device_table(
     }
     ui.memory_mut(|m| m.data.insert_temp(widths_id, widths));
     let widths = stretch_columns(widths, ui.available_width());
-    crate::table::row(ui, "device headers", &widths, false, |column, ui| {
+    DesktopColumns {
+        widths,
+        total,
+        rate,
+    }
+}
+
+/// One table of all devices: online rows carry live counters and a plot,
+/// offline rows show what is known (name and address) and dashes.
+fn device_table(
+    ui: &mut egui::Ui,
+    network: &NetworkReport,
+    devices: &[Device<'_>],
+    (traffic, unit): (&Traffic, Unit),
+    (confirm, forget_confirm): (&mut Option<ExitConfirm>, &mut Option<ForgetConfirm>),
+    speed: &speed::Controls<'_>,
+    table: &DesktopColumns,
+) {
+    if devices.is_empty() {
+        ui.weak("none");
+        return;
+    }
+    let network_id = &network.network_id;
+    let headers = column_headers(unit);
+    let widths = &table.widths;
+    crate::table::row(ui, "device headers", widths, false, |column, ui| {
         let response = ui.weak(headers[column]);
         match column {
+            1 => {
+                let rect = ui.max_rect();
+                let speed_rect = rect.split_left_right_at_x(rect.right() - speed::WIDTH).1;
+                let r = ui.interact(
+                    speed_rect,
+                    ui.id().with("speed units"),
+                    egui::Sense::click(),
+                );
+                ui.painter_at(speed_rect).text(
+                    speed_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    speed::HEADER,
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    ui.visuals().weak_text_color(),
+                );
+                widgets::hint(r, speed::HEADER_HINT);
+            }
             2 => {
                 response.on_hover_text("Encrypted data channel readiness.");
             }
@@ -745,14 +812,19 @@ fn device_table(
         crate::table::row(
             ui,
             device.id,
-            &widths,
+            widths,
             index % 2 == 0,
             |column, ui| match column {
                 0 => {
                     name_cell(ui, device);
                     forget_button(ui, device, network, forget_confirm);
                 }
-                1 => exit_cell(ui, device, network_id, confirm),
+                1 => {
+                    let rect = ui.max_rect();
+                    let speed_rect = rect.split_left_right_at_x(rect.right() - speed::WIDTH).1;
+                    exit_cell(ui, device, network_id, confirm);
+                    speed.cell(ui, speed_rect, device);
+                }
                 2 => tunnel_cell(ui, device),
                 3 => {
                     ui.label(rtt_pair(device)).on_hover_text(
@@ -789,17 +861,17 @@ fn device_table(
     crate::table::row(
         ui,
         "device totals",
-        &widths,
+        widths,
         false,
         |column, ui| match column {
             0 => {
                 ui.strong("total");
             }
             6 => {
-                ui.strong(&total);
+                ui.strong(&table.total);
             }
             7 => {
-                ui.strong(&rate);
+                ui.strong(&table.rate);
             }
             _ => {}
         },
@@ -918,6 +990,27 @@ mod tests {
         fn busy(&self) -> bool {
             false
         }
+    }
+
+    fn device_table(
+        ui: &mut egui::Ui,
+        unit: Unit,
+        network: &NetworkReport,
+        devices: &[Device<'_>],
+        traffic: &Traffic,
+        confirm: &mut Option<ExitConfirm>,
+        forget: &mut Option<ForgetConfirm>,
+    ) {
+        let table = desktop_columns(ui, unit, network, devices, traffic);
+        super::device_table(
+            ui,
+            network,
+            devices,
+            (traffic, unit),
+            (confirm, forget),
+            &speed::Controls::new(network, &ReadOnly),
+            &table,
+        );
     }
 
     #[test]

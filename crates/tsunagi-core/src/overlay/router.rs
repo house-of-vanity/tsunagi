@@ -121,6 +121,18 @@ impl RoutingTable {
         Self::default()
     }
 
+    /// Exact local and signed remote addresses for a mesh diagnostic. Exit routes do not qualify.
+    pub(crate) fn peer_addresses(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+    ) -> Option<(Ipv4Addr, Ipv4Addr)> {
+        let networks = self.read();
+        let routes = networks.get(&network)?;
+        let (address, _) = routes.peers.iter().find(|(_, owner)| *owner == peer)?;
+        Some((routes.local?, *address))
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<NetworkId, NetworkRoutes>> {
         match self.networks.read() {
             Ok(guard) => guard,

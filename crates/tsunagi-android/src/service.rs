@@ -34,6 +34,15 @@ pub enum Request {
     },
 }
 
+/// The latest service lifecycle and cost of the physical network Android selected.
+#[derive(Clone, Copy, Default)]
+pub struct ServiceSignals {
+    /// End this instance.
+    pub stopped: bool,
+    /// Android reports that data on the current underlay may be billed.
+    pub metered: bool,
+}
+
 /// A configured default route stays visible if its remote peer goes offline.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExitNotice {
@@ -159,6 +168,14 @@ pub async fn apply(
     command: Command,
     agent: &Agent,
 ) -> Result<Outcome, Box<dyn std::error::Error + Send + Sync>> {
+    apply_on_link(command, agent, false).await
+}
+
+async fn apply_on_link(
+    command: Command,
+    agent: &Agent,
+    metered: bool,
+) -> Result<Outcome, Box<dyn std::error::Error + Send + Sync>> {
     match command {
         Command::Join { name, secret } => {
             agent
@@ -201,6 +218,16 @@ pub async fn apply(
                 .set_exit_via(network_id.parse()?, peer.map(|p| p.parse()).transpose()?)
                 .await?
         }
+        Command::StartSpeedTest { network_id, peer } => {
+            agent
+                .start_speed_test(
+                    network_id.parse()?,
+                    peer.map(|p| p.parse()).transpose()?,
+                    metered,
+                )
+                .await?;
+        }
+        Command::StopSpeedTest { network_id } => agent.stop_speed_test(network_id.parse()?),
         Command::SetExitOffer { .. } => {
             return Err("This phone can only use a remote exit node.".into());
         }
@@ -293,7 +320,7 @@ pub async fn serve(
     dns: crate::dns::Resolver,
     mut commands: mpsc::Receiver<(Request, Reply)>,
     state: &watch::Sender<State>,
-    mut stop: watch::Receiver<bool>,
+    mut signals: watch::Receiver<ServiceSignals>,
     mut publish_exit: impl FnMut(Option<&ExitNotice>),
 ) {
     let mut roster = agent.watch_roster();
@@ -301,10 +328,20 @@ pub async fn serve(
     let mut cached_zones = None;
     let mut retry = false;
     let mut published_exit = None;
+    let mut link = *signals.borrow_and_update();
+    agent.set_speed_test_metered(link.metered);
     loop {
+        if link.stopped {
+            break;
+        }
         let (reply, mut refresh_zones) = tokio::select! {
             biased;
-            _ = async { drop(stop.wait_for(|stopped| *stopped).await) } => break,
+            changed = signals.changed() => {
+                if changed.is_err() { break; }
+                link = *signals.borrow_and_update();
+                agent.set_speed_test_metered(link.metered);
+                continue;
+            }
             command = commands.recv() => {
                 let Some((request, reply)) = command else { break };
                 let refresh_zones = !matches!(request, Request::Refresh);
@@ -314,7 +351,7 @@ pub async fn serve(
                         if matches!(cmd, Command::Join { .. } | Command::Leave { .. } | Command::SetActive { .. }) {
                             dns.replace(None);
                         }
-                        apply(cmd, &agent).await.map_err(|e| e.to_string())
+                        apply_on_link(cmd, &agent, link.metered).await.map_err(|e| e.to_string())
                     }
                     Request::NetworkChanged => {
                         agent.endpoint().network_change().await;

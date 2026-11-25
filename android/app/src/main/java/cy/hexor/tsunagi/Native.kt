@@ -6,12 +6,13 @@ import android.content.Context
 internal object Native {
     init { System.loadLibrary("tsunagi_android") }
     external fun trust(context: Context)
-    external fun start(service: MeshVpn, context: Context, state: String, cache: String, addresses: String): Long
+    external fun start(service: MeshVpn, context: Context, state: String, cache: String, addresses: String, metered: Boolean): Long
     external fun failed(instance: Long): Boolean
     external fun stop(instance: Long)
     external fun disconnectExit(instance: Long, network: String, peer: String): Boolean
     external fun tileExit(instance: Long, network: String, peer: String, connect: Boolean, waitForDiscovery: Boolean): String?
     external fun networkChanged(instance: Long, addresses: String)
+    external fun setMetered(instance: Long, metered: Boolean)
 
     external fun surface()
     external fun draw(host: MeshSurface, width: Int, height: Int, density: Float, serviceStarted: Boolean, landscape: Boolean): Long

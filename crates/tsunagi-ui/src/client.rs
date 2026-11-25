@@ -1,6 +1,9 @@
 //! Commands and observations shared by both graphical clients.
-use std::{path::PathBuf, time::Instant};
-use tsunagi::ipc::StatusReport;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+use tsunagi::ipc::{SpeedPhase, SpeedReport, StatusReport};
 
 /// A request from the UI to the agent.
 pub enum Command {
@@ -62,6 +65,18 @@ pub enum Command {
         /// Selected member identity.
         peer: Option<String>,
     },
+    /// Measure one peer, or all compatible online exits in sequence.
+    StartSpeedTest {
+        /// Exact network identity.
+        network_id: String,
+        /// Exact peer identity, or all exits when absent.
+        peer: Option<String>,
+    },
+    /// Cancel this network's current test and any queued exits.
+    StopSpeedTest {
+        /// Exact network identity.
+        network_id: String,
+    },
     /// Join a network, or start one already configured.
     Join {
         /// Network name.
@@ -118,4 +133,26 @@ pub trait Client {
     fn send(&self, command: Command);
     /// An earlier action is waiting for an acknowledgement.
     fn busy(&self) -> bool;
+}
+
+pub(crate) fn speed_running(report: &SpeedReport) -> bool {
+    report.batch.is_some()
+        || report.peers.values().any(|peer| {
+            matches!(
+                peer.phase,
+                SpeedPhase::Queued
+                    | SpeedPhase::Preparing
+                    | SpeedPhase::Download
+                    | SpeedPhase::Upload
+            )
+        })
+}
+
+/// Poll more frequently while showing a short, live speed measurement.
+pub fn status_poll_interval(report: Option<&StatusReport>) -> Duration {
+    if report.is_some_and(|r| r.networks.iter().any(|n| speed_running(&n.speed))) {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_secs(2)
+    }
 }

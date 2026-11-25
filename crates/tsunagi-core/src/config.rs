@@ -211,6 +211,8 @@ pub struct Limits {
     pub max_discovery_candidates: usize,
     /// Maximum simultaneous authenticated sessions per network.
     pub max_sessions_per_network: usize,
+    /// Maximum per-peer speed results or queued tests retained by the agent.
+    pub max_speed_results: usize,
     /// Maximum simultaneous inbound connections being handshaken.
     pub max_inbound_handshakes: usize,
     /// Capacity of a session's outbound queue, providing backpressure.
@@ -247,6 +249,7 @@ impl Default for Limits {
             max_concurrent_dials: 8,
             max_discovery_candidates: 16,
             max_sessions_per_network: 64,
+            max_speed_results: 256,
             max_inbound_handshakes: 32,
             session_send_queue: 64,
             event_buffer: 512,

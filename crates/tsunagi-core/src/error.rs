@@ -15,6 +15,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A requested mesh throughput test cannot run.
+    #[error("{0}")]
+    SpeedTest(String),
     /// A node-history cleanup is unsafe, stale or cannot be performed.
     #[error("cannot forget node: {0}")]
     ForgetNode(String),

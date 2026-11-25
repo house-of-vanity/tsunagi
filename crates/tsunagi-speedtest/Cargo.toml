@@ -1,0 +1,20 @@
+[package]
+name = "tsunagi-speedtest"
+version = "0.1.0"
+description = "Bounded, adaptive goodput measurements over an authenticated mesh tunnel"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+postcard.workspace = true
+serde.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

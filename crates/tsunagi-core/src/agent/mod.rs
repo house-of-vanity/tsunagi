@@ -22,6 +22,7 @@ mod events;
 mod network;
 mod session;
 mod shutdown;
+mod speed;
 mod status;
 
 pub use events::Event;
@@ -95,6 +96,7 @@ pub struct Agent {
 #[derive(Debug)]
 struct Inner {
     config: AgentConfig,
+    speed: speed::SpeedTests,
     limits: Arc<Limits>,
     storage: Storage,
     identity: DeviceIdentity,
@@ -220,6 +222,9 @@ impl PacketSink for Sink {
             let Some(inner) = self.0.upgrade() else {
                 return;
             };
+            if speed::receive_packet(&inner, network, peer, &packet) {
+                return;
+            }
             let Some(interface) = inner.interface.get() else {
                 return;
             };
@@ -444,6 +449,7 @@ impl Agent {
 
         let (range_changed, range_updates) = watch::channel(());
         let inner = Arc::new(Inner {
+            speed: speed::SpeedTests::default(),
             limits,
             storage,
             identity,
@@ -1007,6 +1013,7 @@ impl Agent {
             self.inner.ensure_interface().await;
         }
         let handle = network::spawn(RuntimeParams {
+            agent: Arc::downgrade(&self.inner),
             vips,
             retirements,
             broadcast,
@@ -1080,6 +1087,7 @@ impl Agent {
     }
 
     async fn stop_network_locked(&self, network_id: NetworkId) -> Result<()> {
+        self.inner.speed.remove_network(network_id);
         let handle = {
             let mut networks = self.inner.networks.write().await;
             networks
@@ -1316,6 +1324,7 @@ impl Agent {
                 })
                 .collect();
             networks.push(NetworkStatus {
+                speed: Default::default(),
                 vips,
                 protocols: self.effective_protocols(stored.protocols.as_ref()),
                 auto_start: stored.auto_start,
@@ -1395,6 +1404,7 @@ impl Agent {
     /// After this returns, the state directory can be opened by another agent.
     pub async fn shutdown(&self) {
         self.inner.shutdown.trigger();
+        self.inner.speed.shutdown();
         let lifecycle_guard = self.inner.lifecycle.lock().await;
 
         let handles: Vec<NetworkHandle> = {

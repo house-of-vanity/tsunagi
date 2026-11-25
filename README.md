@@ -145,6 +145,21 @@ change applies on the next start. In the tray or on Android, click the network
 name to expand its card. Open **data transports** to enable transports and set
 their initial preference order. **Show devices** lists peers and their reported
 Tsunagi versions. On Android, tap a device to see its version and traffic.
+
+Select a peer’s speedometer in **Devices** to measure download and upload
+through its current encrypted mesh path. The cell shows live rates in Mbit/s.
+Select the result to test again, or use **Test exits** to check the network’s
+online, compatible exit nodes one at a time. The test ends at the peer, so its
+Internet uplink beyond that peer is outside the measurement. A **≥** result is a
+sustained lower bound when the time or traffic budget runs out. A missing
+direction means the sample was too short. Both peers need speed-test support.
+
+A test runs for up to five seconds. It raises the offered rate in steps and
+counts unique payload bytes at the receiver. The traffic ceiling is 96 MiB per
+direction for one peer, or 8 MiB when either endpoint reports a metered link.
+A batch shares 128 MiB per direction among its exits, or 16 MiB on a metered
+initiator. These ceilings count probe IP packets before tunnel overhead.
+
 Adjacent peers need a common external transport at the same wire version.
 Peers that both support link comparison probe another mutually enabled transport
 while traffic continues on the current one. They can switch to a faster healthy link.

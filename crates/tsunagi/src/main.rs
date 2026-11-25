@@ -1760,6 +1760,38 @@ impl tsunagi::ipc::ReportSource for AgentControl {
         })
     }
 
+    fn start_speed_test(
+        &self,
+        network_id: String,
+        peer: Option<String>,
+        metered: bool,
+    ) -> tsunagi::BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let network = network_id
+                .parse()
+                .map_err(|err| format!("invalid network id: {err}"))?;
+            let peer = peer
+                .as_deref()
+                .map(str::parse::<EndpointId>)
+                .transpose()
+                .map_err(|err| format!("invalid endpoint id: {err}"))?;
+            self.agent
+                .start_speed_test(network, peer, metered)
+                .await
+                .map_err(|err| err.to_string())
+        })
+    }
+
+    fn stop_speed_test(&self, network_id: String) -> tsunagi::BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let network = network_id
+                .parse()
+                .map_err(|err| format!("invalid network id: {err}"))?;
+            self.agent.stop_speed_test(network);
+            Ok(())
+        })
+    }
+
     fn set_exit_node(
         &self,
         network_id: String,
@@ -5202,6 +5234,7 @@ mod status_tests {
     /// The situation that prompted this: one peer left and came back.
     fn network_after_a_peer_returned() -> NetworkReport {
         NetworkReport {
+            speed: Default::default(),
             vips: Vec::new(),
             protocols: vec!["wg-quic".into()],
             auto_start: true,

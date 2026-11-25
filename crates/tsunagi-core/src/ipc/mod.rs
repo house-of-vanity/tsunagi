@@ -25,6 +25,9 @@
 //! rather than the crate's internal structures, so internal refactors do not
 //! silently change what a client sees.
 
+mod speed;
+pub use speed::{SpeedBatchReport, SpeedPeerReport, SpeedPhase, SpeedRate, SpeedReport};
+
 #[cfg(unix)]
 pub mod unix;
 #[cfg(windows)]
@@ -277,6 +280,20 @@ pub enum Request {
         /// The member's endpoint id, or `None` to stop using an exit node.
         peer: Option<String>,
     },
+    /// Begin a peer test or a sequential batch of advertised exits.
+    StartSpeedTest {
+        /// Active network identifier.
+        network_id: String,
+        /// One peer, or all online exits when absent.
+        peer: Option<String>,
+        /// Apply the smaller metered-link byte budget.
+        metered: bool,
+    },
+    /// Cancel the active local test or batch in this network.
+    StopSpeedTest {
+        /// Active network identifier.
+        network_id: String,
+    },
 }
 
 impl std::fmt::Debug for Request {
@@ -300,6 +317,15 @@ impl std::fmt::Debug for Request {
                 f,
                 "SetProtocols {{ {network_id}, protocols: {protocols:?} }}"
             ),
+            Request::StartSpeedTest {
+                network_id,
+                peer,
+                metered,
+            } => write!(
+                f,
+                "StartSpeedTest {{ {network_id}, peer: {peer:?}, metered: {metered} }}"
+            ),
+            Request::StopSpeedTest { network_id } => write!(f, "StopSpeedTest({network_id})"),
             Request::Status => f.write_str("Status"),
             Request::SetBroadcast {
                 network_id,
@@ -331,6 +357,8 @@ impl std::fmt::Debug for Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Response {
+    /// A speed-test action was accepted.
+    SpeedTestAccepted,
     /// Accepted configuration with fresh local routing observations.
     Vips(Vec<crate::vip::VipStatus>),
     /// An observed offline claim was durably retired.
@@ -711,6 +739,9 @@ pub struct ProtocolReport {
 /// One network.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkReport {
+    /// Current capabilities and results of peer speed tests.
+    #[serde(default)]
+    pub speed: SpeedReport,
     /// Shared VIPs and this client's routing observations.
     #[serde(default)]
     pub vips: Vec<crate::vip::VipStatus>,
@@ -1063,6 +1094,24 @@ pub trait ReportSource: Send + Sync + 'static {
         Box::pin(async move { Err("this agent cannot change broadcast participation".into()) })
     }
 
+    /// Queues a diagnostic against one peer, or all current exit peers.
+    fn start_speed_test(
+        &self,
+        _network_id: String,
+        _peer: Option<String>,
+        _metered: bool,
+    ) -> BoxFuture<'_, std::result::Result<(), String>> {
+        Box::pin(async { Err("this agent cannot test peer speeds".into()) })
+    }
+
+    /// Cancels an individual test and any remaining batch members.
+    fn stop_speed_test(
+        &self,
+        _network_id: String,
+    ) -> BoxFuture<'_, std::result::Result<(), String>> {
+        Box::pin(async { Err("this agent cannot stop speed tests".into()) })
+    }
+
     /// Stops serving a network, or starts serving it again.
     ///
     /// Defaulted to a refusal, like the others.
@@ -1147,7 +1196,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 26]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 27]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///
@@ -1231,6 +1280,18 @@ where
         },
         Request::Secret { network_id } => match source.network_secret(network_id).await {
             Ok(secret) => Response::Secret(RedactedText::new(secret)),
+            Err(reason) => Response::Error(reason),
+        },
+        Request::StartSpeedTest {
+            network_id,
+            peer,
+            metered,
+        } => match source.start_speed_test(network_id, peer, metered).await {
+            Ok(()) => Response::SpeedTestAccepted,
+            Err(reason) => Response::Error(reason),
+        },
+        Request::StopSpeedTest { network_id } => match source.stop_speed_test(network_id).await {
+            Ok(()) => Response::SpeedTestAccepted,
             Err(reason) => Response::Error(reason),
         },
         Request::SetExitOffer {
@@ -1448,6 +1509,43 @@ pub async fn set_exit_node(
     match exchange(path.as_ref(), &request, EXCHANGE_TIMEOUT).await? {
         Response::ExitNode(peer) => Ok(peer),
         Response::Error(message) => Err(Error::Storage(message)),
+        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
+    }
+}
+
+/// Measures the mesh data path to one peer, or queues the network's online exit nodes.
+pub async fn start_speed_test(
+    path: impl AsRef<Path>,
+    network_id: &str,
+    peer: Option<&str>,
+    metered: bool,
+) -> Result<()> {
+    speed_request(
+        path.as_ref(),
+        Request::StartSpeedTest {
+            network_id: network_id.to_owned(),
+            peer: peer.map(str::to_owned),
+            metered,
+        },
+    )
+    .await
+}
+
+/// Stops the current local speed test and clears its remaining queue.
+pub async fn stop_speed_test(path: impl AsRef<Path>, network_id: &str) -> Result<()> {
+    speed_request(
+        path.as_ref(),
+        Request::StopSpeedTest {
+            network_id: network_id.to_owned(),
+        },
+    )
+    .await
+}
+
+async fn speed_request(path: &Path, request: Request) -> Result<()> {
+    match exchange(path, &request, EXCHANGE_TIMEOUT).await? {
+        Response::SpeedTestAccepted => Ok(()),
+        Response::Error(reason) => Err(Error::SpeedTest(reason)),
         other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
     }
 }

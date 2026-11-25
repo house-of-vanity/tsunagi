@@ -1,8 +1,8 @@
 //! A width-constrained device table for touch. Optional columns move into the
 //! expanded row before any essential columns run out of space.
 use super::{
-    AMBER, Device, ExitConfirm, ForgetConfirm, NetworkReport, Traffic, Unit, data_path_text,
-    devices, exit, forget_button, format, icon, rtt_text, traffic_pair, tunnel_cell,
+    AMBER, Device, ExitConfirm, ForgetConfirm, NetworkReport, Traffic, Unit, data_path_text, exit,
+    forget_button, format, icon, rtt_text, speed, traffic_pair, tunnel_cell,
 };
 use crate::widgets;
 use egui::{Align2, Color32, FontId, Rect, Sense, Ui, Vec2, pos2, vec2};
@@ -10,6 +10,7 @@ use egui::{Align2, Color32, FontId, Rect, Sense, Ui, Vec2, pos2, vec2};
 #[derive(Clone, Copy)]
 enum Column {
     Device,
+    Speed,
     State,
     Address,
     Rtt,
@@ -23,6 +24,7 @@ impl Column {
     fn title(self, unit: Unit) -> &'static str {
         match self {
             Self::Device => "device",
+            Self::Speed => speed::HEADER,
             Self::State => "State",
             Self::Address => "IPv4",
             Self::Rtt => "Data RTT",
@@ -44,7 +46,17 @@ fn columns(ui: &Ui, width: f32, landscape: bool, unit: Unit) -> Vec<(Column, f32
             .x
             + 10.
     };
-    let mut cols = vec![(Column::Device, 0.)];
+    let mut cols = vec![
+        (Column::Device, 0.),
+        (
+            Column::Speed,
+            if landscape {
+                speed::WIDTH.min(width * 0.28)
+            } else {
+                speed::PORTRAIT_WIDTH.min(width * 0.18)
+            },
+        ),
+    ];
     if landscape && width >= 510. {
         cols.push((Column::State, measure("Control only").min(width * 0.16)));
     }
@@ -56,7 +68,7 @@ fn columns(ui: &Ui, width: f32, landscape: bool, unit: Unit) -> Vec<(Column, f32
         Column::Rtt,
         measure("9999 ms").min(width * if landscape { 0.15 } else { 0.22 }),
     ));
-    if landscape {
+    if landscape && width >= 420. {
         cols.push((
             Column::Traffic,
             measure(Column::Traffic.title(unit))
@@ -95,17 +107,12 @@ fn text_cell(ui: &Ui, rect: Rect, text: &str, font: &FontId, color: Color32) {
 pub(super) fn roster(
     ui: &mut Ui,
     network: &NetworkReport,
-    own_id: &str,
+    members: &[Device<'_>],
     traffic: &Traffic,
     unit: Unit,
     (exit, forget): (&mut Option<ExitConfirm>, &mut Option<ForgetConfirm>),
+    speed: &speed::Controls<'_>,
 ) {
-    let members = devices(network, own_id);
-    let online = members.iter().filter(|m| m.online).count();
-    ui.strong(format!(
-        "devices ({online} online / {} known)",
-        members.len()
-    ));
     // An Android rotation changes the surrounding scroll area but not the selected peer.
     let id = egui::Id::new(("expanded device", &network.network_id));
     let mut selected = ui.data(|d| d.get_temp::<String>(id));
@@ -121,13 +128,25 @@ pub(super) fn roster(
         if matches!(column, Column::Device) {
             rect.min.x += 20.;
         }
-        text_cell(
-            ui,
-            rect,
-            column.title(unit),
-            &font,
-            ui.visuals().text_color(),
-        );
+        if matches!(column, Column::Speed) {
+            ui.painter_at(rect).text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                column.title(unit),
+                font.clone(),
+                ui.visuals().text_color(),
+            );
+            let r = ui.interact(rect, id.with("speed units"), Sense::click());
+            widgets::hint(r, speed::HEADER_HINT);
+        } else {
+            text_cell(
+                ui,
+                rect,
+                column.title(unit),
+                &font,
+                ui.visuals().text_color(),
+            );
+        }
         x += w;
     }
     for (index, member) in members.iter().enumerate() {
@@ -176,6 +195,10 @@ pub(super) fn roster(
             let mut rect = Rect::from_min_size(pos2(x, row.top()), vec2(w, row.height()));
             x += w;
             let text = match column {
+                Column::Speed => {
+                    speed.cell(ui, rect, member);
+                    continue;
+                }
                 Column::Device => {
                     channel.paint(
                         ui,
@@ -184,13 +207,13 @@ pub(super) fn roster(
                     rect.min.x += 20.;
                     if member.in_use || member.exit_node {
                         ui.painter_at(rect).text(
-                            rect.left_center(),
-                            Align2::LEFT_CENTER,
+                            rect.right_center(),
+                            Align2::RIGHT_CENTER,
                             icon::SIGN_OUT,
                             font.clone(),
                             if member.in_use { exit::GOOD } else { normal },
                         );
-                        rect.min.x += font.size + 3.;
+                        rect.max.x -= font.size + 3.;
                     }
                     member.name()
                 }

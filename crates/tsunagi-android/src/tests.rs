@@ -24,7 +24,7 @@ async fn a_hidden_service_waits_for_mesh_changes_and_visible_stats_are_on_demand
         .await
         .unwrap();
     let (state, mut snapshots) = watch::channel(State::Starting);
-    let (stop, stopped) = watch::channel(false);
+    let (stop, stopped) = watch::channel(crate::service::ServiceSignals::default());
     let (commands, requests) = mpsc::channel(4);
     let agent = phone.agent.clone();
     let task = tokio::spawn(async move {
@@ -59,7 +59,7 @@ async fn a_hidden_service_waits_for_mesh_changes_and_visible_stats_are_on_demand
     tokio::time::timeout(Duration::from_secs(5), snapshots.wait_for(|s| {
         matches!(s, State::Ready(r, _) if r.dns.as_ref().is_some_and(|d| d.zones.iter().any(|z| z == "background-mesh")))
     })).await.unwrap().unwrap();
-    stop.send_replace(true);
+    stop.send_modify(|s| s.stopped = true);
     task.await.unwrap();
 }
 
@@ -118,7 +118,7 @@ async fn notification_tracks_the_selected_exit_and_a_stale_disconnect_keeps_the_
         .unwrap();
     let agent = phone.agent.clone();
     let (commands, requests) = mpsc::channel(4);
-    let (stop, stopped) = watch::channel(false);
+    let (stop, stopped) = watch::channel(crate::service::ServiceSignals::default());
     let (published, mut notices) = watch::channel(None);
     let (state, mut live) = watch::channel(State::Starting);
     let task = tokio::spawn(async move {
@@ -225,7 +225,7 @@ async fn notification_tracks_the_selected_exit_and_a_stale_disconnect_keeps_the_
         .unwrap();
     notice_matching(&mut notices, Option::is_none).await;
     assert!(phone.agent.is_active(id).await);
-    stop.send_replace(true);
+    stop.send_modify(|s| s.stopped = true);
     task.await.unwrap();
 }
 

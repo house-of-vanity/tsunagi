@@ -240,6 +240,8 @@ pub struct RangeConflict {
 /// Status of one network.
 #[derive(Debug, Clone)]
 pub struct NetworkStatus {
+    /// Available mesh throughput tests, with local progress and results.
+    pub speed: crate::ipc::SpeedReport,
     /// Shared service configuration with this client's routing observations.
     pub vips: Vec<crate::vip::VipStatus>,
     /// Enabled local data-plane protocols, in preference order.

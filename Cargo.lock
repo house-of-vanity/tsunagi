@@ -6394,6 +6394,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tsunagi-core",
+ "tsunagi-speedtest",
  "tun",
  "windows-sys 0.61.2",
  "zbus",
@@ -6411,6 +6412,16 @@ dependencies = [
  "tsunagi-tcp-tls",
  "tsunagi-wg-quic",
  "tsunagi-wireguard",
+]
+
+[[package]]
+name = "tsunagi-speedtest"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "postcard",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

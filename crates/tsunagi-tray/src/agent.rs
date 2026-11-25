@@ -9,15 +9,12 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eframe::egui;
 use tokio::sync::mpsc;
 
 use tsunagi::ipc;
-
-/// How often the worker refreshes status while idle.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 use tsunagi_ui::client::Client;
 pub(crate) use tsunagi_ui::client::{Command, Snapshot, VipSaveResult};
@@ -105,12 +102,19 @@ async fn worker(
     ctx: egui::Context,
 ) {
     refresh(&shared, &ctx).await;
-    let mut tick = tokio::time::interval(POLL_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     loop {
+        let interval = {
+            let snapshot = lock(&shared);
+            tsunagi_ui::client::status_poll_interval(
+                snapshot
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.as_ref().ok())
+                    .map(Arc::as_ref),
+            )
+        };
         tokio::select! {
-            _ = tick.tick() => {
+            _ = tokio::time::sleep(interval) => {
                 refresh(&shared, &ctx).await;
             }
             command = rx.recv() => {
@@ -245,6 +249,16 @@ async fn run(
                 })
                 .map_err(|err| err.to_string())
         }
+        Command::StartSpeedTest { network_id, peer } => {
+            ipc::start_speed_test(socket, &network_id, peer.as_deref(), false)
+                .await
+                .map(|_| String::new())
+                .map_err(|err| err.to_string())
+        }
+        Command::StopSpeedTest { network_id } => ipc::stop_speed_test(socket, &network_id)
+            .await
+            .map(|_| String::new())
+            .map_err(|err| err.to_string()),
         Command::Join { name, secret } => ipc::join_network(socket, &name, &secret)
             .await
             .map(|report| {

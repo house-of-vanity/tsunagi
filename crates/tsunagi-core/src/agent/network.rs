@@ -177,6 +177,7 @@ impl NetworkHandle {
 
 /// Everything a network runtime needs to run.
 pub(crate) struct RuntimeParams {
+    pub(super) agent: std::sync::Weak<super::Inner>,
     pub(crate) vips: crate::vip::VipSet,
     pub(crate) retirements: Vec<SignedRetirement>,
     pub(crate) broadcast: bool,
@@ -656,7 +657,7 @@ impl Runtime {
                 message,
                 reply,
             } => {
-                if matches!(&message, ControlMessage::Transport { .. })
+                if matches!(&message, ControlMessage::Transport { protocol, .. } if protocol != tsunagi_speedtest::PROTOCOL)
                     && let Some(interface) = self.params.interface.clone()
                 {
                     // Locally bound pair sockets must be protected before their
@@ -2691,6 +2692,9 @@ impl Runtime {
                 return;
             }
             if let Some(old) = self.sessions.remove(&peer) {
+                if let Some(inner) = self.params.agent.upgrade() {
+                    inner.speed.disconnected(self.network_id, peer);
+                }
                 old.abort();
                 old.conn
                     .close(0u32.into(), b"replaced by preferred session");
@@ -2779,6 +2783,12 @@ impl Runtime {
         if self.params.carriers.len() > 1 {
             capabilities.push(selection::capability());
         }
+        if self.params.interface.is_some()
+            && self.params.tunnel.is_some()
+            && !self.params.carriers.is_empty()
+        {
+            capabilities.push(super::speed::capability());
+        }
         capabilities.truncate(self.params.limits.max_capabilities);
         self.local_capabilities = capabilities
             .iter()
@@ -2861,6 +2871,9 @@ impl Runtime {
                 if current != Some(session_id) {
                     return;
                 }
+                if let Some(inner) = self.params.agent.upgrade() {
+                    inner.speed.disconnected(self.network_id, peer);
+                }
                 if let Some(session) = self.sessions.remove(&peer) {
                     // Read the cause before local cleanup closes a still-open connection.
                     if let Some(cause) = session.conn.close_reason() {
@@ -2934,6 +2947,25 @@ impl Runtime {
     fn dispatch_message(&mut self, peer: EndpointId, message: ControlMessage) {
         match &message {
             ControlMessage::Transport { protocol, payload } => {
+                if protocol == tsunagi_speedtest::PROTOCOL {
+                    if super::speed::supported(&self.local_capabilities)
+                        && let Some(session) = self.sessions.get(&peer)
+                        && super::speed::supported(&session.capabilities)
+                        && let Some(message) =
+                            tsunagi_speedtest::Control::decode(payload.as_bytes())
+                        && let Some(inner) = self.params.agent.upgrade()
+                        && let Some(reply) = super::speed::receive_control(
+                            &inner,
+                            self.network_id,
+                            peer,
+                            message,
+                            || snapshot_connection(&session.conn).rtt,
+                        )
+                    {
+                        let _ = self.send_to(peer, reply);
+                    }
+                    return;
+                }
                 if protocol == selection::PROTOCOL {
                     self.receive_choice(peer, payload.as_bytes());
                     return;
@@ -2986,7 +3018,7 @@ impl Runtime {
                 let changed = self.sessions.get(&peer).is_some_and(|session| {
                     let selection = |caps: &[PluginCapability]| {
                         caps.iter()
-                            .filter(|c| c.enabled)
+                            .filter(|c| c.enabled && c.protocol != tsunagi_speedtest::PROTOCOL)
                             .map(|c| (c.protocol.clone(), c.version))
                             .collect::<Vec<_>>()
                     };
@@ -3347,6 +3379,18 @@ impl Runtime {
 
         let exit = self.exit_policy();
         NetworkStatus {
+            speed: self
+                .params
+                .agent
+                .upgrade()
+                .map(|inner| {
+                    inner.speed.report(
+                        self.network_id,
+                        &peers,
+                        super::speed::supported(&self.local_capabilities),
+                    )
+                })
+                .unwrap_or_default(),
             vips: self.params.routes.vips.statuses(self.network_id),
             protocols: self
                 .params
