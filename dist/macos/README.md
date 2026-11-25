@@ -1,8 +1,10 @@
 # Running tsunagi on macOS
 
-The agent needs **root** on macOS: creating a `utun` interface and writing
-`/etc/resolver` are both root-only, and macOS has no per-capability grant like
-Linux. There are two ways to run it.
+The tray and CLI run as your normal account. The packaged service creates the
+system `utun` and publishes `/etc/resolver` entries. A separate user agent
+with its own writable state and cache can also offer an exit through physical
+TCP, UDP and ICMP echo sockets when macOS denies creation of its utun.
+The system service provides the host's overlay addresses and routes.
 
 ## Quick start — `sudo`
 
@@ -40,6 +42,12 @@ sudo brew services start tsunagi   # the agent, as a root daemon at boot
 The cask starts the service for you. The agent runs as root, and its control
 socket is open to the `admin` group, so the CLI and the tray work without
 `sudo` for an administrator.
+
+Enabling exit sharing configures IPv4 forwarding and the network's PF rules.
+The system agent already has the required permissions. For a user agent with
+an existing utun, the tray and CLI can request the missing permission in a
+macOS administrator dialog. [Exit sharing on macOS](../../docs/exit-node.md#macos)
+describes the per-user subnet grant and its removal.
 
 After upgrading the CLI, run `sudo brew services restart tsunagi` to load the
 new binary into the system daemon. Running `brew services start tsunagi` in

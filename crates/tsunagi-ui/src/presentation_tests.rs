@@ -366,3 +366,196 @@ fn compact_roster_reserves_the_full_tx_rx_pair_as_counters_grow() {
         }
     }
 }
+
+#[test]
+fn desktop_full_table_survives_long_names_and_compact_exit_icon_starts_and_stops() {
+    use std::cell::RefCell;
+    #[derive(Default)]
+    struct Actions(RefCell<Vec<Command>>);
+    impl Client for Actions {
+        fn busy(&self) -> bool {
+            false
+        }
+        fn send(&self, command: Command) {
+            self.0.borrow_mut().push(command);
+        }
+    }
+    let client = Actions::default();
+    let mut net = NetworkReport {
+        active: true,
+        name: "lab".into(),
+        network_id: "lab-id".into(),
+        peers: vec![PeerReport {
+            endpoint_id: "gw-device".into(),
+            hostname: Some("a-long-gateway-name-repeated".repeat(3)),
+            exit_node: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    for (width, full, stopping) in [
+        (1230., true, false),
+        (990., true, false),
+        (640., false, false),
+        (640., false, true),
+    ] {
+        let ctx = Context::default();
+        ctx.set_os(egui::os::OperatingSystem::Mac);
+        ctx.set_fonts(crate::app_fonts());
+        net.exit.via = stopping.then(|| "gw-device".into());
+        let mut pending = None;
+        let mut draw = |time, events| {
+            frame(&ctx, egui::vec2(width, 680.), time, events, |ctx| {
+                devices::show(
+                    ctx,
+                    &client,
+                    &mut Unit::Bytes,
+                    (&mut pending, &mut None),
+                    &net,
+                    "local",
+                    &Traffic::default(),
+                )
+            })
+        };
+        draw(0., vec![]);
+        let out = draw(0.1, vec![]);
+        assert_eq!(
+            label(&out, "RTT data / control").is_some(),
+            full,
+            "width {width}"
+        );
+        let at = label(&out, icon::SIGN_OUT).unwrap().center();
+        draw(0.2, vec![Event::PointerMoved(at), press(at, true)]);
+        draw(0.3, vec![press(at, false)]);
+        draw(0.4, vec![]);
+        let out = draw(0.5, vec![]);
+        let accept = label(&out, if stopping { "Stop" } else { "Use" })
+            .expect("confirmation")
+            .center();
+        assert!(label(&out, "Endpoint ID").is_none());
+        draw(0.6, vec![Event::PointerMoved(accept), press(accept, true)]);
+        draw(0.7, vec![press(accept, false)]);
+        assert!(
+            matches!(client.0.borrow_mut().pop(),Some(Command::SetExitNode { network_id,peer }) if network_id=="lab-id" && peer.as_deref()==(!stopping).then_some("gw-device"))
+        );
+    }
+}
+
+#[test]
+fn exit_users_scroll_a_row_inside_the_existing_card_and_disappear_on_deselection() {
+    for (width, os) in [
+        (360., egui::os::OperatingSystem::Android),
+        (860., egui::os::OperatingSystem::Mac),
+    ] {
+        let ctx = Context::default();
+        ctx.set_fonts(crate::app_fonts());
+        ctx.set_os(os);
+        let mut state = home::UiState::default();
+        let mut network = NetworkReport {
+            name: "office".into(),
+            network_id: "lab".into(),
+            active: true,
+            range: Some("10.2.3.0/24".into()),
+            overlay: Some(OverlayReport {
+                address: Some("10.2.3.4".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for i in 0..12 {
+            network.peers.push(PeerReport {
+                endpoint_id: format!("public-{i:02}"),
+                hostname: Some(format!("peer-{i:02}")),
+                ..Default::default()
+            });
+        }
+        network.exit.offering = true;
+        network.exit.forwarding = Some(true);
+        network.exit.offer_rules = Some(tsunagi::ipc::RuleSetReport {
+            ok: true,
+            detail: "ok".into(),
+        });
+        let report = tsunagi::ipc::StatusReport::default();
+        let mut draw = |net: &NetworkReport, time, events| {
+            let mut height = 0.;
+            let out = frame(&ctx, egui::vec2(width, 720.), time, events, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    home::draw_network(
+                        ui,
+                        &ReadOnly,
+                        &mut state,
+                        &Traffic::default(),
+                        net,
+                        &report,
+                        true,
+                    );
+                    height = ui.min_rect().height();
+                    assert!(ui.min_rect().right() <= width);
+                });
+            });
+            (out, height)
+        };
+        draw(&network, 0., vec![]);
+        let (folded, _) = draw(&network, 0.1, vec![]);
+        let title = label(&folded, "office").unwrap().center();
+        draw(
+            &network,
+            0.2,
+            vec![Event::PointerMoved(title), press(title, true)],
+        );
+        draw(&network, 0.3, vec![press(title, false)]);
+        let (empty, baseline) = draw(&network, 0.4, vec![]);
+        assert!(label(&empty, "peer-00").is_none());
+        network.peers[0].uses_our_exit = true;
+        let (one, h) = draw(&network, 0.5, vec![]);
+        assert!(label(&one, "1 exit user").is_some() && label(&one, "peer-00").is_some());
+        assert!((h - baseline).abs() < 1.);
+        for p in &mut network.peers {
+            p.uses_our_exit = true;
+        }
+        let (many, h) = draw(&network, 0.6, vec![]);
+        assert!(label(&many, "12 exit users").is_some());
+        assert!((h - baseline).abs() < 1.);
+        let first = label(&many, "peer-00").unwrap();
+        let heading = label(&many, "12 exit users").unwrap();
+        if os == egui::os::OperatingSystem::Android {
+            assert!(
+                heading.left() <= 168.,
+                "mobile roster belongs close to the metadata"
+            );
+        }
+        assert!(
+            (first.left() - heading.left()).abs() < 3.,
+            "roster names align with the heading"
+        );
+        let row = label(&many, "peer-01").unwrap().top() - first.top();
+        let down = many
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == icon::CARET_DOWN => {
+                    Some(t.visual_bounding_rect())
+                }
+                _ => None,
+            })
+            .max_by(|a, b| a.left().total_cmp(&b.left()))
+            .unwrap()
+            .center();
+        assert!((down.y - heading.center().y).abs() < 3. && down.x - first.left() < 160.);
+        draw(
+            &network,
+            0.7,
+            vec![Event::PointerMoved(down), press(down, true)],
+        );
+        draw(&network, 0.8, vec![press(down, false)]);
+        let (scrolled, h) = draw(&network, 0.9, vec![]);
+        assert!((label(&scrolled, "peer-01").unwrap().top() - first.top()).abs() < 1. && row > 10.);
+        assert!((h - baseline).abs() < 1.);
+        for p in &mut network.peers {
+            p.uses_our_exit = false;
+        }
+        let (empty, h) = draw(&network, 1., vec![]);
+        assert!(label(&empty, "peer-01").is_none());
+        assert!((h - baseline).abs() < 1.);
+    }
+}

@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-core"
-version = "1.0.8"
+version = "1.0.9"
 description = "Small private mesh networks: persistent agent identity, deterministic network spaces, an iroh control plane, signed state and a local DNS view."
 readme = "../../README.md"
 keywords = ["mesh", "p2p", "iroh", "networking"]
@@ -98,9 +98,11 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 # safe wrapper, which is how the provisioner observes an adapter by name
 # before deciding what to change. Creating an adapter needs the process to be
 # elevated and `wintun.dll` to be reachable at run time.
-[target.'cfg(target_os = "windows")'.dependencies]
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 smoltcp = { version = "0.12", default-features = false, features = ["medium-ip", "socket-tcp"] }
 socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_Security",

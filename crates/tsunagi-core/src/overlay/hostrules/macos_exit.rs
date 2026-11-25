@@ -8,7 +8,7 @@
 //! Per offered range, in the anchor `com.apple/tsunagi-exit-<if>`:
 //!
 //! ```text
-//! nat on <egress> inet from <range> to any -> (<egress>)
+//! nat on <egress> inet from <range> to any tagged <forwarded> -> (<egress>)
 //! pass in quick on <if> inet from <range> to ! <range> tag <forwarded> no state
 //! pass out quick on <if> route-to (<egress> <gateway>) inet from <range> to any tagged <forwarded> no state
 //! pass out quick on <egress> inet from any to any flags any tagged <forwarded> keep state (if-bound)
@@ -18,11 +18,11 @@
 //! evaluates `nat-anchor "com.apple/*"` and `anchor "com.apple/*"`, so the
 //! rules take effect without editing the user's ruleset. `pf` cannot say
 //! "every interface but one" in a translation address, so the egress is the
-//! interface of the physical default route. An active exit client refreshes
-//! the rules when this egress changes.
+//! interface of the physical default route. Both roles follow egress changes.
 //!
-//! The kernel's `net.inet.ip.forwarding` is only read, never written: it
-//! changes how the whole host behaves, which is the owner's decision.
+//! A local offer enables IPv4 forwarding after its rules are loaded. This
+//! host-wide switch has no ownership token, so cleanup only releases our PF
+//! reference and removes our own rules.
 //!
 //! # Using
 //!
@@ -72,12 +72,21 @@ use crate::state::Ipv4Range;
 use super::RuleOutcome;
 use super::exit::{ExitHostPlan, ExitHostReport};
 
+#[cfg(all(test, unix))]
+#[path = "macos_exit_helper_tests.rs"]
+mod helper_tests;
 #[cfg(all(test, target_os = "macos", feature = "tun-device"))]
 #[path = "macos_exit_kernel.rs"]
 mod kernel;
 #[path = "macos_scoped.rs"]
 mod scoped;
 use scoped::ScopedRoutes;
+
+use super::macos_authorization::NEEDS_AUTHORIZATION;
+#[cfg(test)]
+use super::macos_authorization::{macos_exit_authorization_uid, macos_exit_needs_authorization};
+
+const OFFER_HELPER: &str = "/private/etc/tsunagi-exit/offer-v1";
 
 /// The programs this module runs, always by absolute path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +95,7 @@ pub(super) enum Tool {
     Pfctl,
     Sysctl,
     Id,
+    OfferHelper,
 }
 
 impl Tool {
@@ -95,6 +105,7 @@ impl Tool {
             Self::Pfctl => "/sbin/pfctl",
             Self::Sysctl => "/usr/sbin/sysctl",
             Self::Id => "/usr/bin/id",
+            Self::OfferHelper => OFFER_HELPER,
         }
     }
 }
@@ -121,7 +132,17 @@ pub(super) fn run_tool(tool: Tool, args: &[String], stdin: Option<&str>) -> Ran 
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let mut command = Command::new(tool.path());
+    let mut command = if tool == Tool::OfferHelper {
+        if !std::path::Path::new(OFFER_HELPER).is_file() {
+            return Ran::Missing;
+        }
+        let mut sudo = Command::new("/usr/bin/sudo");
+        sudo.args(["-n", "--", OFFER_HELPER])
+            .arg(std::process::id().to_string());
+        sudo
+    } else {
+        Command::new(tool.path())
+    };
     command
         .env("LC_ALL", "C")
         .args(args)
@@ -192,6 +213,7 @@ pub(super) struct DefaultRoute {
 pub(super) struct HostState {
     token: Mutex<Option<String>>,
     routes: Mutex<ScopedRoutes>,
+    helper_offers: Mutex<Vec<Ipv4Range>>,
 }
 
 impl HostState {
@@ -267,7 +289,13 @@ fn default_route(run: Run<'_>, overlay: &str) -> Result<DefaultRoute, String> {
     Ok(route)
 }
 
-/// Whether the kernel forwards IPv4. Read only.
+/// Physical default interface shared with the socket-based exit forwarder.
+#[cfg(target_os = "macos")]
+pub(in crate::overlay) fn macos_default_uplink() -> Result<String, String> {
+    default_route(&run_tool, "").map(|route| route.interface)
+}
+
+/// Whether the kernel forwards IPv4.
 fn forwarding_state(run: Run<'_>) -> Option<bool> {
     let out = run_ok(
         run,
@@ -280,6 +308,48 @@ fn forwarding_state(run: Run<'_>) -> Option<bool> {
         "1" => Some(true),
         "0" => Some(false),
         _ => None,
+    }
+}
+
+fn enable_forwarding(run: Run<'_>) -> Result<(), String> {
+    match forwarding_state(run) {
+        Some(true) => return Ok(()),
+        Some(false) => {}
+        None => return Err("cannot determine whether macOS forwards IPv4".into()),
+    }
+    run_ok(
+        run,
+        Tool::Sysctl,
+        &owned(&["-w", "net.inet.ip.forwarding=1"]),
+        None,
+    )?;
+    if forwarding_state(run) == Some(true) {
+        Ok(())
+    } else {
+        Err("macOS did not enable IPv4 forwarding".into())
+    }
+}
+
+fn permission_denied(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("permission denied") || reason.contains("operation not permitted")
+}
+
+fn authorized_offer(
+    run: Run<'_>,
+    action: &str,
+    interface: &str,
+    range: Ipv4Range,
+) -> Result<(), String> {
+    let args = owned(&[action, interface, &range.to_string()]);
+    match run(Tool::OfferHelper, &args, None) {
+        Ran::Exited { success: true, .. } => Ok(()),
+        Ran::Exited { stdout, stderr, .. }
+            if !stderr.contains("sudo:") && !stderr.contains(NEEDS_AUTHORIZATION) =>
+        {
+            Err(failure(&stderr, &stdout))
+        }
+        _ => Err(NEEDS_AUTHORIZATION.into()),
     }
 }
 
@@ -346,10 +416,10 @@ fn pf_rules(
         ));
     }
     for range in offer {
-        // PF takes the first matching NAT rule. Preserve the transport's source
-        // port even when its overlay source falls inside one of our own offers.
-        nat.push(format!("nat on {out} inet from {range} to any -> ({out})"));
         let tag = format!("tsng_forward_{interface}");
+        nat.push(format!(
+            "nat on {out} inet from {range} to any tagged {tag} -> ({out})"
+        ));
         // Classify at authenticated overlay ingress. Only packets the host
         // actually forwards AND its routes send back to our utun need steering.
         // Local services, connected LANs and the owner's forwarding switch
@@ -611,38 +681,80 @@ fn set_routes(
 
 /// Makes the host match the plan.
 pub(super) fn apply_plan(run: Run<'_>, state: &HostState, plan: &ExitHostPlan) -> ExitHostReport {
+    let native = apply_rules(run, state, plan, None);
+    let client = plan.client.then(|| verdict(native.clone()));
+    let offer = native.clone().and_then(|()| {
+        if plan.offer.is_empty() {
+            Ok(())
+        } else {
+            enable_forwarding(run)
+        }
+    });
+    // Permission errors can be fixed by a previously approved local helper.
+    // Configuration and tool errors retain their original diagnostics.
+    let helper_uid =
+        if !plan.offer.is_empty() && offer.as_ref().is_err_and(|why| permission_denied(why)) {
+            agent_uid(run).ok().filter(|uid| *uid != 0)
+        } else {
+            None
+        };
+    let action = if native.is_ok() { "forward" } else { "apply" };
+    let mut active = lock(&state.helper_offers);
+    let mut wanted = Vec::new();
+    let mut outcomes = Vec::new();
+    for &range in &plan.offer {
+        let outcome = if let Some(uid) = helper_uid {
+            let outcome = authorized_offer(run, action, &plan.interface, range).map_err(|why| {
+                if why == NEEDS_AUTHORIZATION {
+                    format!("{NEEDS_AUTHORIZATION} for UID {uid}")
+                } else {
+                    why
+                }
+            });
+            if action == "apply" && outcome.is_ok() {
+                wanted.push(range);
+            }
+            outcome
+        } else {
+            offer.clone()
+        };
+        outcomes.push((range, verdict(outcome)));
+    }
+    for range in std::mem::take(&mut *active) {
+        if !wanted.contains(&range)
+            && let Err(why) = authorized_offer(run, "clear", &plan.interface, range)
+        {
+            tracing::warn!(%range, %why, "could not clear the authorized exit rules");
+            wanted.push(range);
+        }
+    }
+    *active = wanted;
+    if !active.is_empty() && !plan.client {
+        lock(&state.routes).active = default_route(run, &plan.interface).ok();
+    }
     let forwarding = if plan.offer.is_empty() {
         None
     } else {
         forwarding_state(run)
     };
-    let outcome = apply_rules(run, state, plan, None);
-    let verdict = |ok: bool, why: &str| {
-        if ok {
-            RuleOutcome::Applied
-        } else {
-            RuleOutcome::Failed(why.to_string())
+    if forwarding != Some(true) {
+        for (_, outcome) in &mut outcomes {
+            if outcome.is_applied() {
+                *outcome = RuleOutcome::Failed("macOS could not confirm IPv4 forwarding".into());
+            }
         }
-    };
-    match outcome {
-        Ok(()) => ExitHostReport {
-            offer: plan
-                .offer
-                .iter()
-                .map(|range| (*range, RuleOutcome::Applied))
-                .collect(),
-            forwarding,
-            client: plan.client.then_some(RuleOutcome::Applied),
-        },
-        Err(why) => ExitHostReport {
-            offer: plan
-                .offer
-                .iter()
-                .map(|range| (*range, verdict(false, &why)))
-                .collect(),
-            forwarding,
-            client: plan.client.then(|| verdict(false, &why)),
-        },
+    }
+    ExitHostReport {
+        offer: outcomes,
+        forwarding,
+        client,
+    }
+}
+
+fn verdict(result: Result<(), String>) -> RuleOutcome {
+    match result {
+        Ok(()) => RuleOutcome::Applied,
+        Err(why) => RuleOutcome::Failed(why),
     }
 }
 
@@ -696,18 +808,21 @@ fn apply_rules(
             return Err(reason);
         }
         scoped.retain(run, &wanted)?;
-        scoped.active = Some(egress);
     } else {
         clear_routes(run, interface);
         clear_v6(run, &mut scoped)?;
         scoped.retain(run, &[])?;
-        scoped.active = None;
     }
+    scoped.active = Some(egress);
     Ok(())
 }
 
 /// Removes everything this agent put there for the interface.
 pub(super) fn clear_all(run: Run<'_>, state: &HostState, interface: &str) {
+    if safe_name(interface) {
+        let _ = run(Tool::OfferHelper, &owned(&["clear", interface]), None);
+        lock(&state.helper_offers).clear();
+    }
     let mut scoped = lock(&state.routes);
     clear_routes(run, interface);
     if let Err(why) = scoped
@@ -726,6 +841,26 @@ pub(super) fn clear_all(run: Run<'_>, state: &HostState, interface: &str) {
         }
     }
     release_pf(run, &state.token);
+}
+
+/// An offer's NAT follows the host's physical default even without a local exit client.
+pub(super) fn refresh_offer(
+    run: Run<'_>,
+    state: &HostState,
+    plan: &ExitHostPlan,
+) -> Option<ExitHostReport> {
+    let mut routes = lock(&state.routes);
+    if plan.client || plan.offer.is_empty() || !routes.check_due(std::time::Instant::now()) {
+        return None;
+    }
+    if let Ok(egress) = default_route(run, &plan.interface)
+        && Some(&egress) == routes.active.as_ref()
+        && forwarding_state(run) == Some(true)
+    {
+        return None;
+    }
+    drop(routes);
+    Some(apply_plan(run, state, plan))
 }
 
 /// The logical plan can be unchanged while Wi-Fi changes gateway or moves
@@ -768,7 +903,7 @@ pub(super) fn refresh_client(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     use super::*;
 
@@ -795,7 +930,10 @@ destination: default\n\
         calls: RefCell<Vec<String>>,
         stdins: RefCell<Vec<String>>,
         default_route: Option<String>,
-        forwarding: &'static str,
+        forwarding: Cell<&'static str>,
+        deny_forwarding: bool,
+        deny_pf: bool,
+        helper: bool,
         pf_missing: bool,
         pf_load_fails: bool,
         route_add_fails: bool,
@@ -812,7 +950,10 @@ destination: default\n\
                 calls: RefCell::new(Vec::new()),
                 stdins: RefCell::new(Vec::new()),
                 default_route: Some(DEFAULT_ROUTE.to_string()),
-                forwarding: "1\n",
+                forwarding: Cell::new("1\n"),
+                deny_forwarding: false,
+                deny_pf: false,
+                helper: false,
                 pf_missing: false,
                 pf_load_fails: false,
                 route_add_fails: false,
@@ -841,8 +982,21 @@ destination: default\n\
                 stderr: why.to_string(),
             };
             match tool {
+                Tool::Id if self.deny_forwarding || self.deny_pf => ok("501\n", ""),
                 Tool::Id => ok("0\n", ""),
-                Tool::Sysctl => ok(self.forwarding, ""),
+                Tool::Sysctl if args == ["-w", "net.inet.ip.forwarding=1"] => {
+                    if self.deny_forwarding {
+                        return fail("Operation not permitted");
+                    }
+                    self.forwarding.set("1\n");
+                    ok("net.inet.ip.forwarding: 0 -> 1", "")
+                }
+                Tool::Sysctl => ok(self.forwarding.get(), ""),
+                Tool::OfferHelper if self.helper => {
+                    self.forwarding.set("1\n");
+                    ok("", "")
+                }
+                Tool::OfferHelper => fail("sudo: a password is required"),
                 Tool::Route if args.iter().any(|a| a == "-inet6") => {
                     let half = args[args.iter().position(|a| a == "-net").unwrap() + 1].clone();
                     let mut table = self.v6.borrow_mut();
@@ -941,6 +1095,7 @@ destination: default\n\
                 }
                 Tool::Route => ok("", ""),
                 Tool::Pfctl if self.pf_missing => Ran::Missing,
+                Tool::Pfctl if self.deny_pf => fail("pfctl: /dev/pf: Permission denied"),
                 Tool::Pfctl if args == ["-E"] => ok("", self.pf_enable_output),
                 Tool::Pfctl if args.contains(&"-f".to_string()) && self.pf_load_fails => {
                     fail("pfctl: Syntax error")
@@ -1010,7 +1165,7 @@ destination: default\n\
         let text = pf_rules("utun5", &egress(), &[range()], None);
         assert_eq!(
             text,
-            "nat on en0 inet from 10.13.37.0/24 to any -> (en0)\n\
+            "nat on en0 inet from 10.13.37.0/24 to any tagged tsng_forward_utun5 -> (en0)\n\
              pass out quick on utun5 route-to (en0 192.168.1.1) inet from any to any tagged tsng_forward_utun5 no state\n\
              pass in quick on utun5 inet from 10.13.37.0/24 to ! 10.13.37.0/24 tag tsng_forward_utun5 no state\n\
              pass out quick on en0 inet from any to any flags any tagged tsng_forward_utun5 keep state (if-bound)\n"
@@ -1035,7 +1190,7 @@ destination: default\n\
         );
         assert_eq!(
             nat.next(),
-            Some("nat on en0 inet from 10.13.37.0/24 to any -> (en0)")
+            Some("nat on en0 inet from 10.13.37.0/24 to any tagged tsng_forward_utun5 -> (en0)")
         );
     }
 
@@ -1117,7 +1272,7 @@ destination: default\n\
     }
 
     #[test]
-    fn offering_loads_the_anchor_and_reads_but_never_writes_forwarding() {
+    fn offering_leaves_preexisting_forwarding_on() {
         let fake = Fake::new();
         let token = HostState::default();
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, false));
@@ -1133,12 +1288,12 @@ destination: default\n\
         );
         assert_eq!(
             fake.stdins.borrow()[0],
-            "nat on en0 inet from 10.13.37.0/24 to any -> (en0)\n\
+            "nat on en0 inet from 10.13.37.0/24 to any tagged tsng_forward_utun5 -> (en0)\n\
              pass out quick on utun5 route-to (en0 192.168.1.1) inet from any to any tagged tsng_forward_utun5 no state\n\
              pass in quick on utun5 inet from 10.13.37.0/24 to ! 10.13.37.0/24 tag tsng_forward_utun5 no state\n\
              pass out quick on en0 inet from any to any flags any tagged tsng_forward_utun5 keep state (if-bound)\n"
         );
-        // sysctl is only ever asked, never told.
+        // Forwarding was already enabled by the owner.
         assert!(
             calls
                 .iter()
@@ -1152,15 +1307,67 @@ destination: default\n\
     }
 
     #[test]
-    fn forwarding_off_is_reported_and_unreadable_is_none() {
+    fn a_local_offer_enables_forwarding_after_nat_and_never_disables_other_routers() {
+        let fake = Fake::new();
+        fake.forwarding.set("0\n");
+        let state = HostState::default();
+        let run = |t, a: &[String], s: Option<&str>| fake.run(t, a, s);
+        apply_plan(&run, &state, &plan(false, true));
+        assert_eq!(fake.count("Sysctl"), 0);
+        let report = apply_plan(&run, &state, &plan(true, false));
+        assert_eq!(report.forwarding, Some(true));
+        assert_eq!(report.offer[0].1, RuleOutcome::Applied);
+        assert!(fake.position("Pfctl -q -a").unwrap() < fake.position("Sysctl -w").unwrap());
+        apply_plan(&run, &state, &plan(true, false));
+        clear_all(&run, &state, "utun5");
+        assert_eq!(fake.count("Sysctl -w"), 1);
+    }
+
+    #[test]
+    fn unknown_forwarding_or_an_unwritable_switch_never_advertises_a_working_offer() {
         let mut fake = Fake::new();
-        fake.forwarding = "0\n";
+        fake.forwarding.set("0\n");
+        fake.deny_forwarding = true;
         let token = HostState::default();
-        let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, false));
+        let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, true));
         assert_eq!(report.forwarding, Some(false));
-        fake.forwarding = "junk";
+        assert!(
+            matches!(&report.offer[0].1, RuleOutcome::Failed(why) if macos_exit_needs_authorization(why))
+        );
+        assert_eq!(report.client, Some(RuleOutcome::Applied));
+        fake.forwarding.set("junk");
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, false));
         assert_eq!(report.forwarding, None);
+        assert!(matches!(&report.offer[0].1, RuleOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn a_denied_native_pf_uses_only_a_previously_authorized_offer_helper() {
+        let mut fake = Fake::new();
+        fake.deny_pf = true;
+        fake.forwarding.set("0\n");
+        let state = HostState::default();
+        let report = apply_plan(&|t, a, s| fake.run(t, a, s), &state, &plan(true, false));
+        assert!(
+            matches!(&report.offer[0].1, RuleOutcome::Failed(why) if macos_exit_needs_authorization(why))
+        );
+        assert!(
+            matches!(&report.offer[0].1, RuleOutcome::Failed(why) if macos_exit_authorization_uid(why) == Some(501))
+        );
+        for suffix in ["0", "", "501: denied", "+501", "4294967296"] {
+            assert_eq!(
+                macos_exit_authorization_uid(&format!("{NEEDS_AUTHORIZATION} for UID {suffix}")),
+                None
+            );
+        }
+        assert!(fake.position("Pfctl -E").unwrap() < fake.position("OfferHelper").unwrap());
+        fake.helper = true;
+        let run = |t, a: &[String], s: Option<&str>| fake.run(t, a, s);
+        let report = apply_plan(&run, &state, &plan(true, false));
+        assert_eq!(report.offer[0].1, RuleOutcome::Applied);
+        assert_eq!(report.forwarding, Some(true));
+        clear_all(&run, &state, "utun5");
+        assert!(fake.position("OfferHelper clear utun5").is_some());
     }
 
     #[test]
@@ -1327,9 +1534,25 @@ destination: default\n\
     }
 
     #[test]
+    fn serving_without_an_upstream_moves_nat_when_the_physical_interface_changes() {
+        let mut fake = Fake::new();
+        let state = HostState::default();
+        let plan = plan(true, false);
+        let first = apply_plan(&|t, a, s| fake.run(t, a, s), &state, &plan);
+        assert_eq!(first.offer[0].1, RuleOutcome::Applied);
+        fake.default_route = Some(DEFAULT_ROUTE.replace("en0", "en7"));
+        let moved = refresh_offer(&|t, a, s| fake.run(t, a, s), &state, &plan).unwrap();
+        assert_eq!(moved.offer[0].1, RuleOutcome::Applied);
+        assert!(fake.stdins.borrow().last().unwrap().contains("nat on en7"));
+        assert_eq!(moved.client, None);
+        assert_eq!(fake.count(" add "), 0);
+    }
+
+    #[test]
     fn no_routes_are_added_when_the_rules_did_not_load() {
         let mut fake = Fake::new();
         fake.pf_load_fails = true;
+        fake.forwarding.set("0\n");
         let token = HostState::default();
         let report = apply_plan(&|t, a, s| fake.run(t, a, s), &token, &plan(true, true));
         let Some(RuleOutcome::Failed(why)) = report.client else {
@@ -1341,6 +1564,8 @@ destination: default\n\
         // Nothing sent the host's traffic into a tunnel it could not exempt
         // the agent from.
         assert_eq!(fake.count(" add "), 0);
+        assert_eq!(fake.count("Sysctl -w"), 0);
+        assert_eq!(fake.count("OfferHelper"), 0);
     }
 
     #[test]

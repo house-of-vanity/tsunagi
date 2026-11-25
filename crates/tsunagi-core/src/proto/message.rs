@@ -91,9 +91,17 @@ pub struct Announcement {
     /// Announced IP plugin capabilities. Opaque to the core.
     pub capabilities: Vec<PluginCapability>,
     /// Software release reported by this peer for display after authentication.
-    /// Keep this trailer last: original v8 readers stop after the capabilities.
+    /// Original v8 readers stop after the capabilities.
     #[serde(default, deserialize_with = "read_agent_version")]
     pub agent_version: Option<String>,
+    /// Whether the sender selected the recipient of this authenticated session as its exit.
+    /// Older v8 frames end before this optional display hint.
+    #[serde(default, deserialize_with = "read_exit_use")]
+    pub uses_your_exit: Option<bool>,
+}
+
+fn read_exit_use<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    Ok(Option::<bool>::deserialize(d).ok().flatten())
 }
 
 fn read_agent_version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
@@ -433,6 +441,10 @@ mod tests {
         let mut a = read(&legacy);
         assert_eq!(a.agent_version, None);
         a.agent_version = Some("2.1.0-rc.2+android".into());
+        let mut version_only = legacy.clone();
+        version_only.extend(encode(&a.agent_version).unwrap());
+        assert_eq!(read(&version_only).uses_your_exit, None);
+        a.uses_your_exit = Some(true);
         let wire = encode(&Envelope {
             network_id: old.0,
             message: ControlMessage::Announce(a.clone()),
@@ -440,6 +452,16 @@ mod tests {
         .unwrap();
         assert_eq!(decode::<OldFrame>(&wire).unwrap(), old);
         assert_eq!(read(&wire), a);
+        type VersionFrame = (
+            [u8; 32],
+            u8,
+            bool,
+            bool,
+            String,
+            Vec<PluginCapability>,
+            Option<String>,
+        );
+        assert_eq!(decode::<VersionFrame>(&wire).unwrap().6, a.agent_version);
 
         for invalid in ["", "1.2.3\nforged", &"1".repeat(256)] {
             let mut wire = legacy.clone();

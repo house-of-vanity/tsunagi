@@ -33,6 +33,10 @@ pub enum OverlayError {
     /// reason and, where there is one, what to do about it.
     #[error("overlay unavailable: {0}")]
     Unavailable(String),
+    /// The OS denied creation of a macOS host utun.
+    #[cfg(target_os = "macos")]
+    #[error("overlay unavailable: {0}")]
+    UtunDenied(String),
     /// Anything else.
     #[error("{0}")]
     Other(String),
@@ -40,9 +44,10 @@ pub enum OverlayError {
 
 pub mod broadcast;
 pub mod config;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod egress;
 pub mod exit;
+mod exit_activity;
 pub mod hostrules;
 pub mod interface;
 pub mod packet;

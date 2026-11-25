@@ -22,7 +22,9 @@ use crate::BoxFuture;
 use std::sync::Arc;
 
 use super::exit::{ExitHostPlan, ExitHostReport, ExitHostRules};
-use super::macos_exit::{HostState, apply_plan, clear_all, refresh_client, run_tool};
+use super::macos_exit::{
+    HostState, apply_plan, clear_all, refresh_client, refresh_offer, run_tool,
+};
 use super::{BroadcastHostRules, BroadcastRulesPlan, BroadcastRulesReport, RuleOutcome};
 
 /// The limited-broadcast destination routed through the overlay interface.
@@ -131,6 +133,22 @@ impl ExitHostRules for MacosHostRules {
             tokio::task::spawn_blocking(move || refresh_client(&run_tool, &state, &plan))
                 .await
                 .unwrap_or_else(|err| Some(RuleOutcome::Failed(err.to_string())))
+        })
+    }
+
+    fn refresh_offer<'a>(
+        &'a self,
+        plan: &'a ExitHostPlan,
+    ) -> BoxFuture<'a, Option<ExitHostReport>> {
+        Box::pin(async move {
+            let state = Arc::clone(&self.state);
+            let plan = plan.clone();
+            tokio::task::spawn_blocking(move || refresh_offer(&run_tool, &state, &plan))
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(%err, "cannot check the physical egress for exit sharing");
+                    None
+                })
         })
     }
 

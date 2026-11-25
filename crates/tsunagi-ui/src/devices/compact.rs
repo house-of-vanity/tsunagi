@@ -243,14 +243,10 @@ pub(super) fn roster(
                     );
                     rect.min.x += 20.;
                     if member.in_use || member.exit_node {
-                        ui.painter_at(rect).text(
-                            rect.right_center(),
-                            Align2::RIGHT_CENTER,
-                            icon::SIGN_OUT,
-                            font.clone(),
-                            if member.in_use { exit::GOOD } else { normal },
-                        );
-                        rect.max.x -= font.size + 3.;
+                        let edge = (rect.right() - (font.size + 10.)).max(rect.left());
+                        let button = Rect::from_min_max(pos2(edge, rect.top()), rect.max);
+                        super::exit_action(ui, button, member, &network.network_id, exit);
+                        rect.max.x = edge;
                     }
                     member.name()
                 }

@@ -217,9 +217,10 @@ kernel test `serving_an_established_flow_while_switching_the_local_exit` uses
 network namespaces and keeps a real TCP connection open across both switches.
 On disposable macOS and Windows runners the native subnet workflow checks the
 same-destination split on two utuns or two Wintun adapters. Its macOS test
-requires IPv4 forwarding enabled. Windows userspace forwarding also has
-ordinary loopback tests for TCP resets, half-closes, UDP port stability and
-connection limits.
+starts with IPv4 forwarding disabled and verifies the offer enables it. The
+workflow restores the original value. Userspace exits have loopback tests for
+TCP resets, half-closes, UDP port stability and connection limits. The macOS
+test sends ICMP echo through an unprivileged socket bound to loopback.
 
 Linux exit-client unit tests cover preservation of foreign mark bits, matching
 only the agent's UID and locally owned TCP/UDP sockets, exact tagged cleanup,

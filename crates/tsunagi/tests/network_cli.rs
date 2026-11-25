@@ -730,7 +730,10 @@ fn an_exit_node_is_offered_per_network_only_when_asked_and_nobody_offers_by_defa
         "{}",
         String::from_utf8_lossy(&on.stderr)
     );
-    assert!(String::from_utf8_lossy(&on.stdout).contains("exit node on"));
+    let output = String::from_utf8_lossy(&on.stdout);
+    assert!(output.contains("exit node on"));
+    assert!(output.contains("waiting for the host"));
+    assert!(!output.contains("Members can now"));
     assert!(offered());
 
     let off = agent.run(&["network", "exit-node", "exit-offer", "off"]);

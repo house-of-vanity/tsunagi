@@ -148,7 +148,7 @@ impl Tally {
 /// The overlay interface.
 pub struct Interface {
     device: Arc<dyn TunDevice>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     forwarding: Option<super::egress::Gateway>,
     factory: Arc<dyn TunFactory>,
     name: String,
@@ -227,8 +227,24 @@ impl Interface {
         carrier: Arc<dyn PacketCarrier>,
     ) -> Result<Self, OverlayError> {
         let name = name.into();
+        let request = TunRequest::bare(name.clone(), mtu);
+        let device = factory.create(request.clone()).await;
+        #[cfg(target_os = "macos")]
+        let (factory, device, use_sockets) = match device {
+            Err(OverlayError::UtunDenied(reason)) if factory.on_host() => {
+                tracing::warn!(%reason,"system utun unavailable; exit sharing will use physical sockets");
+                let sockets: Arc<dyn TunFactory> =
+                    Arc::new(super::egress::macos::SocketExit::default());
+                let device = sockets.create(request).await?;
+                (sockets, device, true)
+            }
+            result => (factory, result?, false),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let device = device?;
+        #[cfg(windows)]
+        let use_sockets = factory.on_host();
         let host_rules = factory.host_rules();
-        let device = factory.create(TunRequest::bare(name.clone(), mtu)).await?;
         // The name the operating system actually gave the interface. On Linux
         // and Windows that is the one we asked for; on macOS the kernel assigns
         // the utun unit, so the real name differs and everything that
@@ -238,8 +254,8 @@ impl Interface {
         let name = device.name().to_string();
         let tally = Arc::new(Tally::default());
 
-        #[cfg(windows)]
-        let forwarding = factory.on_host().then(|| {
+        #[cfg(any(windows, target_os = "macos"))]
+        let forwarding = use_sockets.then(|| {
             let routes = routes.clone();
             let carrier = carrier.clone();
             super::egress::Gateway::new(mtu, move |route, packet| {
@@ -419,7 +435,7 @@ impl Interface {
         };
 
         Ok(Self {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             forwarding,
             device,
             factory,
@@ -543,7 +559,7 @@ impl Interface {
             (state.plan.clone(), state.is_ok())
         };
         if wanted.is_empty() {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             if let Some(gateway) = &self.forwarding {
                 gateway.configure(Vec::new());
             }
@@ -557,6 +573,12 @@ impl Interface {
             return;
         }
         if planned.as_ref() == Some(&wanted) && ok {
+            if !wanted.client
+                && !wanted.offer.is_empty()
+                && let Some(report) = exit.refresh_offer(&wanted).await
+            {
+                self.exit_state().report = Some(report);
+            }
             if let Some(outcome) = exit.refresh(&wanted).await {
                 if let RuleOutcome::Failed(reason) = &outcome {
                     tracing::warn!(interface = %self.name, %reason, "cannot refresh exit-client socket protection");
@@ -565,12 +587,12 @@ impl Interface {
                     report.client = Some(outcome);
                 }
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             self.configure_forwarding(exit.forwarded_uplink());
             return;
         }
         let report = exit.apply(&wanted).await;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         self.configure_forwarding(exit.forwarded_uplink());
         for (range, outcome) in &report.offer {
             match outcome {
@@ -596,7 +618,7 @@ impl Interface {
                 if cfg!(target_os = "windows") {
                     "`Set-NetIPInterface -Forwarding Enabled` on the interfaces involved"
                 } else if cfg!(target_os = "macos") {
-                    "`sysctl -w net.inet.ip.forwarding=1`, set again after every reboot"
+                    "enable the exit in Tsunagi to authorize forwarding on macOS"
                 } else {
                     "`sysctl -w net.ipv4.ip_forward=1` (or `net.ipv4.conf.<interface>.forwarding=1`), \
                      and set it in sysctl.d to keep it"
@@ -619,7 +641,7 @@ impl Interface {
         state.report = Some(report);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn configure_forwarding(&self, physical: Option<(u32, std::net::Ipv4Addr)>) {
         if let Some(gateway) = &self.forwarding {
             gateway.configure(
@@ -744,7 +766,18 @@ impl Interface {
                     {
                         Some((_, outcome)) => RuleSetReport {
                             ok: outcome.is_applied(),
-                            detail: offer_detail(outcome, &range),
+                            detail: {
+                                #[cfg(target_os = "macos")]
+                                if self.forwarding.is_some() && outcome.is_applied() {
+                                    format!(
+                                        "physical TCP, UDP and ICMP echo forwarding for {range}"
+                                    )
+                                } else {
+                                    offer_detail(outcome, &range)
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                offer_detail(outcome, &range)
+                            },
                         },
                         None => failed("not applied yet"),
                     }
@@ -780,8 +813,8 @@ impl Interface {
     }
 
     /// Whether this agent can really act as an exit node in a network: the
-    /// rules members' traffic needs are in place. Kernel forwarding is not
-    /// part of it, because the agent never turns that on itself.
+    /// platform reports that its offer rules are applied. The macOS kernel backend
+    /// includes enabling IPv4 forwarding in that outcome.
     pub fn exit_offer_ready(&self, network: NetworkId) -> bool {
         let Some((policy, Some(range))) = self.routes.exit_settings(network) else {
             return false;
@@ -884,7 +917,7 @@ impl Interface {
 
     /// Removes the interface from the host.
     pub async fn remove(&self) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(gateway) = &self.forwarding {
             gateway.configure(Vec::new());
         }
@@ -1072,9 +1105,17 @@ impl Interface {
         // Only authenticated member traffic admitted by the exit policy can
         // open a physical socket. A rejected allocation never falls through
         // to Wintun, where the local upstream's split routes might recapture it.
-        #[cfg(windows)]
+        let client = if forwarded {
+            self.routes.exit_activity.stamp(network, peer)
+        } else {
+            None
+        };
+        #[cfg(any(windows, target_os = "macos"))]
         if forwarded && let Some(gateway) = &self.forwarding {
             if gateway.forward(Route { network, peer }, packet) {
+                if let Some(stamp) = client {
+                    self.routes.exit_activity.forwarded(&stamp);
+                }
                 obs.record();
                 self.tally.received.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -1085,6 +1126,9 @@ impl Interface {
         // Remote broadcasts terminate here. Only local TUN ingress can fan out.
         let len = packet.len() as u64;
         if self.device.send(packet).await.is_ok() {
+            if let Some(stamp) = client {
+                self.routes.exit_activity.forwarded(&stamp);
+            }
             obs.record();
             if let Some(exit) = exit {
                 exit.rx_bytes.fetch_add(len, Ordering::Relaxed);

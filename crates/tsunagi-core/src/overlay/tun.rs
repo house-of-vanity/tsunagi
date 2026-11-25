@@ -509,6 +509,12 @@ mod system {
             }
             _ => false,
         };
+        #[cfg(target_os = "macos")]
+        if denied {
+            return OverlayError::UtunDenied(format!(
+                "permission denied creating utun for `{name}`: {error}. Use the installed Tsunagi service for a host interface; a per-user `tsng up` can serve an exit through sockets."
+            ));
+        }
         if denied {
             let hint = if cfg!(target_os = "windows") {
                 "Open PowerShell or Command Prompt with 'Run as administrator' and \
@@ -516,9 +522,6 @@ mod system {
             } else if cfg!(target_os = "linux") {
                 "Start `tsng up` as root or grant CAP_NET_ADMIN with \
                  `sudo setcap cap_net_admin,cap_net_bind_service+p /path/to/tsunagi`."
-            } else if cfg!(target_os = "macos") {
-                "Creating a utun interface needs root on macOS; start `tsng up` \
-                 with `sudo`, or install it as a root LaunchDaemon."
             } else {
                 "Start `tsng up` with the privileges required to create a TUN interface."
             };
@@ -549,8 +552,7 @@ mod system {
         }
         #[cfg(target_os = "macos")]
         {
-            "Creating a utun interface needs root; start the agent with `sudo` or as a root \
-             LaunchDaemon, or run with `--no-tun` to keep the tunnels off the operating system."
+            "Check the Tsunagi system service and the macOS interface configuration."
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {

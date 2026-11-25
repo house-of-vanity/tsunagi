@@ -1,4 +1,4 @@
-//! A Windows exit offer terminates its forwarded connections on physical
+//! On Windows and on Macs without a host utun, an exit terminates forwarded connections on physical
 //! sockets. This keeps them out of the destination-only routes used by local
 //! applications. The stack and its sockets live for the offer, independently
 //! of this device's upstream selection.
@@ -23,6 +23,8 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+#[cfg(target_os = "macos")]
+pub(super) mod macos;
 mod tcp;
 #[cfg(test)]
 mod tests;
@@ -42,13 +44,22 @@ impl Physical {
         let socket = TcpSocket::new_v4()?;
         #[cfg(windows)]
         windows::pin(&socket, self.index)?;
+        #[cfg(target_os = "macos")]
+        self.pin(&socket2::SockRef::from(&socket))?;
         socket.bind((self.address, 0).into())?;
         socket.connect(remote).await
     }
 
+    #[cfg(target_os = "macos")]
+    fn pin(self, socket: &socket2::Socket) -> io::Result<()> {
+        let index = std::num::NonZeroU32::new(self.index)
+            .ok_or_else(|| io::Error::other("no physical exit interface"))?;
+        socket.bind_device_by_index_v4(Some(index))
+    }
+
     fn datagram(self, protocol: socket2::Protocol) -> io::Result<UdpSocket> {
         use socket2::{Domain, Protocol, Socket, Type};
-        let ty = if protocol == Protocol::UDP {
+        let ty = if protocol == Protocol::UDP || cfg!(target_os = "macos") {
             Type::DGRAM
         } else {
             Type::RAW
@@ -56,6 +67,8 @@ impl Physical {
         let socket = Socket::new(Domain::IPV4, ty, Some(protocol))?;
         #[cfg(windows)]
         windows::pin(&socket, self.index)?;
+        #[cfg(target_os = "macos")]
+        self.pin(&socket)?;
         socket.bind(&SocketAddr::V4(SocketAddrV4::new(self.address, 0)).into())?;
         socket.set_nonblocking(true)?;
         UdpSocket::from_std(socket.into())
@@ -328,7 +341,18 @@ async fn echo(
     let until = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
         let len = tokio::time::timeout_at(until, socket.recv(&mut buf)).await??;
-        let Some(h) = packet::header(&buf[..len]) else {
+        // Darwin ping sockets return a BSD IPv4 header whose length field is
+        // the host-endian ICMP payload length. The connected socket supplies
+        // its peer and the checksum and nonce below authenticate this reply.
+        #[cfg(target_os = "macos")]
+        let header = buf[..len]
+            .first()
+            .filter(|b| *b >> 4 == 4)
+            .map(|b| usize::from(*b & 15) * 4)
+            .filter(|h| *h >= 20 && *h <= len);
+        #[cfg(not(target_os = "macos"))]
+        let header = packet::header(&buf[..len]);
+        let Some(h) = header else {
             continue;
         };
         let body = &buf[h..len];

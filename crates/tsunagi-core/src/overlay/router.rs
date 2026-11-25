@@ -149,6 +149,7 @@ pub enum RouteError {
 pub struct RoutingTable {
     pub(crate) traffic: Arc<crate::traffic::TrafficMonitor>,
     pub(crate) vips: Arc<crate::vip::VipRouter>,
+    pub(super) exit_activity: super::exit_activity::ExitActivity,
     broadcast: ArcSwap<BroadcastTable>,
     selected_exit: ArcSwapOption<SelectedExit>,
     networks: RwLock<HashMap<NetworkId, NetworkRoutes>>,
@@ -246,6 +247,13 @@ impl RoutingTable {
         let ownership_changed = networks
             .get(&network)
             .is_none_or(|old| old.local != routes.local || old.peers != routes.peers);
+        if ownership_changed
+            || networks
+                .get(&network)
+                .is_some_and(|old| old.exit.offer != routes.exit.offer)
+        {
+            self.exit_activity.configure(network, Some(&routes));
+        }
         networks.insert(network, routes);
         if ownership_changed {
             self.address_revision.fetch_add(2, Ordering::Release);
@@ -260,6 +268,7 @@ impl RoutingTable {
     pub fn remove_network(&self, network: NetworkId) {
         self.vips.remove_network(network);
         let mut networks = self.write();
+        self.exit_activity.configure(network, None);
         if networks.remove(&network).is_some() {
             self.address_revision.fetch_add(2, Ordering::Release);
         }
@@ -292,7 +301,11 @@ impl RoutingTable {
     pub(crate) fn update_exit(&self, network: NetworkId, update: impl FnOnce(&mut ExitPolicy)) {
         let mut networks = self.write();
         if let Some(routes) = networks.get_mut(&network) {
+            let offered = routes.exit.offer;
             update(&mut routes.exit);
+            if offered != routes.exit.offer {
+                self.exit_activity.configure(network, Some(routes));
+            }
             if routes.exit.via.is_some() {
                 clear_other_exits(&mut networks, network);
             }
@@ -312,6 +325,10 @@ impl RoutingTable {
                 })
             }));
         }
+    }
+
+    pub(crate) fn recent_exit_client(&self, network: NetworkId, peer: EndpointId) -> bool {
+        self.exit_activity.recent(network, peer)
     }
 
     pub(crate) fn exit_traffic(&self, network: NetworkId, peer: EndpointId) -> Option<ExitTraffic> {

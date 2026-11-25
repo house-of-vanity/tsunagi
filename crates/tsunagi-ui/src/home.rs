@@ -1,4 +1,5 @@
 //! Shared compact network tiles, device header and join form.
+mod card;
 use crate::{
     client::{Client, Command},
     devices, exit, format,
@@ -126,24 +127,21 @@ pub fn draw_network(
     network: &NetworkReport,
     report: &StatusReport,
     offer_exit: bool,
-) -> bool {
-    let mut pick_exit = false;
+) {
     ui.add_space(5.0);
     ui.push_id(&network.network_id, |ui| {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let open = state.expanded_networks.contains(&network.network_id);
-            if overview(ui, network, report, state, open) {
+            if overview(ui, network, report, state, open, traffic) {
                 state.toggle_network(&network.network_id, !open);
             }
             if state.expanded_networks.contains(&network.network_id) {
                 ui.separator();
-                pick_exit =
-                    draw_network_details(ui, agent, state, traffic, network, report, offer_exit);
+                draw_network_details(ui, agent, state, traffic, network, report, offer_exit);
             }
         });
     });
-    pick_exit
 }
 
 impl UiState {
@@ -175,20 +173,23 @@ fn overview(
     report: &StatusReport,
     state: &mut UiState,
     open: bool,
+    traffic: &Traffic,
 ) -> bool {
-    let status = if network.active {
-        format!(
-            "{} online",
-            devices::online_count(network, &report.endpoint_id)
-        )
-    } else {
-        "Stopped".into()
-    };
-    let clicked = network_header(ui, &network.name, &status, open).clicked();
+    let warnings = exit::warnings(network);
+    let clicked = card::header(
+        ui,
+        network,
+        report,
+        open,
+        traffic.network(&network.network_id),
+        state.unit,
+        warnings.first().map(|w| w.text.as_str()),
+    )
+    .clicked();
     if let Some(via) = &network.exit.via {
         draw_selected_exit(ui, network, via, state);
     }
-    for warning in exit::warnings(network) {
+    for warning in warnings {
         draw_exit_warning(ui, &warning);
     }
     if !network.range_conflicts.is_empty() {
@@ -203,6 +204,7 @@ pub fn draw_network_selector(
     network: &NetworkReport,
     report: &StatusReport,
     state: &mut UiState,
+    traffic: &Traffic,
 ) {
     let open = state.selected_network.as_deref() == Some(&network.network_id);
     ui.push_id(&network.network_id, |ui| {
@@ -212,7 +214,7 @@ pub fn draw_network_selector(
         }
         frame.show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            if overview(ui, network, report, state, open) {
+            if overview(ui, network, report, state, open, traffic) {
                 state.toggle_network(&network.network_id, !open);
             }
         });
@@ -228,7 +230,7 @@ pub fn draw_network_details(
     network: &NetworkReport,
     report: &StatusReport,
     offer_exit: bool,
-) -> bool {
+) {
     ui.horizontal_wrapped(|ui| {
         if ui
             .button(format!("{} Copy secret", icon::COPY))
@@ -255,7 +257,7 @@ pub fn draw_network_details(
         }
     });
     ui.separator();
-    draw_metadata(ui, network, &report.endpoint_id);
+    card::metadata(ui, network, &report.endpoint_id);
     draw_protocols(ui, agent, network, &report.available_protocols);
     format::sparkline(ui, traffic.network(&network.network_id), state.unit, 34.0);
     network_settings(ui, agent, network, offer_exit)
@@ -264,7 +266,9 @@ pub fn draw_network_details(
 fn draw_metadata(ui: &mut egui::Ui, network: &NetworkReport, own_id: &str) {
     egui::Grid::new(ui.id().with("metadata"))
         .num_columns(2)
-        .spacing([10.0, 3.0])
+        .max_col_width((ui.available_width() - 30.).max(24.))
+        .min_col_width(18.)
+        .spacing([6.0, 3.0])
         .show(ui, |ui| {
             widgets::field(ui, icon::TAG, "", "Network name");
             format::copy_field(ui, &network.name, &network.name);
@@ -297,8 +301,7 @@ fn network_settings(
     agent: &dyn Client,
     network: &NetworkReport,
     offer_exit: bool,
-) -> bool {
-    let mut pick_exit = false;
+) {
     if !network.range_conflicts.is_empty() {
         for conflict in &network.range_conflicts {
             ui.label(format!(
@@ -353,8 +356,20 @@ fn network_settings(
                     enabled: offering,
                 });
             }
-        } else {
-            pick_exit = ui.button("Exit node…").clicked();
+            #[cfg(target_os = "macos")]
+            if offering
+                && network.exit.offer_rules.as_ref().is_some_and(|rules| {
+                    !rules.ok && tsunagi::overlay::hostrules::macos_exit_needs_authorization(&rules.detail)
+                })
+                && ui.add_enabled(!agent.busy(), egui::Button::new("Authorize…"))
+                    .on_hover_text("Allow this network to share the Mac’s internet connection")
+                    .clicked()
+            {
+                agent.send(Command::SetExitOffer {
+                    network_id: network.network_id.clone(),
+                    enabled: true,
+                });
+            }
         }
         let leave = egui::Button::new(egui::RichText::new("Leave").color(egui::Color32::WHITE))
             .fill(LEAVE_RED);
@@ -364,60 +379,6 @@ fn network_settings(
             });
         }
     });
-    pick_exit
-}
-
-fn network_header(ui: &mut egui::Ui, name: &str, status: &str, open: bool) -> egui::Response {
-    let height = ui.text_style_height(&egui::TextStyle::Heading).max(30.0);
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), height),
-        egui::Sense::click(),
-    );
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, ui.is_enabled(), name)
-    });
-    let visuals = ui.style().interact(&response);
-    if response.hovered() || response.has_focus() {
-        ui.painter().rect_filled(rect, 3.0, visuals.weak_bg_fill);
-    }
-    let font = egui::TextStyle::Body.resolve(ui.style());
-    ui.painter().text(
-        rect.left_center(),
-        egui::Align2::LEFT_CENTER,
-        if open {
-            icon::CARET_DOWN
-        } else {
-            icon::CARET_RIGHT
-        },
-        font.clone(),
-        visuals.text_color(),
-    );
-    let end = ui.painter().text(
-        rect.right_center(),
-        egui::Align2::RIGHT_CENTER,
-        status,
-        font.clone(),
-        ui.visuals().text_color(),
-    );
-    let left = rect.left() + font.size + 6.0;
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        name.into(),
-        egui::FontId::new(font.size + 4.0, egui::FontFamily::Name("Bold".into())),
-        ui.visuals().strong_text_color(),
-    );
-    job.wrap.max_width = (end.left() - left - 8.0).max(0.0);
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let title = ui.painter().layout_job(job);
-    ui.painter().galley(
-        egui::pos2(left, rect.center().y - title.size().y / 2.0),
-        title,
-        visuals.text_color(),
-    );
-    widgets::hint(
-        response.on_hover_cursor(egui::CursorIcon::PointingHand),
-        name,
-    )
 }
 
 fn draw_selected_exit(ui: &mut egui::Ui, network: &NetworkReport, via: &str, state: &mut UiState) {
@@ -428,17 +389,23 @@ fn draw_selected_exit(ui: &mut egui::Ui, network: &NetworkReport, via: &str, sta
             exit::LOUD
         };
         let name = exit::name_of(network, via);
-        let button = ui
-            .add(egui::Button::new(egui::RichText::new(icon::SIGN_OUT).color(color)).frame(false));
-        let clicked = widgets::hint(button, "Stop using this exit node").clicked();
-        if widgets::hint(
-            ui.link(format!("Exit via {name}")),
-            "Stop using this exit node",
-        )
-        .clicked()
-            || clicked
-        {
-            state.exit_confirm = Some(devices::ExitConfirm::stop_from_tile(network, via));
+        if ui.ctx().os() == egui::os::OperatingSystem::Android {
+            ui.label(egui::RichText::new(icon::SIGN_OUT).color(color));
+            ui.label(format!("Exit via {name}"));
+        } else {
+            let button = ui.add(
+                egui::Button::new(egui::RichText::new(icon::SIGN_OUT).color(color)).frame(false),
+            );
+            let clicked = widgets::hint(button, "Stop using this exit node").clicked();
+            if widgets::hint(
+                ui.link(format!("Exit via {name}")),
+                "Stop using this exit node",
+            )
+            .clicked()
+                || clicked
+            {
+                state.exit_confirm = Some(devices::ExitConfirm::stop_from_tile(network, via));
+            }
         }
         if let Some(t) = network.exit.traffic {
             for (glyph, bytes, hint) in [

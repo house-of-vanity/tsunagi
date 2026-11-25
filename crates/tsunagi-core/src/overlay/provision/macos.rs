@@ -477,6 +477,11 @@ async fn run(program: &'static str, args: Vec<String>) -> Result<String, Overlay
             text
         }
     };
+    if message.contains("Operation not permitted") || message.contains("Permission denied") {
+        return Err(OverlayError::UtunDenied(format!(
+            "{display} failed: {message}"
+        )));
+    }
     Err(OverlayError::Unavailable(format!(
         "{display} failed: {message}"
     )))

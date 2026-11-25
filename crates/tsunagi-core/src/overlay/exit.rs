@@ -31,9 +31,8 @@ pub struct ExitRulesReport {
     pub offer: Option<RuleSetReport>,
     /// Whether the kernel forwards packets for the overlay interface.
     ///
-    /// `Some(false)` means the rules are in place but nothing passes until
-    /// forwarding is turned on, which the agent never does itself. `None`
-    /// when it could not be read.
+    /// `Some(false)` means kernel forwarding is off. `None` when unavailable
+    /// or when the exit forwards through physical sockets.
     pub forwarding: Option<bool>,
     /// The routes that send this device's traffic through its exit node.
     /// `None` means it uses none through this network.

@@ -79,3 +79,25 @@ pub(crate) fn device_address(ui: &mut Ui) {
     };
     field(ui, glyph, "", "This device’s IPv4 address");
 }
+
+/// Paint a bounded line in a fixed cell, with an ellipsis for long hostnames.
+pub(crate) fn single_line(
+    painter: &egui::Painter,
+    cell: egui::Rect,
+    align: egui::Align,
+    value: &str,
+    font: egui::FontId,
+    ink: egui::Color32,
+) {
+    if !cell.is_positive() {
+        return;
+    }
+    let mut job = egui::text::LayoutJob::simple_singleline(value.into(), font, ink);
+    job.wrap.max_width = cell.width();
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let text = painter.layout_job(job);
+    let bounds =
+        egui::Align2([align, egui::Align::Center]).align_size_within_rect(text.size(), cell);
+    painter.galley(bounds.min, text, ink);
+}

@@ -122,7 +122,9 @@ One exit serves the whole agent. Peers in every active Tsunagi network stay
 reachable on their own mesh routes.
 
 The tray does the same with a checkbox. An exit node sees everything you send
-through it, so use only members you trust.
+through it, so use only members you trust. The folded network card shows its
+status and recent traffic. Expand it to see who is using this device for internet
+access.
 [Details and per-OS notes](docs/exit-node.md).
 
 The initial data transport order is `wg,awg,wg-quic,tcp-tls` by default. AWG negotiates a

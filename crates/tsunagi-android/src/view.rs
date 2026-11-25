@@ -24,14 +24,13 @@ enum Page {
     Join,
     Devices(String),
     Vips(String),
-    Exit(String),
-    ExitNetworks,
+    Exits,
     Leave(String),
 }
 impl Page {
     fn network(&self) -> Option<&str> {
         match self {
-            Self::Devices(id) | Self::Vips(id) | Self::Exit(id) | Self::Leave(id) => Some(id),
+            Self::Devices(id) | Self::Vips(id) | Self::Leave(id) => Some(id),
             _ => None,
         }
     }
@@ -43,7 +42,7 @@ impl Page {
             Self::Join => "Join a network",
             Self::Devices(_) => "Devices",
             Self::Vips(_) => "VIP",
-            Self::Exit(_) | Self::ExitNetworks => "Exit node",
+            Self::Exits => "Exit nodes",
             Self::Leave(_) => "Leave network",
         }
     }
@@ -187,34 +186,56 @@ impl Phone {
         self.pick_exit = true;
     }
 
-    fn exit_networks(&mut self, ui: &mut egui::Ui, networks: &[tsunagi::ipc::NetworkReport]) {
-        if networks.is_empty() {
-            ui.label("Join a network to choose an exit node.");
-            if ui.button("Join or create a network").clicked() {
-                self.page = Page::Join;
-            }
-            return;
+    fn open_exit_picker(&mut self) {
+        if self.page != Page::Exits {
+            self.before_picker = Some(std::mem::replace(&mut self.page, Page::Exits));
+            self.forms.exit_confirm = None;
         }
-        if !networks.iter().any(|n| n.active) {
-            ui.label("Start a network to choose an exit node.");
-            if ui.button("Show networks").clicked() {
-                self.home();
-            }
-            return;
-        }
-        ui.label("Choose a network for the exit node");
-        for n in networks.iter().filter(|n| n.active) {
-            let ambiguous = networks.iter().any(|other| {
-                other.active && other.name == n.name && other.network_id != n.network_id
-            });
-            let label = if ambiguous {
-                format!("{} · {}", n.name, tsunagi_ui::format::short(&n.network_id))
-            } else {
-                n.name.clone()
-            };
-            if ui.button(label).clicked() {
-                self.page = Page::Exit(n.network_id.clone());
-            }
+    }
+
+    /// This control lives outside both portrait and landscape scroll areas.
+    fn exit_button(&mut self, ctx: &Context, ready: bool) {
+        let clicked = egui::Area::new("home exit button".into())
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-16., -16.])
+            .order(egui::Order::Middle)
+            .movable(false)
+            .show(ctx, |ui| {
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(60., 60.),
+                    if ready {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    },
+                );
+                let (mut fill, mut ink) = devices::exit_action_colors(ui.visuals().dark_mode);
+                if !ready {
+                    fill = ui.visuals().widgets.inactive.bg_fill;
+                    ink = ui.visuals().weak_text_color();
+                }
+                ui.painter().circle_filled(rect.center(), 30., fill);
+                if ready && (response.hovered() || response.has_focus()) {
+                    ui.painter().circle_stroke(rect.center(), 27., (1_f32, ink));
+                }
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon::SIGN_OUT,
+                    egui::FontId::proportional(29.),
+                    ink,
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        ready,
+                        "Choose an exit node",
+                    )
+                });
+                tsunagi_ui::widgets::hint(response, "Choose an exit node").clicked()
+            })
+            .inner;
+        if ready && clicked {
+            self.open_exit_picker();
         }
     }
 
@@ -239,7 +260,13 @@ impl Phone {
                     .id_salt("network list")
                     .show(ui, |ui| {
                         for network in &report.networks {
-                            home::draw_network_selector(ui, network, report, &mut self.forms);
+                            home::draw_network_selector(
+                                ui,
+                                network,
+                                report,
+                                &mut self.forms,
+                                &self.traffic,
+                            );
                         }
                     });
             });
@@ -254,7 +281,7 @@ impl Phone {
                     if let Some(n) = selected {
                         ui.heading(&n.name);
                         ui.push_id(&n.network_id, |ui| {
-                            if home::draw_network_details(
+                            home::draw_network_details(
                                 ui,
                                 actions,
                                 &mut self.forms,
@@ -262,15 +289,14 @@ impl Phone {
                                 n,
                                 report,
                                 false,
-                            ) {
-                                self.page = Page::Exit(n.network_id.clone());
-                            }
+                            );
                         });
                     } else {
                         ui.heading("This device");
                         ui.label("Tsunagi Agent is running");
                         home::draw_header(ui, actions, &mut self.forms, report);
                     }
+                    ui.add_space(80.);
                 });
         });
     }
@@ -341,18 +367,13 @@ impl Phone {
             }
             if self.pick_exit && self.pending.is_none() {
                 self.pick_exit = false;
-                let mut active = report.networks.iter().filter(|n| n.active);
-                let picker = match (active.next(), active.next()) {
-                    (Some(n), None) => Page::Exit(n.network_id.clone()),
-                    _ => Page::ExitNetworks,
-                };
-                if !matches!(self.page, Page::Exit(_) | Page::ExitNetworks) {
-                    self.before_picker = Some(std::mem::replace(&mut self.page, picker));
-                }
+                self.open_exit_picker();
             }
             Some(report)
         } else {
-            if self.page.network().is_some() || matches!(self.page, Page::Join | Page::Monitor) {
+            if self.page.network().is_some()
+                || matches!(self.page, Page::Join | Page::Monitor | Page::Exits)
+            {
                 self.home();
             }
             self.snapshot = Snapshot::default();
@@ -446,7 +467,7 @@ impl Phone {
                         self.landscape_home(ui, &actions, report);
                         return;
                     }
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt(self.page.title()).auto_shrink([false, false]).show(ui, |ui| {
                         let Some(report) = report else {
                             match state {
                                 State::Starting => {ui.spinner(); ui.label("Starting Tsunagi Agent…");}
@@ -463,19 +484,23 @@ impl Phone {
                                 ui.separator();
                                 if ui.button("Join or create a network").clicked() {self.page = Page::Join;}
                                 for n in &report.networks {
-                                    if home::draw_network(ui, &actions, &mut self.forms, &self.traffic, n, report, false) {self.page = Page::Exit(n.network_id.clone());}
+                                    home::draw_network(ui, &actions, &mut self.forms, &self.traffic, n, report, false);
                                 }
+                                ui.add_space(80.);
                             }
                             Page::Join => {
                                 home::draw_join(ui, &actions, &mut self.forms.join);
                                 if ui.button(format!("{} Paste secret", icon::CLIPBOARD)).clicked() {system = Some(SystemAction::PasteSecret);}
                             }
-                            Page::Exit(_) => {
-                                if let Some(n) = selected && let Some(choice) = devices::choose_exit(ui, n, &report.endpoint_id) {
+                            Page::Exits => {
+                                if let Some(choice) = devices::choose_exit_from_networks(ui, &report.networks, &report.endpoint_id) {
                                     self.forms.exit_confirm = Some(choice);
                                 }
+                                if report.networks.is_empty() && ui.button("Join or create a network").clicked() {
+                                    self.before_picker = None;
+                                    self.page = Page::Join;
+                                }
                             }
-                            Page::ExitNetworks => self.exit_networks(ui, &report.networks),
                             Page::Leave(id) => {
                                 if let Some(n) = selected {
                                     ui.label(format!("Leave {} on this phone? You will need its secret to join again.", n.name));
@@ -500,6 +525,9 @@ impl Phone {
                             break;
                         }
                     }
+                }
+                if self.page == Page::Home && self.forms.exit_confirm.is_none() {
+                    self.exit_button(ctx, report.is_some() && !actions.busy());
                 }
                 devices::confirm_exit(ctx, &actions, &mut self.forms.exit_confirm, None);
             }

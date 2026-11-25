@@ -25,6 +25,8 @@
 //! rather than the crate's internal structures, so internal refactors do not
 //! silently change what a client sees.
 
+mod exit_offer;
+pub use exit_offer::{ExitOfferOutcome, set_exit_offer};
 mod traffic;
 pub use traffic::TrafficStream;
 mod speed;
@@ -273,8 +275,8 @@ pub enum Request {
     SetExitOffer {
         /// Public network identifier.
         network_id: String,
-        /// Whether members may send their internet traffic through this agent.
-        enabled: bool,
+        /// Set the desired offer, or reconcile its current value after authorization.
+        enabled: Option<bool>,
     },
     /// Send all this device's internet traffic through a member of one
     /// network, or back the ordinary way.
@@ -350,7 +352,7 @@ impl std::fmt::Debug for Request {
             Request::SetExitOffer {
                 network_id,
                 enabled,
-            } => write!(f, "SetExitOffer {{ {network_id}, enabled: {enabled} }}"),
+            } => write!(f, "SetExitOffer {{ {network_id}, enabled: {enabled:?} }}"),
             Request::SetExitNode { network_id, peer } => {
                 write!(f, "SetExitNode {{ {network_id}, peer: {peer:?} }}")
             }
@@ -391,7 +393,7 @@ pub enum Response {
     /// A network's shared secret, redacted in `Debug`.
     Secret(RedactedText),
     /// Whether this agent now offers itself as an exit node.
-    ExitOffer(bool),
+    ExitOffer(ExitOfferOutcome),
     /// The member this device now sends its internet traffic through.
     ExitNode(Option<String>),
     /// The request could not be served.
@@ -868,6 +870,9 @@ pub struct MemberReport {
 /// One control plane peer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerReport {
+    /// The connected member has selected this gateway, or recently sent exit traffic on a legacy session.
+    #[serde(default)]
+    pub uses_our_exit: bool,
     /// The software version reported by this authenticated peer, when available.
     pub agent_version: Option<String>,
     /// Actionable carrier failure or policy mismatch; absent for a usable route.
@@ -1164,8 +1169,8 @@ pub trait ReportSource: Send + Sync + 'static {
     fn set_exit_offer(
         &self,
         _network_id: String,
-        _enabled: bool,
-    ) -> BoxFuture<'_, std::result::Result<bool, String>> {
+        _enabled: Option<bool>,
+    ) -> BoxFuture<'_, std::result::Result<ExitOfferOutcome, String>> {
         Box::pin(async move { Err("this agent cannot be an exit node".to_string()) })
     }
 
@@ -1209,7 +1214,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 28]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 29]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///
@@ -1501,23 +1506,6 @@ pub async fn set_dns(
     match exchange(path, &Request::Dns { enable, port }, EXCHANGE_TIMEOUT).await? {
         Response::Dns(report) => Ok(report),
         Response::Error(reason) => Err(Error::Storage(reason)),
-        other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
-    }
-}
-
-/// Offers the running agent as an exit node in one network, or stops.
-pub async fn set_exit_offer(
-    path: impl AsRef<Path>,
-    network_id: &str,
-    enabled: bool,
-) -> Result<bool> {
-    let request = Request::SetExitOffer {
-        network_id: network_id.to_owned(),
-        enabled,
-    };
-    match exchange(path.as_ref(), &request, EXCHANGE_TIMEOUT).await? {
-        Response::ExitOffer(enabled) => Ok(enabled),
-        Response::Error(message) => Err(Error::Storage(message)),
         other => Err(Error::Storage(format!("unexpected answer: {other:?}"))),
     }
 }

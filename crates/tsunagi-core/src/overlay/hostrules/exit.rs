@@ -63,8 +63,7 @@ pub struct ExitHostReport {
     /// One outcome per offered range: its masquerade and forward rules.
     pub offer: Vec<(Ipv4Range, RuleOutcome)>,
     /// Whether the kernel forwards packets for the interface. `None` when it
-    /// could not be read. The agent only reads this: turning forwarding on is
-    /// the owner's decision.
+    /// could not be read. A local macOS offer enables forwarding when needed.
     pub forwarding: Option<bool>,
     /// The routes and rules that send this device's traffic through the
     /// interface, when the plan asked for them.
@@ -88,6 +87,14 @@ pub trait ExitHostRules: Send + Sync + std::fmt::Debug + 'static {
 
     /// Refreshes volatile local socket protection without replacing exit routes.
     fn refresh<'a>(&'a self, _plan: &'a ExitHostPlan) -> BoxFuture<'a, Option<RuleOutcome>> {
+        Box::pin(async { None })
+    }
+
+    /// Refresh a provider-only plan when the physical egress changes.
+    fn refresh_offer<'a>(
+        &'a self,
+        _plan: &'a ExitHostPlan,
+    ) -> BoxFuture<'a, Option<ExitHostReport>> {
         Box::pin(async { None })
     }
 

@@ -760,6 +760,7 @@ async fn network_cards_start_closed_and_keep_exit_traffic_visible_when_folded() 
     };
     let opened = click(titles[0]);
     assert_eq!(positions(&opened, "Show devices").len(), 1);
+    assert!(positions(&opened, "Exit node…").is_empty());
     use egui_phosphor::regular as icon;
     let vip = format!("{} VIP", icon::NETWORK);
     let y = |label: &str| positions(&opened, label)[0].y;
@@ -771,6 +772,18 @@ async fn network_cards_start_closed_and_keep_exit_traffic_visible_when_folded() 
     let folded = click(positions(&opened, name.as_str())[0]);
     assert!(positions(&folded, "Show devices").is_empty());
     assert_eq!(positions(&folded, "Exit via gateway").len(), 1);
+    let fab = positions(&folded, icon::SIGN_OUT)
+        .into_iter()
+        .find(|p| p.y > 625. && p.x > 265.)
+        .expect("fixed exit button");
+    let picker = click(fab);
+    assert_eq!(positions(&picker, "No exit node").len(), 1);
+    assert_eq!(positions(&picker, "gateway").len(), 1);
+    let dialog = click(positions(&picker, "No exit node")[0]);
+    assert_eq!(positions(&dialog, "Disconnect").len(), 1);
+    let picker = click(positions(&dialog, "Cancel")[0]);
+    assert!(positions(&picker, "Disconnect").is_empty());
+    assert_eq!(positions(&picker, "gateway").len(), 1);
     agent.shutdown().await;
 }
 
@@ -803,6 +816,12 @@ fn the_system_tile_waits_for_the_agent_and_distinguishes_networks_with_the_same_
         [("alpha", true), ("bravo", true), ("paused", false)].map(|(id, active)| NetworkReport {
             network_id: id.into(),
             name: "home".into(),
+            peers: vec![tsunagi::ipc::PeerReport {
+                endpoint_id: "same-device".into(),
+                hostname: Some(format!("gateway-{id}")),
+                exit_node: true,
+                ..Default::default()
+            }],
             active,
             ..Default::default()
         });
@@ -817,6 +836,9 @@ fn the_system_tile_waits_for_the_agent_and_distinguishes_networks_with_the_same_
     let chooser = draw(&mut phone, &state);
     assert!(chooser.iter().any(|s| s == "home · alpha"));
     assert!(chooser.iter().any(|s| s == "home · bravo"));
+    assert!(chooser.iter().any(|s| s == "gateway-alpha"));
+    assert!(chooser.iter().any(|s| s == "gateway-bravo"));
+    assert_eq!(chooser.iter().filter(|s| *s == "No exit node").count(), 1);
     assert!(!chooser.iter().any(|s| s.contains("paused")));
     assert!(phone.back().is_none());
     assert!(draw(&mut phone, &state).iter().any(|s| s == "tsunagi"));

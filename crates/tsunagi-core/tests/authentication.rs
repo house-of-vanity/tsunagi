@@ -73,6 +73,7 @@ async fn an_authenticated_disconnect_reports_the_quic_close_code() {
         hostname: "returning-peer".into(),
         capabilities: Vec::new(),
         agent_version: None,
+        uses_your_exit: None,
     });
     write_frame(
         &mut send,

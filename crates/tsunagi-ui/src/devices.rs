@@ -13,7 +13,7 @@ mod speed;
 mod speed_tests;
 mod status;
 pub use crate::exit::name_of;
-pub use exit_picker::choose_exit;
+pub use exit_picker::{choose_exit, choose_exit_from_networks, exit_action_colors};
 
 use egui_phosphor::regular as icon;
 
@@ -152,6 +152,62 @@ fn name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
     }
 }
 
+// Reserve the version and the offline action before eliding a long hostname.
+fn short_name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
+    ui.spacing_mut().item_spacing.x = 4.;
+    let (mark, r) = ui.allocate_exact_size(egui::Vec2::splat(16.), egui::Sense::hover());
+    device.channel().paint(ui, mark);
+    widgets::hint(r, device.channel_hint());
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let version = device.version_label();
+    let measure = |s: &str, font: egui::FontId| {
+        ui.painter()
+            .layout_no_wrap(s.into(), font, ui.visuals().text_color())
+            .size()
+            .x
+    };
+    let forget = if !device.online && !device.in_use && device.record_version.is_some() {
+        measure("Forget", egui::TextStyle::Button.resolve(ui.style()))
+            + 2. * ui.spacing().button_padding.x
+            + 6.
+    } else {
+        0.
+    };
+    let width = (ui.available_width() - measure(&version, font) - forget - 8.).max(1.);
+    let name = device.name();
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Sense::click(),
+    );
+    let hint = if let Some((taken, holder)) = &device.name_taken {
+        format!("Name `{taken}` belongs to {holder}. Use this device's address.")
+    } else {
+        format!("{name}\n{}\nClick to copy the device address", device.id)
+    };
+    let ink = if device.name_taken.is_some() {
+        AMBER
+    } else {
+        ui.visuals().text_color()
+    };
+    widgets::single_line(
+        ui.painter(),
+        rect,
+        egui::Align::Min,
+        &name,
+        egui::TextStyle::Body.resolve(ui.style()),
+        ink,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
+    if widgets::hint(response, &hint).clicked() {
+        ui.ctx()
+            .copy_text(device.copy.as_deref().unwrap_or(device.id).to_owned());
+    }
+    ui.small(version).on_hover_text(format!(
+        "Tsunagi {}",
+        device.agent_version.unwrap_or("version unknown")
+    ));
+}
+
 /// Draws the window body into its viewport.
 pub fn show(
     ctx: &egui::Context,
@@ -236,16 +292,17 @@ pub fn show(
                 // an animation frame need not format and measure all peers a second time.
                 let available = ui.available_width();
                 let id = egui::Id::new(("devices column widths", &network.network_id));
-                let fits = |w: &[f32; 9]| {
-                    w[..8].iter().sum::<f32>() + MIN_PLOT_WIDTH + crate::table::GAP * 8.
-                        <= available
-                };
+                let em = egui::TextStyle::Body.resolve(ui.style()).size;
                 let could_fit = ui
                     .data(|d| d.get_temp::<[f32; 9]>(id))
-                    .is_none_or(|w| fits(&w));
+                    .is_none_or(|w| fit_desktop_widths(w, available, em).is_some());
                 let table =
                     could_fit.then(|| desktop_columns(ui, unit, network, &devices, traffic));
-                if let Some(table) = table.filter(|t| fits(&t.widths)) {
+                if let Some(mut table) = table
+                    && let Some(widths) = fit_desktop_widths(table.widths, available, em)
+                {
+                    table.short_identity = widths[0] < table.widths[0];
+                    table.widths = widths;
                     device_table(
                         ui,
                         network,
@@ -338,59 +395,104 @@ pub fn confirm_exit(
     }) else {
         return;
     };
-    egui::Area::new(egui::Id::new("exit confirm backdrop"))
-        .order(egui::Order::Middle)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            let screen = ctx.screen_rect();
-            ui.allocate_response(screen.size(), egui::Sense::click_and_drag());
-            ui.painter()
-                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
-        });
-
-    let (mut accepted, mut cancelled) = (false, false);
-    egui::Window::new("Exit node")
-        .order(egui::Order::Foreground)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.set_max_width((ctx.screen_rect().width() - 40.0).clamp(160.0, 380.0));
-            let phone = ctx.os() == egui::os::OperatingSystem::Android;
-            ui.label(if pending.stop {
-                format!("Stop using {}?", pending.name)
-            } else if phone {
-                format!(
-                    "Route this phone’s IPv4 internet traffic through {}?",
-                    pending.name
-                )
+    let phone = ctx.os() == egui::os::OperatingSystem::Android;
+    let id = egui::Id::new("confirm exit node");
+    let mut modal = egui::Modal::new(id);
+    if phone {
+        modal = modal
+            .area(egui::Modal::default_area(id).anchor(egui::Align2::CENTER_BOTTOM, [0., -10.]))
+            .frame(
+                egui::Frame::popup(&ctx.style())
+                    .fill(if ctx.style().visuals.dark_mode {
+                        egui::Color32::from_rgb(37, 44, 49)
+                    } else {
+                        egui::Color32::WHITE
+                    })
+                    .inner_margin(16)
+                    .corner_radius(14),
+            );
+    }
+    let result = modal.show(ctx, |ui| {
+        let width = (ctx.screen_rect().width() - 56.).clamp(140., 420.);
+        if phone {
+            ui.set_width(width);
+        } else {
+            ui.set_max_width(width);
+        }
+        let title = if pending.stop {
+            "Disconnect exit node?"
+        } else {
+            "Use exit node?"
+        };
+        ui.label(
+            egui::RichText::new(title)
+                .size(if phone { 22. } else { 17. })
+                .strong(),
+        );
+        ui.add_space(4.);
+        let message = if pending.stop {
+            format!(
+                "Stop using {} and return to the local internet connection?",
+                pending.name
+            )
+        } else if phone {
+            format!(
+                "Route this phone’s IPv4 internet traffic through {}?",
+                pending.name
+            )
+        } else {
+            format!("Use {} as exit node?", pending.name)
+        };
+        ui.label(
+            egui::RichText::new(message)
+                .size(if phone { 17. } else { 14. })
+                .color(ui.visuals().strong_text_color()),
+        );
+        ui.add_space(if phone { 12. } else { 6. });
+        ui.horizontal(|ui| {
+            let action = match (phone, pending.stop) {
+                (true, true) => "Disconnect",
+                (true, false) => "Use exit node",
+                (false, true) => "Stop",
+                (false, false) => "Use",
+            };
+            let (bg, fg) = exit_action_colors(ui.visuals().dark_mode);
+            let font = if phone { 17. } else { 14. };
+            let size = if phone {
+                egui::vec2((width - ui.spacing().item_spacing.x) / 2., 48.)
             } else {
-                format!("Use {} as exit node?", pending.name)
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if phone {
-                    ui.spacing_mut().interact_size = egui::vec2(104., 48.);
-                    ui.spacing_mut().button_padding.x = 18.;
-                }
-                if ui
-                    .button(if pending.stop { "Stop" } else { "Use" })
-                    .clicked()
-                {
-                    accepted = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancelled = true;
-                }
-            });
-        });
+                ui.spacing().interact_size
+            };
+            let cancel = ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("Cancel")
+                            .size(font)
+                            .color(ui.visuals().strong_text_color()),
+                    )
+                    .min_size(size),
+                )
+                .clicked();
+            let accept = ui
+                .add_enabled(
+                    !agent.busy(),
+                    egui::Button::new(egui::RichText::new(action).size(font).color(fg).strong())
+                        .fill(bg)
+                        .min_size(size),
+                )
+                .clicked();
+            (accept, cancel)
+        })
+        .inner
+    });
+    let (accepted, cancelled) = result.inner;
     if accepted {
         agent.send(Command::SetExitNode {
             network_id: pending.network_id.clone(),
             peer: (!pending.stop).then(|| pending.peer_id.clone()),
         });
     }
-    if accepted || cancelled || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if accepted || cancelled || result.should_close() {
         *confirm = None;
     }
 }
@@ -475,24 +577,34 @@ fn known_ids<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<&'a str> {
         .as_ref()
         .map(|o| o.peers.as_slice())
         .unwrap_or(&[]);
-    let mut ids: Vec<&str> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let candidates = overlay_peers
         .iter()
         .map(|p| p.endpoint_id.as_str())
         .chain(network.peers.iter().map(|p| p.endpoint_id.as_str()))
         .chain(network.members.iter().map(|m| m.endpoint_id.as_str()))
         .chain(network.exit.via.as_deref());
-    for id in candidates {
-        if id != own_id && !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    ids
+    candidates
+        .filter(|id| *id != own_id && seen.insert(*id))
+        .collect()
 }
 
 /// How many other devices can be reached now, by any path.
 pub fn online_count(network: &NetworkReport, own_id: &str) -> usize {
-    devices(network, own_id).iter().filter(|d| d.online).count()
+    network
+        .peers
+        .iter()
+        .map(|p| p.endpoint_id.as_str())
+        .chain(
+            network
+                .members
+                .iter()
+                .filter(|m| m.online)
+                .map(|m| m.endpoint_id.as_str()),
+        )
+        .filter(|id| *id != own_id)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 /// How many other devices this network knows of, connected or not.
@@ -516,30 +628,44 @@ fn devices<'a>(network: &'a NetworkReport, own_id: &str) -> Vec<Device<'a>> {
             .iter()
             .filter_map(|p| p.hostname.as_deref().map(|h| (p.endpoint_id.as_str(), h))),
     );
-    let overlay_peers = network
+    let overlay_peers: HashMap<_, _> = network
         .overlay
-        .as_ref()
-        .map(|o| o.peers.as_slice())
-        .unwrap_or(&[]);
+        .iter()
+        .flat_map(|o| &o.peers)
+        .map(|p| (p.endpoint_id.as_str(), p))
+        .collect();
+    let members: HashMap<_, _> = network
+        .members
+        .iter()
+        .map(|m| (m.endpoint_id.as_str(), m))
+        .collect();
+    let peers: HashMap<_, _> = network
+        .peers
+        .iter()
+        .map(|p| (p.endpoint_id.as_str(), p))
+        .collect();
+    let peer_name = |id: &str| {
+        hostnames
+            .get(id)
+            .map_or_else(|| format::short(id), |name| (*name).to_owned())
+    };
 
-    let ids = known_ids(network, own_id);
-
-    let mut devices: Vec<Device> = ids
+    let mut devices: Vec<Device> = known_ids(network, own_id)
         .into_iter()
         .map(|id| {
-            let overlay = overlay_peers.iter().find(|p| p.endpoint_id == id);
-            let member = network.members.iter().find(|m| m.endpoint_id == id);
-            let peer = network.peers.iter().find(|p| p.endpoint_id == id);
+            let overlay = overlay_peers.get(id).copied();
+            let member = members.get(id).copied();
+            let peer = peers.get(id).copied();
             let online = member.is_some_and(|m| m.online) || peer.is_some();
             let path = peer.map(|p| &p.path).or_else(|| member.map(|m| &m.path));
             let via_name = match path {
-                Some(DataPathReport::Relayed { via, .. }) => Some(exit::name_of(network, via)),
+                Some(DataPathReport::Relayed { via, .. }) => Some(peer_name(via)),
                 _ => None,
             };
             let name_taken = member.and_then(|m| {
                 m.hostname_conflict
                     .as_ref()
-                    .map(|c| (c.name.as_str(), exit::name_of(network, &c.holder)))
+                    .map(|c| (c.name.as_str(), peer_name(&c.holder)))
             });
             let hostname = hostnames.get(id).copied();
             Device {
@@ -645,19 +771,32 @@ fn stretch_columns(mut widths: [f32; 9], available: f32) -> [f32; 9] {
     widths
 }
 
+// Keep the numeric columns and controls intact. A long hostname or relay name
+// alone must not turn a normal desktop window into the touch roster.
+fn fit_desktop_widths(widths: [f32; 9], available: f32, em: f32) -> Option<[f32; 9]> {
+    let mut widths = stretch_columns(widths, available);
+    let mut excess = (widths.iter().sum::<f32>() + crate::table::GAP * 8. - available).max(0.);
+    for (column, floor) in [(8, 4. * em), (0, 11. * em), (5, 4. * em)] {
+        let take = (widths[column] - floor).max(0.).min(excess);
+        widths[column] -= take;
+        excess -= take;
+    }
+    (excess <= 0.1).then_some(widths)
+}
+
 /// The exit-node mark of a device: shown when it offers to be one, bright
 /// for the one in use, and clickable (to confirm) only while that can be done.
 ///
 /// The one in use stays clickable even when it has gone away, since stopping
 /// is the only way out of the traffic being blocked.
-fn exit_cell(
+fn exit_action(
     ui: &mut egui::Ui,
+    rect: egui::Rect,
     device: &Device<'_>,
     network_id: &str,
     confirm: &mut Option<ExitConfirm>,
 ) {
     if !device.exit_node && !device.in_use {
-        ui.label("");
         return;
     }
     let (color, hint) = if device.in_use {
@@ -670,16 +809,21 @@ fn exit_cell(
     } else {
         (ui.visuals().text_color(), "Use this exit node")
     };
+    ui.painter_at(rect).text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icon::SIGN_OUT,
+        egui::FontId::proportional(16.),
+        color,
+    );
     let response = ui
-        .add(
-            egui::Label::new(
-                egui::RichText::new(egui_phosphor::regular::SIGN_OUT)
-                    .size(16.0)
-                    .color(color),
-            )
-            .sense(egui::Sense::click()),
+        .interact(
+            rect,
+            ui.id().with(("exit action", network_id, device.id)),
+            egui::Sense::click(),
         )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, hint));
     if widgets::hint(response, hint).clicked() {
         *confirm = Some(ExitConfirm {
             network_id: network_id.to_string(),
@@ -695,6 +839,7 @@ struct DesktopColumns {
     widths: [f32; 9],
     total: String,
     rate: String,
+    short_identity: bool,
 }
 
 fn desktop_columns(
@@ -765,6 +910,7 @@ fn desktop_columns(
         widths,
         total,
         rate,
+        short_identity: false,
     }
 }
 
@@ -829,13 +975,21 @@ fn device_table(
             index % 2 == 0,
             |column, ui| match column {
                 0 => {
-                    name_cell(ui, device);
+                    if table.short_identity {
+                        short_name_cell(ui, device);
+                    } else {
+                        name_cell(ui, device);
+                    }
                     forget_button(ui, device, network, forget_confirm);
                 }
                 1 => {
                     let rect = ui.max_rect();
                     let speed_rect = rect.split_left_right_at_x(rect.right() - speed::WIDTH).1;
-                    exit_cell(ui, device, network_id, confirm);
+                    let exit_rect = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(speed_rect.left(), rect.bottom()),
+                    );
+                    exit_action(ui, exit_rect, device, network_id, confirm);
                     speed.cell(ui, speed_rect, device);
                 }
                 2 => tunnel_cell(ui, device),
@@ -937,7 +1091,11 @@ fn data_path_cell(ui: &mut egui::Ui, device: &Device<'_>) {
     if !device.online {
         text = text.weak();
     }
-    let response = ui.add(egui::Label::new(text).extend().sense(egui::Sense::click()));
+    let response = ui.add(
+        egui::Label::new(text)
+            .truncate()
+            .sense(egui::Sense::click()),
+    );
     widgets::hint(
         response,
         match device.path {

@@ -51,13 +51,13 @@ pub const DATA_REASSEMBLY_TTL: Duration = Duration::from_secs(5);
 pub const DATA_RECENT_IDS: usize = 128;
 
 /// Simultaneous TCP, UDP and ICMP work on a userspace exit.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) const EXIT_FORWARD_FLOWS: usize = 256;
 /// Bounded packet queue shared by userspace exit clients.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) const EXIT_FORWARD_QUEUE: usize = 64;
 /// Concurrent fragmented datagrams accepted by a userspace exit.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) const EXIT_FORWARD_FRAGMENTS: usize = 32;
 
 /// Where the two stores live.

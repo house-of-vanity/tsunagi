@@ -17,7 +17,8 @@ The offering side, per network, off by default:
 tsng network exit-node <network> on      # or off
 ```
 
-Linux and macOS report kernel forwarding in `status`. To enable it on Linux:
+Linux and macOS report kernel forwarding in `status`. macOS enables it when
+the local owner offers an exit. On Linux, enable it with:
 
 ```sh
 sudo sysctl -w net.ipv4.ip_forward=1
@@ -34,6 +35,7 @@ tsng exit-node off
 
 The tray does the same: a checkbox on the network tile to offer, and an icon on
 each device in the devices window that offers one, with a confirmation.
+On Android the round button at the bottom right of the home screen opens all available exits, grouped by network. A check marks the current choice. **No exit node** returns to the phone’s own connection.
 The network card shows the selected peer even when folded. The up arrow counts
 IP bytes sent through the exit and the down arrow counts reply bytes delivered
 to this device. Traffic addressed to the peer within the mesh is counted only
@@ -104,19 +106,41 @@ subnet is dropped locally. Offering an exit remains a per-network choice.
 
 ## macOS
 
-macOS has no `iptables` and no per-user policy routing, so the same behaviour
-is built from `pf` and `route`. The agent runs as root there.
+macOS uses `pf` and `route`. The packaged system agent can configure both.
+
+A user agent that cannot create a system utun can still offer an exit through
+the userspace forwarder. It opens TCP and UDP sockets on the physical uplink
+and handles ICMP echo. A system utun is required to carry traffic from local
+Mac applications over the mesh. Both modes retain the agent's own identity
+and configured networks.
 
 - **Offering:** a `pf` anchor `com.apple/tsunagi-exit-<interface>` (the stock
   `/etc/pf.conf` already evaluates `com.apple/*`) holds
-  `nat on <egress> from <range> to any -> (<egress>)` and tags packets entering from an offered range. A tagged packet that the
+  NAT for traffic tagged on entry from an offered range. A tagged packet that the
   kernel would forward back to the utun gets a PF `route-to` through the
   physical gateway. The physical NAT state is interface-bound.
   `pf` is enabled if it was off, and that reference is released when the rules
-  go. Forwarding is only read: `sudo sysctl -w net.inet.ip.forwarding=1`, which
-  macOS forgets at reboot. The egress is the default route's interface **at the
-  time the rules are applied**; after it changes (Wi-Fi to Ethernet) switch the
-  offer off and on.
+  go. After installing the rules the agent enables IPv4 forwarding and checks
+  the kernel's answer before advertising the exit. Stopping the offer removes
+  its rules and leaves the system-wide switch available to Internet Sharing
+  and other routers. An active offer enables it again after reboot. The agent
+  follows the physical default route when Wi-Fi or Ethernet changes.
+- With an existing overlay interface, a user agent first tries its own
+  permissions. If the operating system denies an exit operation, an explicit
+  enable from the tray or CLI can open the macOS administrator dialog. Approval
+  installs a root-owned helper under `/private/etc/tsunagi-exit` and a sudoers
+  entry for this user and that helper alone. Each approved overlay subnet has
+  a separate grant. The helper checks the live utun address and mask, selects
+  the uplink from the kernel, and manages its own PF anchor and enable token.
+  It accepts only sharing operations. The agent can subsequently reconcile and
+  remove these rules without prompting. At startup it reclaims orphaned helper
+  anchors for the account by checking the owning process and its start time.
+  For a system agent with the necessary
+  rights, the initial enable completes directly.
+- To revoke a grant, turn off its offer, then remove
+  `/private/etc/tsunagi-exit/grant_<uid>_<address>_<prefix>` as administrator.
+  Removing `/private/etc/sudoers.d/tsunagi-exit-<uid>` revokes that user's
+  access to the helper for all subnets.
 - When **using** an exit, ordinary IPv4 internet connections take the two
   split-default routes through the utun, with the local address of the selected
   network. More specific routes continue to reach their own networks.
@@ -175,7 +199,8 @@ is built from `pf` and `route`. The agent runs as root there.
   clear. The agent logs it once, `status` and the tray say so loudly.
 - **IPv6-only destinations are unreachable** meanwhile; carrying IPv6 through
   the exit node is not implemented. DNS is untouched.
-- Kernel forwarding is only read, never changed.
+- Linux reports the administrator's kernel forwarding setting. macOS enables
+  IPv4 forwarding for a local offer. Windows uses a userspace forwarder.
 
 ## Trust
 

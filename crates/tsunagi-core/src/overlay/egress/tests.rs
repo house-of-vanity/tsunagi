@@ -16,6 +16,21 @@ fn addr() -> Ipv4Addr {
     Ipv4Addr::new(10, 13, 37, 9)
 }
 
+fn loopback() -> Physical {
+    #[cfg(target_os = "macos")]
+    let index = netdev::get_interfaces()
+        .into_iter()
+        .find(|i| i.is_loopback())
+        .unwrap()
+        .index;
+    #[cfg(not(target_os = "macos"))]
+    let index = 0;
+    Physical {
+        index,
+        address: Ipv4Addr::LOCALHOST,
+    }
+}
+
 #[tokio::test]
 async fn a_udp_flow_keeps_its_external_port_while_the_upstream_changes_and_stops_with_its_offer() {
     let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -25,10 +40,7 @@ async fn a_udp_flow_keeps_its_external_port_while_the_upstream_changes_and_stops
         assert_eq!(r, route);
         let _ = replies.try_send(p);
     });
-    let physical = Physical {
-        index: 0,
-        address: Ipv4Addr::LOCALHOST,
-    };
+    let physical = loopback();
     gateway.configure(vec![(route.network, physical)]);
     let flow = Tuple {
         src: addr(),
@@ -71,13 +83,7 @@ async fn refused_tcp_returns_a_reset_to_the_originating_client() {
         assert_eq!(r, route);
         let _ = tx.try_send(p);
     });
-    gateway.configure(vec![(
-        route.network,
-        Physical {
-            index: 0,
-            address: Ipv4Addr::LOCALHOST,
-        },
-    )]);
+    gateway.configure(vec![(route.network, loopback())]);
     let flow = Tuple {
         src: addr(),
         dst: Ipv4Addr::LOCALHOST,
@@ -135,10 +141,7 @@ async fn a_tcp_stream_to_the_same_destination_survives_offer_reconciliation() {
             assert_eq!(r, route);
             let _ = tx.try_send(p);
         });
-        let physical = Physical {
-            index: 0,
-            address: Ipv4Addr::LOCALHOST,
-        };
+        let physical = loopback();
         gateway.configure(vec![(route.network, physical)]);
         let flow = Tuple {
             src: addr(),
@@ -350,13 +353,7 @@ async fn resetting_a_half_open_mesh_handshake_closes_the_physical_socket() {
     let gateway = Gateway::new(1280, move |_, packet| {
         let _ = tx.try_send(packet);
     });
-    gateway.configure(vec![(
-        route.network,
-        Physical {
-            index: 0,
-            address: Ipv4Addr::LOCALHOST,
-        },
-    )]);
+    gateway.configure(vec![(route.network, loopback())]);
     let flow = Tuple {
         src: addr(),
         dst: Ipv4Addr::LOCALHOST,
@@ -386,13 +383,7 @@ async fn a_server_half_close_still_receives_the_members_final_bytes_and_fin() {
     let gateway = Gateway::new(1280, move |_, packet| {
         let _ = out.try_send(packet);
     });
-    gateway.configure(vec![(
-        origin.network,
-        Physical {
-            index: 0,
-            address: Ipv4Addr::LOCALHOST,
-        },
-    )]);
+    gateway.configure(vec![(origin.network, loopback())]);
     let flow = Tuple {
         src: addr(),
         dst: Ipv4Addr::LOCALHOST,
@@ -431,13 +422,7 @@ async fn at_capacity_existing_udp_flows_continue_and_a_new_tuple_is_dropped() {
     let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let origin = route();
     let gateway = Gateway::new(1280, |_, _| {});
-    gateway.configure(vec![(
-        origin.network,
-        Physical {
-            index: 0,
-            address: Ipv4Addr::LOCALHOST,
-        },
-    )]);
+    gateway.configure(vec![(origin.network, loopback())]);
     let flow = Tuple {
         src: addr(),
         dst: Ipv4Addr::LOCALHOST,

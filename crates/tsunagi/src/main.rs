@@ -1749,17 +1749,57 @@ impl tsunagi::ipc::ReportSource for AgentControl {
     fn set_exit_offer(
         &self,
         network_id: String,
-        enabled: bool,
-    ) -> tsunagi::BoxFuture<'_, Result<bool, String>> {
+        enabled: Option<bool>,
+    ) -> tsunagi::BoxFuture<'_, Result<tsunagi::ipc::ExitOfferOutcome, String>> {
+        use tsunagi::ipc::ExitOfferOutcome;
         Box::pin(async move {
             let id = network_id
                 .parse()
                 .map_err(|err| format!("invalid network id: {err}"))?;
-            self.agent
-                .set_exit_offer(id, enabled)
+            if let Some(change) = enabled {
+                self.agent
+                    .set_exit_offer(id, change)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                if !change || !self.agent.is_active(id).await {
+                    return Ok(ExitOfferOutcome::Set(change));
+                }
+            } else {
+                // Wait for the actor to apply the current plan before reading its report.
+                // Re-announcing cannot turn on an offer withdrawn during authorization.
+                if !self.agent.is_active(id).await {
+                    return Ok(ExitOfferOutcome::Set(false));
+                }
+                self.agent
+                    .reannounce(id)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            let net = self
+                .agent
+                .network_status(id)
                 .await
                 .map_err(|err| err.to_string())?;
-            Ok(enabled)
+            #[cfg(target_os = "macos")]
+            if net.exit_offer
+                && let Some(rule) = &net.exit_rules.offer
+                && !rule.ok
+            {
+                if let Some(agent_uid) =
+                    tsunagi::overlay::hostrules::macos_exit_authorization_uid(&rule.detail)
+                    && let Some(range) = net.range
+                {
+                    return Ok(ExitOfferOutcome::NeedsAuthorization { range, agent_uid });
+                }
+                if enabled.is_none() {
+                    return Err(rule.detail.clone());
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if enabled.is_none() && net.exit_offer && net.exit_rules.offer.is_none() {
+                return Err("The agent has no usable data interface for exit sharing. Check the data transports in the network settings.".into());
+            }
+            Ok(ExitOfferOutcome::Set(net.exit_offer))
         })
     }
 
@@ -2442,31 +2482,18 @@ async fn broadcast_command(
     Ok(())
 }
 
-/// What to run to turn kernel forwarding on, which the agent never does.
 #[cfg(target_os = "macos")]
-const FORWARDING_COMMAND: &str = "sudo sysctl -w net.inet.ip.forwarding=1";
-#[cfg(target_os = "windows")]
-const FORWARDING_COMMAND: &str = "Get-NetIPInterface | Set-NetIPInterface -Forwarding Enabled   # in an administrator PowerShell";
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const FORWARDING_COMMAND: &str = "sudo sysctl -w net.ipv4.ip_forward=1";
-
-/// How to keep forwarding on across reboots.
-#[cfg(target_os = "macos")]
-const FORWARDING_PERSIST: &str = "macOS forgets it at reboot; set it again from a boot script \
-                                  such as a LaunchDaemon";
-#[cfg(target_os = "windows")]
-const FORWARDING_PERSIST: &str = "the setting is kept across reboots";
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const FORWARDING_PERSIST: &str =
-    "keep it across reboots with `net.ipv4.ip_forward = 1` in /etc/sysctl.d/99-tsunagi.conf";
-
-/// The warning for an exit node whose rules are in place while the kernel is
-/// not forwarding, so that nothing passes.
 fn forwarding_off_note() -> String {
-    format!(
-        "kernel forwarding is OFF, so nothing passes yet: run `{FORWARDING_COMMAND}` \
-         ({FORWARDING_PERSIST})"
-    )
+    "IPv4 forwarding is off. Enable the exit in Tsunagi to request macOS authorization.".into()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn forwarding_off_note() -> String {
+    #[cfg(target_os = "windows")]
+    let instruction = "run `Get-NetIPInterface | Set-NetIPInterface -Forwarding Enabled` in an administrator PowerShell";
+    #[cfg(not(target_os = "windows"))]
+    let instruction = "run `sudo sysctl -w net.ipv4.ip_forward=1` and set `net.ipv4.ip_forward = 1` in /etc/sysctl.d/99-tsunagi.conf to keep it across reboots";
+    format!("kernel forwarding is OFF, so nothing passes yet: {instruction}")
 }
 
 /// Offers this device as an exit node in a network, or stops.
@@ -2476,13 +2503,12 @@ async fn exit_offer_command(
     wanted: &str,
     choice: BroadcastChoice,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let configured = stored_networks(paths);
-    let network = resolve_network(&configured, wanted)?;
     let enabled = matches!(choice, BroadcastChoice::On);
-    let id = network.network_id.to_string();
-
     if !tsunagi::ipc::is_serving(socket).await {
         let storage = tsunagi::storage::Storage::open(paths)?;
+        let configured = storage.list_networks().await?;
+        let network = resolve_network(&configured, wanted)?;
+        let id = network.network_id.to_string();
         storage.set_exit_node(network.network_id, enabled).await?;
         storage.release_ownership_lock();
         println!(
@@ -2498,18 +2524,26 @@ async fn exit_offer_command(
         return Ok(());
     }
 
-    tsunagi::ipc::set_exit_offer(socket, &id, enabled).await?;
+    let live = tsunagi::ipc::request_status(socket).await?;
+    let entries = live
+        .networks
+        .iter()
+        .map(|net| (net.network_id.clone(), net.name.clone()))
+        .collect::<Vec<_>>();
+    let network = &live.networks[resolve_network_index(&entries, wanted)?];
+    let id = &network.network_id;
+    let enabled = tsunagi::ipc::set_exit_offer(socket, id, enabled).await?;
     println!(
         "exit node {} for `{}` ({})",
         if enabled { "on" } else { "off" },
         network.name,
-        short(&id, 10)
+        short(id, 10)
     );
     if !enabled {
         return Ok(());
     }
     let status = tsunagi::ipc::request_status(socket).await?;
-    let Some(report) = status.networks.iter().find(|n| n.network_id == id) else {
+    let Some(report) = status.networks.iter().find(|n| &n.network_id == id) else {
         return Ok(());
     };
     match &report.exit.offer_rules {
@@ -2522,6 +2556,18 @@ async fn exit_offer_command(
     }
     if report.exit.forwarding == Some(false) {
         eprintln!("warning: {}", forwarding_off_note());
+    }
+    if !report
+        .exit
+        .offer_rules
+        .as_ref()
+        .is_some_and(|rules| rules.ok)
+        || report.exit.forwarding == Some(false)
+    {
+        println!(
+            "Exit sharing is enabled in the configuration and is waiting for the host to be ready."
+        );
+        return Ok(());
     }
     println!(
         "\nMembers can now send all their internet traffic through this device, and it \
@@ -5252,6 +5298,7 @@ mod status_tests {
             relay_sent_via: 0,
             relay_received_via: 0,
             peers: vec![PeerReport {
+                uses_our_exit: false,
                 agent_version: None,
                 data_error: None,
                 endpoint_id: ONLINE.into(),
@@ -5595,7 +5642,7 @@ mod status_tests {
         out.push(network_section(&network, OWN, false));
         let text = out.render(false);
         assert_eq!(out.worst(), Health::Degraded, "{text}");
-        assert!(text.contains(FORWARDING_COMMAND), "{text}");
+        assert!(text.contains(&forwarding_off_note()), "{text}");
         assert!(text.contains("ok (nat + forward)"), "{text}");
 
         network.exit.forwarding = Some(true);

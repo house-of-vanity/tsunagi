@@ -17,9 +17,9 @@ existing `NetworkId`.
 Control version 8 adds signed, multi-writer VIP field snapshots to version 7's
 node retirements. The transition from control v7 to v8 requires updating all
 members together. Members already on v8 can adopt the optional software version
-field independently. Data ALPN is `tsunagi/data/6` for the single internal
+and exit-use fields independently. Data ALPN is `tsunagi/data/6` for the single internal
 WireGuard channel. Network ids, derivation labels, handshake encoding and
-existing record signatures are unchanged. Local CLI/tray IPC is version 25.
+existing record signatures are unchanged. Local CLI/tray IPC is version 29.
 Restart the agent with matching clients. SQLite schema 10 adds `vip_fields`, preserving identity,
 network configuration, signed node records and retirement proofs.
 See [virtual services](vip.md), [state sync](sync-model.md) and [AWG](amnezia.md).
@@ -250,7 +250,7 @@ not affect other networks.
 
 | message | meaning |
 |---|---|
-| `Announce { broadcast, exit_node, hostname, capabilities, agent_version? }` | this agent’s hostname, capabilities, broadcast and exit settings, and optional software release |
+| `Announce { broadcast, exit_node, hostname, capabilities, agent_version?, uses_your_exit? }` | this agent’s hostname, capabilities, broadcast and exit settings, and optional software release |
 | `Transport { protocol, payload }` | private, bounded per-peer transport negotiation; never state or a public message event |
 | `Ping { seq, payload }` | small request used to verify the exchange |
 | `Pong { seq, payload }` | the echoed reply |
@@ -260,13 +260,19 @@ not affect other networks.
 | `Reachable { links }` | sender's current direct data links, by kind of transport |
 | `Bye { reason }` | graceful goodbye; not a revocation of anything |
 
-The final field of an authenticated announcement is an optional Tsunagi software
-version. It is a display hint for the current session. Control v8 readers that
+The capabilities in an authenticated announcement may be followed by a Tsunagi
+software version. It is a display hint for the current session. Control v8 readers that
 predate the field stop decoding after the capabilities. Updated readers accept a
 frame ending there and show the version as unknown. A present label is limited
 to 64 ASCII letters, digits, dots, plus signs and hyphens. An invalid hint is
 ignored. Authentication, identity derivation and transport selection use their
 own wire versions independently of this label.
+
+The next optional field, `uses_your_exit`, tells the recipient whether the sender
+selected it as the exit for this network. It is sent directly to the affected peer
+when the selection changes, including while idle. The hint only affects the
+display and expires with the authenticated session. For peers that omit it, an
+exit lists the peer for one minute after its last delivered forwarding packet.
 
 `broadcast` is a per-network local opt-in, enabled by default and treated as
 false until an authenticated announcement arrives. It governs IP broadcast

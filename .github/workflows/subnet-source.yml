@@ -12,6 +12,7 @@ on:
       - 'crates/tsunagi-core/src/overlay/hostrules/linux_exit*.rs'
       - 'crates/tsunagi-core/src/overlay/provision/linux.rs'
       - 'crates/tsunagi-core/src/overlay/hostrules/macos*.rs'
+      - 'crates/tsunagi-core/src/overlay/hostrules/macos/**'
       - 'crates/tsunagi-core/src/overlay/hostrules/windows*.rs'
       - 'crates/tsunagi-core/src/overlay/provision/macos.rs'
       - 'crates/tsunagi-core/src/overlay/provision/windows.rs'
@@ -79,7 +80,7 @@ jobs:
           "$TEST_BINARY" --ignored --exact "$EXIT_TEST" --list | grep -Fx "$EXIT_TEST: test"
           previous=$(sysctl -n net.inet.ip.forwarding)
           trap 'sudo -n sysctl -w "net.inet.ip.forwarding=$previous"' EXIT
-          sudo -n sysctl -w net.inet.ip.forwarding=1
+          sudo -n sysctl -w net.inet.ip.forwarding=0
           sudo -n -- "$TEST_BINARY" --ignored --exact "$EXIT_TEST" --nocapture
       - name: Verify source selection on a real Wintun adapter
         if: runner.os == 'Windows'

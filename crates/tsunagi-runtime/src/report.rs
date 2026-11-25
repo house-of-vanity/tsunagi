@@ -113,6 +113,7 @@ pub fn networks(
                         data_rtt_ms: peer.data_rtt.map(|rtt| rtt.as_millis() as u64),
                         data_transport_detail: peer.data_transport_detail.clone(),
                         exit_node: peer.exit_node,
+                        uses_our_exit: peer.uses_our_exit,
                         path: data_path_report(&peer.data_path),
                     })
                     .collect(),

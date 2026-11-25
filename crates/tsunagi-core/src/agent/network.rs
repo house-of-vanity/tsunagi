@@ -549,6 +549,7 @@ impl Runtime {
         // address it holds.
         self.load_state().await;
 
+        let mut roster = self.params.roster_changed.subscribe();
         let mut ticker = tokio::time::interval(self.params.discovery_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -559,6 +560,7 @@ impl Runtime {
             tokio::select! {
                 biased;
                 _ = self.shutdown.wait() => break,
+                _ = roster.changed() => self.sync_exit_use(),
                 _ = reach_refresh.tick(), if self.params.discovery_interval > REACH_EXPIRY / 3 => self.announce_reach(false),
                 _ = self.hub.changed() => {
                     self.ensure_links();
@@ -590,6 +592,7 @@ impl Runtime {
                     self.start_dials();
                 }
                 _ = ticker.tick() => {
+                    self.sync_exit_use(); // Retry an announcement if the control queue was full.
                     self.discovery_round().await;
                     self.ensure_links();
                     self.update_paths();
@@ -842,15 +845,54 @@ impl Runtime {
     /// Used when a plugin's capability changed, so peers do not have to wait
     /// for a reconnect to learn about it.
     fn reannounce(&mut self) {
-        let announcement = ControlMessage::Announce(self.local_announcement());
+        let announcement = self.local_announcement();
+        self.announced_exit = announcement.exit_node;
+        let via = self.exit_policy().via;
         let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
         for peer in peers {
-            if let Err(err) = self.send_to(peer, announcement.clone()) {
+            if let Err(err) = self.announce_to(peer, announcement.clone(), via) {
                 tracing::debug!(%err, "could not queue re-announcement");
             }
         }
         // What was announced decides which protocol each pair runs.
         self.update_paths();
+    }
+
+    fn announce_to(
+        &mut self,
+        peer: EndpointId,
+        mut announcement: Announcement,
+        via: Option<EndpointId>,
+    ) -> Result<()> {
+        let selected = via == Some(peer);
+        announcement.uses_your_exit = Some(selected);
+        self.send_to(peer, ControlMessage::Announce(announcement))?;
+        if let Some(session) = self.sessions.get_mut(&peer) {
+            session.notified_exit_use = Some(selected);
+        }
+        Ok(())
+    }
+
+    // The selected route is shared by all network actors. A selection in another
+    // network must also clear the old gateway, even if neither peer sends traffic.
+    fn sync_exit_use(&mut self) {
+        let via = self.exit_policy().via;
+        let changed: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                (session.notified_exit_use != Some(via == Some(*id))).then_some(*id)
+            })
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let announcement = self.local_announcement();
+        for peer in changed {
+            if let Err(err) = self.announce_to(peer, announcement.clone(), via) {
+                tracing::debug!(%err, "could not queue exit selection");
+            }
+        }
     }
 
     /// Queues a message without blocking the runtime loop.
@@ -2737,8 +2779,8 @@ impl Runtime {
 
         // Announce ourselves straight away so the peer learns our hostname and
         // capabilities without another round of discovery.
-        let announcement = ControlMessage::Announce(self.local_announcement());
-        if let Err(err) = self.send_to(peer, announcement) {
+        let announcement = self.local_announcement();
+        if let Err(err) = self.announce_to(peer, announcement, self.exit_policy().via) {
             tracing::debug!(%err, "could not queue initial announcement");
         }
 
@@ -2808,13 +2850,13 @@ impl Runtime {
             })
             .collect();
         let exit_node = self.exit_ready();
-        self.announced_exit = exit_node;
         Announcement {
             broadcast: self.params.broadcast,
             exit_node,
             hostname: self.params.hostname.clone(),
             capabilities,
             agent_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            uses_your_exit: None,
         }
     }
 
@@ -3048,6 +3090,7 @@ impl Runtime {
                     session
                         .agent_version
                         .clone_from(&announcement.agent_version);
+                    session.uses_our_exit = announcement.uses_your_exit;
                     session.broadcast = announcement.broadcast;
                     if session.exit_node != announcement.exit_node {
                         session.exit_node = announcement.exit_node;
@@ -3297,6 +3340,7 @@ impl Runtime {
     }
 
     fn status(&self) -> NetworkStatus {
+        let exit = self.exit_policy();
         let served = self.served_protocols();
         let mut peers: Vec<PeerStatus> = self
             .sessions
@@ -3316,6 +3360,12 @@ impl Runtime {
                     data_transport_detail: selected.map(|link| link.path_description()),
                     broadcast: session.broadcast,
                     exit_node: session.exit_node,
+                    uses_our_exit: exit.offer
+                        && session.uses_our_exit.unwrap_or_else(|| {
+                            self.params
+                                .routes
+                                .recent_exit_client(self.network_id, session.peer)
+                        }),
                     endpoint_id: session.peer,
                     role: session.role,
                     agent_version: session.agent_version.clone(),
@@ -3393,7 +3443,6 @@ impl Runtime {
         members.sort_by(|a, b| a.endpoint_id.as_bytes().cmp(b.endpoint_id.as_bytes()));
         members.dedup_by(|a, b| a.endpoint_id == b.endpoint_id);
 
-        let exit = self.exit_policy();
         NetworkStatus {
             speed: self
                 .params

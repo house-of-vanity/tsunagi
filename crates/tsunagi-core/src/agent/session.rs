@@ -93,6 +93,10 @@ pub(crate) struct Session {
     pub(crate) outbound: mpsc::Sender<zeroize::Zeroizing<Vec<u8>>>,
     pub(crate) hostname: Option<String>,
     pub(crate) agent_version: Option<String>,
+    /// Selection reported by this peer, or unknown for a pre-extension session.
+    pub(super) uses_our_exit: Option<bool>,
+    /// Last selection successfully queued to this recipient on this session.
+    pub(super) notified_exit_use: Option<bool>,
     pub(crate) capabilities: Vec<PluginCapability>,
     pub(crate) broadcast: bool,
     /// The peer offers itself as an exit node in this network.
@@ -253,6 +257,8 @@ pub(crate) fn spawn(
         reach_sent: None,
         hostname: None,
         agent_version: None,
+        uses_our_exit: None,
+        notified_exit_use: None,
         capabilities: Vec::new(),
         broadcast: false,
         exit_node: false,

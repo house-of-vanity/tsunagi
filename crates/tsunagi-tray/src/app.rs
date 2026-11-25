@@ -195,11 +195,17 @@ impl App {
                 continue;
             };
             let viewport = egui::ViewportId::from_hash_of(("devices", id));
+            let preferred = egui::vec2(1240., 740.);
+            let size = ctx
+                .input(|i| i.viewport().monitor_size)
+                .map_or(preferred, |monitor| {
+                    preferred.min((monitor - egui::vec2(48., 80.)).max(egui::vec2(560., 400.)))
+                });
             let builder = egui::ViewportBuilder::default()
                 .with_title(devices::title(&report.networks[index]))
                 .with_app_id(crate::icon::APP_ID)
                 .with_icon(crate::icon::window())
-                .with_inner_size([1000., 640.])
+                .with_inner_size(size)
                 .with_min_inner_size([560., 400.]);
             let views = self.views.clone();
             let agent = self.agent.clone();

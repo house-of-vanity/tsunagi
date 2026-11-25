@@ -107,6 +107,41 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
+/// Small unlabelled trace painted in an existing network or table row.
+pub(crate) fn mini_traffic(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    series: Option<&Series>,
+    unit: Unit,
+    idle: egui::Color32,
+    active: bool,
+) {
+    let baseline = rect.bottom() - 1.;
+    let history = series.map(|s| s.history(unit));
+    if active && let Some(history) = history {
+        let n = history.len().min(24);
+        let samples = history.iter().skip(history.len() - n);
+        let peak = samples.clone().copied().fold(0_f32, f32::max);
+        if n >= 2 && peak > 0. {
+            let points = samples
+                .enumerate()
+                .map(|(i, s)| {
+                    egui::pos2(
+                        rect.left() + rect.width() * i as f32 / (n - 1) as f32,
+                        baseline - (rect.height() - 2.) * s / peak,
+                    )
+                })
+                .collect();
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(1.5_f32, ACCENT),
+            ));
+            return;
+        }
+    }
+    painter.hline(rect.x_range(), baseline, egui::Stroke::new(1_f32, idle));
+}
+
 /// A fixed-height sparkline of a series' recent rate, with the peak (top-left)
 /// and current value (bottom-right) overlaid. The space is always reserved —
 /// even with no data — so the layout never jumps when data arrives.
@@ -115,6 +150,17 @@ pub fn sparkline(ui: &mut egui::Ui, series: Option<&Series>, unit: Unit, height:
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
+    if width < 84.0 {
+        mini_traffic(
+            &painter,
+            rect.shrink2(egui::vec2(1., 3.)),
+            series,
+            unit,
+            visuals.weak_text_color(),
+            true,
+        );
+        return;
+    }
     painter.rect_filled(rect, 2.0, visuals.extreme_bg_color);
 
     let Some(series) = series else {

@@ -86,6 +86,7 @@ impl Capture<'_> {
             Some(&rules),
         )
         .unwrap();
+        enable_forwarding(&run_tool).unwrap();
     }
     fn enable(&mut self) {
         self.offer(true);
@@ -314,8 +315,8 @@ async fn exit_preserves_underlay_and_both_meshes() {
         added_route: false,
         added_scoped: false,
     };
-    // The disposable runner enables kernel forwarding. A keeps the same
-    // translated address and port when B installs an upstream route to this IP.
+    // The local offer enables kernel forwarding. A keeps the same translated
+    // address and port when B installs an upstream route to this IP.
     capture.offer(false);
     let port = member_round_trip(&*overlay, &*uplink, 43001, b"member before").await;
     capture.enable();

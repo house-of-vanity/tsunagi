@@ -37,6 +37,7 @@ fn source(agent: Agent, plugin: Arc<WireguardPlugin>) -> Arc<dyn tsunagi::ipc::R
                         .peers
                         .iter()
                         .map(|peer| tsunagi::ipc::PeerReport {
+                            uses_our_exit: peer.uses_our_exit,
                             agent_version: peer.agent_version.clone(),
                             data_error: None,
                             endpoint_id: peer.endpoint_id.to_string(),

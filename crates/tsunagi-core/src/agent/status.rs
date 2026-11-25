@@ -145,6 +145,8 @@ pub struct MemberStatus {
 /// Status of one authenticated session.
 #[derive(Debug, Clone)]
 pub struct PeerStatus {
+    /// The connected member has selected this gateway, or recently sent exit traffic on a legacy session.
+    pub uses_our_exit: bool,
     /// This authenticated peer accepts network broadcasts.
     pub broadcast: bool,
     /// This authenticated peer offers itself as an exit node.

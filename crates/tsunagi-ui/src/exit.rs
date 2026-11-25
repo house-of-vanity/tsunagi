@@ -10,9 +10,7 @@ pub(crate) const GOOD: egui::Color32 = egui::Color32::from_rgb(0x3c, 0xb0, 0x4a)
 /// Something about exit nodes the user has to look at.
 pub(crate) const LOUD: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x4a, 0x3c);
 
-/// What to run to turn kernel forwarding on, which the agent never does.
-#[cfg(target_os = "macos")]
-pub(crate) const FORWARDING_COMMAND: &str = "sudo sysctl -w net.inet.ip.forwarding=1";
+/// Platform instructions for hosts where an administrator manages forwarding.
 #[cfg(target_os = "windows")]
 pub(crate) const FORWARDING_COMMAND: &str =
     "Get-NetIPInterface | Set-NetIPInterface -Forwarding Enabled";
@@ -54,8 +52,7 @@ pub(crate) fn warnings(network: &NetworkReport) -> Vec<Warning> {
         if !exit.via_online {
             out.push(Warning {
                 text: format!(
-                    "exit node {name} is offline — your internet traffic is blocked until it \
-                     returns; stop using it from the devices window"
+                    "Exit node {name} is offline. Internet traffic is blocked until it returns or you disconnect it."
                 ),
                 copy: None,
             });
@@ -90,6 +87,9 @@ pub(crate) fn warnings(network: &NetworkReport) -> Vec<Warning> {
             Some(_) => {}
         }
         if exit.forwarding == Some(false) {
+            #[cfg(target_os = "macos")]
+            out.push(Warning { text: "IPv4 forwarding is off. Enable the exit to authorize sharing this Mac’s internet.".into(),copy:None });
+            #[cfg(not(target_os = "macos"))]
             out.push(Warning {
                 text: format!("exit node: kernel forwarding is OFF — run: {FORWARDING_COMMAND}"),
                 copy: Some(FORWARDING_COMMAND),
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn a_working_exit_node_is_quiet_and_forwarding_off_gives_the_command() {
+    fn a_working_exit_is_quiet_and_forwarding_off_explains_the_platform_action() {
         let working = ExitReport {
             via: Some("abcdef0123456789".into()),
             via_online: true,
@@ -164,6 +164,9 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(offering.len(), 1);
+        #[cfg(target_os = "macos")]
+        assert!(offering[0].copy.is_none() && offering[0].text.contains("authorize"));
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(offering[0].copy, Some(FORWARDING_COMMAND));
     }
 }

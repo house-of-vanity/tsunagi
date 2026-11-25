@@ -74,9 +74,22 @@ pub use windows::WindowsHostRules;
 #[cfg(all(feature = "tun-device", target_os = "macos"))]
 mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[path = "macos/authorization.rs"]
+mod macos_authorization;
+#[cfg(any(test, target_os = "macos"))]
+#[cfg_attr(
+    not(all(feature = "tun-device", target_os = "macos")),
+    allow(dead_code)
+)]
 mod macos_exit;
 #[cfg(all(feature = "tun-device", target_os = "macos"))]
 pub use macos::MacosHostRules;
+#[cfg(target_os = "macos")]
+pub use macos_authorization::{
+    authorize_macos_exit, macos_exit_authorization_uid, macos_exit_needs_authorization,
+};
+#[cfg(target_os = "macos")]
+pub(in crate::overlay) use macos_exit::macos_default_uplink;
 
 /// What the host should be told for one interface.
 #[derive(Debug, Clone, PartialEq, Eq)]

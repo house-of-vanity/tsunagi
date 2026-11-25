@@ -245,6 +245,20 @@ async fn an_exit_keeps_serving_its_client_while_switching_its_own_upstream() {
         c.wait_for_tunnels(net, 2)
     );
     a.agent.set_exit_via(net, Some(b.id())).await.unwrap();
+    wait_until(
+        "only the selected gateway sees the idle exit client",
+        || async {
+            let gateway = b.status(net).await;
+            let other = c.status(net).await;
+            (gateway
+                .peers
+                .iter()
+                .any(|p| p.endpoint_id == a.id() && p.uses_our_exit)
+                && other.peers.iter().all(|p| !p.uses_our_exit))
+            .then_some(())
+        },
+    )
+    .await;
     let (at, bt, ct) = (a.tun().await, b.tun().await, c.tun().await);
     let (aa, ba) = (a.overlay(net).await, b.overlay(net).await);
     for (epoch, upstream) in [false, true, false, true].into_iter().enumerate() {
@@ -272,6 +286,19 @@ async fn an_exit_keeps_serving_its_client_while_switching_its_own_upstream() {
         assert_eq!(a.status(net).await.exit_via, Some(b.id()));
         assert!(b.status(net).await.exit_offer);
     }
+    a.agent.set_exit_via(net, None).await.unwrap();
+    wait_until(
+        "deselection removes a client even immediately after forwarding",
+        || async {
+            b.status(net)
+                .await
+                .peers
+                .iter()
+                .all(|p| !p.uses_our_exit)
+                .then_some(())
+        },
+    )
+    .await;
     let _ = tokio::join!(a.shutdown(), b.shutdown(), c.shutdown());
 }
 
@@ -298,6 +325,26 @@ async fn switching_the_exit_between_networks_keeps_both_overlays_reachable() {
             .set_exit_via(exit.id, Some(exit.peer.id()))
             .await
             .unwrap();
+        wait_until(
+            "selection is visible in exactly the chosen network",
+            || async {
+                let alpha_used = left
+                    .status(alpha.id)
+                    .await
+                    .peers
+                    .iter()
+                    .any(|p| p.uses_our_exit);
+                let beta_used = right
+                    .status(beta.id)
+                    .await
+                    .peers
+                    .iter()
+                    .any(|p| p.uses_our_exit);
+                (alpha_used == (exit.id == alpha.id) && beta_used == (exit.id == beta.id))
+                    .then_some(())
+            },
+        )
+        .await;
         let plan = client.rules.exit().installed().unwrap();
         assert_eq!(plan.client_source, Some(exit.client_addr));
         assert_eq!(plan.overlay.len(), 2);
