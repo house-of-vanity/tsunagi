@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-awg"
-version = "1.0.3"
+version = "1.0.4"
 description = "Ephemeral pairwise Amnezia transport for Tsunagi."
 edition.workspace = true
 rust-version.workspace = true

@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Instant};
 use tokio::sync::{mpsc, watch};
 use tsunagi::{
     Agent, NetworkName, NetworkSecret,
-    ipc::{PrivilegeReport, ProtocolReport, StatusReport},
+    ipc::{DnsReport, PrivilegeReport, ProtocolReport, StatusReport},
     vip::VipStatus,
 };
 use tsunagi_ui::client::Command;
@@ -14,6 +14,8 @@ use zeroize::Zeroizing;
 pub enum Request {
     /// A command from the same form used by the tray.
     Action(Command),
+    /// The visible activity requested current counters.
+    Refresh,
     /// The physical network changed.
     NetworkChanged,
     /// Disable only the exit identified by the notification the user tapped.
@@ -177,12 +179,21 @@ pub async fn report(
     wg: Option<&WireguardPlugin>,
     dns: &crate::dns::Resolver,
 ) -> tsunagi::Result<StatusReport> {
+    snapshot(agent, wg, dns, None).await
+}
+
+async fn snapshot(
+    agent: &Agent,
+    wg: Option<&WireguardPlugin>,
+    dns: &crate::dns::Resolver,
+    cached_zones: Option<DnsReport>,
+) -> tsunagi::Result<StatusReport> {
     let status = agent.status().await?;
     let overlay = agent.overlay();
     Ok(StatusReport {
         networks: tsunagi_runtime::report::networks(&status, overlay.as_ref(), wg),
         overlay_config_error: overlay.and_then(|state| state.address_error),
-        dns: Some(dns.refresh(&status.networks)),
+        dns: Some(dns.with_listener(cached_zones.unwrap_or_else(|| dns.refresh(&status.networks)))),
         endpoint_id: status.endpoint_id.to_string(),
         hostname: status.hostname,
         bound_sockets: status
@@ -218,16 +229,20 @@ pub async fn serve(
     mut stop: watch::Receiver<bool>,
     mut publish_exit: impl FnMut(Option<&ExitNotice>),
 ) {
-    let mut poll = tokio::time::interval(std::time::Duration::from_secs(2));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut roster = agent.watch_roster();
+    roster.mark_changed(); // Load the initial zones before waiting for any actions.
+    let mut cached_zones = None;
+    let mut retry = false;
     let mut published_exit = None;
     loop {
-        let reply = tokio::select! {
+        let (reply, mut refresh_zones) = tokio::select! {
             biased;
-            _ = stop.wait_for(|stopped| *stopped) => break,
+            _ = async { drop(stop.wait_for(|stopped| *stopped).await) } => break,
             command = commands.recv() => {
                 let Some((request, reply)) = command else { break };
+                let refresh_zones = !matches!(request, Request::Refresh);
                 let result = match request {
+                    Request::Refresh => Ok(Outcome::Applied),
                     Request::Action(cmd) => {
                         if matches!(cmd, Command::Join { .. } | Command::Leave { .. } | Command::SetActive { .. }) {
                             dns.replace(None);
@@ -242,21 +257,39 @@ pub async fn serve(
                     Request::DisconnectExit {network, peer} => disconnect_exit(&agent, &network, &peer).await
                         .map(|()| Outcome::Applied).map_err(|e| e.to_string()),
                 };
-                Some((reply, result))
+                (Some((reply, result)), refresh_zones)
             }
-            _ = poll.tick() => None,
+            changed = roster.changed() => {
+                if changed.is_err() { break; }
+                (None, true)
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)), if retry => (None, true),
         };
-        state.send_replace(match report(&agent, Some(&wg), &dns).await {
-            Ok(report) => {
-                let notice = exit_notice(&report);
-                if published_exit.as_ref() != Some(&notice) {
-                    publish_exit(notice.as_ref());
-                    published_exit = Some(notice);
+        // A command may itself have changed the roster. Consume notifications
+        // before taking the snapshot so changes during the read stay pending.
+        refresh_zones |= roster.has_changed().unwrap_or(false);
+        if refresh_zones {
+            roster.borrow_and_update();
+            cached_zones = None;
+        }
+        state.send_replace(
+            match snapshot(&agent, Some(&wg), &dns, cached_zones.take()).await {
+                Ok(report) => {
+                    retry = false;
+                    cached_zones.clone_from(&report.dns);
+                    let notice = exit_notice(&report);
+                    if published_exit.as_ref() != Some(&notice) {
+                        publish_exit(notice.as_ref());
+                        published_exit = Some(notice);
+                    }
+                    State::Ready(Arc::new(report), Instant::now())
                 }
-                State::Ready(Arc::new(report), Instant::now())
-            }
-            Err(error) => State::Error(error.to_string()),
-        });
+                Err(error) => {
+                    retry = true;
+                    State::Error(error.to_string())
+                }
+            },
+        );
         if let Some((reply, outcome)) = reply {
             let _ = reply.send(outcome);
         }

@@ -68,8 +68,12 @@ pub(crate) struct Session {
     pub(crate) role: Role,
     pub(crate) established: Instant,
     pub(crate) conn: Connection,
-    /// Already encoded frame payloads, so the runtime can account for the exact
-    /// number of control bytes it queues.
+    /// Last signed-state revision queued on this ordered stream.
+    pub(super) state_sent: u64,
+    /// Prefix of the current introduction list already queued on this stream.
+    pub(super) introductions_sent: usize,
+    pub(super) reach_sent: Option<Instant>,
+    /// Already encoded frames, accounted for when queued.
     pub(crate) outbound: mpsc::Sender<zeroize::Zeroizing<Vec<u8>>>,
     pub(crate) hostname: Option<String>,
     pub(crate) agent_version: Option<String>,
@@ -228,6 +232,9 @@ pub(crate) fn spawn(
         established: Instant::now(),
         conn,
         outbound: outbound_tx,
+        state_sent: 0,
+        introductions_sent: 0,
+        reach_sent: None,
         hostname: None,
         agent_version: None,
         capabilities: Vec::new(),

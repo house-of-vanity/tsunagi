@@ -150,6 +150,10 @@ pub trait PacketLink: Send + Sync + std::fmt::Debug + 'static {
         None
     }
 
+    /// The link monitor received a timely, authenticated answer to a data probe
+    /// on this very link. A carrier can use it in place of its own idle probe.
+    fn confirm_delivery(&self) {}
+
     /// A short description of the path in use, for diagnostics.
     ///
     /// Reports what the transport actually knows. It must not invent a value.

@@ -46,16 +46,23 @@ impl Resolver {
         let view = tsunagi::dns::RosterZones::from_networks(networks);
         let names = view.zones.names() as u32;
         self.replace(Some(view.zones));
-        let address = *self.listening.borrow();
         tsunagi::ipc::DnsReport {
-            listening: address.map(|ip| format!("{ip}:53")).into_iter().collect(),
-            publish_error: (address.is_none() && !view.labels.is_empty())
-                .then(|| "Waiting for a VPN interface with a DNS address.".into()),
             zones: view.labels,
             zone_warnings: view.warnings,
             names,
             ..Default::default()
         }
+    }
+
+    pub(crate) fn with_listener(
+        &self,
+        mut report: tsunagi::ipc::DnsReport,
+    ) -> tsunagi::ipc::DnsReport {
+        let address = *self.listening.borrow();
+        report.listening = address.map(|ip| format!("{ip}:53")).into_iter().collect();
+        report.publish_error = (address.is_none() && !report.zones.is_empty())
+            .then(|| "Waiting for a VPN interface with a DNS address.".into());
+        report
     }
 
     /// Answer a local DNS request. Slow public lookups never block a mesh answer.

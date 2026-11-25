@@ -16,6 +16,97 @@ async fn view(agent: &Agent, network: NetworkId, id: &str) -> VipStatus {
     })
     .await
 }
+
+#[tokio::test]
+async fn a_local_storage_failure_is_repaired_from_the_peer_after_reconnect() {
+    use tsunagi::{StoragePaths, agent::Event, testing::wait_event};
+    let discovery = SharedMemoryDiscovery::new();
+    let a = TestAgent::spawn(&discovery).await.unwrap();
+    let b = TestAgent::spawn(&discovery).await.unwrap();
+    let (name, secret) = network("retry-signed-update");
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    wait_for_peers(&a.agent, id, 1).await;
+    let path = StoragePaths::under(b.dir.path()).state_db();
+    let trigger = |sql: &'static str| {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap()
+        })
+    };
+    trigger("CREATE TRIGGER reject_vip BEFORE INSERT ON vip_fields BEGIN SELECT RAISE(ABORT, 'test write failure'); END;").await.unwrap();
+    let mut events = b.agent.subscribe();
+    let vip = VipConfig::new("recover");
+    a.agent
+        .save_vip(id, vip.clone(), None, false)
+        .await
+        .unwrap();
+    wait_event(&mut events, |e| matches!(e, Event::PluginError { protocol, reason, .. } if protocol == "state" && reason.contains("test write failure")).then_some(())).await;
+    trigger("DROP TRIGGER reject_vip").await.unwrap();
+    assert_eq!(view(&b.agent, id, &vip.id).await.config, vip);
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test]
+async fn idle_maintenance_does_not_republish_acknowledged_mesh_state() {
+    use tsunagi::{agent::Event, proto::ControlMessage};
+    let discovery = SharedMemoryDiscovery::new();
+    let a = TestAgent::spawn(&discovery).await.unwrap();
+    let b = TestAgent::spawn(&discovery).await.unwrap();
+    let (name, secret) = network("quiet-mesh");
+    let id = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    wait_for_peers(&a.agent, id, 1).await;
+    let vip = VipConfig::new("web");
+    a.agent
+        .save_vip(id, vip.clone(), None, false)
+        .await
+        .unwrap();
+    view(&b.agent, id, &vip.id).await;
+    let mut events = b.agent.subscribe();
+    // Mark the end of each round on the same ordered control stream.
+    let last_hints = std::cell::RefCell::new(None);
+    for round in 0..4 {
+        a.agent.recheck_network(id).await.unwrap();
+        a.agent
+            .send(
+                id,
+                b.agent.endpoint_id(),
+                ControlMessage::Ping {
+                    seq: round,
+                    payload: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        tsunagi::testing::wait_event(&mut events, |event| {
+            if let Event::MessageReceived { message, .. } = event {
+                match message {
+                    ControlMessage::Ping { seq, .. } if *seq == round => return Some(()),
+                    ControlMessage::Vips { .. } | ControlMessage::Reachable { .. } if round > 0 => {
+                        panic!("republished unchanged state on maintenance round {round}")
+                    }
+                    ControlMessage::Peers { peers } => {
+                        assert_ne!(
+                            last_hints.replace(Some(peers.clone())).as_ref(),
+                            Some(peers),
+                            "unchanged introductions"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            None
+        })
+        .await;
+    }
+    a.stop().await;
+    b.stop().await;
+}
 #[tokio::test]
 async fn any_member_can_edit_services_and_an_offline_creator_is_not_required() {
     let discovery = SharedMemoryDiscovery::new();

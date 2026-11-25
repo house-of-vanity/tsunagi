@@ -110,7 +110,11 @@ fresh private marker/key to the sender's endpoint id. Unanswered requests expire
 after three seconds. After a 20-second warmup, at least 15 completed observations
 and at least 60% loss in the last 20 observations retire a carrier. Probes are
 consumed at the carrier boundary and never enter the TUN or user IP counters.
-AWG additionally checks encrypted outer delivery throughout the pair lifetime.
+Both WG and AWG start with native encrypted probes. A timely authenticated
+round trip on the full-sized carrier check also proves outer delivery, so it
+replaces the native probe. Native probes resume after three seconds without
+such a confirmation. Each peer still answers both types of probe independently,
+including requests from 1.0.3 peers.
 
 Setup failure or persistent runtime loss advances to the next mutually supported
 carrier in the initiator's order. Earlier expired cooldowns do not jump ahead of

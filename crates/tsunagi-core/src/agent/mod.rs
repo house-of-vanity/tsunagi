@@ -106,6 +106,7 @@ struct Inner {
     /// Serialises start, stop, switching and conflict cleanup, including teardown.
     lifecycle: Arc<Mutex<()>>,
     range_changed: watch::Sender<()>,
+    roster_changed: watch::Sender<()>,
     range_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     accept_task: std::sync::Mutex<Option<JoinHandle<()>>>,
     plugin_task: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -452,6 +453,7 @@ impl Agent {
             shutdown: Shutdown::new(),
             lifecycle: Arc::new(Mutex::new(())),
             range_changed,
+            roster_changed: watch::channel(()).0,
             range_task: std::sync::Mutex::new(None),
             accept_task: std::sync::Mutex::new(None),
             plugin_task: std::sync::Mutex::new(None),
@@ -690,6 +692,7 @@ impl Agent {
         for sender in senders {
             let _ = sender.send(NetCommand::SetHostname(hostname.clone())).await;
         }
+        self.inner.roster_changed.send_replace(());
         Ok(hostname)
     }
 
@@ -704,6 +707,13 @@ impl Agent {
     /// than allowed to stall the runtime.
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
+    }
+
+    /// Subscribe to changes affecting the mesh DNS roster or selected exit.
+    /// Changes coalesce. Read the current status after subscribing and again on
+    /// notification. Packet counters and routine control traffic do not wake subscribers.
+    pub fn watch_roster(&self) -> watch::Receiver<()> {
+        self.inner.roster_changed.subscribe()
     }
 
     /// Makes this agent a member of a network, activating it.
@@ -1019,6 +1029,7 @@ impl Agent {
             unreachable_data_peers: Arc::clone(&self.inner.config.unreachable_data_peers),
             ipv4_range: range,
             range_changed: self.inner.range_changed.clone(),
+            roster_changed: self.inner.roster_changed.clone(),
         });
         networks.insert(network_id, handle);
         drop(networks);
@@ -1030,6 +1041,7 @@ impl Agent {
             tunnel.on_network_activated(network_id);
         }
 
+        self.inner.roster_changed.send_replace(());
         let _ = self.inner.events.send(Event::NetworkActivated {
             network: network_id,
         });
@@ -1097,6 +1109,7 @@ impl Agent {
             interface.sync_broadcast_rules().await;
             interface.sync_exit_rules().await;
         }
+        self.inner.roster_changed.send_replace(());
         Ok(())
     }
 
@@ -1111,6 +1124,7 @@ impl Agent {
             self.stop_network_locked(network_id).await?;
         }
         self.inner.storage.remove_network(network_id).await?;
+        self.inner.roster_changed.send_replace(());
         for plugin in &self.inner.config.carriers {
             plugin.on_network_forgotten(network_id);
         }

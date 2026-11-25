@@ -142,8 +142,9 @@ Missing snapshot fields are never deletion.
 Saving validates the entire draft and checks the revision shown by the editor.
 The merged snapshot and author's counter commit together in SQLite before local
 routing changes or publication. Receivers verify and persist complete service
-snapshots before exposing them. Periodic rotating snapshots repair queue loss
-and returning replicas without requiring the creator online. Concurrent edits
+snapshots before exposing them. Each session sends changed services and retries
+when its send queue has room. Reconnecting replicas receive all retained
+services and tombstones from any member. Concurrent edits
 made before participants have seen each other can still merge after a save.
 A merged configuration exceeding listener/backend limits is reported as an
 error and excluded from routing rather than selected according to arrival order.

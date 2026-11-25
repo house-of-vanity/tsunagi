@@ -18,6 +18,27 @@ pub(crate) const MAX_PAYLOAD: usize = tsunagi::config::MAX_DATA_DATAGRAM;
 const CHUNK: usize = 700;
 const QUEUE: usize = 64;
 const WINDOW: Duration = Duration::from_secs(20);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct DeliveryChecks {
+    replies: AtomicU64,
+    last_shared: Mutex<Option<Instant>>,
+}
+
+impl DeliveryChecks {
+    fn confirm_shared(&self, now: Instant) {
+        *self.last_shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+        self.replies.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn needs_probe(&self, now: Instant) -> bool {
+        self.last_shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none_or(|last| now.saturating_duration_since(last) >= PROBE_TIMEOUT)
+    }
+}
 
 pub(crate) struct PairLink {
     network: NetworkId,
@@ -30,7 +51,7 @@ pub(crate) struct PairLink {
     closed: AtomicBool,
     remote: Mutex<Option<SocketAddr>>,
     reason: Mutex<Option<String>>,
-    checks: Arc<AtomicU64>,
+    checks: Arc<DeliveryChecks>,
 }
 impl std::fmt::Debug for PairLink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -42,7 +63,7 @@ impl std::fmt::Debug for PairLink {
 }
 impl PairLink {
     pub(crate) fn delivery_checks(&self) -> u64 {
-        self.checks.load(Ordering::Relaxed)
+        self.checks.replies.load(Ordering::Relaxed)
     }
     pub(crate) fn has_authenticated_path(&self) -> bool {
         match self.remote.lock() {
@@ -99,6 +120,9 @@ impl PacketLink for PairLink {
     fn close(&self) {
         self.stop.send_replace(true);
     }
+    fn confirm_delivery(&self) {
+        self.checks.confirm_shared(Instant::now());
+    }
     fn failure_reason(&self) -> Option<String> {
         match self.reason.lock() {
             Ok(reason) => reason.clone(),
@@ -145,7 +169,7 @@ pub(crate) fn start(
         closed: AtomicBool::new(false),
         remote: Mutex::new(None),
         reason: Mutex::new(None),
-        checks: Arc::new(AtomicU64::new(0)),
+        checks: Arc::default(),
     });
     let weak = Arc::downgrade(&link);
     let checks = link.checks.clone();
@@ -198,7 +222,7 @@ struct Engine {
     assemblies: HashMap<u64, Assembly>,
     started: Instant,
     last_authenticated: Instant,
-    checks: Arc<AtomicU64>,
+    checks: Arc<DeliveryChecks>,
 }
 enum ResultOwned {
     Wire(Vec<u8>),
@@ -249,12 +273,23 @@ impl Engine {
                 _=timer.tick()=>{
                     let result=own(self.tunn.update_timers(&mut scratch));self.process(result,None).await;
                     if last_probe.elapsed()>=Duration::from_secs(1) {
-                        last_probe=Instant::now();self.sequence=self.sequence.wrapping_add(1);
-                        self.pending.push_back((self.sequence,Instant::now()));
-                        let mut probe=vec![1];probe.extend_from_slice(&self.sequence.to_be_bytes());
-                        probe.resize(713,0);rand::fill(&mut probe[9..]);self.encrypt(&probe).await;
+                        last_probe = Instant::now();
+                        if self.checks.needs_probe(last_probe) {
+                            self.sequence = self.sequence.wrapping_add(1);
+                            self.pending.push_back((self.sequence, last_probe));
+                            let mut probe = vec![1];
+                            probe.extend_from_slice(&self.sequence.to_be_bytes());
+                            probe.resize(713, 0);
+                            rand::fill(&mut probe[9..]);
+                            self.encrypt(&probe).await;
+                        } else {
+                            // A full-sized round trip passed through fragmentation and
+                            // reassembly. The outer monitor owns loss accounting now.
+                            self.samples.clear();
+                            self.pending.clear();
+                        }
                     }
-                    while self.pending.front().is_some_and(|(_,at)|at.elapsed()>=Duration::from_secs(3)) {
+                    while self.pending.front().is_some_and(|(_,at)|at.elapsed()>=PROBE_TIMEOUT) {
                         self.pending.pop_front();self.samples.push_back(false);
                     }
                     while self.samples.len()>20 {self.samples.pop_front();}
@@ -363,7 +398,7 @@ impl Engine {
                         {
                             self.pending.remove(index);
                             self.samples.push_back(true);
-                            self.checks.fetch_add(1, Ordering::Relaxed);
+                            self.checks.replies.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     Some(3) => self.fragment(seq, payload),
@@ -410,5 +445,24 @@ impl Engine {
                 let _ = self.inbox.try_send(Bytes::from(packet));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    #[test]
+    fn shared_delivery_replaces_native_probes_only_while_round_trips_succeed() {
+        let checks = DeliveryChecks::default();
+        let start = Instant::now();
+        assert!(checks.needs_probe(start));
+        checks.confirm_shared(start);
+        assert!(!checks.needs_probe(start + Duration::from_secs(2)));
+        assert!(checks.needs_probe(start + Duration::from_secs(3)));
+        checks.confirm_shared(start + Duration::from_secs(4));
+        assert!(!checks.needs_probe(start + Duration::from_secs(5)));
+        assert_eq!(checks.replies.load(Ordering::Relaxed), 2);
     }
 }

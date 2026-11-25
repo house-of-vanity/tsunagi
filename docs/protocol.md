@@ -225,8 +225,8 @@ ignores it. Each row belongs to the authenticated sender and is replaced
 atomically, expires after 90 seconds, and is withdrawn on session closure. Only
 authenticated members enter the graph; local edges always come from actual
 links.
-Announcements refresh on the existing control maintenance interval and are
-sent immediately on link changes. Topology stays volatile, outside signed state.
+Each new session receives the current edges. Link changes trigger an immediate
+update, and unchanged edges are due for refresh after 30 seconds. Topology stays volatile, outside signed state.
 
 Version 5 also adds `hostname_since` to a signed hostname claim (signing domain
 `tsunagi-signed-record-v3`): a name belongs to whoever claimed it first. Stored

@@ -9,8 +9,78 @@ fn addr(octet: u8) -> Cidr {
 }
 
 #[tokio::test]
+async fn a_hidden_service_waits_for_mesh_changes_and_visible_stats_are_on_demand() {
+    use crate::service::{Request, State, serve};
+    use std::time::Duration;
+    use tokio::sync::{mpsc, oneshot, watch};
+    use tsunagi::{
+        discovery::SharedMemoryDiscovery,
+        testing::{TestAgent, network},
+    };
+    use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
+    let discovery = SharedMemoryDiscovery::new();
+    let phone = TestAgent::spawn(&discovery).await.unwrap();
+    let wg = WireguardPlugin::open(WireguardConfig::new(phone.dir.path().join("wg")))
+        .await
+        .unwrap();
+    let (state, mut snapshots) = watch::channel(State::Starting);
+    let (stop, stopped) = watch::channel(false);
+    let (commands, requests) = mpsc::channel(4);
+    let agent = phone.agent.clone();
+    let task = tokio::spawn(async move {
+        serve(
+            agent,
+            wg,
+            crate::dns::Resolver::new(|_| None),
+            requests,
+            &state,
+            stopped,
+            |_| {},
+        )
+        .await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(*snapshots.borrow_and_update(), State::Ready(..)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(2200), snapshots.changed())
+            .await
+            .is_err(),
+        "a hidden, idle service rebuilt the status"
+    );
+    let (tx, rx) = oneshot::channel();
+    commands.send((Request::Refresh, tx)).await.unwrap();
+    rx.await.unwrap().unwrap();
+    assert!(snapshots.has_changed().unwrap());
+    let (name, secret) = network("background-mesh");
+    phone.agent.join_network(&name, &secret).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), snapshots.wait_for(|s| {
+        matches!(s, State::Ready(r, _) if r.dns.as_ref().is_some_and(|d| d.zones.iter().any(|z| z == "background-mesh")))
+    })).await.unwrap().unwrap();
+    stop.send_replace(true);
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn notification_tracks_the_selected_exit_and_a_stale_disconnect_keeps_the_current_route() {
-    use crate::service::{disconnect_exit, exit_notice, report};
+    use crate::service::{ExitNotice, State, disconnect_exit, serve};
+    use tokio::sync::{mpsc, watch};
+    use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
+    async fn notice_matching(
+        notices: &mut watch::Receiver<Option<ExitNotice>>,
+        predicate: impl Fn(&Option<ExitNotice>) -> bool,
+    ) -> Option<ExitNotice> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            notices.wait_for(predicate),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone()
+    }
     use tsunagi::{
         discovery::SharedMemoryDiscovery,
         testing::{TestAgent, network, wait_until},
@@ -43,10 +113,32 @@ async fn notification_tracks_the_selected_exit_and_a_stale_disconnect_keeps_the_
             .then_some(())
     })
     .await;
-    let dns = crate::dns::Resolver::new(|_| None);
-    assert!(exit_notice(&report(&phone.agent, None, &dns).await.unwrap()).is_none());
+    let wg = WireguardPlugin::open(WireguardConfig::new(phone.dir.path().join("wg")))
+        .await
+        .unwrap();
+    let agent = phone.agent.clone();
+    let (_commands, requests) = mpsc::channel(4);
+    let (stop, stopped) = watch::channel(false);
+    let (published, mut notices) = watch::channel(None);
+    let task = tokio::spawn(async move {
+        let (state, _) = watch::channel(State::Starting);
+        serve(
+            agent,
+            wg,
+            crate::dns::Resolver::new(|_| None),
+            requests,
+            &state,
+            stopped,
+            |notice| {
+                published.send_replace(notice.cloned());
+            },
+        )
+        .await;
+    });
     phone.agent.set_exit_via(id, Some(peer)).await.unwrap();
-    let notice = exit_notice(&report(&phone.agent, None, &dns).await.unwrap()).unwrap();
+    let notice = notice_matching(&mut notices, |n| n.as_ref().is_some_and(|n| n.online))
+        .await
+        .unwrap();
     assert_eq!(notice.name, "gateway");
     assert_eq!(notice.network_name, "travel");
     assert!(notice.online);
@@ -61,21 +153,20 @@ async fn notification_tracks_the_selected_exit_and_a_stale_disconnect_keeps_the_
         phone.agent.network_status(id).await.unwrap().exit_via,
         Some(peer)
     );
-    exit.stop().await;
-    wait_until(
-        "offline exit remains selected in the notification",
-        || async {
-            let report = report(&phone.agent, None, &dns).await.ok()?;
-            exit_notice(&report).filter(|n| !n.online)
-        },
-    )
+    exit.agent.set_hostname("renamed-gateway").await.unwrap();
+    notice_matching(&mut notices, |n| {
+        n.as_ref().is_some_and(|n| n.name == "renamed-gateway")
+    })
     .await;
+    exit.stop().await;
+    notice_matching(&mut notices, |n| n.as_ref().is_some_and(|n| !n.online)).await;
     disconnect_exit(&phone.agent, &notice.network, &notice.peer)
         .await
         .unwrap();
-    assert!(exit_notice(&report(&phone.agent, None, &dns).await.unwrap()).is_none());
+    notice_matching(&mut notices, Option::is_none).await;
     assert!(phone.agent.is_active(id).await);
-    phone.stop().await;
+    stop.send_replace(true);
+    task.await.unwrap();
 }
 
 #[tokio::test]

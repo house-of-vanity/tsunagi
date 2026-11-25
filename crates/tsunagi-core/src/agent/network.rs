@@ -38,8 +38,10 @@ use super::status::{
     CandidateStatus, DataPath, HostnameConflict, MemberStatus, NetworkMetrics, NetworkState,
     NetworkStatus, PeerStatus,
 };
+use sync::{Changes, SyncKey};
 
 mod selection;
+mod sync;
 
 /// An inbound connection that already passed the handshake.
 #[derive(Debug)]
@@ -205,6 +207,7 @@ pub(crate) struct RuntimeParams {
     pub(crate) ipv4_range: Option<Ipv4Range>,
     /// Coalesced notifications to the agent's lifecycle manager.
     pub(crate) range_changed: tokio::sync::watch::Sender<()>,
+    pub(crate) roster_changed: tokio::sync::watch::Sender<()>,
     /// How data plane links are opened. `None` disables the data plane.
     pub(crate) transport: Option<Arc<dyn PacketTransport>>,
 }
@@ -429,10 +432,9 @@ struct Runtime {
     /// Snapshots received while dispatching, handled on the next loop pass.
     pending_state: Vec<(EndpointId, Vec<SignedRecord>)>,
     pending_retirements: Vec<(EndpointId, Vec<SignedRetirement>)>,
-    pending_vips: Vec<Vec<crate::vip::VipEntry>>,
-    vip_cursor: HashMap<EndpointId, usize>,
-    /// Next cleanup batch per live session; prevents queue pressure starving a suffix.
-    retirement_cursor: HashMap<EndpointId, usize>,
+    pending_vips: Vec<(EndpointId, Vec<crate::vip::VipEntry>)>,
+    changes: Changes,
+    introductions: Vec<crate::proto::message::PeerHint>,
     /// The highest version this agent has ever published for this network.
     own_version: u64,
     /// Whether the exit node in use was reachable when last looked at, so
@@ -521,8 +523,8 @@ impl Runtime {
             pending_state: Vec::new(),
             pending_retirements: Vec::new(),
             pending_vips: Vec::new(),
-            vip_cursor: HashMap::new(),
-            retirement_cursor: HashMap::new(),
+            changes: Changes::default(),
+            introductions: Vec::new(),
             own_version: 0,
             exit_via_was_online: false,
             announced_exit: false,
@@ -545,10 +547,14 @@ impl Runtime {
         let mut ticker = tokio::time::interval(self.params.discovery_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Long discovery intervals must not let live transit edges expire.
+        let mut reach_refresh = tokio::time::interval(REACH_EXPIRY / 3);
+        reach_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
                 _ = self.shutdown.wait() => break,
+                _ = reach_refresh.tick(), if self.params.discovery_interval > REACH_EXPIRY / 3 => self.announce_reach(false),
                 _ = self.hub.changed() => {
                     self.ensure_links();
                     self.update_paths();
@@ -787,7 +793,6 @@ impl Runtime {
                     // author, so the new version replaces the old name
                     // rather than sitting beside it.
                     self.ensure_own_claim().await;
-                    self.broadcast_state();
                 }
                 // Told to peers regardless, so a session that missed the
                 // earlier announcement is not left with a stale name.
@@ -894,12 +899,11 @@ impl Runtime {
         // the check is a comparison when nothing has changed.
         self.ensure_own_claim().await;
         self.report_hostname_taken();
-        self.broadcast_vips();
-        self.broadcast_retirements();
+        self.flush_updates();
         // The same timer repairs the relay picture: reachability is soft
         // state, repeated while it holds and forgotten when it stops.
         self.update_paths();
-        self.announce_reach(true);
+        self.announce_reach(false);
 
         let mut candidates: Vec<Candidate> = Vec::new();
 
@@ -1210,6 +1214,7 @@ impl Runtime {
             }
         }
 
+        self.index_stored_state();
         self.ensure_own_claim().await;
         self.publish_allocations().await;
     }
@@ -1425,14 +1430,7 @@ impl Runtime {
         self.candidate_addrs.remove(&peer);
         self.publish_allocations().await;
         self.report_hostname_taken();
-        let message = ControlMessage::Retirements {
-            markers: vec![marker],
-        };
-        let peers: Vec<_> = self.sessions.keys().copied().collect();
-        let peers_told = peers
-            .into_iter()
-            .filter(|peer| self.send_to(*peer, message.clone()).is_ok())
-            .count();
+        let peers_told = self.share_changes([SyncKey::Retirement(peer)]);
         Ok(super::ForgetNodeOutcome {
             target: peer,
             record_version: expected_version,
@@ -1440,40 +1438,8 @@ impl Runtime {
         })
     }
 
-    fn broadcast_retirements(&mut self) -> usize {
-        let markers = self.state.retirements();
-        if markers.is_empty() {
-            return 0;
-        }
-        // Each proof has an encoded bound; reserve envelope/list overhead and
-        // chunk every marker, so a low-id prefix cannot starve later cleanup.
-        let batch = (self.params.limits.max_frame_len.saturating_sub(128) / MAX_RETIREMENT_LEN)
-            .max(1)
-            .min(self.params.limits.max_state_records.max(1));
-        let mut delivered = HashSet::new();
-        let peers: Vec<_> = self.sessions.keys().copied().collect();
-        let chunks: Vec<_> = markers.chunks(batch).collect();
-        for peer in peers {
-            let start = self.retirement_cursor.get(&peer).copied().unwrap_or(0) % chunks.len();
-            for offset in 0..chunks.len() {
-                let index = (start + offset) % chunks.len();
-                let message = ControlMessage::Retirements {
-                    markers: chunks[index].to_vec(),
-                };
-                if self.send_to(peer, message).is_err() {
-                    self.retirement_cursor.insert(peer, index);
-                    break;
-                }
-                delivered.insert(peer);
-                self.retirement_cursor
-                    .insert(peer, (index + 1) % chunks.len());
-            }
-        }
-        delivered.len()
-    }
-
     async fn receive_retirements(&mut self, peer: EndpointId, markers: Vec<SignedRetirement>) {
-        let mut changed = false;
+        let mut changed = Vec::new();
         for marker in markers {
             let mut candidate = self.state.clone();
             match candidate.merge_retirement(
@@ -1495,11 +1461,7 @@ impl Runtime {
             }
             let target = marker.target.author_id().ok();
             if let Err(err) = self.params.storage.put_retirement(marker).await {
-                self.emit(Event::PluginError {
-                    network: self.network_id,
-                    protocol: "state".into(),
-                    reason: format!("cannot persist cleanup proof: {err}"),
-                });
+                self.retry_signed_sync(peer, err);
                 continue;
             }
             self.state = candidate;
@@ -1511,14 +1473,16 @@ impl Runtime {
                 self.dial_states.remove(&target);
                 self.candidate_addrs.remove(&target);
             }
-            changed = true;
+            if let Some(target) = target {
+                changed.push(SyncKey::Retirement(target));
+            }
         }
-        if changed {
+        if !changed.is_empty() {
             // A live target answers cleanup with a fresh claim; its identity
             // is still authenticated, and old hostname priority is not reused.
             self.ensure_own_claim().await;
             self.publish_allocations().await;
-            self.broadcast_retirements();
+            self.share_changes(changed);
         }
     }
 
@@ -1565,7 +1529,7 @@ impl Runtime {
                 return;
             }
         }
-        self.broadcast_state();
+        self.share_changes([SyncKey::Claim(self.local_id)]);
     }
 
     fn update_vips(&self) {
@@ -1654,25 +1618,21 @@ impl Runtime {
             .storage
             .put_vip_fields(
                 self.network_id,
-                snapshot.clone(),
+                snapshot,
                 Some((*self.local_id.as_bytes(), version)),
             )
             .await?;
         self.own_version = version;
         self.params.vips = candidate;
         self.update_vips();
-        let peers: Vec<_> = self.sessions.keys().copied().collect();
-        for peer in peers {
-            let _ = self.send_to(
-                peer,
-                ControlMessage::Vips {
-                    entries: snapshot.clone(),
-                },
-            );
-        }
+        self.share_changes([SyncKey::Vip(config.id)]);
         Ok(self.params.routes.vips.statuses(self.network_id))
     }
-    async fn receive_vips(&mut self, entries: Vec<crate::vip::VipEntry>) -> Result<()> {
+    async fn receive_vips(
+        &mut self,
+        peer: EndpointId,
+        entries: Vec<crate::vip::VipEntry>,
+    ) -> Result<()> {
         let Some(id) = entries.first().map(|e| e.vip.clone()) else {
             return Ok(());
         };
@@ -1694,14 +1654,21 @@ impl Runtime {
             (own_seen > self.own_version).then_some((*self.local_id.as_bytes(), own_seen));
         let snapshot = candidate.entries(&id);
         self.validate_vip_frame(&snapshot)?;
-        self.params
+        if let Err(err) = self
+            .params
             .storage
             .put_vip_fields(self.network_id, snapshot, counter)
-            .await?;
+            .await
+        {
+            self.retry_signed_sync(peer, err);
+            return Ok(());
+        }
         self.own_version = self.own_version.max(own_seen);
         self.params.vips = candidate;
         self.update_vips();
-        self.broadcast_vips();
+        if changed {
+            self.share_changes([SyncKey::Vip(id)]);
+        }
         Ok(())
     }
     fn validate_vip_frame(&self, entries: &[crate::vip::VipEntry]) -> Result<()> {
@@ -1719,33 +1686,10 @@ impl Runtime {
         }
         Ok(())
     }
-    fn broadcast_vips(&mut self) {
-        let ids = self.params.vips.ids();
-        if ids.is_empty() {
-            return;
-        }
-        let peers: Vec<_> = self.sessions.keys().copied().collect();
-        for peer in peers {
-            let start = self.vip_cursor.get(&peer).copied().unwrap_or(0) % ids.len();
-            for step in 0..ids.len() {
-                let index = (start + step) % ids.len();
-                let entries = self.params.vips.entries(&ids[index]);
-                if self
-                    .send_to(peer, ControlMessage::Vips { entries })
-                    .is_err()
-                {
-                    self.vip_cursor.insert(peer, index);
-                    break;
-                }
-                self.vip_cursor.insert(peer, (index + 1) % ids.len());
-            }
-        }
-    }
-
     /// Handles snapshots collected while dispatching messages.
     async fn drain_pending_state(&mut self) {
-        for entries in std::mem::take(&mut self.pending_vips) {
-            if let Err(err) = self.receive_vips(entries).await {
+        for (peer, entries) in std::mem::take(&mut self.pending_vips) {
+            if let Err(err) = self.receive_vips(peer, entries).await {
                 self.metrics.protocol_violations += 1;
                 tracing::warn!(%err,"rejecting VIP snapshot");
             }
@@ -1759,29 +1703,33 @@ impl Runtime {
         self.report_hostname_taken();
     }
 
-    /// Sends everything we know to every peer.
-    fn broadcast_state(&mut self) {
-        self.broadcast_vips();
-        self.broadcast_retirements();
-        let mut records = self.state.records();
-        records.truncate(self.params.limits.max_state_records);
-        if records.is_empty() {
-            return;
-        }
-        let message = ControlMessage::State { records };
-        let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
-        for peer in peers {
-            if let Err(err) = self.send_to(peer, message.clone()) {
-                tracing::debug!(%err, "could not queue a state snapshot");
-            }
+    /// Reopening the affected reliable stream requests a full replay from
+    /// this replica. A local write failure must not silently acknowledge it.
+    fn retry_signed_sync(&self, peer: EndpointId, error: Error) {
+        self.emit(Event::PluginError {
+            network: self.network_id,
+            protocol: "state".into(),
+            reason: format!("cannot persist a signed update: {error}"),
+        });
+        if let Some(session) = self.sessions.get(&peer) {
+            session
+                .conn
+                .close(1u32.into(), b"retry state synchronization");
         }
     }
 
     /// Merges a snapshot from a peer.
-    async fn receive_state(&mut self, peer: EndpointId, records: Vec<SignedRecord>) {
-        let before = self.state.records();
-        let (outcomes, errors) = self.state.merge_all(self.network_id, records);
-
+    async fn receive_state(&mut self, peer: EndpointId, mut records: Vec<SignedRecord>) {
+        // Older peers can send a full snapshot on someone else's update.
+        // Exact copies of records already verified and committed are cheap.
+        records.retain(|r| r.author_id().ok().and_then(|a| self.state.get(&a)) != Some(r));
+        if records.is_empty() {
+            return;
+        }
+        let mut authors: std::collections::BTreeSet<_> =
+            records.iter().filter_map(|r| r.author_id().ok()).collect();
+        let mut candidate = self.state.clone();
+        let (outcomes, errors) = candidate.merge_all(self.network_id, records);
         for err in errors {
             self.metrics.protocol_violations += 1;
             self.emit(Event::ProtocolViolation {
@@ -1790,43 +1738,30 @@ impl Runtime {
                 reason: format!("unusable signed record: {err}"),
             });
         }
-        for outcome in &outcomes {
-            if *outcome == Merged::Conflicted {
-                self.emit(Event::PluginError {
-                    network: self.network_id,
-                    protocol: "overlay".into(),
-                    reason: "two different records from one author at the same version; \
-                             a device key appears to be in use in two places"
-                        .into(),
-                });
-            }
+        if outcomes.contains(&Merged::Conflicted) {
+            self.emit(Event::PluginError {
+                network: self.network_id,
+                protocol: "overlay".into(),
+                reason: "two different records from one author at the same version; a device key appears to be in use in two places".into(),
+            });
         }
-
-        let changed = outcomes.iter().any(|outcome| {
-            matches!(
-                outcome,
-                Merged::Added | Merged::Updated | Merged::Conflicted
-            )
-        });
-        if !changed {
+        authors.retain(|author| self.state.get(author) != candidate.get(author));
+        if authors.is_empty() {
             return;
         }
-
-        for record in self.state.records() {
-            if record.author == *self.local_id.as_bytes() {
-                continue;
-            }
-            if let Err(err) = self.params.storage.put_signed_record(record).await {
-                tracing::debug!(%err, "cannot persist a record");
+        for author in &authors {
+            if *author != self.local_id
+                && let Some(record) = candidate.get(author)
+                && let Err(err) = self.params.storage.put_signed_record(record.clone()).await
+            {
+                self.retry_signed_sync(peer, err);
+                return;
             }
         }
-
-        // Somebody may have taken the address we were using.
+        self.state = candidate;
+        self.share_changes(authors.into_iter().map(SyncKey::Claim));
         self.ensure_own_claim().await;
         self.publish_allocations().await;
-        if self.state.records() != before {
-            self.broadcast_state();
-        }
     }
 
     fn broadcast_policy(&self) -> crate::overlay::broadcast::BroadcastPolicy {
@@ -1863,6 +1798,7 @@ impl Runtime {
             .routes
             .update_exit(self.network_id, |exit| exit.via = via);
         self.exit_via_was_online = via.is_some();
+        self.params.roster_changed.send_replace(());
         Ok(())
     }
 
@@ -1907,6 +1843,7 @@ impl Runtime {
             return;
         }
         self.exit_via_was_online = online;
+        self.params.roster_changed.send_replace(());
         if online {
             tracing::info!(
                 network = %self.network_id,
@@ -1979,6 +1916,7 @@ impl Runtime {
         }
         if self.published_range != Some(range) {
             self.published_range = Some(range);
+            self.params.roster_changed.send_replace(());
             self.params.range_changed.send_replace(());
         }
 
@@ -2312,9 +2250,12 @@ impl Runtime {
     ///
     /// A device told about one member ends up talking to all of them: a
     /// network is a mesh, and which member happened to be named on a
-    /// command line should not decide who anybody talks to. Sent on every
-    /// round, because it is cheap, bounded and self-repairing.
+    /// command line should not decide who anybody talks to. A new stream or
+    /// a changed, bounded address list is enough to update a replica.
     fn introduce_peers(&mut self) {
+        if self.sessions.is_empty() || self.params.limits.max_state_records == 0 {
+            return;
+        }
         let mut hints: Vec<crate::proto::message::PeerHint> = Vec::new();
 
         // What this agent can see for itself: where each peer it is
@@ -2363,21 +2304,48 @@ impl Runtime {
             endpoint: *self.local_id.as_bytes(),
             addrs: hint_addrs(&self.underlay_addr(self.params.adapter.addr())),
         });
-        hints.truncate(self.params.limits.max_state_records);
-        if hints.is_empty() {
-            return;
+        hints.sort_unstable_by_key(|hint| hint.endpoint);
+        if hints != self.introductions {
+            let common = hints
+                .iter()
+                .zip(&self.introductions)
+                .take_while(|(a, b)| a == b)
+                .count();
+            self.introductions = hints;
+            for session in self.sessions.values_mut() {
+                session.introductions_sent = session.introductions_sent.min(common);
+            }
         }
-
-        let message = ControlMessage::Peers { peers: hints };
-        let peers: Vec<EndpointId> = self.sessions.keys().copied().collect();
-        for peer in peers {
-            if let Err(err) = self.send_to(peer, message.clone()) {
-                tracing::debug!(%err, "could not queue an introduction");
+        use crate::proto::message::{MAX_HINT_ADDR_LEN, MAX_HINT_ADDRS};
+        let max_hint_size = 40 + MAX_HINT_ADDRS * (MAX_HINT_ADDR_LEN + 2);
+        let limits = &self.params.limits;
+        let batch = (limits.max_frame_len.saturating_sub(128) / max_hint_size)
+            .max(1)
+            .min(limits.max_state_records);
+        let pending: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|s| s.introductions_sent < self.introductions.len())
+            .map(|s| (s.peer, s.introductions_sent))
+            .collect();
+        for (peer, mut start) in pending {
+            while start < self.introductions.len() {
+                let end = (start + batch).min(self.introductions.len());
+                let message = ControlMessage::Peers {
+                    peers: self.introductions[start..end].to_vec(),
+                };
+                if self.send_to(peer, message).is_err() {
+                    break;
+                }
+                start = end;
+            }
+            if let Some(session) = self.sessions.get_mut(&peer) {
+                session.introductions_sent = start;
             }
         }
     }
 
-    /// Publishes only locally observed, protocol-specific transport edges.
+    /// Publish changed edges immediately and refresh soft state before peers expire it.
     fn announce_reach(&mut self, force: bool) {
         let live: HashSet<_> = self
             .links
@@ -2390,18 +2358,33 @@ impl Runtime {
                 },
             )
             .collect();
-        if !force && live == self.announced_reach {
+        if force || live != self.announced_reach {
+            self.announced_reach = live;
+            for session in self.sessions.values_mut() {
+                session.reach_sent = None;
+            }
+        }
+        let pending: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|s| {
+                s.reach_sent
+                    .is_none_or(|last| last.elapsed() >= REACH_EXPIRY / 3)
+            })
+            .map(|s| s.peer)
+            .collect();
+        if pending.is_empty() {
             return;
         }
-        self.announced_reach = live.clone();
-        let mut links: Vec<_> = live.into_iter().collect();
+        let mut links: Vec<_> = self.announced_reach.iter().cloned().collect();
         links.sort_by(|a, b| (&a.protocol, a.peer).cmp(&(&b.protocol, b.peer)));
         links.truncate(self.params.limits.max_state_records);
         let message = ControlMessage::Reachable { links };
-        let peers: Vec<_> = self.sessions.keys().copied().collect();
-        for peer in peers {
-            if let Err(err) = self.send_to(peer, message.clone()) {
-                tracing::debug!(%err, "could not queue a reachability announcement");
+        for peer in pending {
+            if self.send_to(peer, message.clone()).is_ok()
+                && let Some(s) = self.sessions.get_mut(&peer)
+            {
+                s.reach_sent = Some(Instant::now());
             }
         }
     }
@@ -2626,8 +2609,6 @@ impl Runtime {
     /// Drops every link to a peer.
     fn drop_links_for(&mut self, peer: EndpointId) {
         self.tunnel_errors.remove(&peer);
-        self.retirement_cursor.remove(&peer);
-        self.vip_cursor.remove(&peer);
         self.reset_peer_data(peer, "peer session ended");
         if let Some(tunnel) = &self.params.tunnel {
             tunnel.on_peer_gone(self.network_id, peer);
@@ -2747,8 +2728,11 @@ impl Runtime {
             tracing::debug!(%err, "could not queue initial announcement");
         }
 
-        self.broadcast_state();
+        self.flush_peer(peer);
+        self.introduce_peers();
+        self.announce_reach(false);
 
+        self.params.roster_changed.send_replace(());
         self.emit(Event::PeerConnected {
             network: self.network_id,
             peer,
@@ -2898,6 +2882,7 @@ impl Runtime {
                     .or_insert_with(|| DialState::new(CandidateSource::Discovery));
                 state.in_flight = false;
                 state.next_attempt = Instant::now() + policy.initial_delay;
+                self.params.roster_changed.send_replace(());
                 self.emit(Event::PeerDisconnected {
                     network: self.network_id,
                     peer,
@@ -2921,6 +2906,7 @@ impl Runtime {
             return;
         }
         self.known_hostnames.insert(peer, hostname.to_string());
+        self.params.roster_changed.send_replace(());
         let storage = self.params.storage.clone();
         let network_id = self.network_id;
         let hostname = hostname.to_string();
@@ -3024,7 +3010,7 @@ impl Runtime {
                     tracing::debug!(%err, "could not queue pong");
                 }
             }
-            ControlMessage::Vips { entries } => self.pending_vips.push(entries.clone()),
+            ControlMessage::Vips { entries } => self.pending_vips.push((peer, entries.clone())),
             ControlMessage::State { records } => {
                 self.pending_state.push((peer, records.clone()));
             }
@@ -3038,6 +3024,7 @@ impl Runtime {
                 let learned = self.learn_peers(peers);
                 if learned > 0 {
                     self.start_dials();
+                    self.introduce_peers();
                 }
             }
             // What that peer can reach, from that peer. Kept with the time

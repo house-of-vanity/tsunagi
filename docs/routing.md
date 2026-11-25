@@ -24,8 +24,8 @@ the selected link fails or its MTU is too small. The configured order
 selects the initial link. Peers with automatic carrier selection can then
 prefer a faster measured link for that neighbour. Every authenticated
 member enters the graph; a member in the middle needs no protocol in common
-with either end, only a link to each. A snapshot refreshes on the maintenance
-interval, expires after 90 seconds, and is withdrawn when the session ends.
+with either end, only a link to each. A snapshot is due for refresh after 30
+seconds, expires after 90 seconds, and is withdrawn when the session ends.
 Link arrival, closure and changed announcements rebuild routes immediately.
 Unchanged announcements refresh their age without republishing the forwarding
 snapshot.

@@ -25,6 +25,7 @@ use tsunagi_wg_quic::{DEFAULT_MTU, WireguardConfig, WireguardPlugin};
 
 struct Session {
     id: i64,
+    last_refresh: Option<std::time::Instant>,
     commands: mpsc::Sender<(Request, Reply)>,
     state: watch::Receiver<State>,
     underlay: watch::Sender<Vec<std::net::IpAddr>>,
@@ -39,10 +40,21 @@ fn current() -> std::sync::MutexGuard<'static, Option<Session>> {
     SESSION.lock().unwrap_or_else(|e| e.into_inner())
 }
 fn status() -> State {
-    current()
-        .as_ref()
-        .map(|s| s.state.borrow().clone())
-        .unwrap_or_default()
+    let mut current = current();
+    let Some(session) = current.as_mut() else {
+        return State::Off;
+    };
+    if session
+        .last_refresh
+        .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(2))
+        && session
+            .commands
+            .try_send((Request::Refresh, oneshot::channel().0))
+            .is_ok()
+    {
+        session.last_refresh = Some(std::time::Instant::now());
+    }
+    session.state.borrow().clone()
 }
 fn send(cmd: tsunagi_ui::client::Command) -> Result<Response, String> {
     let (reply, result) = oneshot::channel();
@@ -227,6 +239,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_start(
             })?;
         *slot = Some(Session {
             id,
+            last_refresh: None,
             commands,
             state: state_rx,
             underlay,

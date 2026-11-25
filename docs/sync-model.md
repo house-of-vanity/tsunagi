@@ -90,9 +90,10 @@ is not a permanent identity ban or a change of secret.
 
 The marker and requester's own author counter commit in one SQLite transaction
 before publication. Receivers persist a verified marker before applying it.
-Invalid proofs are rejected individually. Periodic bounded marker batches
-rotate through each peer's send queue, including when a queue fills, so a
-replica that missed an update can catch up without the requester being online.
+Invalid proofs are rejected individually. Each authenticated stream receives
+the current claims, markers and VIPs, then their changes. A per-session cursor
+advances when a bounded frame enters the send queue. The next maintenance
+round retries pending revisions, and a new session starts from the beginning.
 
 One strongest marker per target is retained, with a default limit of 1024 per
 network and 1024 bytes per encoded marker. New targets beyond that limit are

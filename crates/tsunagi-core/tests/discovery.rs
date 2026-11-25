@@ -148,13 +148,21 @@ async fn being_told_about_one_member_is_enough_to_meet_them_all() {
 
     // Three that already know each other, and nothing that resolves by
     // network: no shared discovery here, only what members pass on.
+    // A single introduction fits each frame, including when three members
+    // already know the same bootstrap. No peer may get stuck behind the first.
+    let small_frames = |dir: &std::path::Path| {
+        let mut config = local_config(dir);
+        config.limits.max_state_records = 1;
+        config.limits.session_send_queue = 2;
+        config
+    };
     let first_dir = tempfile::TempDir::new().unwrap();
-    let first = Agent::spawn(local_config(first_dir.path())).await.unwrap();
+    let first = Agent::spawn(small_frames(first_dir.path())).await.unwrap();
     let network_id = first.join_network(&name, &secret).await.unwrap();
 
     let second_dir = tempfile::TempDir::new().unwrap();
     let second = Agent::spawn(
-        local_config(second_dir.path())
+        small_frames(second_dir.path())
             .with_discovery(Arc::new(StaticBootstrap::new([first.local_addr()]))),
     )
     .await
@@ -164,7 +172,7 @@ async fn being_told_about_one_member_is_enough_to_meet_them_all() {
 
     let third_dir = tempfile::TempDir::new().unwrap();
     let third = Agent::spawn(
-        local_config(third_dir.path())
+        small_frames(third_dir.path())
             .with_discovery(Arc::new(StaticBootstrap::new([first.local_addr()]))),
     )
     .await

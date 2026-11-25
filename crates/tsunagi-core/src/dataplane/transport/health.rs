@@ -31,7 +31,7 @@ impl std::fmt::Debug for Settings {
     }
 }
 struct Samples {
-    pending: VecDeque<(u64, Instant)>,
+    pending: VecDeque<(u64, Instant, usize)>,
     recent: VecDeque<Option<Duration>>,
     last_reply: Option<Instant>,
 }
@@ -45,8 +45,8 @@ impl Samples {
             last_reply: None,
         }
     }
-    fn sent(&mut self, seq: u64, now: Instant) {
-        self.pending.push_back((seq, now));
+    fn sent(&mut self, seq: u64, now: Instant, size: usize) {
+        self.pending.push_back((seq, now, size));
     }
     fn record(&mut self, rtt: Option<Duration>) {
         if self.recent.len() == WINDOW {
@@ -54,9 +54,12 @@ impl Samples {
         }
         self.recent.push_back(rtt);
     }
-    fn acknowledge(&mut self, seq: u64, now: Instant) {
-        if let Some(i) = self.pending.iter().position(|(n, _)| *n == seq)
-            && let Some((_, sent)) = self.pending.remove(i)
+    fn acknowledge(&mut self, seq: u64, now: Instant, size: usize) -> bool {
+        if let Some(i) = self
+            .pending
+            .iter()
+            .position(|(n, _, expected)| *n == seq && *expected == size)
+            && let Some((_, sent, _)) = self.pending.remove(i)
         {
             let rtt = now.saturating_duration_since(sent);
             let success = rtt < PROBE_TIMEOUT;
@@ -64,13 +67,15 @@ impl Samples {
             if success {
                 self.last_reply = Some(now);
             }
+            return success;
         }
+        false
     }
     fn expire(&mut self, now: Instant) {
         while self
             .pending
             .front()
-            .is_some_and(|(_, at)| now.duration_since(*at) >= PROBE_TIMEOUT)
+            .is_some_and(|(_, at, _)| now.duration_since(*at) >= PROBE_TIMEOUT)
         {
             self.pending.pop_front();
             self.record(None);
@@ -160,7 +165,7 @@ impl HealthLink {
                         sequence=sequence.wrapping_add(1);
                         let size=raw.max_datagram_size();
                         let packet=probe(&settings,local,1,sequence,size.min(1000));
-                        samples.sent(sequence,now);
+                        samples.sent(sequence,now,packet.len());
                         let _=raw.send(packet);
                     }
                     packet=raw.recv()=>{
@@ -170,7 +175,9 @@ impl HealthLink {
                             if let Some((kind,seq))=verify(&settings,raw.peer(),&packet) {
                                 if kind==1 {let _=raw.send(probe(&settings,local,2,seq,packet.len()));}
                                 else if kind==2 && marker == Some(settings.marker) {
-                                    samples.acknowledge(seq, Instant::now());
+                                    if samples.acknowledge(seq, Instant::now(), packet.len()) {
+                                        raw.confirm_delivery();
+                                    }
                                     *lock(&link.quality) = samples.quality().map(|q| (settings.marker, q));
                                 }
                             }
@@ -306,18 +313,28 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     #[test]
+    fn an_authenticated_short_reply_does_not_prove_full_size_delivery() {
+        let start = Instant::now();
+        let mut samples = Samples::new();
+        samples.sent(7, start, 1000);
+        assert!(!samples.acknowledge(7, start, 57));
+        assert!(samples.quality().is_none());
+        assert!(samples.acknowledge(7, start, 1000));
+    }
+
+    #[test]
     fn quality_uses_matched_fresh_replies_and_keeps_losses_in_the_window() {
         let mut samples = Samples::new();
         let start = Instant::now();
         assert!(samples.quality().is_none());
         for (seq, delay) in [(1, 10), (2, 30), (3, 250)] {
-            samples.sent(seq, start);
-            samples.acknowledge(seq, start + Duration::from_millis(delay));
+            samples.sent(seq, start, 1000);
+            samples.acknowledge(seq, start + Duration::from_millis(delay), 1000);
         }
-        samples.acknowledge(1, start + Duration::from_secs(1));
-        samples.sent(4, start);
+        assert!(!samples.acknowledge(1, start + Duration::from_secs(1), 1000));
+        samples.sent(4, start, 1000);
         samples.expire(start + Duration::from_secs(3));
-        samples.acknowledge(4, start + Duration::from_secs(4));
+        assert!(!samples.acknowledge(4, start + Duration::from_secs(4), 1000));
         let measured = samples.quality().unwrap();
         assert_eq!(measured.rtt, Duration::from_millis(30));
         assert_eq!((measured.samples, measured.losses), (3, 1));
@@ -326,8 +343,8 @@ mod tests {
 
         for seq in 5..25 {
             let sent = start + Duration::from_secs(seq);
-            samples.sent(seq, sent);
-            samples.acknowledge(seq, sent + Duration::from_millis(80));
+            samples.sent(seq, sent, 1000);
+            samples.acknowledge(seq, sent + Duration::from_millis(80), 1000);
         }
         let recovered = samples.quality().unwrap();
         assert_eq!(recovered.rtt, Duration::from_millis(80));
@@ -339,17 +356,17 @@ mod tests {
         let mut samples = Samples::new();
         let now = Instant::now();
         for seq in 0..20 {
-            samples.sent(seq, now);
+            samples.sent(seq, now, 1000);
             if seq % 5 == 0 {
-                samples.acknowledge(seq, now);
+                samples.acknowledge(seq, now, 1000);
             }
         }
         assert!(!samples.degraded());
         samples.expire(now + Duration::from_secs(4));
         assert!(samples.degraded());
         for seq in 20..40 {
-            samples.sent(seq, now);
-            samples.acknowledge(seq, now);
+            samples.sent(seq, now, 1000);
+            samples.acknowledge(seq, now, 1000);
         }
         samples.expire(now + Duration::from_secs(4));
         assert!(!samples.degraded());

@@ -16,7 +16,7 @@ cd android
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Open **tsunagi** to start the agent. On first launch, accept Android’s VPN permission prompt so the agent can create its mesh interface. Join with the existing network name and secret. The service continues when the activity closes. **About → Stop Tsunagi Agent** keeps it stopped across launches. After stopping or declining consent, tap **Start Tsunagi Agent** to enable automatic startup again. The app-private state directory holds the device identity and its saved networks.
+Open **tsunagi** to start the agent. On first launch, accept Android’s VPN permission prompt so the agent can create its mesh interface. Join with the existing network name and secret. The service continues when the activity closes. Mesh changes update split DNS and the selected-exit notification in the background. Opening the activity also requests live traffic counters. **About → Stop Tsunagi Agent** keeps it stopped across launches. After stopping or declining consent, tap **Start Tsunagi Agent** to enable automatic startup again. The app-private state directory holds the device identity and its saved networks.
 
 The Rust agent owns one interface across the active networks. The Android service establishes the TUN and supplies its descriptor when addresses or exit routes change. Discovery and transport sockets use the selected physical network. TCP health checks bind to the VPN and the address of their own mesh network. The per-network transport selector offers `wg`, `awg`, `wg-quic` and `tcp-tls` in the same default order as the desktop. Each network retains its saved selection and priority. An advertised remote exit can carry the phone’s IPv4 internet traffic.
 

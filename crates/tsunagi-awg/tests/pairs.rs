@@ -532,6 +532,9 @@ struct FaultLink {
     sequence: AtomicU64,
 }
 impl PacketLink for FaultLink {
+    fn confirm_delivery(&self) {
+        self.raw.confirm_delivery();
+    }
     fn network(&self) -> NetworkId {
         self.raw.network()
     }
