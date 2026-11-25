@@ -3,7 +3,7 @@
 //!
 //! # Offering
 //!
-//! For every network that offers this agent as an exit node, three rules,
+//! For every network that offers this agent as an exit node, rules
 //! selected by that network's range and carrying the tag
 //! `tsunagi-exit:<if>:<range>`:
 //!
@@ -11,6 +11,8 @@
 //! -t nat    POSTROUTING  -s <range> ! -o <if> -j MASQUERADE
 //! -t filter FORWARD      -i <if> -s <range> ! -o <if> -j ACCEPT
 //! -t filter FORWARD      -o <if> -d <range> -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+//! -t mangle PREROUTING   -i <if> -s <range> -j MARK --set-xmark <underlay bit>
+//! -t mangle PREROUTING   ! -i <if> -m conntrack --ctorigsrc <range> --ctdir REPLY --ctstate SNAT -j MARK --set-xmark <underlay bit>
 //! ```
 //!
 //! `! -o <if>` is the egress without naming it: whatever interface the
@@ -28,7 +30,7 @@
 //! 5205: from all fwmark 0x40000000/0x40000000 lookup main
 //! 5206: from all uidrange <euid>-<euid> lookup main
 //! 5290: from all lookup main suppress_prefixlength 0
-//! 5300: from all lookup 0x7473
+//! 5300: from all iif lo lookup 0x7473
 //! ```
 //!
 //! The first two keep the agent's *own* sockets and marked replies off the tunnel: its QUIC, relay,
@@ -56,7 +58,11 @@ use super::linux::{
 use super::linux_exit_mark;
 
 /// The chains the offering rules live in: `(table, chain)`.
-const CHAINS: [(&str, &str); 2] = [("nat", "POSTROUTING"), ("filter", "FORWARD")];
+const CHAINS: [(&str, &str); 3] = [
+    ("nat", "POSTROUTING"),
+    ("filter", "FORWARD"),
+    ("mangle", "PREROUTING"),
+];
 
 /// One firewall rule: where it goes, and its match and target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +76,7 @@ fn owned(words: &[&str]) -> Vec<String> {
     words.iter().map(|word| word.to_string()).collect()
 }
 
-/// The three rules of one offered range.
+/// The rules of one offered range.
 ///
 /// Each carries a comment naming its interface and range, which is how it is
 /// found again. A kernel without the `comment` match (small router builds
@@ -125,6 +131,37 @@ fn offer_rules(interface: &str, range: &Ipv4Range, comment: bool) -> Vec<Rule> {
                 &["-j", "ACCEPT"],
             ),
         },
+        // These marks select the physical routing table for clients we
+        // forward, including the reverse-path check on physical replies.
+        // The conntrack original tuple survives switching our own upstream.
+        Rule {
+            table: "mangle",
+            chain: "PREROUTING",
+            spec: spec(
+                &["-i", interface, "-s", &range_text],
+                &["-j", "MARK", "--set-xmark", linux_exit_mark::MARK],
+            ),
+        },
+        Rule {
+            table: "mangle",
+            chain: "PREROUTING",
+            spec: spec(
+                &[
+                    "!",
+                    "-i",
+                    interface,
+                    "-m",
+                    "conntrack",
+                    "--ctorigsrc",
+                    &range_text,
+                    "--ctdir",
+                    "REPLY",
+                    "--ctstate",
+                    "SNAT",
+                ],
+                &["-j", "MARK", "--set-xmark", linux_exit_mark::MARK],
+            ),
+        },
     ]
 }
 
@@ -159,7 +196,7 @@ struct Found {
 
 /// Every rule in an `iptables -S <chain>` listing that is ours: carrying a
 /// tag that starts with `prefix`, or, on a kernel with no `comment` match,
-/// being exactly one of the three rules this module writes for some range.
+/// being exactly one of the rules this module writes for some range.
 /// Anything else in the chain is left alone.
 fn tagged_rules(listing: &str, chain: &str, prefix: &str) -> Vec<Found> {
     // `tsunagi-exit:<interface>:`
@@ -198,7 +235,7 @@ fn uncommented_tag(interface: &str, chain: &str, rest: &[String]) -> Option<Stri
     }
     let range: Ipv4Range = rest
         .windows(2)
-        .find(|pair| pair[0] == "-s" || pair[0] == "-d")
+        .find(|pair| matches!(pair[0].as_str(), "-s" | "-d" | "--ctorigsrc"))
         .and_then(|pair| pair[1].parse().ok())?;
     offer_rules(interface, &range, false)
         .iter()
@@ -380,7 +417,7 @@ fn read_sysctl(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-fn check_kernel_rpf(overlay: &str) -> Result<(), String> {
+fn check_kernel_rpf(overlay: &str, uid: u32) -> Result<(), String> {
     let directory = "/proc/sys/net/ipv4/conf";
     let value = |name: &str, setting: &str| -> Result<u32, String> {
         read_sysctl(&format!("{directory}/{name}/{setting}"))
@@ -391,7 +428,7 @@ fn check_kernel_rpf(overlay: &str) -> Result<(), String> {
     for entry in std::fs::read_dir(directory).map_err(|err| err.to_string())? {
         let entry = entry.map_err(|err| err.to_string())?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name != "all" && name != "default" && name != "lo" && name != overlay {
+        if name != "all" && name != "default" && name != "lo" && (name != overlay || uid == 0) {
             interfaces.push((
                 name.clone(),
                 value(&name, "rp_filter")?,
@@ -481,7 +518,7 @@ impl LinuxHostRules {
         }
         let name = interface.to_string();
         let prepared = Self::blocking(move || {
-            check_kernel_rpf(&name)?;
+            check_kernel_rpf(&name, euid)?;
             linux_exit_mark::install(
                 &run_firewall,
                 &name,
@@ -567,7 +604,7 @@ impl LinuxHostRules {
                 .ok()
                 .and_then(|s| parse_euid(&s))
                 .ok_or("cannot read agent UID")?;
-            check_kernel_rpf(&work_name)?;
+            check_kernel_rpf(&work_name, uid)?;
             let v6 = std::path::Path::new("/proc/sys/net/ipv6").is_dir();
             let sockets = linux_exit_mark::local_sockets(uid, v6)?;
             if previous
@@ -671,7 +708,21 @@ mod tests {
     #[test]
     fn the_rules_masquerade_the_range_out_of_every_other_interface_and_forward_it() {
         let rules = offer_rules("tsun0", &range(), true);
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 5);
+        let outgoing = words(&rules[3].spec);
+        let replies = words(&rules[4].spec);
+        assert!(
+            outgoing.starts_with("-i tsun0 -s 10.13.37.0/24 "),
+            "{outgoing}"
+        );
+        assert!(
+            replies.contains("--ctorigsrc 10.13.37.0/24 --ctdir REPLY --ctstate SNAT"),
+            "{replies}"
+        );
+        for rule in &rules[3..] {
+            assert_eq!((rule.table, rule.chain), ("mangle", "PREROUTING"));
+            assert!(words(&rule.spec).ends_with("-j MARK --set-xmark 0x40000000/0x40000000"));
+        }
         assert_eq!(
             words(&rules[0].spec),
             "-s 10.13.37.0/24 ! -o tsun0 -m comment --comment tsunagi-exit:tsun0:10.13.37.0/24 -j MASQUERADE"
@@ -805,7 +856,7 @@ mod tests {
         let outcome = apply_offer(&|args| fake.run(args), "tsun0", &[range()]);
         assert_eq!(outcome, vec![(range(), RuleOutcome::Applied)]);
         let inserted = fake.verbs("-I");
-        assert_eq!(inserted.len(), 3, "{inserted:?}");
+        assert_eq!(inserted.len(), 5, "{inserted:?}");
         assert!(
             inserted.iter().all(|call| !call.contains("comment")),
             "{inserted:?}"
@@ -837,12 +888,12 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_host_gets_the_three_rules() {
+    fn a_fresh_host_gets_the_offer_rules() {
         let fake = Fake::new(false);
         let outcome = apply_offer(&|args| fake.run(args), "tsun0", &[range()]);
         assert_eq!(outcome, vec![(range(), RuleOutcome::Applied)]);
         let inserted = fake.verbs("-I");
-        assert_eq!(inserted.len(), 3, "{inserted:?}");
+        assert_eq!(inserted.len(), 5, "{inserted:?}");
         assert!(inserted[0].contains("-t nat -I POSTROUTING 1"));
         assert!(fake.verbs("-D").is_empty());
     }
@@ -857,6 +908,15 @@ mod tests {
             )
             .with_rule("filter", &format!("-A FORWARD -i tsun0 -m comment --comment {tag} -j ACCEPT"))
             .with_rule("filter", &format!("-A FORWARD -o tsun0 -m comment --comment {tag} -j ACCEPT"));
+        let fake = offer_rules("tsun0", &range(), true)
+            .into_iter()
+            .filter(|rule| rule.chain == "PREROUTING")
+            .fold(fake, |fake, rule| {
+                fake.with_rule(
+                    rule.table,
+                    &format!("-A {} {}", rule.chain, words(&rule.spec)),
+                )
+            });
         let outcome = apply_offer(&|args| fake.run(args), "tsun0", &[range()]);
         assert_eq!(outcome, vec![(range(), RuleOutcome::Applied)]);
         assert!(fake.verbs("-I").is_empty());
@@ -875,7 +935,7 @@ mod tests {
                     "-A POSTROUTING -s 10.99.0.0/24 -m comment --comment {old_tag} -j MASQUERADE"
                 ),
             )
-            // Only one of the three for the current range.
+            // Only one rule for the current range.
             .with_rule(
                 "filter",
                 &format!("-A FORWARD -i tsun0 -m comment --comment {tag} -j ACCEPT"),
@@ -897,7 +957,7 @@ mod tests {
             deleted.iter().all(|call| !call.contains("eth0")),
             "{deleted:?}"
         );
-        assert_eq!(fake.verbs("-I").len(), 3);
+        assert_eq!(fake.verbs("-I").len(), 5);
     }
 
     #[test]

@@ -91,6 +91,12 @@ pub trait ExitHostRules: Send + Sync + std::fmt::Debug + 'static {
         Box::pin(async { None })
     }
 
+    /// The physical interface index and IPv4 address used by a userspace exit.
+    /// Kernel-forwarding hosts do not need to expose an egress socket address.
+    fn forwarded_uplink(&self) -> Option<(u32, std::net::Ipv4Addr)> {
+        None
+    }
+
     /// Whether using an exit node on this host needs the underlay addresses
     /// the agent talks to, because the host cannot exempt the agent's own
     /// traffic from the default route by user id (Windows). The default is no.
@@ -112,6 +118,9 @@ pub fn exit_tag_prefix(interface: &str) -> String {
 /// The one-line detail for a set of offer outcomes.
 pub fn offer_detail(outcome: &RuleOutcome, range: &Ipv4Range) -> String {
     match outcome {
+        RuleOutcome::Applied if cfg!(windows) => {
+            format!("physical TCP, UDP and ICMP echo forwarding for {range}")
+        }
         RuleOutcome::Applied => format!("masquerade + forward for {range} in place"),
         RuleOutcome::Failed(reason) => reason.clone(),
     }

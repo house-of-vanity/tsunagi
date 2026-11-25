@@ -99,13 +99,18 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 # before deciding what to change. Creating an adapter needs the process to be
 # elevated and `wintun.dll` to be reachable at run time.
 [target.'cfg(target_os = "windows")'.dependencies]
+smoltcp = { version = "0.12", default-features = false, features = ["medium-ip", "socket-tcp"] }
+socket2 = { version = "0.6", features = ["all"] }
 windows-sys = { version = "0.61", features = [
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Foundation",
 ] }
 
 [dev-dependencies]
+smoltcp = { version = "0.12", default-features = false, features = ["medium-ip", "socket-tcp"] }
+socket2 = { version = "0.6", features = ["all"] }
 # Its own tests use the harness it publishes.
 tsunagi-core = { path = ".", features = ["testing"] }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process", "test-util"] }

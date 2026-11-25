@@ -159,6 +159,19 @@ async fn step(what: &'static str, script: String) -> RuleOutcome {
 #[derive(Debug, Default)]
 pub struct WindowsHostRules {
     relay_cache: Arc<Mutex<RelayCache>>,
+    uplink: Arc<Mutex<Option<(u32, Ipv4Addr)>>>,
+}
+
+/// A temporary inventory failure cannot revoke existing sockets. A positive
+/// withdrawal of the last offer releases their uplink.
+fn remember_uplink(
+    cache: &Mutex<Option<(u32, Ipv4Addr)>>,
+    offering: bool,
+    observed: Option<(u32, Ipv4Addr)>,
+) {
+    if !offering || observed.is_some() {
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = observed;
+    }
 }
 
 impl WindowsHostRules {
@@ -233,6 +246,10 @@ fn resolve_host(host: &str) -> Vec<std::net::Ipv4Addr> {
 }
 
 impl ExitHostRules for WindowsHostRules {
+    fn forwarded_uplink(&self) -> Option<(u32, Ipv4Addr)> {
+        *self.uplink.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn needs_bypass(&self) -> bool {
         true
     }
@@ -241,17 +258,20 @@ impl ExitHostRules for WindowsHostRules {
         Box::pin(async move {
             let job = plan.clone();
             let cache = Arc::clone(&self.relay_cache);
+            let uplink = Arc::clone(&self.uplink);
             tokio::task::spawn_blocking(move || {
                 let hosts = cache.lock().unwrap_or_else(|p| p.into_inner()).lookup(
                     &job.bypass_hosts,
                     Instant::now(),
                     &resolve_host,
                 );
-                windows_exit::apply_plan(
+                let (report, physical) = windows_exit::reconcile(
                     &|script| run_powershell_output(script),
                     &|host| hosts.get(host).cloned().unwrap_or_default(),
                     &job,
-                )
+                );
+                remember_uplink(&uplink, !job.offer.is_empty(), physical);
+                report
             })
             .await
             .unwrap_or_else(|err| {
@@ -271,11 +291,12 @@ impl ExitHostRules for WindowsHostRules {
 
     fn refresh<'a>(&'a self, plan: &'a ExitHostPlan) -> BoxFuture<'a, Option<RuleOutcome>> {
         Box::pin(async move {
-            if !plan.client {
+            if !plan.client && plan.offer.is_empty() {
                 return None;
             }
             let job = plan.clone();
             let cache = Arc::clone(&self.relay_cache);
+            let uplink = Arc::clone(&self.uplink);
             tokio::task::spawn_blocking(move || {
                 let now = Instant::now();
                 let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -287,6 +308,16 @@ impl ExitHostRules for WindowsHostRules {
                 }
                 let hosts = cache.lookup(&job.bypass_hosts, now, &resolve_host);
                 drop(cache);
+                if !job.offer.is_empty() {
+                    remember_uplink(
+                        &uplink,
+                        true,
+                        windows_exit::uplink(&run_powershell_output, &job.interface).ok(),
+                    );
+                }
+                if !job.client {
+                    return None;
+                }
                 Some(
                     match windows_exit::refresh_bypass(
                         &run_powershell_output,
@@ -307,7 +338,9 @@ impl ExitHostRules for WindowsHostRules {
         Box::pin(async move {
             let name = interface.to_string();
             let cache = Arc::clone(&self.relay_cache);
+            let uplink = Arc::clone(&self.uplink);
             let _ = tokio::task::spawn_blocking(move || {
+                *uplink.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 *cache.lock().unwrap_or_else(|p| p.into_inner()) = RelayCache::default();
                 windows_exit::clear_all(&|script| run_powershell_output(script), &name)
             })
@@ -354,6 +387,22 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn transient_uplink_lookup_failure_preserves_the_live_forwarding_address() {
+        let cache = Mutex::new(None);
+        let old = (4, Ipv4Addr::new(192, 0, 2, 5));
+        let new = (7, Ipv4Addr::new(198, 51, 100, 3));
+        for (offering, observed, expected) in [
+            (true, Some(old), Some(old)),
+            (true, None, Some(old)),
+            (true, Some(new), Some(new)),
+            (false, None, None),
+        ] {
+            remember_uplink(&cache, offering, observed);
+            assert_eq!(*cache.lock().unwrap(), expected);
+        }
+    }
 
     #[test]
     fn relay_dns_survives_a_transient_failure_and_retires_rotated_addresses() {

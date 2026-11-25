@@ -4,6 +4,11 @@ A member can offer itself as an **exit node** in a network. Other members can
 then send their default IPv4 internet traffic through it. Linux, macOS and
 Windows can offer or use an exit node. Android can use one.
 
+An exit serves members through its own internet connection even while its local
+applications use another exit. If A selects B and B selects C, the same website
+sees B for requests from A and C for requests from B. Changing B’s selection
+keeps established connections from A on B’s original egress.
+
 ## Using it
 
 The offering side, per network, off by default:
@@ -12,8 +17,7 @@ The offering side, per network, off by default:
 tsng network exit-node <network> on      # or off
 ```
 
-Rules are installed even when the kernel does not forward yet, and `status`
-says so. Turning forwarding on is left to you, on purpose:
+Linux and macOS report kernel forwarding in `status`. To enable it on Linux:
 
 ```sh
 sudo sysctl -w net.ipv4.ip_forward=1
@@ -57,7 +61,13 @@ subnet is dropped locally. Offering an exit remains a per-network choice.
   lookup main` and `5206 uidrange <agent uid> lookup main` keep the agent's
   sockets and their replies outside the tunnel, before Tailscale's rules.
   `5290 lookup main suppress_prefixlength 0` preserves LAN and other specific
-  routes, and `5300 lookup 29811` directs other traffic through the exit.
+  routes, and `5300 iif lo lookup 29811` directs locally originated
+  IPv4 traffic through the exit. Forwarded member packets and their SNAT
+  replies carry the agent’s underlay bit, including during strict reverse-path
+  checks. Their conntrack entries live independently of B’s exit selection.
+  When the daemon runs as root, rule `5204` directs reverse lookups for
+  authenticated replies to local exit-client connections back to the overlay
+  using the independent packet-mark bit `0x20000000`.
   The exit table is `29811` (`0x7473`).
 - **Linux reverse-path filtering:** only the agent's dedicated UID is marked
   in mangle `OUTPUT`. Its own bit, `0x40000000`, is saved to conntrack and
@@ -99,7 +109,9 @@ is built from `pf` and `route`. The agent runs as root there.
 
 - **Offering:** a `pf` anchor `com.apple/tsunagi-exit-<interface>` (the stock
   `/etc/pf.conf` already evaluates `com.apple/*`) holds
-  `nat on <egress> from <range> to any -> (<egress>)` and a `pass in` rule.
+  `nat on <egress> from <range> to any -> (<egress>)` and tags packets entering from an offered range. A tagged packet that the
+  kernel would forward back to the utun gets a PF `route-to` through the
+  physical gateway. The physical NAT state is interface-bound.
   `pf` is enabled if it was off, and that reference is released when the rules
   go. Forwarding is only read: `sudo sysctl -w net.inet.ip.forwarding=1`, which
   macOS forgets at reboot. The egress is the default route's interface **at the
@@ -122,13 +134,15 @@ is built from `pf` and `route`. The agent runs as root there.
 
 ## Windows
 
-- **Offering:** each offered range gets a WinNAT object
-  `tsunagi-exit:<interface>:<range>` (`New-NetNat`), removed with the offer, the
-  network and the agent. Forwarding is read for the overlay interface and never
-  changed; Windows forwards per interface, so enable it on the ones involved
-  (`Get-NetIPInterface | Set-NetIPInterface -Forwarding Enabled`, administrator
-  PowerShell). Some Windows versions allow one NAT per host; a second range then
-  reports its own failure.
+- **Offering** uses IPv4 sockets bound to the physical adapter index and
+  address (`IP_UNICAST_IF`). A bounded smoltcp stack handles the member-facing
+  TCP connection and passes stream data and half-closes in both directions.
+  Each UDP flow keeps its physical source port for two minutes of inactivity.
+  ICMP echo uses a physically bound raw socket. Fragmented IPv4 datagrams are
+  reassembled before transport processing and replies are split to the mesh
+  MTU. Other IPv4 protocols and new connections above the shared limit of 256
+  are dropped. Legacy Tsunagi WinNAT objects are cleaned up on startup. The
+  Windows offer works with kernel IP forwarding disabled.
 - **Using:** Windows has no per-user routing, so the agent's own traffic is kept
   off the tunnel *by destination*. `0.0.0.0/1` and `128.0.0.0/1` go through the
   overlay interface; a `/32` route with metric 7373 (the marker for "ours")

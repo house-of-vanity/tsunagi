@@ -55,7 +55,7 @@ use crate::BoxFuture;
 use crate::overlay::OverlayError;
 
 use super::super::config::Cidr;
-use super::super::hostrules::linux_exit_mark::{UNDERLAY_MARK, UNDERLAY_MASK};
+use super::super::hostrules::linux_exit_mark::{EXIT_REPLY_MARK, UNDERLAY_MARK, UNDERLAY_MASK};
 use super::super::tun::{TunDevice, TunRequest};
 use super::privilege::{NetAdmin, Privilege, probe_net_admin};
 use super::{
@@ -671,6 +671,7 @@ const EXIT_TABLE: u32 = 0x7473;
 /// The main table.
 const MAIN_TABLE: u32 = 254;
 /// Protect marked underlay and initial socket routing before Tailscale's rules.
+const EXIT_REPLY_PRIORITY: u32 = 5204;
 const EXIT_MARK_PRIORITY: u32 = 5205;
 const EXIT_BYPASS_PRIORITY: u32 = 5206;
 const LEGACY_EXIT_BYPASS_PRIORITY: u32 = 5280;
@@ -704,6 +705,15 @@ fn rule_priority(rule: &RuleMessage) -> Option<u32> {
 fn is_exit_rule(rule: &RuleMessage) -> bool {
     let table = rule_table(rule);
     match rule_priority(rule) {
+        Some(EXIT_REPLY_PRIORITY) => {
+            table == EXIT_TABLE
+                && rule
+                    .attributes
+                    .contains(&RuleAttribute::FwMark(EXIT_REPLY_MARK))
+                && rule
+                    .attributes
+                    .contains(&RuleAttribute::FwMask(EXIT_REPLY_MARK))
+        }
         Some(EXIT_MARK_PRIORITY) => {
             table == MAIN_TABLE
                 && rule
@@ -865,11 +875,11 @@ async fn replace_exit_default(
 /// ip rule add priority 5205 fwmark 0x40000000/0x40000000 lookup main
 /// ip rule add priority 5206 uidrange <uid>-<uid> lookup main
 /// ip rule add priority 5290 lookup main suppress_prefixlength 0
-/// ip rule add priority 5300 lookup 0x7473
+/// ip rule add priority 5300 iif lo lookup 0x7473
 /// ```
 ///
 /// and the same for IPv6 with `ip -6 route replace unreachable default table
-/// 0x7473`, so that IPv6 is refused instead of leaving the ordinary way.
+/// 0x7473` and no interface selector, so IPv6 is refused.
 ///
 /// What an earlier call left is removed first, so repeating it is safe, and
 /// the rules go in last, so a failure part way never leaves a rule that
@@ -886,7 +896,24 @@ async fn set_exit_client(
         };
         replace_exit_default(&handle, name, source).await?;
 
-        add_mark_bypass(&handle, false).await?;
+        if uid == 0 {
+            add_mark_rule(
+                &handle,
+                false,
+                EXIT_TABLE,
+                EXIT_REPLY_PRIORITY,
+                EXIT_REPLY_MARK,
+            )
+            .await?;
+        }
+        add_mark_rule(
+            &handle,
+            false,
+            MAIN_TABLE,
+            EXIT_MARK_PRIORITY,
+            UNDERLAY_MARK,
+        )
+        .await?;
 
         let mut bypass = handle
             .rule()
@@ -930,6 +957,7 @@ async fn set_exit_client(
             .table_id(EXIT_TABLE)
             .action(RuleAction::ToTable)
             .priority(EXIT_DEFAULT_PRIORITY)
+            .input_interface("lo")
             .execute()
             .await
             .map_err(|err| fail("rule for the default route", err))?;
@@ -960,7 +988,7 @@ async fn set_exit_block_v6(handle: &rtnetlink::Handle, uid: u32) -> Result<(), O
         };
     }
 
-    add_mark_bypass(handle, true).await?;
+    add_mark_rule(handle, true, MAIN_TABLE, EXIT_MARK_PRIORITY, UNDERLAY_MARK).await?;
     let mut bypass = handle
         .rule()
         .add()
@@ -1008,14 +1036,20 @@ async fn set_exit_block_v6(handle: &rtnetlink::Handle, uid: u32) -> Result<(), O
         .map_err(|err| fail("rule for the default route", err))
 }
 
-async fn add_mark_bypass(handle: &rtnetlink::Handle, v6: bool) -> Result<(), OverlayError> {
+async fn add_mark_rule(
+    handle: &rtnetlink::Handle,
+    v6: bool,
+    table: u32,
+    priority: u32,
+    bit: u32,
+) -> Result<(), OverlayError> {
     let mut rule = handle
         .rule()
         .add()
-        .table_id(MAIN_TABLE)
+        .table_id(table)
         .action(RuleAction::ToTable)
-        .priority(EXIT_MARK_PRIORITY)
-        .fw_mark(UNDERLAY_MARK);
+        .priority(priority)
+        .fw_mark(bit);
     rule.message_mut().header.family = if v6 {
         rtnetlink::packet_route::AddressFamily::Inet6
     } else {
@@ -1023,9 +1057,11 @@ async fn add_mark_bypass(handle: &rtnetlink::Handle, v6: bool) -> Result<(), Ove
     };
     rule.message_mut()
         .attributes
-        .push(RuleAttribute::FwMask(UNDERLAY_MASK));
+        .push(RuleAttribute::FwMask(bit));
     rule.execute().await.map_err(|err| {
-        OverlayError::Unavailable(format!("cannot protect marked underlay traffic: {err}"))
+        OverlayError::Unavailable(format!(
+            "cannot add exit routing rule {priority} for mark {bit:#x}: {err}"
+        ))
     })
 }
 

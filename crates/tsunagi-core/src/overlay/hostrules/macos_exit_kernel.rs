@@ -66,14 +66,14 @@ impl Drop for Capture<'_> {
 }
 
 impl Capture<'_> {
-    fn enable(&mut self) {
+    fn offer(&self, use_upstream: bool) {
         let ranges = [FIRST, SECOND]
             .map(|ip| Ipv4Range::new(Ipv4Addr::from(u32::from(ip) & !0xf), 28).unwrap());
         let rules = pf_rules(
             self.overlay,
             &self.uplink,
-            &[],
-            Some(&ClientRules {
+            &ranges[..1],
+            use_upstream.then_some(&ClientRules {
                 uid: 0,
                 overlay: &ranges,
             }),
@@ -86,6 +86,9 @@ impl Capture<'_> {
             Some(&rules),
         )
         .unwrap();
+    }
+    fn enable(&mut self) {
+        self.offer(true);
         run_ok(
             &run_tool,
             Tool::Route,
@@ -250,6 +253,45 @@ async fn udp_round_trip(uplink: &dyn TunDevice, socket: &UdpSocket, stage: &str)
     assert_eq!(&buf[..len], b"QUIC path");
 }
 
+async fn member_round_trip(
+    overlay: &dyn TunDevice,
+    uplink: &dyn TunDevice,
+    port: u16,
+    data: &[u8],
+) -> u16 {
+    let member = Ipv4Addr::from(u32::from(FIRST) + 2);
+    let ip = Ipv4Repr {
+        src_addr: member,
+        dst_addr: REMOTE,
+        next_header: IpProtocol::Udp,
+        payload_len: 8 + data.len(),
+        hop_limit: 64,
+    };
+    let mut raw = vec![0; ip.buffer_len() + ip.payload_len];
+    let mut out = Ipv4Packet::new_unchecked(&mut raw[..]);
+    ip.emit(&mut out, &Default::default());
+    let mut udp = UdpPacket::new_unchecked(out.payload_mut());
+    udp.set_len(ip.payload_len as u16);
+    udp.set_src_port(port);
+    udp.set_dst_port(8020);
+    udp.payload_mut().copy_from_slice(data);
+    udp.fill_checksum(&member.into(), &REMOTE.into());
+    overlay.send(raw.into()).await.unwrap();
+    let outbound = packet(uplink, REMOTE, IpProtocol::Udp, 8020, data).await;
+    let physical = Ipv4Packet::new_checked(&outbound[..]).unwrap();
+    assert_eq!(physical.src_addr(), UPLINK);
+    let translated = UdpPacket::new_checked(physical.payload())
+        .unwrap()
+        .src_port();
+    uplink.send(reply(&outbound)).await.unwrap();
+    let inbound = packet(overlay, member, IpProtocol::Udp, port, data).await;
+    assert_eq!(
+        Ipv4Packet::new_checked(&inbound[..]).unwrap().src_addr(),
+        REMOTE
+    );
+    translated
+}
+
 #[tokio::test]
 #[ignore = "requires root, the stock Apple PF anchor, and a disposable macOS runner"]
 async fn exit_preserves_underlay_and_both_meshes() {
@@ -272,7 +314,16 @@ async fn exit_preserves_underlay_and_both_meshes() {
         added_route: false,
         added_scoped: false,
     };
+    // The disposable runner enables kernel forwarding. A keeps the same
+    // translated address and port when B installs an upstream route to this IP.
+    capture.offer(false);
+    let port = member_round_trip(&*overlay, &*uplink, 43001, b"member before").await;
     capture.enable();
+    assert_eq!(
+        member_round_trip(&*overlay, &*uplink, 43001, b"member during").await,
+        port
+    );
+    member_round_trip(&*overlay, &*uplink, 43002, b"new member flow").await;
     check_capture_routes(overlay.name(), uplink.name());
     udp_round_trip(&*uplink, &existing_quic, "existing socket after exit").await;
 

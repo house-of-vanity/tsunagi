@@ -9,7 +9,9 @@
 //!
 //! ```text
 //! nat on <egress> inet from <range> to any -> (<egress>)
-//! pass in quick on <if> inet from <range> to ! <range>
+//! pass in quick on <if> inet from <range> to ! <range> tag <forwarded> no state
+//! pass out quick on <if> route-to (<egress> <gateway>) inet from <range> to any tagged <forwarded> no state
+//! pass out quick on <egress> inet from any to any flags any tagged <forwarded> keep state (if-bound)
 //! ```
 //!
 //! The anchor lives under `com.apple/` on purpose: the stock `/etc/pf.conf`
@@ -310,6 +312,10 @@ fn pf_rules(
     let mut nat = Vec::new();
     let mut filter = Vec::new();
     let mut tables = Vec::new();
+    let via = match egress.gateway {
+        Some(gateway) => format!("({out} {gateway})"),
+        None => out.clone(),
+    };
     if let Some(client) = client {
         let tag = format!("tsng_underlay_{interface}");
         nat.push(format!(
@@ -327,10 +333,6 @@ fn pf_rules(
             ));
             format!("! <tsunagi_overlay_{interface}>")
         };
-        let via = match egress.gateway {
-            Some(gateway) => format!("({out} {gateway})"),
-            None => out.clone(),
-        };
         filter.push(format!(
             "pass out quick on {interface} route-to {via} inet proto {{ tcp udp }} \
              from any to {target} user {} tag {tag} no state",
@@ -347,8 +349,24 @@ fn pf_rules(
         // PF takes the first matching NAT rule. Preserve the transport's source
         // port even when its overlay source falls inside one of our own offers.
         nat.push(format!("nat on {out} inet from {range} to any -> ({out})"));
+        let tag = format!("tsng_forward_{interface}");
+        // Classify at authenticated overlay ingress. Only packets the host
+        // actually forwards AND its routes send back to our utun need steering.
+        // Local services, connected LANs and the owner's forwarding switch
+        // retain their native kernel behavior.
         filter.push(format!(
-            "pass in quick on {interface} inet from {range} to ! {range}"
+            "pass in quick on {interface} inet from {range} to ! {range} tag {tag} no state"
+        ));
+    }
+    if !offer.is_empty() {
+        let tag = format!("tsng_forward_{interface}");
+        filter.insert(0, format!(
+            "pass out quick on {interface} route-to {via} inet from any to any tagged {tag} no state"
+        ));
+        // Keep the outbound NAT state on the physical interface. A floating
+        // state could consume packets on the utun before the reroute rule runs.
+        filter.push(format!(
+            "pass out quick on {out} inet from any to any flags any tagged {tag} keep state (if-bound)"
         ));
     }
     tables
@@ -993,7 +1011,9 @@ destination: default\n\
         assert_eq!(
             text,
             "nat on en0 inet from 10.13.37.0/24 to any -> (en0)\n\
-             pass in quick on utun5 inet from 10.13.37.0/24 to ! 10.13.37.0/24\n"
+             pass out quick on utun5 route-to (en0 192.168.1.1) inet from any to any tagged tsng_forward_utun5 no state\n\
+             pass in quick on utun5 inet from 10.13.37.0/24 to ! 10.13.37.0/24 tag tsng_forward_utun5 no state\n\
+             pass out quick on en0 inet from any to any flags any tagged tsng_forward_utun5 keep state (if-bound)\n"
         );
         // Translation precedes filtering, as pf requires.
         assert!(text.find("nat on").unwrap() < text.find("pass in").unwrap());
@@ -1114,7 +1134,9 @@ destination: default\n\
         assert_eq!(
             fake.stdins.borrow()[0],
             "nat on en0 inet from 10.13.37.0/24 to any -> (en0)\n\
-             pass in quick on utun5 inet from 10.13.37.0/24 to ! 10.13.37.0/24\n"
+             pass out quick on utun5 route-to (en0 192.168.1.1) inet from any to any tagged tsng_forward_utun5 no state\n\
+             pass in quick on utun5 inet from 10.13.37.0/24 to ! 10.13.37.0/24 tag tsng_forward_utun5 no state\n\
+             pass out quick on en0 inet from any to any flags any tagged tsng_forward_utun5 keep state (if-bound)\n"
         );
         // sysctl is only ever asked, never told.
         assert!(

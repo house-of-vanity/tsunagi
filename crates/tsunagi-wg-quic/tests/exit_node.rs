@@ -217,6 +217,65 @@ impl<'a> ExitNetwork<'a> {
 }
 
 #[tokio::test]
+async fn an_exit_keeps_serving_its_client_while_switching_its_own_upstream() {
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("independent-exits");
+    let a = Node::spawn(&discovery, "client-a").await;
+    let b = Node::spawn(&discovery, "gateway-b").await;
+    let c = Node::spawn(&discovery, "upstream-c").await;
+    let net = b.agent.join_network(&name, &secret).await.unwrap();
+    b.overlay(net).await;
+    b.agent.set_exit_offer(net, true).await.unwrap();
+    a.agent.join_network(&name, &secret).await.unwrap();
+    c.agent.join_network(&name, &secret).await.unwrap();
+    c.agent.set_exit_offer(net, true).await.unwrap();
+    wait_until("both exit offers have reached their clients", || async {
+        let offers = |status: NetworkStatus, id| {
+            status
+                .peers
+                .iter()
+                .any(|p| p.endpoint_id == id && p.exit_node)
+        };
+        (offers(a.status(net).await, b.id()) && offers(b.status(net).await, c.id())).then_some(())
+    })
+    .await;
+    tokio::join!(
+        a.wait_for_tunnels(net, 2),
+        b.wait_for_tunnels(net, 2),
+        c.wait_for_tunnels(net, 2)
+    );
+    a.agent.set_exit_via(net, Some(b.id())).await.unwrap();
+    let (at, bt, ct) = (a.tun().await, b.tun().await, c.tun().await);
+    let (aa, ba) = (a.overlay(net).await, b.overlay(net).await);
+    for (epoch, upstream) in [false, true, false, true].into_iter().enumerate() {
+        b.agent
+            .set_exit_via(net, upstream.then(|| c.id()))
+            .await
+            .unwrap();
+        // A retains the same pair of endpoints before, during and after B uses C.
+        let request = ipv4_packet(aa, INTERNET, &[epoch as u8]);
+        at.push_from_os(request.clone());
+        assert_eq!(next(&bt).await, request);
+        if upstream {
+            // Even a misrouted host packet from A cannot be carried a second time.
+            bt.push_from_os(request);
+            let own = ipv4_packet(ba, INTERNET, b"B to the same server");
+            bt.push_from_os(own.clone());
+            assert_eq!(next(&ct).await, own);
+            let reply = ipv4_packet(INTERNET, ba, b"reply to B");
+            ct.push_from_os(reply.clone());
+            assert_eq!(next(&bt).await, reply);
+        }
+        let reply = ipv4_packet(INTERNET, aa, &[epoch as u8]);
+        bt.push_from_os(reply.clone());
+        assert_eq!(next(&at).await, reply);
+        assert_eq!(a.status(net).await.exit_via, Some(b.id()));
+        assert!(b.status(net).await.exit_offer);
+    }
+    let _ = tokio::join!(a.shutdown(), b.shutdown(), c.shutdown());
+}
+
+#[tokio::test]
 async fn switching_the_exit_between_networks_keeps_both_overlays_reachable() {
     let discovery = SharedMemoryDiscovery::new();
     let client = Node::open(TempDir::new().unwrap(), &discovery, "client", None).await;

@@ -8,8 +8,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// Outside Tailscale's 0xff0000 mask and ordinary low-bit WireGuard marks.
 pub(crate) const UNDERLAY_MARK: u32 = 0x4000_0000;
 pub(crate) const UNDERLAY_MASK: u32 = UNDERLAY_MARK;
-const MARK: &str = "0x40000000/0x40000000";
+pub(super) const MARK: &str = "0x40000000/0x40000000";
 const MASK: &str = "0x40000000";
+/// An authenticated return packet from this host’s own upstream exit.
+pub(crate) const EXIT_REPLY_MARK: u32 = 0x2000_0000;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Listener {
@@ -141,11 +143,11 @@ fn words(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| (*s).into()).collect()
 }
 
-fn rules(interface: &str, uid: u32) -> Vec<(&'static str, Vec<String>)> {
+fn rules(interface: &str, uid: u32, ipv6: bool) -> Vec<(&'static str, Vec<String>)> {
     let tag = tag(interface);
-    let uid = uid.to_string();
+    let owner = uid.to_string();
     // Insert at position one in this order: final OUTPUT order is MARK, SAVE.
-    vec![
+    let mut rules = vec![
         (
             "PREROUTING",
             words(&[
@@ -175,7 +177,7 @@ fn rules(interface: &str, uid: u32) -> Vec<(&'static str, Vec<String>)> {
                 "-m",
                 "owner",
                 "--uid-owner",
-                &uid,
+                &owner,
                 "-m",
                 "mark",
                 "--mark",
@@ -199,7 +201,7 @@ fn rules(interface: &str, uid: u32) -> Vec<(&'static str, Vec<String>)> {
                 "-m",
                 "owner",
                 "--uid-owner",
-                &uid,
+                &owner,
                 "-m",
                 "comment",
                 "--comment",
@@ -210,7 +212,40 @@ fn rules(interface: &str, uid: u32) -> Vec<(&'static str, Vec<String>)> {
                 MARK,
             ]),
         ),
-    ]
+    ];
+    if !ipv6 && uid == 0 {
+        // Both xt_rpfilter and the kernel's strict rp_filter perform the
+        // reverse lookup as UID 0. For an established local application's
+        // reply from our upstream, the /0 must point back to this interface,
+        // ahead of the root daemon's UID bypass. The actual packet's LOCAL
+        // destination still uses routing table local at priority zero.
+        rules.push((
+            "PREROUTING",
+            words(&[
+                "-i",
+                interface,
+                "-m",
+                "addrtype",
+                "--dst-type",
+                "LOCAL",
+                "-m",
+                "conntrack",
+                "--ctdir",
+                "REPLY",
+                "--ctstate",
+                "ESTABLISHED,RELATED",
+                "-m",
+                "comment",
+                "--comment",
+                &tag,
+                "-j",
+                "MARK",
+                "--set-xmark",
+                "0x20000000/0x20000000",
+            ]),
+        ));
+    }
+    rules
 }
 
 fn execute(run: RunFamily<'_>, v6: bool, args: Vec<String>) -> Result<String, String> {
@@ -295,7 +330,7 @@ fn install_with_listeners(
     clear(run, interface, v6)?;
     let result = (|| {
         for family in [false, true].into_iter().filter(|family| !family || v6) {
-            for (chain, spec) in rules(interface, uid) {
+            for (chain, spec) in rules(interface, uid, family) {
                 let args = words(&["-t", "mangle", "-I", chain, "1"])
                     .into_iter()
                     .chain(spec)
@@ -407,6 +442,25 @@ mod tests {
             );
         }
         assert_eq!(UNDERLAY_MASK & 0x00ff_0000, 0);
+    }
+
+    #[test]
+    fn only_root_daemons_mark_local_ipv4_replies_from_their_own_exit() {
+        for (uid, v6) in [(990, false), (0, true), (0, false)] {
+            let rules = rules("tsun0", uid, v6);
+            let marked: Vec<_> = rules
+                .iter()
+                .filter(|(_, args)| args.contains(&"0x20000000/0x20000000".to_string()))
+                .collect();
+            if uid == 0 && !v6 {
+                assert_eq!(marked.len(), 1);
+                assert_eq!(marked[0].0, "PREROUTING");
+                let text = marked[0].1.join(" ");
+                assert!(text.contains("-i tsun0 -m addrtype --dst-type LOCAL -m conntrack --ctdir REPLY --ctstate ESTABLISHED,RELATED"));
+            } else {
+                assert!(marked.is_empty());
+            }
+        }
     }
 
     #[test]

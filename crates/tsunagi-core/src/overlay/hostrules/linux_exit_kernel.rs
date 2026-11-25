@@ -467,3 +467,214 @@ while True:
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+const CHAIN_TEST: &str = "overlay::hostrules::linux_exit_kernel::serving_an_established_flow_while_switching_the_local_exit";
+
+fn chain_namespace(role: &str) -> Namespace {
+    let name = format!("tsng-chain-{role}-{}", std::process::id());
+    ip(&["netns", "add", &name]);
+    let guard = Namespace(name);
+    ip(&["-n", &guard.0, "link", "set", "lo", "up"]);
+    guard
+}
+
+fn connect(a: &Namespace, left: &str, b: &Namespace, right: &str) {
+    ip(&[
+        "link", "add", left, "netns", &a.0, "type", "veth", "peer", "name", right, "netns", &b.0,
+    ]);
+    ip(&["-n", &a.0, "link", "set", left, "up"]);
+    ip(&["-n", &b.0, "link", "set", right, "up"]);
+}
+
+fn python_in(namespace: &str) -> Command {
+    let mut cmd = Command::new("ip");
+    cmd.args(["netns", "exec", namespace, "python3"]);
+    cmd
+}
+
+fn chain_echo(namespace: &Namespace, name: &str) -> Echo {
+    let code = r#"import socketserver, sys
+class Echo(socketserver.StreamRequestHandler):
+    def handle(self):
+        for line in self.rfile:
+            self.wfile.write(f'{sys.argv[1]} {self.client_address[0]} '.encode() + line)
+with socketserver.ThreadingTCPServer(('198.51.100.2', 42100), Echo) as server:
+    print('ready', flush=True)
+    server.serve_forever()
+"#;
+    let mut server = Echo(
+        python_in(&namespace.0)
+            .args(["-u", "-c", code, name])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut ready = String::new();
+    BufReader::new(server.0.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    server
+}
+
+fn short_chain_probe(mut cmd: Command, phase: &str, expected: &str) {
+    let probe = r#"import socket
+with socket.create_connection(('198.51.100.2', 42100), timeout=3) as s:
+    s.sendall(b'new\n')
+    print(s.makefile('rb').readline().decode().strip())
+"#;
+    let result = cmd.args(["-c", probe]).output().unwrap();
+    assert!(
+        result.status.success(),
+        "TCP probe {phase} expected {expected}: {}\n{}\n{}\n{}",
+        String::from_utf8_lossy(&result.stderr),
+        ip(&["-4", "route", "get", "198.51.100.2", "uid", "991"]),
+        ip(&["-4", "rule", "show"]),
+        ip(&["neigh", "show"]),
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), expected);
+}
+
+fn chain_middle(a: &str) {
+    use super::{BroadcastHostRules, ExitHostPlan, RuleOutcome};
+    let range = "10.13.37.0/24".parse().unwrap();
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+    // A root agent's UID bypass can also match a kernel reverse lookup.
+    // Both the NAT reply from the uplink and the reply from C on tsun0 must
+    // survive strict filtering when the remote Internet address is identical.
+    for setting in ["rp_filter", "src_valid_mark"] {
+        std::fs::write(format!("/proc/sys/net/ipv4/conf/all/{setting}"), "1").unwrap();
+    }
+    let filter: Vec<String> = [
+        "-t",
+        "mangle",
+        "-A",
+        "PREROUTING",
+        "-m",
+        "rpfilter",
+        "--invert",
+        "--validmark",
+        "-j",
+        "DROP",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let rpf = run_firewall(false, &filter);
+    assert!(
+        matches!(rpf, super::linux::Ran::Exited { success: true, .. }),
+        "{rpf:?}"
+    );
+    let provisioner = NetlinkProvisioner::new().unwrap();
+    let host = provisioner.host_rules();
+    let exit = host.exit_rules().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let apply = |select| {
+        let plan = ExitHostPlan {
+            interface: "tsun0".into(),
+            offer: vec![range],
+            overlay: vec![range],
+            client: select,
+            client_source: select.then(|| "10.13.37.1".parse().unwrap()),
+            ..Default::default()
+        };
+        let result = runtime.block_on(exit.apply(&plan));
+        assert_eq!(result.offer, [(range, RuleOutcome::Applied)]);
+        assert_eq!(result.client, select.then_some(RuleOutcome::Applied));
+    };
+    apply(false);
+    // The socket is created once and remains open across both reconciliations.
+    let persistent = r#"import socket, sys
+with socket.create_connection(('198.51.100.2',42100), timeout=3) as s:
+    out = s.makefile('rb')
+    for line in sys.stdin.buffer:
+        s.sendall(line)
+        print(out.readline().decode().strip(), flush=True)
+"#;
+    let mut stream = Echo(
+        python_in(a)
+            .args(["-u", "-c", persistent])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = stream.0.stdin.take().unwrap();
+    let mut output = BufReader::new(stream.0.stdout.take().unwrap());
+    for (change, phase, b_egress) in [
+        (None, "before", "uplink 192.0.2.1 new"),
+        (Some(true), "selected", "exit-c 10.13.37.1 new"),
+        (Some(false), "cleared", "uplink 192.0.2.1 new"),
+    ] {
+        if let Some(selected) = change {
+            apply(selected);
+        }
+        writeln!(input, "{phase}").unwrap();
+        let mut reply = String::new();
+        output.read_line(&mut reply).unwrap();
+        assert_eq!(
+            reply.trim(),
+            format!("uplink 192.0.2.1 {phase}"),
+            "ongoing TCP stream from A"
+        );
+        short_chain_probe(python_in(a), phase, "uplink 192.0.2.1 new");
+        // A regular application on B sends to exactly the same IP and port as A.
+        let mut local = Command::new("python3");
+        local.uid(991).gid(991);
+        short_chain_probe(local, phase, b_egress);
+    }
+    runtime.block_on(exit.clear("tsun0"));
+}
+
+#[test]
+#[ignore = "needs Linux network namespaces, iproute2, iptables and Python"]
+fn serving_an_established_flow_while_switching_the_local_exit() {
+    if let Ok(a) = std::env::var("TSUNAGI_EXIT_CHAIN_A") {
+        chain_middle(&a);
+        return;
+    }
+    let a = chain_namespace("a");
+    let b = chain_namespace("b");
+    let c = chain_namespace("c");
+    let uplink = chain_namespace("wan");
+    // Emulate the one overlay interface on B. The bridge is a separate
+    // namespace so that A, B and C see only packets on their own veth.
+    let mesh = chain_namespace("lan");
+    ip(&["-n", &mesh.0, "link", "add", "mesh", "type", "bridge"]);
+    ip(&["-n", &mesh.0, "link", "set", "mesh", "up"]);
+    for (ns, port, address) in [
+        (&a, "to-a", "10.13.37.2/24"),
+        (&b, "to-b", "10.13.37.1/24"),
+        (&c, "to-c", "10.13.37.3/24"),
+    ] {
+        connect(ns, "tsun0", &mesh, port);
+        ip(&["-n", &mesh.0, "link", "set", port, "master", "mesh"]);
+        ip(&["-n", &ns.0, "addr", "add", address, "dev", "tsun0"]);
+    }
+    connect(&b, "wan-b", &uplink, "wan");
+    ip(&["-n", &b.0, "addr", "add", "192.0.2.1/24", "dev", "wan-b"]);
+    ip(&["-n", &uplink.0, "addr", "add", "192.0.2.2/24", "dev", "wan"]);
+    ip(&["-n", &a.0, "route", "add", "default", "via", "10.13.37.1"]);
+    ip(&["-n", &b.0, "route", "add", "default", "via", "192.0.2.2"]);
+    for ns in [&uplink, &c] {
+        ip(&["-n", &ns.0, "addr", "add", "198.51.100.2/32", "dev", "lo"]);
+    }
+    let _physical = chain_echo(&uplink, "uplink");
+    let _exit = chain_echo(&c, "exit-c");
+    let result = Command::new("ip")
+        .args(["netns", "exec", &b.0])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", CHAIN_TEST, "--nocapture"])
+        .env("TSUNAGI_EXIT_CHAIN_A", &a.0)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

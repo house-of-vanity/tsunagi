@@ -147,6 +147,8 @@ impl Tally {
 /// The overlay interface.
 pub struct Interface {
     device: Arc<dyn TunDevice>,
+    #[cfg(windows)]
+    forwarding: Option<super::egress::Gateway>,
     factory: Arc<dyn TunFactory>,
     name: String,
     mtu: u32,
@@ -235,6 +237,25 @@ impl Interface {
         let name = device.name().to_string();
         let tally = Arc::new(Tally::default());
 
+        #[cfg(windows)]
+        let forwarding = factory.on_host().then(|| {
+            let routes = routes.clone();
+            let carrier = carrier.clone();
+            super::egress::Gateway::new(mtu, move |route, packet| {
+                if let Some(IpHeader::V4 {
+                    source,
+                    destination,
+                }) = IpHeader::parse(&packet)
+                    && routes.accepts_exit_traffic(route.network, source)
+                    && matches!(
+                        routes.packet_source(route.network, route.peer, destination),
+                        Some(PacketSource::Member)
+                    )
+                {
+                    carrier.carry(route, packet);
+                }
+            })
+        });
         let vip_task = {
             let factory = Arc::clone(&factory);
             let routes = Arc::clone(&routes);
@@ -320,9 +341,11 @@ impl Interface {
                         tally.multicast.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    let selected = match destination {
-                        IpAddr::V4(address) => routes.packet_route(address),
-                        IpAddr::V6(_) => None,
+                    let selected = match (header.source(), destination) {
+                        (IpAddr::V4(source), IpAddr::V4(address)) => {
+                            routes.packet_route(Some(source), address)
+                        }
+                        _ => None,
                     };
                     let Some((route, exit)) = selected else {
                         tally.note_unroutable(destination);
@@ -342,6 +365,8 @@ impl Interface {
         };
 
         Ok(Self {
+            #[cfg(windows)]
+            forwarding,
             device,
             factory,
             name,
@@ -464,6 +489,10 @@ impl Interface {
             (state.plan.clone(), state.is_ok())
         };
         if wanted.is_empty() {
+            #[cfg(windows)]
+            if let Some(gateway) = &self.forwarding {
+                gateway.configure(Vec::new());
+            }
             if planned.is_some() {
                 exit.clear(&self.name).await;
                 let mut state = self.exit_state();
@@ -482,9 +511,13 @@ impl Interface {
                     report.client = Some(outcome);
                 }
             }
+            #[cfg(windows)]
+            self.configure_forwarding(exit.forwarded_uplink());
             return;
         }
         let report = exit.apply(&wanted).await;
+        #[cfg(windows)]
+        self.configure_forwarding(exit.forwarded_uplink());
         for (range, outcome) in &report.offer {
             match outcome {
                 RuleOutcome::Applied => tracing::info!(
@@ -530,6 +563,22 @@ impl Interface {
         let mut state = self.exit_state();
         state.plan = Some(wanted);
         state.report = Some(report);
+    }
+
+    #[cfg(windows)]
+    fn configure_forwarding(&self, physical: Option<(u32, std::net::Ipv4Addr)>) {
+        if let Some(gateway) = &self.forwarding {
+            gateway.configure(
+                self.routes
+                    .exit_offers()
+                    .into_iter()
+                    .filter_map(|(network, _)| {
+                        let (index, address) = physical?;
+                        Some((network, super::egress::Physical { index, address }))
+                    })
+                    .collect(),
+            );
+        }
     }
 
     /// Whether the host routes its own transport by destination.
@@ -781,6 +830,10 @@ impl Interface {
 
     /// Removes the interface from the host.
     pub async fn remove(&self) {
+        #[cfg(windows)]
+        if let Some(gateway) = &self.forwarding {
+            gateway.configure(Vec::new());
+        }
         // The route goes with the interface; the firewall rule does not, so
         // it is taken out explicitly while the interface is still known.
         if let Some(rules) = &self.host_rules {
@@ -848,14 +901,14 @@ impl Interface {
             self.tally.wrong_source.fetch_add(1, Ordering::Relaxed);
             return Err(Rejected::WrongSource);
         };
-        let (broadcast, exit) = match (origin, header.destination()) {
+        let (broadcast, exit, forwarded) = match (origin, header.destination()) {
             (
                 PacketSource::ExitReply {
                     local: Some(local),
                     exit,
                 },
                 IpAddr::V4(destination),
-            ) if destination == local => (false, Some(exit)),
+            ) if destination == local => (false, Some(exit), false),
             (PacketSource::Member, IpAddr::V4(destination))
                 if self.routes.is_broadcast(destination) =>
             {
@@ -865,13 +918,17 @@ impl Interface {
                     self.tally.broadcast_dropped.fetch_add(1, Ordering::Relaxed);
                     return Err(Rejected::BroadcastDenied);
                 }
-                (true, None)
+                (true, None, false)
             }
             (PacketSource::Member, IpAddr::V4(destination))
-                if self.routes.is_local_destination(network, destination)
-                    || self.routes.accepts_exit_traffic(network, destination) =>
+                if self.routes.is_local_destination(network, destination) =>
             {
-                (false, None)
+                (false, None, false)
+            }
+            (PacketSource::Member, IpAddr::V4(destination))
+                if self.routes.accepts_exit_traffic(network, destination) =>
+            {
+                (false, None, true)
             }
             _ => {
                 self.tally.wrong_destination.fetch_add(1, Ordering::Relaxed);
@@ -896,6 +953,20 @@ impl Interface {
             crate::vip::router::Decision::Drop => return Ok(()),
             crate::vip::router::Decision::Pass => packet,
         };
+        // Only authenticated member traffic admitted by the exit policy can
+        // open a physical socket. A rejected allocation never falls through
+        // to Wintun, where the local upstream's split routes might recapture it.
+        #[cfg(not(windows))]
+        let _ = forwarded;
+        #[cfg(windows)]
+        if forwarded && let Some(gateway) = &self.forwarding {
+            if gateway.forward(Route { network, peer }, packet) {
+                self.tally.received.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.tally.undeliverable.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
         // Remote broadcasts terminate here. Only local TUN ingress can fan out.
         let len = packet.len() as u64;
         if self.device.send(packet).await.is_ok() {

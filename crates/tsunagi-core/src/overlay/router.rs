@@ -304,11 +304,12 @@ impl RoutingTable {
     /// unicast destination, goes to this device's exit node when it has one:
     /// that is what sending *all* traffic through a member means.
     pub fn route(&self, destination: Ipv4Addr) -> Option<Route> {
-        self.packet_route(destination).map(|(route, _)| route)
+        self.packet_route(None, destination).map(|(route, _)| route)
     }
 
     pub(super) fn packet_route(
         &self,
+        source: Option<Ipv4Addr>,
         destination: Ipv4Addr,
     ) -> Option<(Route, Option<Arc<SelectedExit>>)> {
         let networks = self.read();
@@ -336,6 +337,14 @@ impl RoutingTable {
             return None;
         }
         let exit = self.selected_exit.load_full()?;
+        // The host's default route may hand a forwarded packet back to the TUN.
+        // Only this device can originate traffic for its own upstream. Replies
+        // to a member above still route by destination with their internet source.
+        if let Some(source) = source
+            && networks.get(&exit.route.network)?.local != Some(source)
+        {
+            return None;
+        }
         Some((exit.route, Some(exit)))
     }
 

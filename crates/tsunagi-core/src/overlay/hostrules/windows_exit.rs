@@ -1,4 +1,4 @@
-//! Exit-node host rules on Windows: WinNAT through PowerShell.
+//! Physical exit socket selection and client routes on Windows, through PowerShell.
 //!
 //! Compiled on every platform so the scripts and the plan logic are tested
 //! everywhere; only `WindowsHostRules` runs them, and only on Windows. It
@@ -6,20 +6,10 @@
 //!
 //! # Offering
 //!
-//! One NAT object per offered range, named with the usual tag
-//! `tsunagi-exit:<if>:<range>`:
-//!
-//! ```text
-//! New-NetNat -Name <tag> -InternalIPInterfaceAddressPrefix <range>
-//! ```
-//!
-//! WinNAT translates that range out of whichever interface the traffic leaves
-//! by, which is the Windows counterpart of the Linux masquerade. Windows
-//! forwards per interface, and the egress is not known here, so forwarding is
-//! only *read* for the overlay interface; turning it on for the interfaces
-//! involved is the owner's decision (`Set-NetIPInterface -Forwarding Enabled`).
-//! Some Windows versions allow a single NAT per host: a second offered range
-//! then reports its own failure.
+//! Forwarded TCP/UDP and ICMP echo use sockets pinned to the physical
+//! interface and address. This keeps a member's traffic independent of local
+//! split routes even for the same destination. The userspace gateway owns the
+//! flows; changing a local upstream does not recreate them.
 //!
 //! # Using
 //!
@@ -51,7 +41,7 @@
 use super::RuleOutcome;
 use std::net::Ipv4Addr;
 
-use super::exit::{ExitHostPlan, ExitHostReport, exit_tag, exit_tag_prefix};
+use super::exit::{ExitHostPlan, ExitHostReport, exit_tag_prefix};
 use crate::state::Ipv4Range;
 
 /// The route metric that marks a bypass route as this agent's.
@@ -68,64 +58,67 @@ fn ps_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Creates the NAT of one range, replacing one this agent made before.
-fn nat_script(interface: &str, range: &Ipv4Range) -> String {
-    let name = ps_literal(&exit_tag(interface, range));
-    let prefix = ps_literal(&range.to_string());
-    format!(
-        "$ErrorActionPreference = 'Stop'\n\
-         $name = {name}\n\
-         Get-NetNat -Name $name -ErrorAction SilentlyContinue | \
-         Remove-NetNat -Confirm:$false -ErrorAction SilentlyContinue\n\
-         New-NetNat -Name $name -InternalIPInterfaceAddressPrefix {prefix} | Out-Null\n"
-    )
-}
-
-/// Removes this interface's NAT objects except those named in `keep`.
-fn prune_script(interface: &str, keep: &[Ipv4Range]) -> String {
+/// Remove only obsolete WinNAT objects created by older Tsunagi releases.
+fn legacy_nat_cleanup(interface: &str) -> String {
     let prefix = ps_literal(&exit_tag_prefix(interface));
-    let keep: Vec<String> = keep
-        .iter()
-        .map(|range| ps_literal(&exit_tag(interface, range)))
-        .collect();
     format!(
         "$ErrorActionPreference = 'SilentlyContinue'\n\
-         $prefix = {prefix}\n\
-         $keep = @({})\n\
-         Get-NetNat | Where-Object {{ $_.Name.StartsWith($prefix) -and \
-         ($keep -notcontains $_.Name) }} | Remove-NetNat -Confirm:$false\n\
-         exit 0\n",
-        keep.join(", ")
+        $prefix = {prefix}\n\
+        Get-NetNat | Where-Object {{ $_.Name.StartsWith($prefix) }} | Remove-NetNat -Confirm:$false\n\
+        exit 0"
     )
 }
 
-/// Prints `Enabled` or `Disabled` for the interface's IPv4 forwarding.
-fn forwarding_script(interface: &str) -> String {
+/// Both client bypasses and forwarded sockets use the winning /0 outside Wintun.
+fn select_gateway(interface: &str) -> String {
     let alias = ps_literal(interface);
     format!(
         "$ErrorActionPreference = 'Stop'\n\
-         (Get-NetIPInterface -InterfaceAlias {alias} -AddressFamily IPv4).Forwarding\n"
+        $alias = {alias}\n\
+        $best = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 \
+        -PolicyStore ActiveStore | Where-Object {{ $_.InterfaceAlias -ne $alias -and \
+        $_.NextHop -ne '0.0.0.0' -and $_.State -ne 'Dead' }} | Sort-Object {{ $_.RouteMetric + \
+        (Get-NetIPInterface -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4).InterfaceMetric }} | \
+        Select-Object -First 1\n\
+        if (-not $best) {{ throw 'the host has no default gateway outside the overlay' }}\n"
     )
 }
 
-/// Prints the physical default and the more specific routes that already
-/// outrank the split defaults. Ignore our own host routes when refreshing.
+/// Read a usable source on the selected physical interface, even while the two
+/// client /1 routes point at Wintun. Never ask the default via the test target.
+fn uplink_script(interface: &str) -> String {
+    format!(
+        "{}$source = Get-NetIPAddress -InterfaceIndex $best.InterfaceIndex -AddressFamily IPv4 \
+        -AddressState Preferred | Where-Object {{ -not $_.SkipAsSource }} | Select-Object -First 1\n\
+        if (-not $source) {{ throw 'the physical interface has no usable IPv4 address' }}\n\
+        \"$($best.InterfaceIndex) $($source.IPAddress)\"",
+        select_gateway(interface)
+    )
+}
+
+pub(super) fn uplink(run: RunScript<'_>, interface: &str) -> Result<(u32, Ipv4Addr), String> {
+    let text = run(&uplink_script(interface))?;
+    parse_gateway(&text)
+        .filter(|(i, ip)| {
+            *i != 0
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !ip.is_loopback()
+                && !ip.is_broadcast()
+        })
+        .ok_or_else(|| {
+            "cannot determine the physical interface and IPv4 source for forwarding".into()
+        })
+}
+
 fn gateway_script(interface: &str) -> String {
-    let alias = ps_literal(interface);
     format!(
-        "$ErrorActionPreference = 'Stop'\n\
-         $alias = {alias}\n\
-         $best = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -AddressFamily IPv4 \
-         -PolicyStore ActiveStore | Where-Object {{ $_.InterfaceAlias -ne $alias -and \
-         $_.NextHop -ne '0.0.0.0' }} | Sort-Object {{ $_.RouteMetric + \
-         (Get-NetIPInterface -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4).InterfaceMetric }} | \
-         Select-Object -First 1\n\
-         if (-not $best) {{ throw 'the host has no default gateway outside the overlay' }}\n\
-         \"$($best.InterfaceIndex) $($best.NextHop)\"\n\
+        "{}\"$($best.InterfaceIndex) $($best.NextHop)\"\n\
          Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object {{ \
          $_.InterfaceAlias -ne $alias -and $_.State -ne 'Dead' -and \
          -not ($_.RouteMetric -eq {BYPASS_METRIC} -and $_.DestinationPrefix.EndsWith('/32')) }} | \
-         Select-Object -ExpandProperty DestinationPrefix\n"
+         Select-Object -ExpandProperty DestinationPrefix\n",
+        select_gateway(interface)
     )
 }
 
@@ -269,35 +262,25 @@ fn apply_client(
     Ok(())
 }
 
-fn parse_forwarding(text: &str) -> Option<bool> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "enabled" | "1" => Some(true),
-        "disabled" | "0" => Some(false),
-        _ => None,
-    }
-}
-
-/// Makes the host match the plan.
-pub(super) fn apply_plan(
+/// Decide the egress for all offered memberships, then reconcile the separate
+/// destination routes used by this device's applications.
+pub(super) fn reconcile(
     run: RunScript<'_>,
     resolve: Resolve<'_>,
     plan: &ExitHostPlan,
-) -> ExitHostReport {
+) -> (ExitHostReport, Option<(u32, Ipv4Addr)>) {
     let interface = plan.interface.as_str();
-    // What an earlier plan left and this one no longer wants.
-    let pruned = run(&prune_script(interface, &plan.offer));
+    let physical = (!plan.offer.is_empty()).then(|| uplink(run, interface));
     let offer = plan
         .offer
         .iter()
         .map(|range| {
-            let outcome = match &pruned {
-                Err(why) => RuleOutcome::Failed(why.clone()),
-                Ok(_) => match run(&nat_script(interface, range)) {
-                    Ok(_) => RuleOutcome::Applied,
-                    Err(why) => RuleOutcome::Failed(why),
-                },
+            let result = match &physical {
+                Some(Ok(_)) => RuleOutcome::Applied,
+                Some(Err(why)) => RuleOutcome::Failed(why.clone()),
+                None => RuleOutcome::Failed("no exit offer".into()),
             };
-            (*range, outcome)
+            (*range, result)
         })
         .collect();
     let client = if plan.client {
@@ -310,23 +293,19 @@ pub(super) fn apply_plan(
         let _ = run(&remove_client_script(interface));
         None
     };
-    let forwarding = if plan.offer.is_empty() {
-        None
-    } else {
-        run(&forwarding_script(interface))
-            .ok()
-            .and_then(|text| parse_forwarding(&text))
-    };
-    ExitHostReport {
-        offer,
-        forwarding,
-        client,
-    }
+    (
+        ExitHostReport {
+            offer,
+            forwarding: None,
+            client,
+        },
+        physical.and_then(Result::ok),
+    )
 }
 
 /// Removes every NAT object of this agent's for the interface.
 pub(super) fn clear_all(run: RunScript<'_>, interface: &str) {
-    if let Err(why) = run(&prune_script(interface, &[])) {
+    if let Err(why) = run(&legacy_nat_cleanup(interface)) {
         tracing::warn!(interface, "cannot remove the exit node NAT: {why}");
     }
     if let Err(why) = run(&remove_client_script(interface)) {
@@ -357,84 +336,51 @@ mod tests {
     }
 
     #[test]
-    fn the_nat_is_named_with_the_tag_and_replaces_its_own() {
-        let script = nat_script("tsun0", &range());
-        assert!(
-            script.contains("$name = 'tsunagi-exit:tsun0:10.13.37.0/24'"),
-            "{script}"
-        );
-        assert!(script.contains("-InternalIPInterfaceAddressPrefix '10.13.37.0/24'"));
-        assert!(
-            script.find("Remove-NetNat").unwrap() < script.find("New-NetNat").unwrap(),
-            "{script}"
-        );
-    }
-
-    #[test]
-    fn a_quote_in_a_value_cannot_escape_the_literal() {
-        let script = nat_script("x'; Remove-Item C:\\ #", &range());
-        assert!(script.contains("'tsunagi-exit:x''; Remove-Item C:\\ #:10.13.37.0/24'"));
-        assert!(prune_script("x'y", &[]).contains("'tsunagi-exit:x''y:'"));
-        assert!(forwarding_script("x'y").contains("'x''y'"));
-    }
-
-    #[test]
-    fn pruning_keeps_wanted_ranges_and_only_selects_this_interfaces_nats() {
-        let script = prune_script("tsun0", &[range()]);
-        assert!(script.contains("$prefix = 'tsunagi-exit:tsun0:'"));
-        assert!(script.contains("$keep = @('tsunagi-exit:tsun0:10.13.37.0/24')"));
-        assert!(script.contains("StartsWith($prefix)"));
-        assert!(script.contains("exit 0"));
-        assert!(prune_script("tsun0", &[]).contains("$keep = @()"));
-    }
-
-    #[test]
-    fn forwarding_text_is_read_never_written() {
-        assert_eq!(parse_forwarding("Enabled\r\n"), Some(true));
-        assert_eq!(parse_forwarding("Disabled"), Some(false));
-        assert_eq!(parse_forwarding("what"), None);
-        let script = forwarding_script("tsun0");
-        assert!(script.contains("Get-NetIPInterface"));
-        assert!(!script.contains("Set-NetIPInterface"));
-    }
-
-    #[test]
-    fn offering_prunes_then_creates_and_reads_forwarding() {
+    fn selecting_an_upstream_never_recreates_a_forwarded_session_or_installs_a_destination_exception()
+     {
         let calls = RefCell::new(Vec::new());
         let run = |script: &str| -> Result<String, String> {
             calls.borrow_mut().push(script.to_string());
-            Ok(if script.contains("Get-NetIPInterface") {
-                "Disabled\n".to_string()
+            Ok(if script.contains("Get-NetIPAddress") {
+                "7 192.0.2.15".into()
+            } else if script.contains("Select-Object -ExpandProperty DestinationPrefix") {
+                "7 192.0.2.1".into()
             } else {
                 String::new()
             })
         };
-        let report = apply_plan(&run, &no_names, &plan(false));
-        assert_eq!(report.offer, vec![(range(), RuleOutcome::Applied)]);
-        assert_eq!(report.forwarding, Some(false));
-        assert_eq!(report.client, None);
-        let calls = calls.borrow();
-        assert!(calls[0].contains("StartsWith"), "{calls:?}");
-        assert!(calls[1].contains("New-NetNat"), "{calls:?}");
-        // Without a client, the routes of an earlier plan are taken away.
-        assert!(calls[2].contains("RouteMetric -eq 7373"), "{calls:?}");
-        assert!(calls[3].contains("Get-NetIPInterface"), "{calls:?}");
+        for client in [false, true, false] {
+            let (report, physical) = reconcile(&run, &no_names, &plan(client));
+            assert_eq!(physical, Some((7, "192.0.2.15".parse().unwrap())));
+            assert_eq!(report.offer, vec![(range(), RuleOutcome::Applied)]);
+            assert_eq!(report.forwarding, None);
+        }
+        assert!(
+            !calls
+                .borrow()
+                .iter()
+                .any(|s| s.contains("NetNat") || s.contains("Set-NetIPInterface"))
+        );
+        assert!(uplink_script("x'y").contains("'x''y'"));
     }
 
     #[test]
-    fn a_failing_nat_is_that_ranges_failure() {
-        let run = |script: &str| -> Result<String, String> {
-            if script.contains("New-NetNat") {
-                Err("A NAT with this prefix already exists".into())
-            } else {
-                Ok(String::new())
-            }
-        };
-        let report = apply_plan(&run, &no_names, &plan(false));
-        let RuleOutcome::Failed(why) = &report.offer[0].1 else {
-            panic!("{report:?}");
-        };
-        assert!(why.contains("already exists"), "{why}");
+    fn failure_to_find_a_physical_source_never_advertises_a_working_exit() {
+        for line in [
+            "",
+            "0 198.51.100.3",
+            "5 0.0.0.0",
+            "5 127.0.0.1",
+            "3 10.0.0.1 extra",
+        ] {
+            let (report, physical) = reconcile(&|_| Ok(line.into()), &no_names, &plan(false));
+            assert_eq!(physical, None);
+            assert!(matches!(&report.offer[0].1, RuleOutcome::Failed(_)));
+        }
+    }
+
+    fn apply_plan(run: RunScript<'_>, resolve: Resolve<'_>, plan: &ExitHostPlan) -> ExitHostReport {
+        reconcile(run, resolve, plan).0
     }
 
     fn no_names(_: &str) -> Vec<Ipv4Addr> {
@@ -764,7 +710,7 @@ exit 0"#
         };
         clear_all(&run, "tsun0");
         let seen = seen.borrow();
-        assert!(seen[0].contains("$keep = @()"));
+        assert!(seen[0].contains("StartsWith($prefix)"));
         assert!(seen[0].contains("'tsunagi-exit:tsun0:'"));
     }
 }

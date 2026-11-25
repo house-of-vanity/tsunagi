@@ -40,6 +40,8 @@ pub enum OverlayError {
 
 pub mod broadcast;
 pub mod config;
+#[cfg(any(windows, test))]
+mod egress;
 pub mod exit;
 pub mod hostrules;
 pub mod interface;

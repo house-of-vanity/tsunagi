@@ -211,6 +211,16 @@ atomic rollback. The CLI test starts two real agent processes and exercises
 offline cleanup by network and hostname through the control socket.
 Native tray rendering and physical screen sizing are not exercised automatically.
 
+The three-agent exit test delivers A’s traffic to B before, during and after B
+chooses C, including both agents contacting the same address. The isolated Linux
+kernel test `serving_an_established_flow_while_switching_the_local_exit` uses
+network namespaces and keeps a real TCP connection open across both switches.
+On disposable macOS and Windows runners the native subnet workflow checks the
+same-destination split on two utuns or two Wintun adapters. Its macOS test
+requires IPv4 forwarding enabled. Windows userspace forwarding also has
+ordinary loopback tests for TCP resets, half-closes, UDP port stability and
+connection limits.
+
 Linux exit-client unit tests cover preservation of foreign mark bits, matching
 only the agent's UID and locally owned TCP/UDP sockets, exact tagged cleanup,
 partial IPv6 failure and mark-aware strict kernel RPF validation. The ignored

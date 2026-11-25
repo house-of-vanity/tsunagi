@@ -50,6 +50,16 @@ pub const DATA_REASSEMBLY_TTL: Duration = Duration::from_secs(5);
 /// Completed or discarded packet IDs retained to ignore late duplicate fragments.
 pub const DATA_RECENT_IDS: usize = 128;
 
+/// Simultaneous TCP, UDP and ICMP work on a userspace exit.
+#[cfg(any(windows, test))]
+pub(crate) const EXIT_FORWARD_FLOWS: usize = 256;
+/// Bounded packet queue shared by userspace exit clients.
+#[cfg(any(windows, test))]
+pub(crate) const EXIT_FORWARD_QUEUE: usize = 64;
+/// Concurrent fragmented datagrams accepted by a userspace exit.
+#[cfg(any(windows, test))]
+pub(crate) const EXIT_FORWARD_FRAGMENTS: usize = 32;
+
 /// Where the two stores live.
 ///
 /// The mandatory state and the disposable cache are separate both logically and
