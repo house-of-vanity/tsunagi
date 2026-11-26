@@ -1,6 +1,6 @@
 [package]
 name = "tsunagi-wireguard"
-version = "1.0.10"
+version = "1.0.11"
 description = "Independent authenticated WireGuard and Amnezia UDP carriers for tsunagi."
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ license = "WTFPL AND Apache-2.0"
 repository.workspace = true
 
 [dependencies]
-tsunagi-core = { path = "../tsunagi-core", version = "1.0.10" }
+tsunagi-core = { path = "../tsunagi-core", version = "1.0.11" }
 iroh.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros"] }
 serde.workspace = true
