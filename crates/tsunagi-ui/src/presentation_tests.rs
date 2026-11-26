@@ -506,6 +506,36 @@ fn exit_users_scroll_a_row_inside_the_existing_card_and_disappear_on_deselection
         draw(&network, 0.3, vec![press(title, false)]);
         let (empty, baseline) = draw(&network, 0.4, vec![]);
         assert!(label(&empty, "peer-00").is_none());
+        let address_icon = if os == egui::os::OperatingSystem::Android {
+            icon::DEVICE_MOBILE
+        } else {
+            icon::LAPTOP
+        };
+        for (glyph, value) in [
+            (icon::TAG, "office"),
+            (icon::HASH, "lab"),
+            (icon::TREE_STRUCTURE, "10.2.3.0/24"),
+            (address_icon, "10.2.3.4"),
+            (icon::DEVICES, "12 online · 12 known"),
+        ] {
+            let marker = label(&empty, glyph).unwrap();
+            let cell = empty
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == value => {
+                        Some(t.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .find(|cell| (cell.center().y - marker.center().y).abs() < 5.)
+                .unwrap();
+            let gap = cell.left() - marker.right();
+            assert!(
+                (1.0..=7.0).contains(&gap),
+                "{value} has a {gap} pt icon gap"
+            );
+        }
         network.peers[0].uses_our_exit = true;
         let (one, h) = draw(&network, 0.5, vec![]);
         assert!(label(&one, "1 exit user").is_some() && label(&one, "peer-00").is_some());

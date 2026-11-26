@@ -266,9 +266,9 @@ pub fn draw_network_details(
 fn draw_metadata(ui: &mut egui::Ui, network: &NetworkReport, own_id: &str) {
     egui::Grid::new(ui.id().with("metadata"))
         .num_columns(2)
-        .max_col_width((ui.available_width() - 30.).max(24.))
-        .min_col_width(18.)
-        .spacing([6.0, 3.0])
+        .min_col_width(0.)
+        .max_col_width(ui.available_width())
+        .spacing([3.0, 3.0])
         .show(ui, |ui| {
             widgets::field(ui, icon::TAG, "", "Network name");
             format::copy_field(ui, &network.name, &network.name);
