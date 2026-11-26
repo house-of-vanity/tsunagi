@@ -328,7 +328,19 @@ impl Grid {
                 _ => &self.body,
             };
             let bounds = slot.rect(row);
-            let response = cell(ui, bounds, &label, font, self.ink(col), numeric(col));
+            let resolved = if names.resolve_addresses {
+                names.resolved_endpoint(key, col)
+            } else {
+                None
+            };
+            let response = cell(
+                ui,
+                bounds,
+                resolved.as_deref().unwrap_or(&label),
+                font,
+                self.ink(col),
+                numeric(col),
+            );
             if col == PeerId {
                 let full = public_id(&key.peer);
                 let button = ui
@@ -344,6 +356,9 @@ impl Grid {
                 if widgets::hint(button, &format!("Copy peer ID\n{full}")).clicked() {
                     ui.ctx().copy_text(full);
                 }
+            } else if resolved.is_some() {
+                // A click sense also gives Android long presses a target.
+                widgets::hint(response.interact(Sense::click()), &label);
             } else {
                 widgets::hint(response, &label);
             }

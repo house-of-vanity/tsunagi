@@ -14,7 +14,8 @@ use history::{Cursor, Filter};
 use std::{collections::BTreeMap, net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
 use tsunagi::{
     NetworkId,
-    ipc::StatusReport,
+    dns::ZoneName,
+    ipc::{NetworkReport, StatusReport},
     iroh_types::EndpointId,
     traffic::{Flow, FlowKey, IpDetail, Role},
 };
@@ -31,6 +32,8 @@ struct Network {
 struct Names {
     networks: BTreeMap<Id, Network>,
     generation: Option<u64>,
+    addresses: BTreeMap<(Id, Ipv4Addr), String>,
+    resolve_addresses: bool,
 }
 
 fn public_id(id: &Id) -> String {
@@ -43,11 +46,13 @@ impl Names {
             return false;
         }
         self.generation = Some(generation);
+        self.addresses.clear();
         let mut changed = false;
         for n in &report.networks {
             let Ok(id) = n.network_id.parse::<NetworkId>() else {
                 continue;
             };
+            self.index_addresses(*id.as_bytes(), n, &report.hostname);
             let entry = self.networks.entry(*id.as_bytes()).or_default();
             if entry.name != n.name {
                 entry.name.clone_from(&n.name);
@@ -96,6 +101,53 @@ impl Names {
             }
         }
         changed
+    }
+    fn index_addresses(&mut self, id: Id, network: &NetworkReport, hostname: &str) {
+        let Ok(zone) = ZoneName::new(&network.name) else {
+            return;
+        };
+        let mut add = |address: Option<Ipv4Addr>, name: Option<&str>| {
+            if let (Some(ip), Some(name)) = (
+                address,
+                name.map(|s| s.trim_matches('.')).filter(|s| !s.is_empty()),
+            ) {
+                self.addresses
+                    .entry((id, ip))
+                    .or_insert_with(|| format!("{}.{}", name.to_ascii_lowercase(), zone.as_str()));
+            }
+        };
+        if network.hostname_conflict.is_none()
+            && let Some(own) = &network.overlay
+        {
+            add(
+                own.address.as_deref().and_then(|s| s.parse().ok()),
+                Some(hostname),
+            );
+        }
+        for member in &network.members {
+            if member.hostname_conflict.is_none() {
+                add(
+                    member
+                        .overlay_address_v4
+                        .as_deref()
+                        .and_then(|s| s.parse().ok()),
+                    member.hostname.as_deref(),
+                );
+            }
+        }
+        for vip in &network.vips {
+            if vip.error.is_none() {
+                add(vip.address, Some(&vip.config.name));
+            }
+        }
+    }
+    fn resolved_endpoint(&self, key: &FlowKey, column: Column) -> Option<String> {
+        let (ip, port) = column.ip_endpoint(key)?;
+        let name = self.addresses.get(&(key.network, ip))?;
+        Some(match port {
+            Some(port) => format!("{name}:{port}"),
+            None => name.clone(),
+        })
     }
     fn network(&self, id: &Id) -> String {
         let Some(n) = self.networks.get(id) else {
@@ -207,7 +259,10 @@ impl Window {
     pub fn new(directory: Option<PathBuf>) -> Self {
         Self {
             worker: Worker::new(directory),
-            names: Names::default(),
+            names: Names {
+                resolve_addresses: true,
+                ..Names::default()
+            },
             filter: Filter::default(),
             keep: false,
             previous: Vec::new(),
@@ -220,12 +275,16 @@ impl Window {
     }
 
     fn controls(&mut self, ui: &mut Ui, grid: &table::Grid) {
-        if ui.available_width() < 540. {
-            ui.horizontal(|ui| self.layers(ui));
+        if ui.available_width() < 620. {
+            ui.horizontal_wrapped(|ui| {
+                self.layers(ui);
+                self.resolve_option(ui);
+            });
             ui.horizontal(|ui| self.history_controls(ui, grid));
         } else {
             ui.horizontal(|ui| {
                 self.layers(ui);
+                self.resolve_option(ui);
                 self.history_controls(ui, grid);
             });
         }
@@ -259,6 +318,15 @@ impl Window {
         if layer != self.filter.transport {
             self.filter.role = None;
             self.filter.protocol = None;
+        }
+    }
+
+    fn resolve_option(&mut self, ui: &mut Ui) {
+        if !self.filter.transport {
+            widgets::hint(
+                ui.checkbox(&mut self.names.resolve_addresses, "Resolve names"),
+                "Show this network’s peer and VIP names. Hover or hold a name to see its IP address.",
+            );
         }
     }
 

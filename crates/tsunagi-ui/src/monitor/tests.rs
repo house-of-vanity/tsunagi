@@ -208,6 +208,76 @@ fn a_stale_member_name_does_not_reindex_the_capture_every_refresh() {
 }
 
 #[test]
+fn endpoint_names_use_the_rows_network_and_current_peer_and_vip_records() {
+    use super::{Column, Names};
+    use tsunagi::ipc::{MemberReport, NetworkReport, OverlayReport, StatusReport};
+    use tsunagi::vip::{VipConfig, VipStatus};
+
+    let network = |id, name: &str, host: &str| NetworkReport {
+        network_id: tsunagi::NetworkId::from_bytes([id; 32]).to_string(),
+        name: name.into(),
+        members: vec![MemberReport {
+            hostname: Some(host.into()),
+            overlay_address_v4: Some("10.0.0.2".into()),
+            ..Default::default()
+        }],
+        overlay: Some(OverlayReport {
+            address: Some("10.0.0.1".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut report = StatusReport {
+        hostname: "laptop".into(),
+        networks: vec![network(1, "tsng", "music"), network(2, "vpn", "home")],
+        ..Default::default()
+    };
+    report.networks[0].vips.push(VipStatus {
+        config: VipConfig::new("radio"),
+        revision: String::new(),
+        address: Some("10.0.0.3".parse().unwrap()),
+        error: None,
+        listeners: vec![],
+    });
+    let mut names = Names::default();
+    names.refresh(Some(&report), 1);
+    let mut key = sample(55201, true).key;
+    assert_eq!(
+        names.resolved_endpoint(&key, Column::Near).as_deref(),
+        Some("laptop.tsng:55201")
+    );
+    assert_eq!(
+        names.resolved_endpoint(&key, Column::Far).as_deref(),
+        Some("music.tsng:443")
+    );
+    key.network = [2; 32];
+    assert_eq!(
+        names.resolved_endpoint(&key, Column::Far).as_deref(),
+        Some("home.vpn:443")
+    );
+    key.network = [1; 32];
+    key.flow = Flow::Ip {
+        near: [10, 0, 0, 3],
+        far: [1, 1, 1, 1],
+        protocol: 1,
+        detail: IpDetail::Echo,
+    };
+    assert_eq!(
+        names.resolved_endpoint(&key, Column::Near).as_deref(),
+        Some("radio.tsng")
+    );
+    assert_eq!(names.resolved_endpoint(&key, Column::Far), None);
+    report.networks[0].vips[0].error = Some("address conflict".into());
+    report.networks[0].members.clear();
+    names.refresh(Some(&report), 2);
+    assert_eq!(names.resolved_endpoint(&key, Column::Near), None);
+    assert_eq!(
+        names.resolved_endpoint(&sample(1, true).key, Column::Far),
+        None
+    );
+}
+
+#[test]
 fn sorting_uses_display_names_numeric_endpoints_and_live_rates() {
     use super::{Column, Names, Network, Sort};
     use std::{collections::BTreeMap, sync::Arc};
@@ -280,7 +350,14 @@ fn monitor_rows_stay_on_one_line_and_headers_sort_in_both_themes() {
         let ctx = Context::default();
         ctx.set_theme(theme);
         ctx.set_fonts(crate::app_fonts());
+        ctx.style_mut(|s| {
+            s.interaction.tooltip_delay = 0.;
+            s.interaction.show_tooltips_only_when_still = false;
+        });
         let mut win = Window::new(None);
+        win.names
+            .addresses
+            .insert(([1; 32], [10, 0, 0, 2].into()), "music.lab".into());
         win.names.networks.insert(
             [1; 32],
             Network {
@@ -366,6 +443,29 @@ fn monitor_rows_stay_on_one_line_and_headers_sort_in_both_themes() {
             wait(win);
         };
         let mut frame = draw(&mut win, vec![]);
+        let checkbox = label(&frame, "Resolve names").0.center();
+        if width > 900. {
+            let name = label(&frame, "music.lab:443").0.center();
+            draw(&mut win, vec![Event::PointerMoved(name)]);
+            frame = draw(&mut win, vec![]);
+            assert!(
+                frame.shapes.iter().any(
+                    |s| matches!(&s.shape, Shape::Text(t) if t.galley.text() == "10.0.0.2:443")
+                ),
+                "hovering a resolved name reveals the numeric endpoint"
+            );
+            click(&mut win, checkbox);
+            frame = draw(&mut win, vec![]);
+            label(&frame, "10.0.0.2:443");
+            assert!(
+                !frame.shapes.iter().any(
+                    |s| matches!(&s.shape, Shape::Text(t) if t.galley.text() == "music.lab:443")
+                )
+            );
+            click(&mut win, checkbox);
+            frame = draw(&mut win, vec![]);
+            label(&frame, "music.lab:443");
+        }
         let chooser = frame
             .shapes
             .iter()

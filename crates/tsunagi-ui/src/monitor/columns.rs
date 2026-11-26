@@ -1,6 +1,7 @@
 //! Fields shared by the table, its column chooser and the history ordering.
 use super::{Names, endpoints, role_name};
 use rusqlite::types::Value;
+use std::net::Ipv4Addr;
 use tsunagi::traffic::{Flow, FlowKey, IpDetail};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -86,21 +87,30 @@ impl Column {
     pub fn uses_names(self) -> bool {
         matches!(self, Self::Peer | Self::Network | Self::Near | Self::Far)
     }
+    pub fn ip_endpoint(self, key: &FlowKey) -> Option<(Ipv4Addr, Option<u16>)> {
+        let Flow::Ip {
+            near, far, detail, ..
+        } = key.flow
+        else {
+            return None;
+        };
+        let ip = match self {
+            Self::Near => near,
+            Self::Far => far,
+            _ => return None,
+        };
+        let port = match detail {
+            IpDetail::Ports(a, b) => Some(if self == Self::Near { a } else { b }),
+            _ => None,
+        };
+        Some((ip.into(), port))
+    }
     // SQLite indexes this value only while sorting by a descriptive column.
     // Numeric IPv4 address and port order is independent of their spelling.
     pub fn label_key(self, key: &FlowKey, names: &Names) -> Value {
-        if let Flow::Ip {
-            near, far, detail, ..
-        } = key.flow
-            && matches!(self, Self::Near | Self::Far)
-        {
-            let near_side = self == Self::Near;
-            let ip = u32::from_be_bytes(if near_side { near } else { far });
-            let port = match detail {
-                IpDetail::Ports(a, b) => 1 + i64::from(if near_side { a } else { b }),
-                _ => 0,
-            };
-            return Value::Integer((i64::from(ip) << 17) + port);
+        if let Some((ip, port)) = self.ip_endpoint(key) {
+            let port = port.map_or(0, |p| i64::from(p) + 1);
+            return Value::Integer((i64::from(u32::from(ip)) << 17) + port);
         }
         let label = match self {
             Self::Peer => names.peer(&key.network, &key.peer),

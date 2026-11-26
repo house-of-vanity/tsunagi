@@ -206,10 +206,15 @@ address/port pair and repeated ICMP echoes for an address pair into one row. Sel
 role to narrow it down. **Via exit node** shows your outgoing internet traffic.
 **Serving exit** shows traffic your device forwards for another peer.
 
+**Resolve names** shows known peers and VIPs by their network names in the
+endpoint columns. Hover over a name, or press and hold on Android, to see the
+IP address. Clear the checkbox to show all endpoints numerically.
+
 **Transport** shows authenticated control sessions and encrypted datagrams
 forwarded between two other endpoints. For relay rows the arrows follow the
-two displayed endpoints in order. Rates update once per second. Select a row
-to see its packet counts. The monitor records header metadata and counters only.
+two displayed endpoints in order. Rates update once per second. Use the
+**TX packets** and **RX packets** columns to see packet counts. The monitor
+records header metadata and counters only.
 
 Inactive rows expire after 60 seconds. **Keep until close** retains flows in a
 private temporary table owned by the window. Closing it discards the table and
