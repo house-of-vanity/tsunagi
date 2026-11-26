@@ -88,39 +88,52 @@ pub(super) fn header(
     let left = dot.x + 9.;
     let mut right = rect.right() - 2.;
     let quiet = ui.visuals().weak_text_color();
-    // Preserve a useful piece of the name even on the narrow landscape selector.
-    if right - left > 98. {
-        let width = (rect.width() * 0.15).clamp(26., 64.);
+    let title_font = FontId::new(font.size + 4., egui::FontFamily::Name("Bold".into()));
+    let strong = ui.visuals().strong_text_color();
+    let title = painter.layout_no_wrap(net.name.clone(), title_font.clone(), strong);
+    let mut spare = right - left - title.size().x.min(64.);
+    const GAP: f32 = 8.;
+    let mut reserve = |text| {
+        let galley = painter.layout_no_wrap(text, font.clone(), ink);
+        let width = galley.size().x + GAP;
+        if width > spare {
+            return None;
+        }
+        spare -= width;
+        Some(galley)
+    };
+    // Reserve the address first. Peer counts grow as sessions reconnect.
+    let address = net.overlay.as_ref().and_then(|o| o.address.as_deref());
+    let ip = address.and_then(|s| reserve(s.to_owned()));
+    let peers = reserve(format!("{} {online}/{known}", icon::DEVICES));
+    let clients = if users > 0 {
+        reserve(format!("{} {users}", icon::SIGN_IN))
+    } else {
+        None
+    };
+    let width = (rect.width() * 0.15).min(64.).min(spare - GAP);
+    if width >= 26. {
         let plot = Rect::from_center_size(pos2(right - width / 2., center), vec2(width, 14.));
         format::mini_traffic(&painter, plot, series, unit, quiet, net.active);
-        right = plot.left() - 7.;
+        right = plot.left() - GAP;
     }
-    let mut field = |text: String, reserved: f32| {
-        let galley = painter.layout_no_wrap(text, font.clone(), ink);
-        if right - left - galley.size().x >= reserved {
-            right -= galley.size().x;
-            painter.galley(pos2(right, center - galley.size().y / 2.), galley, ink);
-            right -= 8.;
-        }
-    };
-    field(format!("{} {online}/{known}", icon::DEVICES), 45.);
-    if users > 0 {
-        field(format!("{} {users}", icon::SIGN_IN), 60.);
+    for galley in [peers, clients, ip].into_iter().flatten() {
+        right -= galley.size().x;
+        painter.galley(pos2(right, center - galley.size().y / 2.), galley, ink);
+        right -= GAP;
     }
-    if let Some(addr) = net.overlay.as_ref().and_then(|o| o.address.as_deref()) {
-        field(addr.to_owned(), 110.);
-    }
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        net.name.clone(),
-        FontId::new(font.size + 4., egui::FontFamily::Name("Bold".into())),
-        ui.visuals().strong_text_color(),
+    widgets::single_line(
+        &painter,
+        Rect::from_min_max(pos2(left, rect.top()), pos2(right.max(left), rect.bottom())),
+        Align::Min,
+        &net.name,
+        title_font,
+        strong,
     );
-    job.wrap.max_width = (right - left).max(1.);
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    let name = painter.layout_job(job);
-    painter.galley(pos2(left, center - name.size().y / 2.), name, ink);
     let mut hint = format!("{} · {status}\n{online} online · {known} known", net.name);
+    if let Some(address) = address {
+        hint.push_str(&format!("\n{address}"));
+    }
     if users > 0 {
         hint.push_str(&format!("\n{}", user_count(users)));
     }

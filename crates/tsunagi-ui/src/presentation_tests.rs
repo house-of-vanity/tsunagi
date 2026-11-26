@@ -442,6 +442,61 @@ fn desktop_full_table_survives_long_names_and_compact_exit_icon_starts_and_stops
 }
 
 #[test]
+fn collapsed_vpn_keeps_its_address_as_peers_reconnect() {
+    let ctx = Context::default();
+    ctx.set_fonts(crate::app_fonts());
+    let mut state = home::UiState::default();
+    let report = tsunagi::ipc::StatusReport::default();
+    let address = "10.78.107.201";
+    let mut network = NetworkReport {
+        name: "vpn".into(),
+        active: true,
+        overlay: Some(OverlayReport {
+            address: Some(address.into()),
+            ..Default::default()
+        }),
+        members: (0..14)
+            .map(|i| MemberReport {
+                endpoint_id: format!("peer-{i}"),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    for width in [320., 359.] {
+        for online in [1, 9, 10, 12, 14] {
+            for (i, member) in network.members.iter_mut().enumerate() {
+                member.online = i < online;
+            }
+            let out = frame(
+                &ctx,
+                egui::vec2(width, 240.),
+                online as f64,
+                vec![],
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        home::draw_network(
+                            ui,
+                            &ReadOnly,
+                            &mut state,
+                            &Traffic::default(),
+                            &network,
+                            &report,
+                            true,
+                        );
+                    });
+                },
+            );
+            let name = label(&out, "vpn").unwrap();
+            let address = label(&out, address).expect("the local address stays visible");
+            let count = label(&out, &format!("{} {online}/14", icon::DEVICES)).unwrap();
+            assert!(name.right() < address.left() && address.right() < count.left());
+            assert!(count.right() <= width);
+        }
+    }
+}
+
+#[test]
 fn exit_users_scroll_a_row_inside_the_existing_card_and_disappear_on_deselection() {
     for (width, os) in [
         (360., egui::os::OperatingSystem::Android),
