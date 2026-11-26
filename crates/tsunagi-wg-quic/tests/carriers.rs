@@ -10,25 +10,39 @@ use std::{
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tsunagi::dataplane::transport::ControlSender;
 use tsunagi::dataplane::transport::{PacketTransport, SharedLink, TransportError};
 use tsunagi::discovery::SharedMemoryDiscovery;
 use tsunagi::overlay::{MemoryTun, MemoryTunFactory};
 use tsunagi::testing::{config_with, network, wait_for_peers, wait_until};
 use tsunagi::{Agent, BoxFuture, NetworkId};
-use tsunagi_tcp_tls::{TcpTlsCarrier, TcpTlsTransport};
+use tsunagi_shoes::{ShoesTransport, ShoesWire};
+use tsunagi_tcp_tls::{TcpCarrier, TcpTlsCarrier, TcpTlsTransport, candidates::TcpEndpoint};
 use tsunagi_wg_quic::{WireguardConfig, WireguardPlugin};
 use tsunagi_wireguard::{UdpCarrier, UdpTransport};
 
 // Only address selection is constrained to loopback. TLS sockets, identity
 // verification, framing, membership and both encryption layers remain real.
 #[derive(Debug)]
-struct LoopbackTls {
-    inner: Arc<TcpTlsTransport>,
+struct LoopbackTcp {
+    inner: Arc<dyn TcpEndpoint>,
     ports: Arc<std::sync::Mutex<Vec<(EndpointId, u16)>>>,
 }
-impl PacketTransport for LoopbackTls {
+impl PacketTransport for LoopbackTcp {
     fn name(&self) -> &str {
-        "tcp-tls"
+        self.inner.name()
+    }
+    fn attach_control(&self, sender: Arc<dyn ControlSender>) {
+        self.inner.attach_control(sender);
+    }
+    fn on_control(
+        &self,
+        net: NetworkId,
+        peer: EndpointId,
+        protocol: &str,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
+        self.inner.on_control(net, peer, protocol, payload)
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -47,8 +61,15 @@ impl PacketTransport for LoopbackTls {
             .find(|(id, _)| *id == peer)
             .unwrap()
             .1;
-        self.inner
-            .replace_peer_addrs(peer, vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
+        self.inner.set_pair_addresses(
+            network,
+            peer,
+            Some(if port == 0 {
+                vec![]
+            } else {
+                vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))]
+            }),
+        );
         self.inner.open(network, peer, protocol)
     }
 }
@@ -95,6 +116,7 @@ impl Node {
             .with_tunnel(tunnel.clone());
         let mut wireguard = None;
         let mut tls = None;
+        let mut shoes = Vec::new();
         for &protocol in protocols {
             match protocol {
                 "wg" => {
@@ -120,12 +142,34 @@ impl Node {
                         .with_carrier(TcpTlsCarrier::new(transport.clone()))
                         .with_custom_transport(
                             protocol,
-                            Arc::new(LoopbackTls {
+                            Arc::new(LoopbackTcp {
                                 inner: transport.clone(),
                                 ports: ports.clone(),
                             }),
                         );
                     tls = Some(transport);
+                }
+                "vless-xhttp" | "ss2022" => {
+                    let wire: Arc<dyn ShoesWire> = if protocol == "vless-xhttp" {
+                        Arc::new(tsunagi_vless_xhttp::VlessXhttp::new(&identity).unwrap())
+                    } else {
+                        Arc::new(tsunagi_ss2022::Shadowsocks2022)
+                    };
+                    let transport = ShoesTransport::bind(wire, Some(0), 0).await.unwrap();
+                    ports
+                        .lock()
+                        .unwrap()
+                        .push((identity.endpoint_id(), transport.bound_port()));
+                    config = config
+                        .with_carrier(TcpCarrier::new(transport.clone()))
+                        .with_custom_transport(
+                            protocol,
+                            Arc::new(LoopbackTcp {
+                                inner: transport.clone(),
+                                ports: ports.clone(),
+                            }),
+                        );
+                    shoes.push(transport);
                 }
                 "wg-quic" => {
                     config = config.with_carrier(Arc::new(
@@ -137,6 +181,9 @@ impl Node {
         }
         let agent = Agent::spawn(config).await.unwrap();
         let mut listeners = tokio::task::JoinSet::new();
+        for transport in shoes {
+            listeners.spawn(transport.listen(agent.clone()));
+        }
         if let Some(transport) = wireguard.clone() {
             let incoming = agent.clone();
             listeners.spawn(async move {
@@ -418,9 +465,8 @@ async fn missing_native_transport_cannot_silently_turn_wireguard_into_quic() {
 }
 
 #[tokio::test]
-async fn wireguard_and_tls_carriers_both_carry_the_same_internal_cipher_and_exact_plaintext_counters()
- {
-    for protocol in ["wg", "tcp-tls"] {
+async fn direct_carriers_share_the_internal_cipher_and_count_exact_plaintext() {
+    for protocol in ["wg", "tcp-tls", "vless-xhttp", "ss2022"] {
         let discovery = SharedMemoryDiscovery::new();
         let ports = Arc::default();
         let a = Node::new(&discovery, protocol, Arc::clone(&ports)).await;
@@ -497,6 +543,45 @@ async fn wireguard_and_tls_carriers_both_carry_the_same_internal_cipher_and_exac
             )
             .await;
         }
+        a.agent.shutdown().await;
+        b.agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn each_tcp_carrier_reverses_when_the_elected_dialler_cannot_reach_the_listener() {
+    for protocol in ["tcp-tls", "vless-xhttp", "ss2022"] {
+        let discovery = SharedMemoryDiscovery::new();
+        let ports = Arc::default();
+        let a = Node::new(&discovery, protocol, Arc::clone(&ports)).await;
+        let b = Node::new(&discovery, protocol, Arc::clone(&ports)).await;
+        // Only the smaller identity accepts a connection from its peer.
+        ports
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .max_by_key(|(id, _)| *id)
+            .unwrap()
+            .1 = 0;
+        let (name, secret) = network(protocol);
+        let id = a.agent.join_network(&name, &secret).await.unwrap();
+        b.agent.join_network(&name, &secret).await.unwrap();
+        wait_until(
+            "both endpoints have an established cipher over the reverse socket",
+            || async {
+                [&a, &b]
+                    .iter()
+                    .all(|n| {
+                        n.tunnel.overview(id).and_then(|o| {
+                            o.peers.first()?.tunnel.as_ref().map(|t| t.health.is_up())
+                        }) == Some(true)
+                    })
+                    .then_some(())
+            },
+        )
+        .await;
+        deliver(&a, &b, id, 41).await;
+        deliver(&b, &a, id, 42).await;
         a.agent.shutdown().await;
         b.agent.shutdown().await;
     }

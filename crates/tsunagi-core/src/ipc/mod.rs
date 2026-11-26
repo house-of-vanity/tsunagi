@@ -739,6 +739,10 @@ pub struct RangeConflictReport {
 /// A data-plane protocol available in the running agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolReport {
+    /// UI family of this transport.
+    pub group: String,
+    /// Human-readable protocol name.
+    pub label: String,
     /// Stable protocol name used by the CLI and network negotiation.
     pub name: String,
     /// A short description of encryption and transport.
@@ -1214,7 +1218,7 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Bump it whenever [`Request`], [`Response`] or anything they contain
 /// changes shape.
-pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 29]);
+pub const CONTROL_PROTOCOL: u32 = u32::from_be_bytes([b'T', b'S', b'N', 30]);
 
 /// Reads one request off an accepted stream, answers it, writes the response.
 ///

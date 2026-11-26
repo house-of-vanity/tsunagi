@@ -1,11 +1,11 @@
 # Pairwise Amnezia transport
 
-The CLI's default carrier preference is `wg,awg,wg-quic,tcp-tls`. To select
+The CLI's default carrier preference is `wg,awg,wg-quic,tcp-tls,vless-xhttp,ss2022`. To select
 AWG explicitly:
 
 ```sh
 tsng up --protocol awg
-tsng up --protocol wg,awg,wg-quic,tcp-tls
+tsng up --protocol wg,awg,wg-quic,tcp-tls,vless-xhttp,ss2022
 ```
 
 The startup list is the initial per-network preference. A saved network choice
@@ -127,7 +127,7 @@ The internal capability is `wireguard-e2e` v4; external `wg` and `awg` use v2,
 `wg-quic` v1 and `tcp-tls` v2, as in 1.0.1. Control ALPN
 `tsunagi/ctrl/8`, discovery, membership and signed state are unchanged. The data
 ALPN is `tsunagi/data/6`; the relay envelope format is unchanged. Automatic
-carrier comparisons are optional on the mesh wire. Local IPC is v29,
+carrier comparisons are optional on the mesh wire. Local IPC is v30,
 so agent, CLI and tray must match. Historical `wg-quic/wireguard.sqlite` is the
 canonical internal key store. Missing keys are imported transactionally from
 `wg` then `awg`, without replacing an existing canonical key or modifying a

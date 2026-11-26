@@ -211,6 +211,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "as-raw-xcb-connection"
@@ -493,6 +496,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -6406,13 +6410,31 @@ dependencies = [
 name = "tsunagi-runtime"
 version = "1.0.10"
 dependencies = [
+ "data-encoding",
+ "hex",
+ "tempfile",
  "tokio",
  "tracing",
  "tsunagi-awg",
  "tsunagi-core",
+ "tsunagi-shoes",
+ "tsunagi-ss2022",
  "tsunagi-tcp-tls",
+ "tsunagi-vless-xhttp",
  "tsunagi-wg-quic",
  "tsunagi-wireguard",
+]
+
+[[package]]
+name = "tsunagi-shoes"
+version = "1.0.0"
+dependencies = [
+ "iroh",
+ "rand 0.10.3",
+ "tokio",
+ "tsunagi-core",
+ "tsunagi-tcp-tls",
+ "zeroize",
 ]
 
 [[package]]
@@ -6423,6 +6445,20 @@ dependencies = [
  "postcard",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "tsunagi-ss2022"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "iroh",
+ "rand 0.10.3",
+ "ring",
+ "tokio",
+ "tsunagi-core",
+ "tsunagi-shoes",
+ "zeroize",
 ]
 
 [[package]]
@@ -6437,12 +6473,14 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "socket2",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "tsunagi-core",
+ "x509-parser",
 ]
 
 [[package]]
@@ -6475,6 +6513,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tsunagi-vless-xhttp"
+version = "1.0.0"
+dependencies = [
+ "bytes",
+ "h2",
+ "hex",
+ "http",
+ "iroh",
+ "rand 0.10.3",
+ "rustls",
+ "subtle",
+ "tokio",
+ "tokio-rustls",
+ "tsunagi-core",
+ "tsunagi-shoes",
+ "tsunagi-tcp-tls",
+ "zeroize",
+]
+
+[[package]]
 name = "tsunagi-wg-quic"
 version = "1.0.10"
 dependencies = [
@@ -6496,7 +6554,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tsunagi-core",
+ "tsunagi-shoes",
+ "tsunagi-ss2022",
  "tsunagi-tcp-tls",
+ "tsunagi-vless-xhttp",
  "tsunagi-wireguard",
  "zeroize",
 ]

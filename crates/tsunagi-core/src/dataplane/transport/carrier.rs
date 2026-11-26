@@ -11,6 +11,10 @@ pub trait DataCarrier: Send + Sync + std::fmt::Debug + 'static {
     fn protocol_id(&self) -> &str;
     /// Wire version, independent of software releases and the internal tunnel.
     fn protocol_version(&self) -> u16;
+    /// Whether the peer may dial back after an unsuccessful elected dial.
+    fn supports_reverse_dial(&self) -> bool {
+        false
+    }
     /// Supported carrier settings.
     fn options(&self) -> &'static [ProtocolOption] {
         &[]
@@ -25,6 +29,17 @@ pub trait DataCarrier: Send + Sync + std::fmt::Debug + 'static {
         peer: EndpointId,
         capability: &PluginCapability,
     ) -> Result<(), PluginError>;
+    /// Adds IP hints from verified direct control paths. Their UDP ports do not
+    /// identify a TCP listener. Carriers authenticate their own data path.
+    fn on_peer_capability_at(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+        capability: &PluginCapability,
+        _ips: &[std::net::IpAddr],
+    ) -> Result<(), PluginError> {
+        self.on_peer_capability(network, peer, capability)
+    }
     /// Supplies the actual owned interface name, including kernel-assigned names.
     fn on_interface_ready(&self, _name: &str) {}
     /// Activates this carrier for one local network.

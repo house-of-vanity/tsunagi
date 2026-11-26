@@ -47,7 +47,8 @@ peer by the agent and runs a WireGuard tunnel over it:
 ```
 
 Reachability belongs to external carriers: ordinary WireGuard UDP (`wg`),
-Amnezia-masked UDP (`awg`), iroh QUIC (`wg-quic`), or TCP/TLS (`tcp-tls`). The
+Amnezia-masked UDP (`awg`), iroh QUIC (`wg-quic`), TCP/TLS (`tcp-tls`),
+VLESS/XHTTP (`vless-xhttp`) or Shadowsocks 2022 (`ss2022`). The
 user's ordered choice applies only to those physical data links. The internal
 capability `wireguard-e2e` v4 is fixed and hidden from the CLI/tray controls.
 All carriers move the same inner encrypted bytes, including through relays.

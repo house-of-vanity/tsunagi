@@ -30,6 +30,9 @@ rand = "0.10"
 boringtun = { version = "0.7.1", default-features = false }
 
 [dev-dependencies]
+tsunagi-shoes = { path = "../tsunagi-shoes" }
+tsunagi-vless-xhttp = { path = "../tsunagi-vless-xhttp" }
+tsunagi-ss2022 = { path = "../tsunagi-ss2022" }
 tsunagi-wireguard = { path = "../tsunagi-wireguard" }
 tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls" }
 tsunagi-core = { path = "../tsunagi-core", features = ["testing"] }

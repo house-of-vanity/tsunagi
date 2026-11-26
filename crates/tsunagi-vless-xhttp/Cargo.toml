@@ -1,0 +1,27 @@
+[package]
+name = "tsunagi-vless-xhttp"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "VLESS over XHTTP, HTTP/2 and TLS for peer-to-peer mesh links."
+
+[dependencies]
+tsunagi-shoes = { path = "../tsunagi-shoes" }
+tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls" }
+tsunagi-core = { path = "../tsunagi-core" }
+iroh.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+http = "1"
+h2 = "0.4"
+rustls = "0.23"
+tokio-rustls = "0.26"
+bytes.workspace = true
+hex.workspace = true
+rand = "0.10"
+subtle = "2.6"
+zeroize = "1.9"
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
 //! TLS carrier options and bounded reachability announcements. No IP cipher lives here.
-use crate::transport::TcpTlsTransport;
+use crate::{candidates::TcpEndpoint, transport::TcpTlsTransport};
 use iroh::EndpointId;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -138,7 +138,12 @@ pub(crate) fn is_candidate_interface(iface: &netdev::Interface) -> bool {
 }
 
 pub(crate) fn is_candidate_ipv4(addr: std::net::Ipv4Addr) -> bool {
-    if addr.is_loopback() || addr.is_unspecified() || addr.is_link_local() || addr.is_broadcast() {
+    if addr.is_multicast()
+        || addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_link_local()
+        || addr.is_broadcast()
+    {
         return false;
     }
     if addr.is_documentation() {
@@ -151,7 +156,7 @@ pub(crate) fn is_candidate_ip(addr: std::net::IpAddr) -> bool {
     match addr {
         std::net::IpAddr::V4(v4) => is_candidate_ipv4(v4),
         std::net::IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
+            if v6.is_multicast() || v6.is_loopback() || v6.is_unspecified() {
                 return false;
             }
             let segments = v6.segments();
@@ -230,71 +235,65 @@ impl TcpTlsConfig {
         Ok(config)
     }
 }
-/// TLS carrier announcements and lifecycle, independent of IP encryption.
+/// Native TLS carrier, retaining the original registration API.
+pub type TcpTlsCarrier = TcpCarrier<TcpTlsTransport>;
+
+/// Bounded TCP address announcements shared by carriers with independent listeners.
 #[derive(Debug)]
-pub struct TcpTlsCarrier {
-    transport: Arc<TcpTlsTransport>,
+pub struct TcpCarrier<T> {
+    transport: Arc<T>,
     excluded_interface: std::sync::Mutex<Option<String>>,
+    bootstrap: std::sync::OnceLock<std::collections::HashMap<EndpointId, Vec<std::net::IpAddr>>>,
     underlay: std::sync::OnceLock<tokio::sync::watch::Receiver<Vec<std::net::IpAddr>>>,
-    peers: std::sync::Mutex<
-        std::collections::HashMap<(NetworkId, EndpointId), Vec<std::net::SocketAddr>>,
-    >,
 }
-impl TcpTlsCarrier {
-    /// Shares the transport's listener; creates no end-to-end cipher.
-    pub fn new(transport: Arc<TcpTlsTransport>) -> Arc<Self> {
+impl<T: TcpEndpoint> TcpCarrier<T> {
+    /// Announces the actual listener's port.
+    pub fn new(transport: Arc<T>) -> Arc<Self> {
         Arc::new(Self {
             transport,
-            excluded_interface: std::sync::Mutex::new(None),
+            excluded_interface: Default::default(),
+            bootstrap: Default::default(),
             underlay: Default::default(),
-            peers: Default::default(),
         })
     }
-    /// Registers a carrier while excluding the agent's own, possibly custom-named interface.
-    pub fn with_interface(transport: Arc<TcpTlsTransport>, interface: String) -> Arc<Self> {
+    /// Excludes the agent's own interface from physical addresses.
+    pub fn with_interface(transport: Arc<T>, interface: String) -> Arc<Self> {
         Arc::new(Self {
             transport,
             excluded_interface: std::sync::Mutex::new(Some(interface)),
+            bootstrap: Default::default(),
             underlay: Default::default(),
-            peers: Default::default(),
         })
+    }
+    /// Bootstrap IPs can be candidates for this peer's separately announced TCP port.
+    pub fn set_bootstrap(&self, endpoints: &[iroh::EndpointAddr]) {
+        let _ = self.bootstrap.set(
+            endpoints
+                .iter()
+                .map(|endpoint| {
+                    (
+                        endpoint.id,
+                        endpoint.ip_addrs().take(32).map(|a| a.ip()).collect(),
+                    )
+                })
+                .collect(),
+        );
     }
     /// Use only the addresses assigned to the OS-selected physical network.
     pub fn set_underlay(&self, source: tokio::sync::watch::Receiver<Vec<std::net::IpAddr>>) {
         let _ = self.underlay.set(source);
     }
-    fn update_peer(
-        &self,
-        network: NetworkId,
-        peer: EndpointId,
-        addrs: Option<Vec<std::net::SocketAddr>>,
-    ) {
-        let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
-        match addrs {
-            Some(addrs) => {
-                peers.insert((network, peer), addrs);
-            }
-            None => {
-                peers.remove(&(network, peer));
-            }
-        }
-        let mut combined = peers
-            .iter()
-            .filter(|((_, id), _)| *id == peer)
-            .flat_map(|(_, addrs)| addrs.iter().copied())
-            .collect::<Vec<_>>();
-        combined.sort_unstable();
-        combined.dedup();
-        combined.truncate(32);
-        self.transport.replace_peer_addrs(peer, combined);
-    }
 }
-impl tsunagi::dataplane::transport::DataCarrier for TcpTlsCarrier {
+
+impl<T: TcpEndpoint> tsunagi::dataplane::transport::DataCarrier for TcpCarrier<T> {
     fn protocol_id(&self) -> &str {
-        TCP_TLS_PROTOCOL
+        self.transport.name()
     }
     fn protocol_version(&self) -> u16 {
-        2
+        self.transport.wire_version()
+    }
+    fn supports_reverse_dial(&self) -> bool {
+        true
     }
     fn on_interface_ready(&self, name: &str) {
         *self
@@ -324,10 +323,10 @@ impl tsunagi::dataplane::transport::DataCarrier for TcpTlsCarrier {
             self.transport.bound_port(),
             ips.into_iter().take(32).collect::<Vec<_>>(),
         ))
-        .map_err(|_| PluginError::Other("cannot encode TLS addresses".into()))?;
+        .map_err(|_| PluginError::Other("cannot encode TCP addresses".into()))?;
         Ok(Some(tsunagi::dataplane::PluginCapability {
-            protocol: TCP_TLS_PROTOCOL.into(),
-            version: 2,
+            protocol: self.protocol_id().into(),
+            version: self.protocol_version(),
             enabled: true,
             data,
         }))
@@ -338,8 +337,20 @@ impl tsunagi::dataplane::transport::DataCarrier for TcpTlsCarrier {
         peer: EndpointId,
         cap: &tsunagi::dataplane::PluginCapability,
     ) -> Result<(), PluginError> {
-        if !cap.enabled || cap.protocol != TCP_TLS_PROTOCOL || cap.version != 2 {
-            return Err(PluginError::Rejected("unsupported TLS carrier".into()));
+        self.on_peer_capability_at(network, peer, cap, &[])
+    }
+    fn on_peer_capability_at(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+        cap: &tsunagi::dataplane::PluginCapability,
+        observed: &[std::net::IpAddr],
+    ) -> Result<(), PluginError> {
+        if !cap.enabled
+            || cap.protocol != self.protocol_id()
+            || cap.version != self.protocol_version()
+        {
+            return Err(PluginError::Rejected("unsupported TCP carrier".into()));
         }
         // Decode a fixed bounded array through the existing common announcement limit.
         #[derive(Deserialize)]
@@ -348,37 +359,36 @@ impl tsunagi::dataplane::transport::DataCarrier for TcpTlsCarrier {
             #[serde(deserialize_with = "bounded_ips")] Vec<std::net::IpAddr>,
         );
         let Addresses(port, ips) = postcard::from_bytes(&cap.data)
-            .map_err(|_| PluginError::Rejected("invalid TLS carrier addresses".into()))?;
+            .map_err(|_| PluginError::Rejected("invalid TCP carrier addresses".into()))?;
         if port == 0 {
-            return Err(PluginError::Rejected("invalid TLS carrier port".into()));
+            return Err(PluginError::Rejected("invalid TCP carrier port".into()));
         }
-        self.update_peer(
-            network,
-            peer,
-            Some(
-                ips.into_iter()
-                    .filter(|ip| is_candidate_ip(*ip))
-                    .map(|ip| std::net::SocketAddr::new(ip, port))
-                    .collect(),
-            ),
-        );
+        let configured = self.bootstrap.get().and_then(|peers| peers.get(&peer));
+        let mut addresses = Vec::new();
+        for ip in observed
+            .iter()
+            .copied()
+            .chain(configured.into_iter().flatten().copied())
+            .chain(ips)
+        {
+            let ip = ip.to_canonical();
+            let addr = std::net::SocketAddr::new(ip, port);
+            if is_candidate_ip(ip) && !addresses.contains(&addr) {
+                addresses.push(addr);
+            }
+            if addresses.len() == 32 {
+                break;
+            }
+        }
+        self.transport
+            .set_pair_addresses(network, peer, Some(addresses));
         Ok(())
     }
     fn on_peer_gone(&self, network: NetworkId, peer: EndpointId) {
-        self.update_peer(network, peer, None);
+        self.transport.set_pair_addresses(network, peer, None);
     }
     fn on_network_deactivated(&self, network: NetworkId) {
-        let peers: Vec<_> = self
-            .peers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .keys()
-            .filter(|(id, _)| *id == network)
-            .map(|(_, peer)| *peer)
-            .collect();
-        for peer in peers {
-            self.update_peer(network, peer, None);
-        }
+        self.transport.clear_network(network);
     }
 }
 fn bounded_ips<'de, D: serde::Deserializer<'de>>(

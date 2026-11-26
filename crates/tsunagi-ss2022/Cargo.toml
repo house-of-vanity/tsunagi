@@ -1,0 +1,21 @@
+[package]
+name = "tsunagi-ss2022"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+repository.workspace = true
+description = "Shadowsocks 2022 TCP transport for peer-to-peer mesh links."
+
+[dependencies]
+tsunagi-shoes = { path = "../tsunagi-shoes" }
+tsunagi-core = { path = "../tsunagi-core" }
+iroh.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+rand = "0.10"
+ring = "0.17"
+blake3 = { version = "1.8", features = ["zeroize"] }
+zeroize = "1.9"
+
+[lints]
+workspace = true

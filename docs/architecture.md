@@ -76,6 +76,9 @@ And in crates of their own:
 |---|---|
 | `tsunagi-wireguard` | independent ordinary WG and masked UDP hop engines, private pair negotiation and local candidates |
 | `tsunagi-tcp-tls` | TLS hop encryption and bounded reachability announcements; no inner IP cipher |
+| `tsunagi-shoes` | ephemeral credentials negotiated privately for each TCP attempt |
+| `tsunagi-vless-xhttp` | VLESS over XHTTP stream-one, HTTP/2 and TLS 1.3 |
+| `tsunagi-ss2022` | Shadowsocks 2022 TCP wire profile and authenticated records |
 | `tsunagi-awg` | ephemeral pairwise Amnezia masking, private negotiation and independently encrypted UDP carriers; shares the independent UDP hop engine with `wg` |
 | `tsunagi-wg-quic` | the single internal WireGuard cipher, keys and opaque announcement (historical crate name) |
 | `tsunagi` | the command line agent, built as the `tsng` executable: the only place that owns a runtime, a logger and signals |

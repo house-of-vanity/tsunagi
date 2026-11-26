@@ -33,14 +33,15 @@ impl ServerCertVerifier for PinnedEndpointVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
-        // Parse the certificate's SPKI / public key
-        let cert_bytes = end_entity.as_ref();
-        let expected_bytes = self.expected.as_bytes();
-
-        // Check if the expected 32-byte Ed25519 public key is in the certificate
-        if cert_bytes
-            .windows(32)
-            .any(|window| window == expected_bytes)
+        use x509_parser::prelude::{FromDer, X509Certificate};
+        let (rest, cert) = X509Certificate::from_der(end_entity.as_ref())
+            .map_err(|_| RustlsError::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+        let key = cert.public_key();
+        if rest.is_empty()
+            && key.algorithm.algorithm == x509_parser::oid_registry::OID_SIG_ED25519
+            && key.algorithm.parameters.is_none()
+            && key.subject_public_key.unused_bits == 0
+            && key.subject_public_key.data.as_ref() == self.expected.as_bytes()
         {
             Ok(ServerCertVerified::assertion())
         } else {
@@ -126,7 +127,7 @@ pub fn make_server_config(
 ) -> Result<Arc<ServerConfig>, rustls::Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
+        .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -138,7 +139,7 @@ pub fn make_client_config(expected_peer: EndpointId) -> Result<Arc<ClientConfig>
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(PinnedEndpointVerifier::new(expected_peer));
     let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()?
+        .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();

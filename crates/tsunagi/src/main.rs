@@ -498,7 +498,7 @@ struct UpArgs {
         long = "protocol",
         value_name = "LIST",
         value_delimiter = ',',
-        default_value = "wg,awg,wg-quic,tcp-tls",
+        default_values = PROTOCOLS.iter().map(|p| p.name),
         help_heading = "Transport"
     )]
     protocols: Vec<String>,
@@ -1475,7 +1475,11 @@ fn take_tunnel_settings(settings: &mut Vec<Setting>) -> Result<Vec<(String, Stri
 }
 
 /// The settings meant for one protocol, refusing any that fit nowhere.
-fn settings_for(spec: &ProtocolSpec, settings: &[Setting]) -> Vec<(String, String)> {
+fn settings_for(
+    spec: &ProtocolSpec,
+    settings: &[Setting],
+    selected: &[&ProtocolSpec],
+) -> Vec<(String, String)> {
     let mut taken = Vec::new();
     for setting in settings {
         let aimed_here = match &setting.protocol {
@@ -1485,7 +1489,19 @@ fn settings_for(spec: &ProtocolSpec, settings: &[Setting]) -> Vec<(String, Strin
             // Unqualified settings go to whichever protocol declares the
             // key. With one selected that is the obvious reading; with
             // several, write `protocol:key=value`.
-            None => spec.options.iter().any(|option| option.key == setting.key),
+            None => {
+                // Existing unqualified ports configure the original listeners.
+                // A Shoes listener can inherit one when it is the sole TCP choice.
+                let shoes_port =
+                    setting.key == "port" && matches!(spec.name, "vless-xhttp" | "ss2022");
+                let eligible = !shoes_port
+                    || selected
+                        .iter()
+                        .filter(|p| matches!(p.name, "tcp-tls" | "vless-xhttp" | "ss2022"))
+                        .count()
+                        == 1;
+                eligible && spec.options.iter().any(|option| option.key == setting.key)
+            }
         };
         if aimed_here {
             taken.push((setting.key.clone(), setting.value.clone()));
@@ -1501,6 +1517,7 @@ fn show_protocols() -> Result<(), Box<dyn std::error::Error>> {
     let mut out = Report::new();
     for spec in PROTOCOLS {
         let mut section = Section::new(format!("{}  (wire version {})", spec.name, spec.version));
+        section.push(Row::new(Health::Info, "group", spec.group));
         section.push(Row::new(Health::Info, "what", spec.summary));
         if spec.options.is_empty() {
             section.push(Row::new(Health::Info, "settings", "none"));
@@ -2033,7 +2050,7 @@ fn parse_protocol_list(text: &str) -> Result<Vec<String>, String> {
         };
         if !PROTOCOLS.iter().any(|spec| spec.name == name) {
             return Err(format!(
-                "unknown protocol `{name}`; use wg,awg,wg-quic,tcp-tls or `none` alone. Run `tsng protocols` for details"
+                "unknown protocol `{name}`; run `tsng protocols` to list available transports, or use `none` alone"
             ));
         }
         if names.iter().any(|n| n == name) {
@@ -4729,10 +4746,10 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
         if !PROTOCOLS
             .iter()
             .filter(|spec| setting.protocol.is_some() || wanted.iter().any(|p| p.name == spec.name))
-            .any(|spec| !settings_for(spec, std::slice::from_ref(setting)).is_empty())
+            .any(|spec| !settings_for(spec, std::slice::from_ref(setting), &wanted).is_empty())
         {
             return Err(format!(
-                "no configured protocol takes `{}`; qualify disabled protocol settings as protocol:key=value. Run `tsng protocols` for details",
+                "no configured protocol takes `{}`; use protocol:key=value to select a specific listener or configure a disabled transport. Run `tsng protocols` for details",
                 setting.key
             )
             .into());
@@ -4772,7 +4789,7 @@ async fn up(args: UpArgs) -> Result<(), Box<dyn std::error::Error>> {
             })
             .cloned()
             .collect();
-        settings_for(spec, &scoped)
+        settings_for(spec, &scoped, &wanted)
     })
     .await?;
 
@@ -4950,13 +4967,7 @@ async fn build_report(
 
     StatusReport {
         overlay_config_error: overlay.and_then(|state| state.address_error),
-        available_protocols: PROTOCOLS
-            .iter()
-            .map(|p| tsunagi::ipc::ProtocolReport {
-                name: p.name.into(),
-                summary: p.summary.into(),
-            })
-            .collect(),
+        available_protocols: PROTOCOLS.iter().map(|p| p.report()).collect(),
         endpoint_id: status.endpoint_id.to_string(),
         hostname: status.hostname.clone(),
         bound_sockets: status
@@ -5988,10 +5999,31 @@ mod network_tests {
     }
 
     #[test]
-    fn default_carriers_include_awg_and_explicit_order_is_preserved() {
+    fn separate_tcp_listeners_preserve_historic_unqualified_ports() {
+        let all: Vec<_> = super::PROTOCOLS.iter().collect();
+        let spec = |name| *all.iter().find(|p| p.name == name).unwrap();
+        let settings = super::parse_settings(&["port=8765".into()]).unwrap();
+        assert_eq!(
+            super::settings_for(spec("tcp-tls"), &settings, &all)[0].1,
+            "8765"
+        );
+        assert!(super::settings_for(spec("vless-xhttp"), &settings, &all).is_empty());
+        for name in ["vless-xhttp", "ss2022"] {
+            let only = [spec(name)];
+            assert_eq!(super::settings_for(only[0], &settings, &only)[0].1, "8765");
+            let qualified = super::parse_settings(&[format!("{name}:port=9876")]).unwrap();
+            assert_eq!(super::settings_for(only[0], &qualified, &all)[0].1, "9876");
+        }
+    }
+
+    #[test]
+    fn all_carriers_default_on_and_explicit_order_is_preserved() {
         use clap::Parser;
         for (words, expected) in [
-            (vec!["tsng", "up"], vec!["wg", "awg", "wg-quic", "tcp-tls"]),
+            (
+                vec!["tsng", "up"],
+                vec!["wg", "awg", "wg-quic", "tcp-tls", "vless-xhttp", "ss2022"],
+            ),
             (
                 vec![
                     "tsng",

@@ -10,7 +10,11 @@ use tsunagi::{
     iroh_types::EndpointAddr,
 };
 use tsunagi_awg::{AWG_PROTOCOL, AWG_WIRE_VERSION, AwgPlugin, AwgTransport};
-use tsunagi_tcp_tls::{TCP_TLS_PROTOCOL, TcpTlsCarrier, TcpTlsConfig, TcpTlsTransport};
+use tsunagi_shoes::ShoesTransport;
+use tsunagi_tcp_tls::{
+    TCP_TLS_PROTOCOL, TcpCarrier, TcpTlsCarrier, TcpTlsConfig, TcpTlsTransport,
+    candidates::TcpEndpoint,
+};
 use tsunagi_wireguard::WG_PROTOCOL;
 
 pub mod report;
@@ -23,6 +27,10 @@ pub mod report;
 pub struct ProtocolSpec {
     /// The name on the wire, which is what peers compare.
     pub name: &'static str,
+    /// Display family; selection is still saved per protocol.
+    pub group: &'static str,
+    /// Compact user-facing name.
+    pub label: &'static str,
     /// The wire version. Not the software version: two peers on different
     /// builds carry traffic for each other as long as this matches.
     pub version: u16,
@@ -30,6 +38,27 @@ pub struct ProtocolSpec {
     pub summary: &'static str,
     /// The settings it accepts.
     pub options: &'static [tsunagi::dataplane::ProtocolOption],
+}
+
+impl ProtocolSpec {
+    /// UI metadata for the current local build.
+    pub fn report(&self) -> tsunagi::ipc::ProtocolReport {
+        tsunagi::ipc::ProtocolReport {
+            name: self.name.into(),
+            label: self.label.into(),
+            group: self.group.into(),
+            summary: self.summary.into(),
+        }
+    }
+}
+
+const fn tcp_port_option(port: &'static str) -> tsunagi::dataplane::ProtocolOption {
+    tsunagi::dataplane::ProtocolOption {
+        key: "port",
+        value: "PORT",
+        help: "local TCP listener port (0 for an available port)",
+        default: Some(port),
+    }
 }
 
 const WG_OPTIONS: &[tsunagi::dataplane::ProtocolOption] = &[tsunagi::dataplane::ProtocolOption {
@@ -43,27 +72,51 @@ const WG_OPTIONS: &[tsunagi::dataplane::ProtocolOption] = &[tsunagi::dataplane::
 pub const PROTOCOLS: &[ProtocolSpec] = &[
     ProtocolSpec {
         name: WG_PROTOCOL,
+        group: "WireGuard",
+        label: "WireGuard",
         version: tsunagi_wireguard::WG_WIRE_VERSION,
         summary: "Pure WireGuard direct UDP transport",
         options: WG_OPTIONS,
     },
     ProtocolSpec {
         name: AWG_PROTOCOL,
+        group: "WireGuard",
+        label: "AmneziaWG",
         version: AWG_WIRE_VERSION,
         summary: "Pairwise Amnezia-masked UDP with fresh private profiles on every connection attempt",
         options: AwgPlugin::OPTIONS,
     },
     ProtocolSpec {
         name: "wg-quic",
+        group: "iroh",
+        label: "WG over QUIC",
         version: 1,
         summary: "iroh QUIC datagram carrier with NAT traversal and relays",
         options: &[],
     },
     ProtocolSpec {
         name: TCP_TLS_PROTOCOL,
+        group: "Native",
+        label: "TCP + TLS",
         version: tsunagi_tcp_tls::TCP_TLS_VERSION,
-        summary: "TCP TLS 1.3 carrier",
+        summary: "Direct TCP with TLS 1.3 pinned to the peer identity. Either peer can initiate the connection.",
         options: TcpTlsConfig::OPTIONS,
+    },
+    ProtocolSpec {
+        name: tsunagi_vless_xhttp::PROTOCOL,
+        group: "Shoes",
+        label: "VLESS + XHTTP",
+        version: tsunagi_vless_xhttp::WIRE_VERSION,
+        summary: "VLESS over XHTTP stream-one, HTTP/2 and TLS 1.3. Each attempt gets a fresh UUID and request path.",
+        options: &[tcp_port_option("9443")],
+    },
+    ProtocolSpec {
+        name: tsunagi_ss2022::PROTOCOL,
+        group: "Shoes",
+        label: "Shadowsocks 2022",
+        version: tsunagi_ss2022::WIRE_VERSION,
+        summary: "Shadowsocks 2022 over TCP. Each attempt gets a fresh private key, salts, padding and a choice of AES-128-GCM or AES-256-GCM.",
+        options: &[tcp_port_option("9444")],
     },
 ];
 
@@ -71,6 +124,7 @@ pub const PROTOCOLS: &[ProtocolSpec] = &[
 pub struct Carriers {
     udp: [Arc<AwgTransport>; 2],
     tls: Arc<TcpTlsTransport>,
+    shoes: Vec<Arc<ShoesTransport>>,
 }
 
 impl Carriers {
@@ -142,20 +196,52 @@ impl Carriers {
                 .await
                 .map_err(|error| -> Box<dyn std::error::Error> { error })?,
         );
-        for address in bootstrap {
-            for ip in address.ip_addrs() {
-                tls.set_peer_addr(address.id, *ip);
-            }
-        }
         let carrier = TcpTlsCarrier::with_interface(tls.clone(), config.interface_name.clone());
-        if let Some(source) = underlay {
-            carrier.set_underlay(source);
+        carrier.set_bootstrap(bootstrap);
+        if let Some(source) = &underlay {
+            carrier.set_underlay(source.clone());
         }
         config = config
             .with_carrier(Arc::new(IrohCarrier))
             .with_carrier(carrier)
             .with_custom_transport(TCP_TLS_PROTOCOL, tls.clone());
-        Ok((config, Self { udp, tls }))
+        let vless = tsunagi_vless_xhttp::VlessXhttp::new(&identity)
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+        let wires: [(Arc<dyn tsunagi_shoes::ShoesWire>, u16); 2] = [
+            (Arc::new(vless), tsunagi_vless_xhttp::PORT),
+            (
+                Arc::new(tsunagi_ss2022::Shadowsocks2022),
+                tsunagi_ss2022::PORT,
+            ),
+        ];
+        let mut shoes = Vec::new();
+        for (wire, default_port) in wires {
+            let name = wire.name();
+            let mut port = None;
+            for (key, value) in options_for(name) {
+                if key != "port" {
+                    return Err(format!("unknown {name} option {key}").into());
+                }
+                port = Some(value.parse::<u16>()?);
+            }
+            let transport = ShoesTransport::bind(wire, port, default_port).await?;
+            let carrier =
+                TcpCarrier::with_interface(transport.clone(), config.interface_name.clone());
+            carrier.set_bootstrap(bootstrap);
+            if let Some(source) = &underlay {
+                carrier.set_underlay(source.clone());
+            }
+            tracing::debug!(
+                protocol = name,
+                port = transport.bound_port(),
+                "TCP listener ready"
+            );
+            config = config
+                .with_carrier(carrier)
+                .with_custom_transport(name, transport.clone());
+            shoes.push(transport);
+        }
+        Ok((config, Self { udp, tls, shoes }))
     }
 
     /// Accept incoming authenticated links until the caller drops the returned task set.
@@ -171,6 +257,9 @@ impl Carriers {
                     }
                 }
             });
+        }
+        for transport in self.shoes {
+            tasks.spawn(transport.listen(agent.clone()));
         }
         let agent = agent.clone();
         tasks.spawn(async move {

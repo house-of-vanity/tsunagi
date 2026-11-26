@@ -127,10 +127,22 @@ status and recent traffic. Expand it to see who is using this device for interne
 access.
 [Details and per-OS notes](docs/exit-node.md).
 
-The initial data transport order is `wg,awg,wg-quic,tcp-tls` by default. AWG negotiates a
+The initial data transport order is `wg,awg,wg-quic,tcp-tls,vless-xhttp,ss2022` by default. AWG negotiates a
 fresh masking profile and outer keys for each pair connection attempt, including
 reentry after fallback. Sustained data loss triggers switching independently of
 the iroh control connection. [Configuration and limits](docs/amnezia.md).
+
+The **Shoes** family adds two embedded TCP carriers. `vless-xhttp` uses VLESS
+over XHTTP stream-one with HTTP/2 and pinned TLS 1.3 (preferred port 9443).
+`ss2022` uses Shadowsocks 2022 with AES-128-GCM or AES-256-GCM (9444).
+Peers agree fresh credentials over their authenticated control connection on
+every attempt. The agent runs both listeners itself. Override their ports with
+`tsng up -o vless-xhttp:port=10443 -o ss2022:port=10444`.
+
+With two updated peers, `tcp-tls` and both Shoes carriers try the opposite dial
+direction if the first fails. One reachable TCP listener suffices. If neither
+side accepts TCP, the mesh can use another enabled carrier or an available
+relay route. [Wire profiles and compatibility](docs/shoes.md).
 
 Change a network's protocol selection without editing its service or restarting:
 
@@ -144,8 +156,10 @@ tsng protocols home none                # control plane only
 Exact network names, full ids and unique id prefixes work here. The choice is
 local to this device, saved per network and applied immediately; an offline
 change applies on the next start. In the tray or on Android, click the network
-name to expand its card. Open **data transports** to enable transports and set
-their initial preference order. **Show devices** lists peers and their reported
+name to expand its card. Open **Data transports** to toggle a family or expand it to select individual
+transports. Checking a partial or unchecked family enables every member. The
+number beside an enabled transport is its priority across all groups. The arrow
+buttons change it. Hover or tap the information icon for protocol details. **Show devices** lists peers and their reported
 Tsunagi versions. On Android, tap a device to see its version and traffic.
 
 Select a peer’s speedometer in **Devices** to measure download and upload

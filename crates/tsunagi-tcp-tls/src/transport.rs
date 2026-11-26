@@ -3,17 +3,16 @@
 //! Provides [`TcpTlsTransport`] implementing [`PacketTransport`]
 //! and [`TcpTlsLink`] implementing [`PacketLink`].
 
-use std::collections::HashMap;
+use crate::candidates::{Candidates, TcpEndpoint, dial_candidates};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use iroh::{EndpointId, Signature};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, mpsc};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch};
 use tokio_rustls::TlsConnector;
 
 use tsunagi::BoxFuture;
@@ -116,9 +115,9 @@ pub struct TcpTlsLink {
     tx: mpsc::Sender<Bytes>,
     rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     tasks: [tokio::task::AbortHandle; 2],
-    closed_notify: Arc<Notify>,
-    is_closed: Arc<AtomicBool>,
+    closed: watch::Sender<bool>,
     remote_addr: String,
+    protocol: &'static str,
 }
 
 impl TcpTlsLink {
@@ -127,16 +126,26 @@ impl TcpTlsLink {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
     {
+        Self::framed("tcp-tls", network, peer, stream, remote_addr)
+    }
+    /// Frames opaque mesh datagrams on a mutually authenticated carrier stream.
+    pub fn framed<S>(
+        protocol: &'static str,
+        network: NetworkId,
+        peer: EndpointId,
+        stream: S,
+        remote_addr: String,
+    ) -> Self
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
         let (mut reader, mut writer) = tokio::io::split(stream);
 
         let (tx_out, mut rx_out) = mpsc::channel::<Bytes>(256);
         let (tx_in, rx_in) = mpsc::channel::<Bytes>(256);
 
-        let is_closed = Arc::new(AtomicBool::new(false));
-        let closed_notify = Arc::new(Notify::new());
-
-        let closed_flag_w = Arc::clone(&is_closed);
-        let closed_notify_w = Arc::clone(&closed_notify);
+        let (closed, _) = watch::channel(false);
+        let writer_closed = closed.clone();
         let writer_task = tokio::spawn(async move {
             while let Some(msg) = rx_out.recv().await {
                 if msg.len() > MAX_FRAME_SIZE {
@@ -153,12 +162,10 @@ impl TcpTlsLink {
                     break;
                 }
             }
-            closed_flag_w.store(true, Ordering::Release);
-            closed_notify_w.notify_waiters();
+            writer_closed.send_replace(true);
         });
 
-        let closed_flag_r = Arc::clone(&is_closed);
-        let closed_notify_r = Arc::clone(&closed_notify);
+        let reader_closed = closed.clone();
         let reader_task = tokio::spawn(async move {
             let mut len_buf = [0u8; 2];
             loop {
@@ -177,8 +184,7 @@ impl TcpTlsLink {
                     break;
                 }
             }
-            closed_flag_r.store(true, Ordering::Release);
-            closed_notify_r.notify_waiters();
+            reader_closed.send_replace(true);
         });
 
         Self {
@@ -187,9 +193,9 @@ impl TcpTlsLink {
             tx: tx_out,
             rx: tokio::sync::Mutex::new(rx_in),
             tasks: [writer_task.abort_handle(), reader_task.abort_handle()],
-            closed_notify,
-            is_closed,
+            closed,
             remote_addr,
+            protocol,
         }
     }
 }
@@ -201,8 +207,7 @@ impl Drop for TcpTlsLink {
 }
 impl PacketLink for TcpTlsLink {
     fn close(&self) {
-        self.is_closed.store(true, Ordering::Release);
-        self.closed_notify.notify_waiters();
+        self.closed.send_replace(true);
         for task in &self.tasks {
             task.abort();
         }
@@ -226,7 +231,7 @@ impl PacketLink for TcpTlsLink {
                 limit: MAX_FRAME_SIZE,
             });
         }
-        if self.is_closed.load(Ordering::Acquire) {
+        if *self.closed.borrow() {
             return Err(TransportError::Closed);
         }
         self.tx
@@ -243,19 +248,16 @@ impl PacketLink for TcpTlsLink {
 
     fn closed(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            if self.is_closed.load(Ordering::Acquire) {
-                return;
-            }
-            self.closed_notify.notified().await;
+            let _ = self.closed.subscribe().wait_for(|closed| *closed).await;
         })
     }
 
     fn is_closed(&self) -> bool {
-        self.is_closed.load(Ordering::Acquire)
+        *self.closed.borrow()
     }
 
     fn path_description(&self) -> String {
-        format!("tcp-tls via {}", self.remote_addr)
+        format!("{} via {}", self.protocol, self.remote_addr)
     }
 }
 
@@ -265,7 +267,7 @@ pub struct TcpTlsTransport {
     local_id: EndpointId,
     listen_port: u16,
     sni: String,
-    peer_addresses: std::sync::RwLock<HashMap<EndpointId, Vec<SocketAddr>>>,
+    peer_addresses: Candidates,
     server_config: Arc<rustls::ServerConfig>,
     listener: Option<Arc<TcpListener>>,
 }
@@ -348,7 +350,6 @@ impl TcpTlsTransport {
         let server_config = make_server_config(cert, key)?;
 
         let target_port = requested_port.unwrap_or(DEFAULT_PORT);
-        let bind_addr = SocketAddr::from(([0, 0, 0, 0], target_port));
 
         let bind_result = {
             #[cfg(target_os = "linux")]
@@ -358,13 +359,11 @@ impl TcpTlsTransport {
                 None
             };
 
-            std::net::TcpListener::bind(bind_addr)
+            crate::candidates::listen(target_port)
         };
 
         let listener = match bind_result {
-            Ok(std_listener) => {
-                std_listener.set_nonblocking(true)?;
-                let l = TcpListener::from_std(std_listener)?;
+            Ok(l) => {
                 tracing::info!(port = target_port, "TCP TLS listening");
                 Some(Arc::new(l))
             }
@@ -391,8 +390,7 @@ impl TcpTlsTransport {
                     );
                 }
 
-                let fallback_addr = SocketAddr::from(([0, 0, 0, 0], FALLBACK_PORT));
-                match TcpListener::bind(fallback_addr).await {
+                match crate::candidates::listen(FALLBACK_PORT) {
                     Ok(l) => {
                         tracing::info!(port = FALLBACK_PORT, "TCP TLS listening on fallback port");
                         Some(Arc::new(l))
@@ -404,8 +402,7 @@ impl TcpTlsTransport {
                             "Cannot bind to fallback port {FALLBACK_PORT}: {fallback_err}. \
                              Falling back to ephemeral port."
                         );
-                        let ephemeral_addr = SocketAddr::from(([0, 0, 0, 0], 0));
-                        let l = TcpListener::bind(ephemeral_addr).await?;
+                        let l = crate::candidates::listen(0)?;
                         let bound = l.local_addr()?.port();
                         tracing::info!(port = bound, "TCP TLS listening on ephemeral port");
                         Some(Arc::new(l))
@@ -438,7 +435,7 @@ impl TcpTlsTransport {
             local_id: identity.endpoint_id(),
             listen_port: bound_port,
             sni,
-            peer_addresses: std::sync::RwLock::new(HashMap::new()),
+            peer_addresses: Candidates::default(),
             server_config,
             listener,
         })
@@ -456,7 +453,7 @@ impl TcpTlsTransport {
 
     /// Records an observed TCP target address for a peer.
     pub fn set_peer_addr(&self, peer: EndpointId, addr: SocketAddr) {
-        if let Ok(mut guard) = self.peer_addresses.write() {
+        if let Ok(mut guard) = self.peer_addresses.manual.lock() {
             let addrs = guard.entry(peer).or_default();
             if !addrs.contains(&addr) {
                 addrs.push(addr);
@@ -466,7 +463,7 @@ impl TcpTlsTransport {
 
     /// Replaces a bounded candidate set learned through an authenticated session.
     pub fn replace_peer_addrs(&self, peer: EndpointId, addresses: Vec<SocketAddr>) {
-        if let Ok(mut peers) = self.peer_addresses.write() {
+        if let Ok(mut peers) = self.peer_addresses.manual.lock() {
             if addresses.is_empty() {
                 peers.remove(&peer);
             } else {
@@ -487,11 +484,19 @@ impl TcpTlsTransport {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&self.server_config));
         let local_id = self.local_id;
 
-        while let Ok((socket, remote_addr)) = listener.accept().await {
+        let mut handshakes = tokio::task::JoinSet::new();
+        loop {
+            let accepted = tokio::select! {
+                _ = handshakes.join_next(), if !handshakes.is_empty() => continue,
+                result = listener.accept(), if handshakes.len() < 64 => result,
+            };
+            let Ok((socket, remote_addr)) = accepted else {
+                break;
+            };
+            let _ = socket.set_nodelay(true);
             let acceptor = acceptor.clone();
             let on_inbound = on_inbound.clone();
-
-            tokio::spawn(async move {
+            handshakes.spawn(tokio::time::timeout(Duration::from_secs(8), async move {
                 let mut tls_stream = match acceptor.accept(socket).await {
                     Ok(s) => s,
                     Err(err) => {
@@ -536,7 +541,7 @@ impl TcpTlsTransport {
                     protocol: "tcp-tls".into(),
                     link: Arc::new(link),
                 });
-            });
+            }));
         }
     }
 }
@@ -561,92 +566,107 @@ impl PacketTransport for TcpTlsTransport {
                 return Err(TransportError::Declined(protocol.to_string()));
             }
 
-            let target_addrs = {
-                let guard = self
-                    .peer_addresses
-                    .read()
-                    .map_err(|_| TransportError::Other("lock poisoned".into()))?;
-                guard.get(&peer).cloned().unwrap_or_default()
-            };
+            let addresses = self
+                .peer_addresses
+                .pairs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&(network, peer))
+                .cloned()
+                .unwrap_or_else(|| {
+                    self.peer_addresses
+                        .manual
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&peer)
+                        .cloned()
+                        .unwrap_or_default()
+                });
+            dial_candidates(addresses, |socket, addr| async move {
+                let client_config = make_client_config(peer)
+                    .map_err(|err| TransportError::Other(err.to_string()))?;
+                let connector = TlsConnector::from(client_config);
 
-            if target_addrs.is_empty() {
-                return Err(TransportError::Unreachable(
-                    "no known TCP address for peer".into(),
-                ));
-            }
+                let server_name = rustls::pki_types::ServerName::try_from(self.sni.as_str())
+                    .map_err(|err| TransportError::Other(err.to_string()))?
+                    .to_owned();
 
-            let mut connected_socket = None;
-            let mut connected_addr = None;
-            for addr in &target_addrs {
-                if addr.ip().is_loopback() && addr.port() == self.listen_port {
-                    continue;
+                let mut tls_stream = connector
+                    .connect(server_name, socket)
+                    .await
+                    .map_err(|err| TransportError::Other(format!("TLS handshake failed: {err}")))?;
+
+                // Send LinkHandshake (fixed 128 bytes)
+                let msg = link_handshake_bytes(network, peer);
+                let sig = self.identity.sign(&msg);
+                let hello = LinkHandshake {
+                    network,
+                    client_id: self.local_id,
+                    signature: sig.to_bytes(),
+                };
+                let hello_bytes = hello.to_bytes();
+                tls_stream
+                    .write_all(&hello_bytes)
+                    .await
+                    .map_err(|err| TransportError::Other(err.to_string()))?;
+                tls_stream
+                    .flush()
+                    .await
+                    .map_err(|err| TransportError::Other(err.to_string()))?;
+
+                // Read LinkAck (fixed 1 byte)
+                let mut ack_buf = [0u8; LinkAck::LEN];
+                tls_stream
+                    .read_exact(&mut ack_buf)
+                    .await
+                    .map_err(|err| TransportError::Other(err.to_string()))?;
+                let ack = LinkAck::from_bytes(&ack_buf)
+                    .ok_or_else(|| TransportError::Other("invalid link ack".into()))?;
+
+                if !ack.accepted {
+                    return Err(TransportError::Declined("link declined".into()));
                 }
-                match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(*addr)).await
-                {
-                    Ok(Ok(socket)) => {
-                        connected_socket = Some(socket);
-                        connected_addr = Some(*addr);
-                        break;
-                    }
-                    _ => continue,
-                }
-            }
 
-            let (socket, addr) = match (connected_socket, connected_addr) {
-                (Some(s), Some(a)) => (s, a),
-                _ => {
-                    return Err(TransportError::Unreachable(
-                        "cannot connect to any TCP address for peer".into(),
-                    ));
-                }
-            };
-
-            let client_config =
-                make_client_config(peer).map_err(|err| TransportError::Other(err.to_string()))?;
-            let connector = TlsConnector::from(client_config);
-
-            let server_name = rustls::pki_types::ServerName::try_from(self.sni.as_str())
-                .map_err(|err| TransportError::Other(err.to_string()))?
-                .to_owned();
-
-            let mut tls_stream = connector
-                .connect(server_name, socket)
-                .await
-                .map_err(|err| TransportError::Other(format!("TLS handshake failed: {err}")))?;
-
-            // Send LinkHandshake (fixed 128 bytes)
-            let msg = link_handshake_bytes(network, peer);
-            let sig = self.identity.sign(&msg);
-            let hello = LinkHandshake {
-                network,
-                client_id: self.local_id,
-                signature: sig.to_bytes(),
-            };
-            let hello_bytes = hello.to_bytes();
-            tls_stream
-                .write_all(&hello_bytes)
-                .await
-                .map_err(|err| TransportError::Other(err.to_string()))?;
-            tls_stream
-                .flush()
-                .await
-                .map_err(|err| TransportError::Other(err.to_string()))?;
-
-            // Read LinkAck (fixed 1 byte)
-            let mut ack_buf = [0u8; LinkAck::LEN];
-            tls_stream
-                .read_exact(&mut ack_buf)
-                .await
-                .map_err(|err| TransportError::Other(err.to_string()))?;
-            let ack = LinkAck::from_bytes(&ack_buf)
-                .ok_or_else(|| TransportError::Other("invalid link ack".into()))?;
-
-            if !ack.accepted {
-                return Err(TransportError::Declined("link declined".into()));
-            }
-
-            let link = TcpTlsLink::new(network, peer, tls_stream, addr.to_string());
-            Ok(Arc::new(link) as SharedLink)
+                let link = TcpTlsLink::new(network, peer, tls_stream, addr.to_string());
+                Ok(Arc::new(link) as SharedLink)
+            })
+            .await
         })
+    }
+}
+
+impl TcpEndpoint for TcpTlsTransport {
+    fn wire_version(&self) -> u16 {
+        crate::TCP_TLS_VERSION
+    }
+    fn bound_port(&self) -> u16 {
+        self.listen_port
+    }
+    fn set_pair_addresses(
+        &self,
+        network: NetworkId,
+        peer: EndpointId,
+        addresses: Option<Vec<SocketAddr>>,
+    ) {
+        let mut pairs = self
+            .peer_addresses
+            .pairs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match addresses {
+            Some(addresses) => {
+                pairs.insert((network, peer), addresses);
+            }
+            None => {
+                pairs.remove(&(network, peer));
+            }
+        }
+    }
+    fn clear_network(&self, network: NetworkId) {
+        self.peer_addresses
+            .pairs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(n, _), _| *n != network);
     }
 }

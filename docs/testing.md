@@ -273,10 +273,15 @@ observations, counter resets, recreated listeners and removal of cached
 histories. These are headless egui checks, not native desktop screenshots.
 
 `tsunagi-wg-quic/tests/carriers.rs` uses the same internal WireGuard plugin over
-real ordinary WG UDP and TCP/TLS, with loopback address selection and memory
-TUNs. Exact original IP byte/packet counts exclude health probes and encryption
+real ordinary WG UDP, native TCP/TLS, VLESS/XHTTP and Shadowsocks 2022 with
+loopback address selection and memory TUNs. For each TCP carrier a second test
+removes every candidate in the elected direction and exchanges IP packets in
+both directions over the reverse socket. Exact original IP byte/packet counts exclude health probes and encryption
 overhead. An artificial delay on a real TCP/TLS link exercises automatic
-selection of a faster QUIC carrier. Both endpoints exchange packets across the
+selection of a faster QUIC carrier. An optional reference test runs the upstream
+Shoes v0.3.8 executable against the embedded VLESS/XHTTP client and both
+Shadowsocks methods. Set `TSUNAGI_SHOES_BIN` and run
+`cargo test --locked -p tsunagi-runtime --test shoes_reference -- --ignored`. Both endpoints exchange packets across the
 transition and retain their original encrypted tunnels. The AWG suite connects
 AWG-only and QUIC-only endpoints through a
 mixed relay. One real smoltcp TCP connection stays established through relay →

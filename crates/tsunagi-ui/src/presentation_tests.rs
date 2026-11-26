@@ -644,3 +644,105 @@ fn exit_users_scroll_a_row_inside_the_existing_card_and_disappear_on_deselection
         assert!((h - baseline).abs() < 1.);
     }
 }
+
+#[test]
+fn protocol_groups_toggle_in_one_command_and_fit_on_a_phone() {
+    use std::cell::RefCell;
+    use tsunagi::ipc::{ProtocolReport, StatusReport};
+    #[derive(Default)]
+    struct Edits(RefCell<Vec<Vec<String>>>);
+    impl Client for Edits {
+        fn busy(&self) -> bool {
+            false
+        }
+        fn send(&self, command: Command) {
+            let Command::SetProtocols {
+                network_id,
+                protocols,
+            } = command
+            else {
+                panic!("unexpected action")
+            };
+            assert_eq!(network_id, "lab");
+            self.0.borrow_mut().push(protocols);
+        }
+    }
+    let edits = Edits::default();
+    let ctx = Context::default();
+    ctx.set_os(egui::os::OperatingSystem::Android);
+    ctx.set_fonts(crate::app_fonts());
+    ctx.style_mut(|s| s.animation_time = 0.);
+    let mut state = home::UiState::default();
+    let report = StatusReport {
+        available_protocols: [
+            ("Native", "tcp-tls", "TCP + TLS"),
+            ("Shoes", "vless-xhttp", "VLESS + XHTTP"),
+            ("Shoes", "ss2022", "Shadowsocks 2022"),
+        ]
+        .map(|(group, name, label)| ProtocolReport {
+            group: group.into(),
+            name: name.into(),
+            label: label.into(),
+            summary: format!("Details for {label}"),
+        })
+        .into(),
+        ..Default::default()
+    };
+    let selected = RefCell::new(vec!["tcp-tls".into(), "ss2022".into()]);
+    let mut draw = |time, events| {
+        frame(&ctx, egui::vec2(320., 700.), time, events, |ctx| {
+            let network = NetworkReport {
+                network_id: "lab".into(),
+                protocols: selected.borrow().clone(),
+                ..Default::default()
+            };
+            egui::CentralPanel::default().show(ctx, |ui| {
+                home::draw_network_details(
+                    ui,
+                    &edits,
+                    &mut state,
+                    &Traffic::default(),
+                    &network,
+                    &report,
+                    false,
+                )
+            });
+        })
+    };
+    draw(0., vec![]);
+    let out = draw(0.1, vec![]);
+    let at = label(&out, "Data transports  2/3").unwrap().center();
+    draw(0.2, vec![Event::PointerMoved(at), press(at, true)]);
+    draw(0.3, vec![press(at, false)]);
+    let out = draw(0.4, vec![]);
+    let group = label(&out, "Shoes").unwrap();
+    for (step, expected) in [
+        vec!["tcp-tls", "ss2022", "vless-xhttp"],
+        vec!["tcp-tls"],
+        vec!["tcp-tls", "vless-xhttp", "ss2022"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = group.center();
+        let t = 1. + step as f64;
+        draw(t, vec![Event::PointerMoved(at), press(at, true)]);
+        draw(t + 0.1, vec![press(at, false)]);
+        let received = std::mem::take(&mut *edits.0.borrow_mut());
+        assert_eq!(received, [expected]);
+        *selected.borrow_mut() = received[0].clone();
+        draw(t + 0.2, vec![]);
+    }
+    // The disclosure arrow is before the checkbox and label. Expanding keeps the selection.
+    let at = egui::pos2(group.left() - 37., group.center().y);
+    draw(5., vec![Event::PointerMoved(at), press(at, true)]);
+    draw(5.1, vec![press(at, false)]);
+    let out = draw(5.2, vec![]);
+    assert!(label(&out, "Shadowsocks 2022").unwrap().right() < 320.);
+    assert!(label(&out, "Details for VLESS + XHTTP").is_none());
+    let info = label(&out, icon::INFO).unwrap().center();
+    draw(5.3, vec![Event::PointerMoved(info), press(info, true)]);
+    draw(5.4, vec![press(info, false)]);
+    assert!(label(&draw(5.5, vec![]), "Details for VLESS + XHTTP").is_some());
+    assert!(edits.0.borrow().is_empty());
+}

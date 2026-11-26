@@ -13,8 +13,16 @@ tsunagi-wg-quic = { path = "../tsunagi-wg-quic", version = "1.0.10" }
 tsunagi-wireguard = { path = "../tsunagi-wireguard", version = "1.0.10" }
 tsunagi-awg = { path = "../tsunagi-awg", version = "1.0.10" }
 tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls", version = "1.0.10" }
+tsunagi-shoes = { path = "../tsunagi-shoes", version = "1.0.0" }
+tsunagi-vless-xhttp = { path = "../tsunagi-vless-xhttp", version = "1.0.0" }
+tsunagi-ss2022 = { path = "../tsunagi-ss2022", version = "1.0.0" }
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+data-encoding.workspace = true
+hex.workspace = true
 
 [lints]
 workspace = true

@@ -40,6 +40,7 @@ use super::status::{
 };
 use sync::{Changes, SyncKey};
 
+mod reverse;
 mod selection;
 mod sync;
 
@@ -407,6 +408,7 @@ struct Runtime {
     /// Links currently being opened, so we do not start two.
     opening: HashSet<(EndpointId, String)>,
     link_tasks: HashMap<(EndpointId, String), tokio::task::AbortHandle>,
+    reverse_dials: HashMap<(EndpointId, String), u64>,
     link_attempts: HashMap<(EndpointId, String), u64>,
     next_link_attempt: u64,
     link_results_tx: mpsc::Sender<LinkOutcome>,
@@ -515,6 +517,7 @@ impl Runtime {
             announced_reach: HashSet::new(),
             opening: HashSet::new(),
             link_tasks: HashMap::new(),
+            reverse_dials: HashMap::new(),
             link_attempts: HashMap::new(),
             next_link_attempt: 0,
             link_results_tx,
@@ -2086,12 +2089,12 @@ impl Runtime {
 
     /// Opens whatever data plane links are missing, and forgets dead ones.
     ///
-    /// Only one side dials, chosen by a rule both sides compute the same way,
-    /// so two agents never open two links for the same thing.
+    /// The smaller endpoint coordinates each attempt, including a reverse
+    /// TCP dial if the negotiated carrier supports it.
     fn ensure_links(&mut self) {
-        let Some(transport) = self.params.transport.clone() else {
+        if self.params.transport.is_none() {
             return;
-        };
+        }
         let served = self.served_protocols();
         if served.is_empty() {
             return;
@@ -2157,8 +2160,7 @@ impl Runtime {
             if self.no_direct_data(peer) {
                 continue;
             }
-            // The smaller endpoint id dials; the other side accepts. Both
-            // compute this identically, so exactly one link is created.
+            // The smaller endpoint tries first and can invite a peer to dial back.
             if self.local_id.as_bytes() >= peer.as_bytes() {
                 continue;
             }
@@ -2206,6 +2208,7 @@ impl Runtime {
         for key in interrupted {
             self.opening.remove(&key);
             self.link_attempts.remove(&key);
+            self.reverse_dials.remove(&key);
             if let Some(task) = self.link_tasks.remove(&key) {
                 task.abort();
             }
@@ -2214,47 +2217,55 @@ impl Runtime {
         let trial = self.next_comparison(&served, now);
         wanted.extend(trial.iter().cloned());
         for (peer, protocol) in wanted {
-            let key = (peer, protocol.clone());
-            if self.links.contains_key(&key) || self.opening.contains(&key) {
-                continue;
-            }
-            self.opening.insert(key.clone());
-
-            let results = self.link_results_tx.clone();
-            let transport = Arc::clone(&transport);
-            let network = self.network_id;
-            let shutdown = self.shutdown.clone();
-            let background = trial.as_ref() == Some(&key);
-            self.next_link_attempt = self.next_link_attempt.wrapping_add(1);
-            let generation = self.next_link_attempt;
-            self.link_attempts.insert(key.clone(), generation);
-            let task = tokio::spawn(async move {
-                let result = tokio::select! {
-                    biased;
-                    _ = shutdown.wait() => Err("network deactivated".to_string()),
-                    result = async {
-                        let dial = transport.open(network, peer, &protocol);
-                        if background {
-                            tokio::time::timeout(Duration::from_secs(30), dial).await
-                                .map_err(|_| "carrier comparison timed out".to_owned())?
-                        } else {
-                            dial.await
-                        }.map_err(|err| err.to_string())
-                    } => {
-                        result
-                    }
-                };
-                let _ = results
-                    .send(LinkOutcome {
-                        generation,
-                        peer,
-                        protocol,
-                        result,
-                    })
-                    .await;
-            });
-            self.link_tasks.insert(key, task.abort_handle());
+            let background = trial.as_ref() == Some(&(peer, protocol.clone()));
+            self.start_link_attempt(peer, protocol, background);
         }
+    }
+
+    fn start_link_attempt(&mut self, peer: EndpointId, protocol: String, background: bool) {
+        let Some(transport) = self.params.transport.clone() else {
+            return;
+        };
+        let key = (peer, protocol.clone());
+        if self.links.contains_key(&key) || self.opening.contains(&key) {
+            return;
+        }
+        self.opening.insert(key.clone());
+
+        let results = self.link_results_tx.clone();
+
+        let network = self.network_id;
+        let shutdown = self.shutdown.clone();
+
+        self.next_link_attempt = self.next_link_attempt.wrapping_add(1);
+        let generation = self.next_link_attempt;
+        self.link_attempts.insert(key.clone(), generation);
+        let task = tokio::spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.wait() => Err("network deactivated".to_string()),
+                result = async {
+                    let dial = transport.open(network, peer, &protocol);
+                    if background {
+                        tokio::time::timeout(Duration::from_secs(30), dial).await
+                            .map_err(|_| "carrier comparison timed out".to_owned())?
+                    } else {
+                        dial.await
+                    }.map_err(|err| err.to_string())
+                } => {
+                    result
+                }
+            };
+            let _ = results
+                .send(LinkOutcome {
+                    generation,
+                    peer,
+                    protocol,
+                    result,
+                })
+                .await;
+        });
+        self.link_tasks.insert(key, task.abort_handle());
     }
 
     /// Takes in what another member knows about the rest.
@@ -2529,6 +2540,17 @@ impl Runtime {
             }
             return;
         }
+        if outcome.result.is_err() {
+            if let Some(token) = self.reverse_dials.remove(&key) {
+                if self.local_id > outcome.peer {
+                    self.send_reverse(outcome.peer, &outcome.protocol, token, false);
+                }
+            } else if self.ask_for_reverse(&outcome) {
+                return;
+            }
+        } else {
+            self.reverse_dials.remove(&key);
+        }
         self.link_attempts.remove(&key);
         self.opening.remove(&key);
         self.link_tasks.remove(&key);
@@ -2585,6 +2607,21 @@ impl Runtime {
         {
             inbound.link.close();
             return;
+        }
+        let key = (inbound.peer, inbound.protocol.clone());
+        if self.local_id < inbound.peer
+            && self.can_reverse(inbound.peer, &inbound.protocol)
+            && !self.reverse_dials.contains_key(&key)
+        {
+            inbound.link.close();
+            return;
+        }
+        if self.local_id < inbound.peer && self.reverse_dials.remove(&key).is_some() {
+            self.link_attempts.remove(&key);
+            self.opening.remove(&key);
+            if let Some(task) = self.link_tasks.remove(&key) {
+                task.abort();
+            }
         }
         self.record_protocol_success(inbound.peer, &inbound.protocol);
         self.adopt_link(inbound.peer, inbound.protocol, inbound.link);
@@ -2675,6 +2712,7 @@ impl Runtime {
     fn reset_peer_data(&mut self, peer: EndpointId, reason: &str) {
         self.comparisons.remove(&peer);
         self.data_errors.remove(&peer);
+        self.reverse_dials.retain(|(id, _), _| *id != peer);
         self.link_attempts.retain(|(id, _), _| *id != peer);
         self.opening.retain(|(id, _)| *id != peer);
         self.link_tasks.retain(|(id, _), task| {
@@ -2831,6 +2869,14 @@ impl Runtime {
                 protocol,
                 reason,
             });
+        }
+        if self
+            .params
+            .carriers
+            .iter()
+            .any(|c| c.supports_reverse_dial())
+        {
+            capabilities.push(reverse::capability());
         }
         if self.params.carriers.len() > 1 {
             capabilities.push(selection::capability());
@@ -3024,6 +3070,10 @@ impl Runtime {
                     }
                     return;
                 }
+                if protocol == reverse::PROTOCOL {
+                    self.receive_reverse(peer, payload.as_bytes());
+                    return;
+                }
                 if protocol == selection::PROTOCOL {
                     self.receive_choice(peer, payload.as_bytes());
                     return;
@@ -3152,6 +3202,14 @@ impl Runtime {
 
     fn dispatch_capabilities(&mut self, peer: EndpointId, capabilities: &[PluginCapability]) {
         let mut errors = Vec::new();
+        let ranges = self.params.routes.overlay_ranges();
+        let ips: Vec<_> = self.sessions.get(&peer).into_iter()
+            .flat_map(|session| snapshot_connection(&session.conn).paths)
+            .filter_map(|path| match path.remote {
+                PathAddr::Ip(addr) => Some(addr.ip().to_canonical()), _ => None,
+            })
+            .filter(|ip| !matches!(ip, std::net::IpAddr::V4(v4) if ranges.iter().any(|range| range.contains(*v4))))
+            .take(self.params.limits.max_hints_per_peer).collect();
         for cap in capabilities {
             let carriers = self
                 .params
@@ -3162,7 +3220,7 @@ impl Runtime {
                     (
                         carrier.protocol_version(),
                         if carrier.protocol_version() == cap.version {
-                            carrier.on_peer_capability(self.network_id, peer, cap)
+                            carrier.on_peer_capability_at(self.network_id, peer, cap, &ips)
                         } else {
                             Ok(())
                         },
@@ -3318,6 +3376,7 @@ impl Runtime {
                 .iter()
                 .filter(|cap| {
                     cap.enabled
+                        && cap.protocol != reverse::PROTOCOL
                         && cap.protocol != selection::PROTOCOL
                         && self
                             .params

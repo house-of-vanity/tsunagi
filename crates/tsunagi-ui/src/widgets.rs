@@ -46,6 +46,18 @@ pub fn hint(response: Response, description: &str) -> Response {
     }
 }
 
+/// A compact help button. Tapping reveals the same detail as desktop hover.
+pub(crate) fn info(ui: &mut Ui, description: &str) {
+    let r = ui.add(egui::Button::new(egui::RichText::new(icon::INFO).weak()).frame(false));
+    r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, description));
+    if r.clicked() && ui.ctx().os() == egui::os::OperatingSystem::Android {
+        let until = ui.input(|i| i.time) + 2.5;
+        let key = egui::Id::new(("touch explanation", ui.ctx().viewport_id()));
+        ui.ctx().data_mut(|d| d.insert_temp(key, (r.id, until)));
+    }
+    hint(r, description);
+}
+
 /// A glyph-only button with its action exposed to assistive technology.
 pub fn icon_button(ui: &mut Ui, glyph: &str, description: &str) -> Response {
     let r = ui.button(glyph);

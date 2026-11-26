@@ -1,5 +1,6 @@
 //! Shared compact network tiles, device header and join form.
 mod card;
+mod protocols;
 use crate::{
     client::{Client, Command},
     devices, exit, format,
@@ -7,6 +8,7 @@ use crate::{
     widgets,
 };
 use egui_phosphor::regular as icon;
+use protocols::draw_protocols;
 use std::collections::BTreeSet;
 use tsunagi::ipc::{NetworkReport, StatusReport};
 use zeroize::{Zeroize, Zeroizing};
@@ -420,81 +422,6 @@ fn draw_selected_exit(ui: &mut egui::Ui, network: &NetworkReport, via: &str, sta
             }
         }
     });
-}
-
-fn draw_protocols(
-    ui: &mut egui::Ui,
-    agent: &dyn Client,
-    network: &NetworkReport,
-    available: &[tsunagi::ipc::ProtocolReport],
-) {
-    let summary = if network.protocols.is_empty() {
-        "none".into()
-    } else {
-        network.protocols.join(", ")
-    };
-    egui::CollapsingHeader::new(format!("data transports  {summary}"))
-        .id_salt(("protocols", &network.network_id))
-        .show(ui, |ui| {
-            ui.weak("Order sets the first choice. Peers that support link comparison can switch to a faster enabled transport.");
-            let mut selected = network.protocols.clone();
-            let mut changed = false;
-            ui.add_enabled_ui(!agent.busy(), |ui| {
-                // Enabled items follow the user's preference; unchecked items
-                // follow the agent's catalog. The worker refreshes after edits.
-                let ordered: Vec<_> = network
-                    .protocols
-                    .iter()
-                    .filter_map(|name| available.iter().find(|p| &p.name == name))
-                    .chain(
-                        available
-                            .iter()
-                            .filter(|p| !network.protocols.contains(&p.name)),
-                    )
-                    .collect();
-                for protocol in ordered {
-                    ui.horizontal(|ui| {
-                        let mut on = selected.contains(&protocol.name);
-                        if ui.checkbox(&mut on, &protocol.name).changed() {
-                            if on {
-                                selected.push(protocol.name.clone());
-                            } else {
-                                selected.retain(|p| p != &protocol.name);
-                            }
-                            changed = true;
-                        }
-                        if let Some(index) = selected.iter().position(|p| p == &protocol.name) {
-                            if widgets::hint(ui.add_enabled(index > 0, egui::Button::new(icon::ARROW_UP)),
-                                "Move transport up in preference order").clicked()
-                            {
-                                selected.swap(index, index - 1);
-                                changed = true;
-                            }
-                            if widgets::hint(ui.add_enabled(
-                                    index + 1 < selected.len(),
-                                    egui::Button::new(icon::ARROW_DOWN),
-                                ), "Move transport down in preference order").clicked()
-                            {
-                                selected.swap(index, index + 1);
-                                changed = true;
-                            }
-                        }
-                    });
-                    ui.indent(("description", &network.network_id, &protocol.name), |ui| {
-                        ui.weak(&protocol.summary);
-                    });
-                }
-            });
-            if selected.is_empty() {
-                ui.weak("Control only; no IP traffic in this network.");
-            }
-            if changed {
-                agent.send(Command::SetProtocols {
-                    network_id: network.network_id.clone(),
-                    protocols: selected,
-                });
-            }
-        });
 }
 
 /// A prominent line about an exit node. One that carries a command copies it

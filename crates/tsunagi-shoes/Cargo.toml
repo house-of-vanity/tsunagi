@@ -1,0 +1,19 @@
+[package]
+name = "tsunagi-shoes"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "WTFPL"
+repository.workspace = true
+description = "Private per-attempt negotiation for Shoes mesh carriers."
+
+[dependencies]
+tsunagi-tcp-tls = { path = "../tsunagi-tcp-tls" }
+tsunagi-core = { path = "../tsunagi-core" }
+iroh.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+rand = "0.10"
+zeroize = { version = "1.9", features = ["derive"] }
+
+[lints]
+workspace = true

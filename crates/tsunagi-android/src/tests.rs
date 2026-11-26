@@ -449,16 +449,21 @@ fn broadcast_route_is_only_present_when_requested() {
 }
 
 #[tokio::test]
-async fn all_four_desktop_carriers_register_and_each_network_keeps_its_preference() {
+async fn all_desktop_carriers_register_and_each_network_keeps_its_preference() {
     use tsunagi::{Agent, testing};
     use tsunagi_runtime::{Carriers, PROTOCOLS};
     let dir = tempfile::tempdir().unwrap();
-    let names = ["wg", "awg", "wg-quic", "tcp-tls"];
+    let names = ["wg", "awg", "wg-quic", "tcp-tls", "vless-xhttp", "ss2022"];
+    assert_eq!(
+        PROTOCOLS.iter().map(|spec| spec.group).collect::<Vec<_>>(),
+        ["WireGuard", "WireGuard", "iroh", "Native", "Shoes", "Shoes"]
+    );
     let (network, secret) = testing::network("carriers");
+    let (other, other_secret) = testing::network("other");
     for restart in [false, true] {
         let config = testing::local_config(dir.path());
         let (config, carriers) = Carriers::configure(config, &[], None, |spec| {
-            if spec.name == "tcp-tls" {
+            if matches!(spec.name, "tcp-tls" | "vless-xhttp" | "ss2022") {
                 vec![("port".into(), "0".into())]
             } else {
                 Vec::new()
@@ -487,15 +492,24 @@ async fn all_four_desktop_carriers_register_and_each_network_keeps_its_preferenc
         let saved = agent.network_status(id).await.unwrap().protocols;
         if restart {
             assert_eq!(saved, ["tcp-tls", "wg"]);
+            let second = agent.join_network(&other, &other_secret).await.unwrap();
+            assert!(
+                agent
+                    .network_status(second)
+                    .await
+                    .unwrap()
+                    .protocols
+                    .is_empty()
+            );
         } else {
             assert_eq!(saved, names);
             agent
                 .set_protocols(id, vec!["tcp-tls".into(), "wg".into()])
                 .await
                 .unwrap();
-            let (other, secret) = testing::network("other");
-            let second = agent.join_network(&other, &secret).await.unwrap();
+            let second = agent.join_network(&other, &other_secret).await.unwrap();
             assert_eq!(agent.network_status(second).await.unwrap().protocols, names);
+            agent.set_protocols(second, vec![]).await.unwrap();
         }
         agent.shutdown().await;
     }

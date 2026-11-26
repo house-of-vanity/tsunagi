@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Instant};
 use tokio::sync::{mpsc, watch};
 use tsunagi::{
     Agent, NetworkName, NetworkSecret,
-    ipc::{DnsReport, PrivilegeReport, ProtocolReport, StatusReport},
+    ipc::{DnsReport, PrivilegeReport, StatusReport},
     vip::VipStatus,
 };
 use tsunagi_ui::client::Command;
@@ -302,10 +302,7 @@ async fn snapshot(
         cache_healthy: status.cache_healthy,
         available_protocols: tsunagi_runtime::PROTOCOLS
             .iter()
-            .map(|spec| ProtocolReport {
-                name: spec.name.into(),
-                summary: spec.summary.into(),
-            })
+            .map(|spec| spec.report())
             .collect(),
         protocols: tsunagi_runtime::PROTOCOLS
             .iter()

@@ -51,3 +51,28 @@ fn test_make_client_and_server_config() {
     let client_config = tsunagi_tcp_tls::cert::make_client_config(peer_id);
     assert!(client_config.is_ok());
 }
+
+#[test]
+fn unrelated_certificate_fields_cannot_satisfy_the_identity_pin() {
+    let expected = DeviceIdentity::generate().endpoint_id();
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["peer.invalid".into()]).unwrap();
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 55555, 1],
+            expected.as_bytes().to_vec(),
+        ));
+    let cert = params.self_signed(&key).unwrap();
+    assert!(
+        PinnedEndpointVerifier::new(expected)
+            .verify_server_cert(
+                cert.der(),
+                &[],
+                &ServerName::try_from("peer.invalid").unwrap(),
+                &[],
+                UnixTime::now()
+            )
+            .is_err()
+    );
+}
