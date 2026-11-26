@@ -493,7 +493,7 @@ impl Phone {
                                 if ui.button(format!("{} Paste secret", icon::CLIPBOARD)).clicked() {system = Some(SystemAction::PasteSecret);}
                             }
                             Page::Exits => {
-                                if let Some(choice) = devices::choose_exit_from_networks(ui, &report.networks, &report.endpoint_id) {
+                                if let Some(choice) = devices::choose_exit_with_tests(ui, &report.networks, &report.endpoint_id, &actions) {
                                     self.forms.exit_confirm = Some(choice);
                                 }
                                 if report.networks.is_empty() && ui.button("Join or create a network").clicked() {

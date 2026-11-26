@@ -1,5 +1,5 @@
 //! One touch target per exit, grouped by the network that will carry the traffic.
-use super::{ExitConfirm, devices};
+use super::{Client, ExitConfirm, devices, speed};
 use crate::{exit, format, widgets};
 use egui::{Align, Align2, Color32, FontFamily, FontId, Rect, Sense, Ui, pos2, vec2};
 use egui_phosphor::regular as icon;
@@ -16,6 +16,25 @@ pub fn choose_exit_from_networks(
     networks: &[NetworkReport],
     own: &str,
 ) -> Option<ExitConfirm> {
+    chooser(ui, networks, own, None)
+}
+
+/// The interactive Android picker can also measure every eligible exit in one network.
+pub fn choose_exit_with_tests(
+    ui: &mut Ui,
+    networks: &[NetworkReport],
+    own: &str,
+    client: &dyn Client,
+) -> Option<ExitConfirm> {
+    chooser(ui, networks, own, Some(client))
+}
+
+fn chooser(
+    ui: &mut Ui,
+    networks: &[NetworkReport],
+    own: &str,
+    client: Option<&dyn Client>,
+) -> Option<ExitConfirm> {
     let current = networks
         .iter()
         .find_map(|n| n.exit.via.as_deref().map(|via| (n, via)));
@@ -28,7 +47,7 @@ pub fn choose_exit_from_networks(
         glyph: icon::GLOBE,
     };
     let mut choice = None;
-    if local.draw(ui, "local internet")
+    if local.draw(ui, "local internet", None)
         && let Some((network, id)) = current
     {
         choice = Some(ExitConfirm::stop_from_tile(network, id));
@@ -64,17 +83,30 @@ pub fn choose_exit_from_networks(
             network.name.clone()
         };
         ui.add_space(10.);
-        let (header, hint) =
-            ui.allocate_exact_size(vec2(ui.available_width(), 30.), Sense::hover());
-        widgets::single_line(
-            ui.painter(),
-            header,
-            Align::Min,
-            &title,
-            bold(19.),
-            ui.visuals().strong_text_color(),
-        );
-        widgets::hint(hint, &network.network_id);
+        ui.push_id(&network.network_id, |ui| {
+            ui.horizontal(|ui| {
+                let (height, button_space) = if client.is_some() {
+                    (44., 44. + ui.spacing().item_spacing.x)
+                } else {
+                    (30., 0.)
+                };
+                let title_width = (ui.available_width() - button_space).max(0.);
+                let (header, hint) =
+                    ui.allocate_exact_size(vec2(title_width, height), Sense::hover());
+                widgets::single_line(
+                    ui.painter(),
+                    header,
+                    Align::Min,
+                    &title,
+                    bold(19.),
+                    ui.visuals().strong_text_color(),
+                );
+                widgets::hint(hint, &network.network_id);
+                if let Some(client) = client {
+                    speed::Controls::new(network, client).batch_button(ui, true);
+                }
+            });
+        });
         if let Some(rules) = &network.exit.client_rules
             && !rules.ok
         {
@@ -94,7 +126,7 @@ pub fn choose_exit_from_networks(
                 selected: true,
                 glyph: icon::SIGN_OUT,
             }
-            .draw(ui, (&network.network_id, id));
+            .draw(ui, (&network.network_id, id), None);
         }
         for d in candidates {
             let name = d.name();
@@ -112,15 +144,17 @@ pub fn choose_exit_from_networks(
                 }
             };
             let latency = d.data_rtt_ms.map(|ms| format!("{ms} ms"));
+            let speed = network.speed.peers.get(d.id).map(speed::exit_caption);
+            let address = d.address.as_deref();
             let row = Row {
                 name: &name,
-                caption: d.address.as_deref().unwrap_or(""),
+                caption: speed.as_deref().or(address).unwrap_or(""),
                 latency: latency.as_deref(),
                 path: Some(&path),
                 selected: d.in_use,
                 glyph: icon::SIGN_OUT,
             };
-            if row.draw(ui, (&network.network_id, d.id)) && !d.in_use {
+            if row.draw(ui, (&network.network_id, d.id), address) && !d.in_use {
                 choice = Some(ExitConfirm {
                     network_id: network.network_id.clone(),
                     peer_id: d.id.into(),
@@ -159,7 +193,7 @@ struct Row<'a> {
     glyph: &'static str,
 }
 impl Row<'_> {
-    fn draw(&self, ui: &mut Ui, id: impl std::hash::Hash) -> bool {
+    fn draw(&self, ui: &mut Ui, id: impl std::hash::Hash, hint: Option<&str>) -> bool {
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 58.), Sense::hover());
         let response = ui.interact(
             rect,
@@ -273,9 +307,12 @@ impl Row<'_> {
                 detail,
             );
         }
-        response
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        match hint {
+            Some(hint) => widgets::hint(response, hint),
+            None => response,
+        }
+        .clicked()
     }
 }
 

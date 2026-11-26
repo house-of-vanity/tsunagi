@@ -9,6 +9,8 @@ mod android;
 pub mod service;
 #[cfg(test)]
 mod tests;
+#[cfg(any(target_os = "android", test))]
+mod touch;
 #[cfg(unix)]
 pub mod tun;
 pub mod view;

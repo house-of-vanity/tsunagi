@@ -13,7 +13,9 @@ mod speed;
 mod speed_tests;
 mod status;
 pub use crate::exit::name_of;
-pub use exit_picker::{choose_exit, choose_exit_from_networks, exit_action_colors};
+pub use exit_picker::{
+    choose_exit, choose_exit_from_networks, choose_exit_with_tests, exit_action_colors,
+};
 
 use egui_phosphor::regular as icon;
 
@@ -244,7 +246,7 @@ pub fn show(
                     "devices ({online} online / {} known)",
                     devices.len()
                 ));
-                speed.toolbar(ui);
+                speed.batch_button(ui, false);
             });
         };
 

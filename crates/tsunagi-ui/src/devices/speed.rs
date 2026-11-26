@@ -29,21 +29,15 @@ impl<'a> Controls<'a> {
         self.network.speed.capable.iter().any(|peer| peer == id)
     }
 
-    pub(super) fn toolbar(&self, ui: &mut Ui) {
-        let (label, help, available) = if self.running {
+    pub(super) fn batch_button(&self, ui: &mut Ui, icon_only: bool) {
+        let (glyph, label, help, available) = if self.running {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
             let label = self.network.speed.batch.map_or_else(
-                || format!("{}  Stop test", icon::STOP_CIRCLE),
-                |batch| {
-                    format!(
-                        "{}  Stop  {}/{}",
-                        icon::STOP_CIRCLE,
-                        batch.done,
-                        batch.total
-                    )
-                },
+                || "Stop test".to_owned(),
+                |batch| format!("Stop  {}/{}", batch.done, batch.total),
             );
             (
+                icon::STOP_CIRCLE,
                 label,
                 "Stop this speed test and skip any queued exits.",
                 true,
@@ -56,7 +50,8 @@ impl<'a> Controls<'a> {
                     .iter()
                     .any(|p| p.exit_node && self.capable(&p.endpoint_id));
             (
-                format!("{}  Test exits", icon::GAUGE),
+                icon::GAUGE,
+                "Test exits".to_owned(),
                 if available {
                     "Test each compatible online exit node in this network, one at a time."
                 } else {
@@ -65,22 +60,26 @@ impl<'a> Controls<'a> {
                 available,
             )
         };
-        // Leave room for the batch count before starting. A wrapping toolbar
-        // must keep the same height when the button becomes Stop.
-        let width = ui
-            .painter()
-            .layout_no_wrap(
-                format!("{}  Stop  9999/9999", icon::STOP_CIRCLE),
-                egui::TextStyle::Button.resolve(ui.style()),
-                ui.visuals().text_color(),
-            )
-            .size()
-            .x
-            + 2. * ui.spacing().button_padding.x;
-        let button = ui.add_enabled(
-            available && !self.client.busy(),
-            egui::Button::new(label).min_size(vec2(width, 0.)),
-        );
+        let button = if icon_only {
+            egui::Button::new(egui::RichText::new(glyph).size(22.)).min_size(vec2(44., 44.))
+        } else {
+            // Switching to Stop must not wrap a toolbar onto a second line.
+            let width = ui
+                .painter()
+                .layout_no_wrap(
+                    format!("{}  Stop  9999/9999", icon::STOP_CIRCLE),
+                    egui::TextStyle::Button.resolve(ui.style()),
+                    ui.visuals().text_color(),
+                )
+                .size()
+                .x
+                + 2. * ui.spacing().button_padding.x;
+            egui::Button::new(format!("{glyph}  {label}")).min_size(vec2(width, 0.))
+        };
+        let button = ui.add_enabled(available && !self.client.busy(), button);
+        button.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, button.enabled(), &label)
+        });
         if widgets::hint(button, help).clicked() {
             let network_id = self.network.network_id.clone();
             let command = if self.running {
@@ -128,6 +127,30 @@ impl<'a> Controls<'a> {
                 network_id: self.network.network_id.clone(),
                 peer: Some(peer.id.into()),
             });
+        }
+    }
+}
+
+pub(super) fn exit_caption(test: &SpeedPeerReport) -> String {
+    match test.phase {
+        SpeedPhase::Queued => "Queued".into(),
+        SpeedPhase::Preparing => "Starting…".into(),
+        SpeedPhase::Cancelled => "Stopped".into(),
+        SpeedPhase::Failed(_) => "Test failed".into(),
+        SpeedPhase::Download | SpeedPhase::Upload | SpeedPhase::Done => {
+            let rate = |value: Option<SpeedRate>, phase| {
+                value.map_or_else(
+                    || if test.phase == phase { "…" } else { "—" }.into(),
+                    compact_rate,
+                )
+            };
+            format!(
+                "{} {}  {} {} Mbit/s",
+                icon::ARROW_DOWN,
+                rate(test.down, SpeedPhase::Download),
+                icon::ARROW_UP,
+                rate(test.up, SpeedPhase::Upload)
+            )
         }
     }
 }

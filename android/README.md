@@ -30,6 +30,8 @@ Rotate the phone to select a network on the left and see its settings on the rig
 
 Tap the round exit button at the bottom right of the home screen. The list groups available gateways by network and shows each peer’s measured data RTT and path. **No exit node** returns to this phone’s internet connection. Tap a row and confirm to route IPv4 internet traffic through it. The selected exit has an ongoing notification, including when the peer is offline. **Disconnect exit node** restores the ordinary internet route and keeps mesh access and DNS active. Mesh-only mode has no persistent app notification. Android controls the system VPN indicator. Android 13 and later request notification permission for the exit notice. Starting with Android 14, an unlocked device allows an individual swipe to dismiss an ongoing VPN notification. [Android notification behavior](https://developer.android.com/about/versions/14/behavior-changes-all#non-dismissable-notifications)
 
+Tap the speedometer beside a network name in the exit list to test its compatible online exits one at a time. Each row shows download and upload in Mbit/s. The stop button ends the test and skips queued peers. Testing keeps the current exit selection.
+
 To switch the exit from the notification shade, edit Android Quick Settings and add **Tsunagi Exit**. The first tap opens the exit chooser if you have never used one. Subsequent taps disconnect the selected exit or reconnect the last peer in its original network. The tile shows the peer name and whether the selected peer is offline. Mesh access stays available when the exit is off.
 
 ## Check two networks on an emulator

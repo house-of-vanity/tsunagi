@@ -1,8 +1,9 @@
 //! Android owns the GLES surface, keyboard and clipboard. egui owns the widgets.
-use crate::view::{Phone, SystemAction};
-use egui::{
-    Event, ImeEvent, Key, Modifiers, PointerButton, Pos2, TouchDeviceId, TouchId, TouchPhase,
+use crate::{
+    touch::TouchInput,
+    view::{Phone, SystemAction},
 };
+use egui::{Event, ImeEvent, Key, Modifiers, Pos2, TouchPhase};
 use egui_glow::{Painter, glow};
 use jni::{
     JNIEnv,
@@ -26,7 +27,7 @@ struct Display {
     ctx: egui::Context,
     ui: Phone,
     events: Vec<Event>,
-    primary: Option<i32>,
+    touch: TouchInput,
     start: Instant,
     ime: i32,
     exit_active: bool,
@@ -81,7 +82,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_surface(
             ctx,
             ui,
             events: Vec::new(),
-            primary: None,
+            touch: TouchInput::default(),
             start: Instant::now(),
             ime: -1,
             exit_active: false,
@@ -104,7 +105,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_draw(
         let size = egui::vec2(w as f32, h as f32) / scale;
         let mut input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
-            events: std::mem::take(&mut d.events),
+            events: d.touch.take_frame(&mut d.events),
             time: Some(d.start.elapsed().as_secs_f64()),
             ..Default::default()
         };
@@ -122,6 +123,9 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_draw(
         }
         d.exit_active = exit_active;
         let output = d.ctx.run(input, |ctx| {
+            if !d.events.is_empty() {
+                ctx.request_repaint();
+            }
             action = d.ui.draw(ctx, &state, super::send).or(action);
         });
         d.ui.poll_monitor(|| super::submit(crate::service::Request::WatchTraffic));
@@ -201,37 +205,7 @@ extern "system" fn Java_cy_hexor_tsunagi_Native_touch(
             2 => TouchPhase::End,
             _ => TouchPhase::Cancel,
         };
-        d.events.push(Event::Touch {
-            device_id: TouchDeviceId(0),
-            id: TouchId(id as u64),
-            phase,
-            pos,
-            force: None,
-        });
-        if phase == TouchPhase::Start && d.primary.is_none() {
-            d.primary = Some(id);
-        }
-        if d.primary != Some(id) {
-            return;
-        }
-        if phase != TouchPhase::Cancel {
-            d.events.push(Event::PointerMoved(pos));
-        }
-        if phase != TouchPhase::Move {
-            if phase == TouchPhase::Cancel {
-                d.events.push(Event::PointerGone);
-            }
-            d.events.push(Event::PointerButton {
-                pos,
-                button: PointerButton::Primary,
-                pressed: phase == TouchPhase::Start,
-                modifiers: Modifiers::NONE,
-            });
-        }
-        if matches!(phase, TouchPhase::Cancel | TouchPhase::End) {
-            d.events.push(Event::PointerGone);
-            d.primary = None;
-        }
+        d.touch.push(&mut d.events, phase, id, pos);
     });
 }
 #[unsafe(no_mangle)]

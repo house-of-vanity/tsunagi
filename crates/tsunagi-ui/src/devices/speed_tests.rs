@@ -52,6 +52,76 @@ fn reading(phase: SpeedPhase) -> SpeedPeerReport {
     }
 }
 
+#[test]
+fn exit_picker_tests_only_the_tapped_network_and_keeps_the_route_selection() {
+    let screen = Screen::new(320., true);
+    let a = network();
+    let mut b = network();
+    b.name = "office".into();
+    b.network_id = "office-id".into();
+    b.exit.via = Some("alice".into());
+    let mut nets = [a, b];
+    let draw = |nets: &[NetworkReport], events| {
+        screen.ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320., 650.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(choose_exit_with_tests(ui, nets, "self", &screen.log).is_none());
+                    assert!(ui.min_rect().right() <= 320.);
+                });
+            },
+        )
+    };
+    let tap = |nets: &[NetworkReport], pos| {
+        for pressed in [true, false] {
+            draw(
+                nets,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+    };
+    let first = draw(&nets, vec![]);
+    let gauges = positions(&first, |s| s == icon::GAUGE);
+    assert_eq!(gauges.len(), 2);
+    let office = positions(&first, |s| s == "office")[0];
+    let button = *gauges.iter().find(|p| (p.y - office.y).abs() < 4.).unwrap();
+    tap(&nets, button);
+    assert!(
+        matches!(screen.log.0.borrow().as_slice(), [Command::StartSpeedTest { network_id, peer: None }] if network_id == "office-id")
+    );
+    nets[1].speed.batch = Some(SpeedBatchReport { done: 0, total: 1 });
+    nets[1]
+        .speed
+        .peers
+        .insert("alice".into(), reading(SpeedPhase::Upload));
+    let live = draw(&nets, vec![]);
+    assert!(!positions(&live, |s| s.contains("125") && s.contains("Mbit/s")).is_empty());
+    let stop = positions(&live, |s| s == icon::STOP_CIRCLE)[0];
+    tap(&nets, stop);
+    assert!(
+        matches!(screen.log.0.borrow().last(), Some(Command::StopSpeedTest { network_id }) if network_id == "office-id")
+    );
+    nets[1].speed = Default::default();
+    draw(&nets, vec![]);
+    tap(&nets, button);
+    assert_eq!(screen.log.0.borrow().len(), 2);
+}
+
 struct Screen {
     ctx: egui::Context,
     width: f32,
