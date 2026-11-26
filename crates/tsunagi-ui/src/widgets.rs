@@ -26,23 +26,28 @@ pub fn hint(response: Response, description: &str) -> Response {
     let held = ctx
         .data(|d| d.get_temp::<(egui::Id, f64)>(key))
         .filter(|(id, until)| touch && *id == response.id && now < *until);
+    let contents = |ui: &mut Ui| {
+        let padding = egui::Frame::popup(ui.style()).total_margin().sum().x;
+        let available = (ui.ctx().screen_rect().width() - padding).max(1.);
+        ui.set_max_width(ui.spacing().tooltip_width.min(available));
+        ui.add(egui::Label::new(description).wrap());
+    };
     if held.is_some() || (!touch && response.has_focus()) {
-        egui::show_tooltip_for(ctx, response.layer_id, response.id, &response.rect, |ui| {
-            ui.set_max_width(
-                ui.spacing()
-                    .tooltip_width
-                    .min(ctx.screen_rect().width() - 16.),
-            );
-            ui.label(description);
-        });
+        egui::show_tooltip_for(
+            ctx,
+            response.layer_id,
+            response.id,
+            &response.rect,
+            contents,
+        );
         if let Some((_, until)) = held {
             ctx.request_repaint_after_secs((until - now) as f32);
         }
         response
     } else {
         response
-            .on_hover_text(description)
-            .on_disabled_hover_text(description)
+            .on_hover_ui(contents)
+            .on_disabled_hover_ui(contents)
     }
 }
 

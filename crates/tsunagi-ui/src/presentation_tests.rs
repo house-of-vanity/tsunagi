@@ -54,6 +54,58 @@ fn keyboard_focus_explains_an_icon_and_the_shared_font_contains_the_status_glyph
     assert!(label(&draw(0.2), "Show secret").is_some());
 }
 
+#[test]
+fn long_protocol_hints_wrap_inside_narrow_windows_on_hover_and_focus() {
+    const DETAIL: &str =
+        "Pairwise Amnezia-masked UDP with fresh private profiles on every connection attempt";
+    for (width, enabled, focus) in [
+        (360., true, false),
+        (320., false, false),
+        (240., true, true),
+    ] {
+        let ctx = Context::default();
+        ctx.set_os(egui::os::OperatingSystem::Mac);
+        ctx.set_fonts(crate::app_fonts());
+        ctx.style_mut(|s| s.interaction.tooltip_delay = 0.);
+        let size = egui::vec2(width, 400.);
+        let draw = |time, events| {
+            frame(&ctx, size, time, events, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        let button = ui.add_enabled(enabled, egui::Button::new(icon::INFO));
+                        if focus {
+                            button.request_focus();
+                        }
+                        crate::widgets::hint(button, DETAIL);
+                    });
+                });
+            })
+        };
+        let first = draw(0., vec![]);
+        let pos = label(&first, icon::INFO).unwrap().center();
+        draw(0.1, vec![Event::PointerMoved(pos)]);
+        draw(0.8, vec![]);
+        let out = draw(1., vec![]);
+        let (text, clip) = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == DETAIL => Some((t, s.clip_rect)),
+                _ => None,
+            })
+            .expect("the full tooltip should be shown");
+        let ink = text.visual_bounding_rect();
+        assert!(
+            text.galley.rows.len() > 1,
+            "the tooltip stayed on one line at width {width}"
+        );
+        assert!(
+            Rect::from_min_size(Pos2::ZERO, size).contains_rect(ink) && clip.contains_rect(ink),
+            "window {width}, clip {clip:?}, text {ink:?}"
+        );
+    }
+}
+
 struct ReadOnly;
 impl Client for ReadOnly {
     fn busy(&self) -> bool {
