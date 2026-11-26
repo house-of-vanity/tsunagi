@@ -10,7 +10,7 @@
 //! ```text
 //! nat on <egress> inet from <range> to any tagged <forwarded> -> (<egress>)
 //! pass in quick on <if> inet from <range> to ! <range> tag <forwarded> no state
-//! pass out quick on <if> route-to (<egress> <gateway>) inet from <range> to any tagged <forwarded> no state
+//! pass out quick on <if> route-to (<egress> <gateway>) inet from <range> to ! <range> tagged <forwarded> no state
 //! pass out quick on <egress> inet from any to any flags any tagged <forwarded> keep state (if-bound)
 //! ```
 //!
@@ -88,6 +88,15 @@ use super::macos_authorization::{macos_exit_authorization_uid, macos_exit_needs_
 
 const OFFER_HELPER: &str = "/private/etc/tsunagi-exit/offer-v1";
 
+fn offer_helper_available(path: &std::path::Path, action: &str) -> bool {
+    // A previous release can still remove its own PF anchors. Applying its
+    // obsolete rules would silently restore the broken return path.
+    if action == "clear" {
+        return path.is_file();
+    }
+    std::fs::read(path).is_ok_and(|bytes| bytes == include_bytes!("macos/exit-offer.sh").as_slice())
+}
+
 /// The programs this module runs, always by absolute path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tool {
@@ -133,7 +142,11 @@ pub(super) fn run_tool(tool: Tool, args: &[String], stdin: Option<&str>) -> Ran 
     use std::process::{Command, Stdio};
 
     let mut command = if tool == Tool::OfferHelper {
-        if !std::path::Path::new(OFFER_HELPER).is_file() {
+        let path = std::path::Path::new(OFFER_HELPER);
+        if !args
+            .first()
+            .is_some_and(|op| offer_helper_available(path, op))
+        {
             return Ran::Missing;
         }
         let mut sudo = Command::new("/usr/bin/sudo");
@@ -415,23 +428,30 @@ fn pf_rules(
              from any to any flags any tagged {tag} keep state (if-bound)"
         ));
     }
-    for range in offer {
+    if let [first, rest @ ..] = offer {
+        let members = if rest.is_empty() {
+            first.to_string()
+        } else {
+            let name = format!("<tsunagi_offer_{interface}>");
+            let ranges: Vec<_> = offer.iter().map(ToString::to_string).collect();
+            tables.push(format!("table {name} const {{ {} }}", ranges.join(", ")));
+            name
+        };
         let tag = format!("tsng_forward_{interface}");
         nat.push(format!(
-            "nat on {out} inet from {range} to any tagged {tag} -> ({out})"
+            "nat on {out} inet from {members} to any tagged {tag} -> ({out})"
         ));
         // Classify at authenticated overlay ingress. Only packets the host
         // actually forwards AND its routes send back to our utun need steering.
         // Local services, connected LANs and the owner's forwarding switch
         // retain their native kernel behavior.
         filter.push(format!(
-            "pass in quick on {interface} inet from {range} to ! {range} tag {tag} no state"
+            "pass in quick on {interface} inet from {members} to ! {members} tag {tag} no state"
         ));
-    }
-    if !offer.is_empty() {
-        let tag = format!("tsng_forward_{interface}");
+        // PF restores the state's tag on replies after undoing NAT. A reply
+        // routed back to a member must leave on the overlay with that tag.
         filter.insert(0, format!(
-            "pass out quick on {interface} route-to {via} inet from any to any tagged {tag} no state"
+            "pass out quick on {interface} route-to {via} inet from {members} to ! {members} tagged {tag} no state"
         ));
         // Keep the outbound NAT state on the physical interface. A floating
         // state could consume packets on the utun before the reroute rule runs.
@@ -1166,12 +1186,38 @@ destination: default\n\
         assert_eq!(
             text,
             "nat on en0 inet from 10.13.37.0/24 to any tagged tsng_forward_utun5 -> (en0)\n\
-             pass out quick on utun5 route-to (en0 192.168.1.1) inet from any to any tagged tsng_forward_utun5 no state\n\
+             pass out quick on utun5 route-to (en0 192.168.1.1) inet from 10.13.37.0/24 to ! 10.13.37.0/24 tagged tsng_forward_utun5 no state\n\
              pass in quick on utun5 inet from 10.13.37.0/24 to ! 10.13.37.0/24 tag tsng_forward_utun5 no state\n\
              pass out quick on en0 inet from any to any flags any tagged tsng_forward_utun5 keep state (if-bound)\n"
         );
         // Translation precedes filtering, as pf requires.
         assert!(text.find("nat on").unwrap() < text.find("pass in").unwrap());
+    }
+
+    #[test]
+    fn forwarding_excludes_replies_to_every_offered_mesh() {
+        let ranges = [range(), "10.99.0.0/16".parse().unwrap()];
+        let client = ClientRules {
+            uid: 0,
+            overlay: &ranges,
+        };
+        for local_exit in [None, Some(&client)] {
+            let text = pf_rules("utun5", &egress(), &ranges, local_exit);
+            let offered = "<tsunagi_offer_utun5>";
+            assert!(text.contains(&format!(
+                "table {offered} const {{ 10.13.37.0/24, 10.99.0.0/16 }}"
+            )));
+            let mut steering = text
+                .lines()
+                .filter(|r| r.contains("route-to") && r.contains("tagged tsng_forward_"));
+            assert!(
+                steering
+                    .next()
+                    .unwrap()
+                    .contains(&format!("from {offered} to ! {offered} "))
+            );
+            assert!(steering.next().is_none());
+        }
     }
 
     #[test]
@@ -1289,7 +1335,7 @@ destination: default\n\
         assert_eq!(
             fake.stdins.borrow()[0],
             "nat on en0 inet from 10.13.37.0/24 to any tagged tsng_forward_utun5 -> (en0)\n\
-             pass out quick on utun5 route-to (en0 192.168.1.1) inet from any to any tagged tsng_forward_utun5 no state\n\
+             pass out quick on utun5 route-to (en0 192.168.1.1) inet from 10.13.37.0/24 to ! 10.13.37.0/24 tagged tsng_forward_utun5 no state\n\
              pass in quick on utun5 inet from 10.13.37.0/24 to ! 10.13.37.0/24 tag tsng_forward_utun5 no state\n\
              pass out quick on en0 inet from any to any flags any tagged tsng_forward_utun5 keep state (if-bound)\n"
         );

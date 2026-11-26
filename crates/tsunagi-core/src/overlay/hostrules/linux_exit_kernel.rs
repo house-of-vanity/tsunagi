@@ -669,6 +669,8 @@ fn serving_an_established_flow_while_switching_the_local_exit() {
         .arg(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", CHAIN_TEST, "--nocapture"])
         .env("TSUNAGI_EXIT_CHAIN_A", &a.0)
+        // B runs as a system service, even when the test was started from a login.
+        .env_remove("XDG_RUNTIME_DIR")
         .output()
         .unwrap();
     assert!(

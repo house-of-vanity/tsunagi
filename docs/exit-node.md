@@ -116,9 +116,10 @@ and configured networks.
 
 - **Offering:** a `pf` anchor `com.apple/tsunagi-exit-<interface>` (the stock
   `/etc/pf.conf` already evaluates `com.apple/*`) holds
-  NAT for traffic tagged on entry from an offered range. A tagged packet that the
-  kernel would forward back to the utun gets a PF `route-to` through the
-  physical gateway. The physical NAT state is interface-bound.
+  NAT for traffic tagged on entry from an offered range. If the kernel chooses
+  the utun for a member's outbound internet packet, PF steers it through the
+  physical gateway. Replies keep the tag after reverse NAT and return to the
+  member over the utun. The physical NAT state is interface-bound.
   `pf` is enabled if it was off, and that reference is released when the rules
   go. After installing the rules the agent enables IPv4 forwarding and checks
   the kernel's answer before advertising the exit. Stopping the offer removes
@@ -133,7 +134,9 @@ and configured networks.
   a separate grant. The helper checks the live utun address and mask, selects
   the uplink from the kernel, and manages its own PF anchor and enable token.
   It accepts only sharing operations. The agent can subsequently reconcile and
-  remove these rules without prompting. At startup it reclaims orphaned helper
+  remove these rules without prompting. When an update changes the helper,
+  enabling sharing again prompts once to replace it and keeps existing subnet
+  grants. At startup the agent reclaims orphaned helper
   anchors for the account by checking the owning process and its start time.
   For a system agent with the necessary
   rights, the initial enable completes directly.

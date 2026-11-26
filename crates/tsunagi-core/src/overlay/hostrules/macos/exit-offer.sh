@@ -125,7 +125,7 @@ if [ ! -f "$record" ]; then
 fi
 if ! /sbin/pfctl -q -a "$anchor" -f - <<RULES
 nat on $out inet from $range to any tagged $tag -> ($out)
-pass out quick on $iface route-to $via inet from any to any tagged $tag no state
+pass out quick on $iface route-to $via inet from $range to ! $range tagged $tag no state
 pass in quick on $iface inet from $range to ! $range tag $tag no state
 pass out quick on $out inet from any to any flags any tagged $tag keep state (if-bound)
 RULES

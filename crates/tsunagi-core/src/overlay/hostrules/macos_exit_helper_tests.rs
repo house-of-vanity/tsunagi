@@ -147,6 +147,25 @@ fn privileged_helper_accepts_only_a_granted_subnet_configured_on_the_utun() {
 }
 
 #[test]
+fn an_update_replaces_the_old_helper_and_preserves_existing_subnet_grants() {
+    let host = Host::new();
+    let helper = host.0.path().join("grants/offer-v1");
+    assert!(!super::offer_helper_available(&helper, "clear"));
+    host.grant("501", "10.13.37.0_24");
+    fs::write(&helper, "#!/bin/sh\n# previous release\n").unwrap();
+    assert!(!super::offer_helper_available(&helper, "apply"));
+    assert!(super::offer_helper_available(&helper, "clear"));
+    host.grant("501", "10.99.0.0_16");
+    assert!(super::offer_helper_available(&helper, "apply"));
+    assert!(
+        host.0
+            .path()
+            .join("grants/grant_501_10.13.37.0_24")
+            .is_file()
+    );
+}
+
+#[test]
 fn authorized_exit_owns_one_pf_reference_and_clears_only_its_anchor() {
     let host = Host::new();
     host.grant("501", "10.13.37.0_24");

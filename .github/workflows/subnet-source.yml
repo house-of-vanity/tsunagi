@@ -65,7 +65,8 @@ jobs:
       - name: Verify separate forwarding and local egress in Linux namespaces
         if: runner.os == 'Linux'
         shell: bash
-        run: sudo -n -- "$TEST_BINARY" --ignored --exact "$TEST_NAME" --nocapture
+        # The invoking login and the service inside namespace B have distinct environments.
+        run: sudo -n -- env XDG_RUNTIME_DIR="/run/user/$(id -u)" "$TEST_BINARY" --ignored --exact "$TEST_NAME" --nocapture
       - name: Verify source selection on a real utun
         if: runner.os == 'macOS'
         shell: bash

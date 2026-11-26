@@ -14,7 +14,7 @@ helper="$directory/offer-v1"
 /bin/chmod 0755 "$directory"
 tmp=$(/usr/bin/mktemp -d "$directory/.install.XXXXXXXX")
 trap '/bin/rm -rf "$tmp"' EXIT
-printf '%s\n' "$helper_body" > "$tmp/offer"
+printf '%s' "$helper_body" > "$tmp/offer"
 printf '#%s ALL = (root) NOPASSWD: NOSETENV: %s\n' "$uid" "$helper" > "$tmp/rule"
 /usr/sbin/visudo -c -q -f "$tmp/rule"
 /bin/chmod 0755 "$tmp/offer"
