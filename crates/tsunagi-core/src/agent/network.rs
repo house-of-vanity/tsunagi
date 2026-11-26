@@ -355,6 +355,14 @@ fn data_link_backoff(failures: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
+#[derive(Clone, Copy)]
+struct PendingSpeedStart {
+    peer: EndpointId,
+    session: u64,
+    request: tsunagi_speedtest::Start,
+    received: Instant,
+}
+
 struct Runtime {
     discovery_worker: Option<DiscoveryWorker>,
     discovery_candidates: mpsc::Receiver<Candidate>,
@@ -380,6 +388,8 @@ struct Runtime {
     /// peer, which outlives any particular path.
     links: HashMap<(EndpointId, String), Arc<HealthLink>>,
     pending_health: HashMap<(EndpointId, String), HealthSettings>,
+    // The initiator can finish its first data echo just before our own.
+    pending_speed: Option<PendingSpeedStart>,
     comparisons: HashMap<EndpointId, selection::Schedule>,
     last_failed_protocol: HashMap<EndpointId, String>,
     /// Every data link of this network, and what is reached through what.
@@ -509,6 +519,7 @@ impl Runtime {
             dial_results_rx,
             links: HashMap::new(),
             pending_health: HashMap::new(),
+            pending_speed: None,
             comparisons: HashMap::new(),
             last_failed_protocol: HashMap::new(),
             hub,
@@ -559,10 +570,13 @@ impl Runtime {
         // Long discovery intervals must not let live transit edges expire.
         let mut reach_refresh = tokio::time::interval(REACH_EXPIRY / 3);
         reach_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut speed_refresh = tokio::time::interval(Duration::from_millis(50));
+        speed_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
                 _ = self.shutdown.wait() => break,
+                _ = speed_refresh.tick(), if self.pending_speed.is_some() => self.retry_speed_start(),
                 _ = roster.changed() => self.sync_exit_use(),
                 _ = reach_refresh.tick(), if self.params.discovery_interval > REACH_EXPIRY / 3 => self.announce_reach(false),
                 _ = self.hub.changed() => {
@@ -3057,16 +3071,29 @@ impl Runtime {
                         && super::speed::supported(&session.capabilities)
                         && let Some(message) =
                             tsunagi_speedtest::Control::decode(payload.as_bytes())
-                        && let Some(inner) = self.params.agent.upgrade()
-                        && let Some(reply) = super::speed::receive_control(
-                            &inner,
-                            self.network_id,
-                            peer,
-                            message,
-                            || snapshot_connection(&session.conn).rtt,
-                        )
                     {
-                        let _ = self.send_to(peer, reply);
+                        match message {
+                            tsunagi_speedtest::Control::Start(start)
+                                if self.pending_speed.is_none()
+                                    && self.overlay_rtt(peer).is_none()
+                                    && self.data_error(session).is_none() =>
+                            {
+                                self.pending_speed = Some(PendingSpeedStart {
+                                    peer,
+                                    session: session.id,
+                                    request: start,
+                                    received: Instant::now(),
+                                });
+                            }
+                            tsunagi_speedtest::Control::Cancel { id }
+                                if self
+                                    .pending_speed
+                                    .is_some_and(|p| p.peer == peer && p.request.id == id) =>
+                            {
+                                self.pending_speed = None;
+                            }
+                            _ => self.deliver_speed_control(peer, message),
+                        }
                     }
                     return;
                 }
@@ -3339,6 +3366,50 @@ impl Runtime {
             })
     }
 
+    fn retry_speed_start(&mut self) {
+        let Some(pending) = self.pending_speed else {
+            return;
+        };
+        let Some(session) = self.sessions.get(&pending.peer).filter(|s| {
+            s.id == pending.session
+                && super::speed::supported(&s.capabilities)
+                && super::speed::supported(&self.local_capabilities)
+        }) else {
+            self.pending_speed = None;
+            return;
+        };
+        // Allow one ordinary three-second echo timeout and the next probe tick.
+        if pending.received.elapsed() < Duration::from_millis(3500)
+            && self.data_error(session).is_none()
+            && self.overlay_rtt(pending.peer).is_none()
+        {
+            return;
+        }
+        self.pending_speed = None;
+        self.deliver_speed_control(
+            pending.peer,
+            tsunagi_speedtest::Control::Start(pending.request),
+        );
+    }
+
+    fn deliver_speed_control(&mut self, peer: EndpointId, message: tsunagi_speedtest::Control) {
+        if let Some(inner) = self.params.agent.upgrade()
+            && let Some(reply) =
+                super::speed::receive_control(&inner, self.network_id, peer, message, || {
+                    self.overlay_rtt(peer)
+                })
+        {
+            let _ = self.send_to(peer, reply);
+        }
+    }
+
+    fn overlay_rtt(&self, peer: EndpointId) -> Option<Duration> {
+        if self.tunnel_errors.contains_key(&peer) || !self.hub.reachable(peer) {
+            return None;
+        }
+        self.params.routes.vips.peer_rtt(self.network_id, peer)
+    }
+
     fn data_error(&self, session: &Session) -> Option<String> {
         if self.params.carriers.is_empty() {
             return Some(super::DATA_DISABLED.into());
@@ -3413,9 +3484,11 @@ impl Runtime {
                     .next()
                     .and_then(|kind| self.links.get(&(session.peer, kind)));
                 PeerStatus {
-                    data_rtt: selected
-                        .and_then(|link| link.quality())
-                        .map(|quality| quality.rtt),
+                    data_rtt: if self.params.interface.is_some() && self.params.tunnel.is_some() {
+                        self.overlay_rtt(session.peer)
+                    } else {
+                        selected.and_then(|link| link.quality()).map(|q| q.rtt)
+                    },
                     data_transport_detail: selected.map(|link| link.path_description()),
                     broadcast: session.broadcast,
                     exit_node: session.exit_node,

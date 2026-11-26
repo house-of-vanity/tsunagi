@@ -192,6 +192,7 @@ impl Session {
         if self.cfg.mtu < MIN_MTU || self.cfg.byte_limit == 0 || self.cfg.local == self.cfg.remote {
             return Err(State::Failed);
         }
+        let negotiation_started = Instant::now();
         if let Some(start) = self.request {
             if !Control::Start(start).valid() {
                 return Err(State::Failed);
@@ -232,6 +233,7 @@ impl Session {
             }
         }
 
+        let negotiation_time = negotiation_started.elapsed();
         for direction in [Direction::Download, Direction::Upload] {
             self.progress.state = match direction {
                 Direction::Download => State::Download,
@@ -240,7 +242,8 @@ impl Session {
             io.progress(self.progress);
             let sender = (direction == Direction::Download) == self.request.is_some();
             let result = if sender {
-                self.send_probes(io, direction, deadline).await?
+                self.send_probes(io, direction, deadline, negotiation_time)
+                    .await?
             } else {
                 self.receive_probes(io, direction).await?
             };
@@ -255,7 +258,9 @@ impl Session {
         io: &impl Io,
         direction: Direction,
         deadline: Instant,
+        negotiation_time: Duration,
     ) -> Result<Reading, State> {
+        let waiting = Instant::now();
         loop {
             if matches!(open_control(self.events.recv().await)?, Control::Ready { direction: d, .. } if d == direction)
             {
@@ -263,10 +268,17 @@ impl Session {
             }
         }
         let start = Instant::now();
-        // Leave room for the opposite direction and the final reliable report.
+        // End and Report travel on reliable control. Leave room for their
+        // exchange and a queued feedback message even on a slow control path.
+        // Only the receiver's data packets contribute to the measured rate.
+        let report_time = negotiation_time
+            .max(waiting.elapsed())
+            .saturating_mul(3)
+            .saturating_add(Duration::from_millis(200))
+            .min(Duration::from_millis(1600));
         let remaining = deadline
             .saturating_duration_since(start)
-            .saturating_sub(Duration::from_millis(200));
+            .saturating_sub(report_time);
         let phase = if direction == Direction::Download {
             remaining / 2
         } else {

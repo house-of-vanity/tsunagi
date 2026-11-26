@@ -3,6 +3,16 @@
 
 pub(crate) const GAP: f32 = 10.0;
 
+pub(crate) fn row_height(ctx: &egui::Context, style: &egui::Style) -> f32 {
+    let font = egui::FontSelection::Default.resolve(style);
+    style
+        .spacing
+        .interact_size
+        .y
+        .max(ctx.fonts(|fonts| fonts.row_height(&font)))
+        + 10.
+}
+
 pub(crate) fn row(
     ui: &mut egui::Ui,
     id: impl std::hash::Hash,
@@ -10,9 +20,7 @@ pub(crate) fn row(
     stripe: bool,
     mut cell: impl FnMut(usize, &mut egui::Ui),
 ) {
-    let font = egui::FontSelection::Default.resolve(ui.style());
-    let text_height = ui.fonts(|fonts| fonts.row_height(&font));
-    let height = ui.spacing().interact_size.y.max(text_height) + 10.0;
+    let height = row_height(ui.ctx(), ui.style());
     let width = widths.iter().sum::<f32>() + GAP * widths.len().saturating_sub(1) as f32;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     if stripe {

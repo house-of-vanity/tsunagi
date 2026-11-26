@@ -2120,6 +2120,101 @@ async fn vip_udp_reaches_another_backend_after_the_selected_agent_stops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_speed_requires_a_bidirectional_data_path_and_can_measure_through_a_relay() {
+    use tsunagi::agent::DataPath;
+    use tsunagi::ipc::SpeedPhase;
+
+    let discovery = SharedMemoryDiscovery::new();
+    let (name, secret) = network("speed-relayed");
+    let blocked = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let a = WgAgent::spawn_cut_off(&discovery, "client", blocked.clone()).await;
+    let b = WgAgent::spawn(&discovery, "server").await;
+    let peer = b.endpoint_id();
+    let key = peer.to_string();
+    blocked.lock().unwrap().insert(peer);
+    let net = a.agent.join_network(&name, &secret).await.unwrap();
+    b.agent.join_network(&name, &secret).await.unwrap();
+    wait_until(
+        "authenticated control-only peer has advertised speed tests",
+        || async {
+            let status = a.agent.network_status(net).await.ok()?;
+            status
+                .peers
+                .iter()
+                .find(|p| {
+                    p.endpoint_id == peer
+                        && p.capabilities
+                            .iter()
+                            .any(|c| c.protocol == "speedtest" && c.enabled)
+                })
+                .map(|_| ())
+        },
+    )
+    .await;
+    let status = a.agent.network_status(net).await.unwrap();
+    assert!(matches!(status.peers[0].data_path, DataPath::None));
+    assert!(status.peers[0].data_rtt.is_none());
+    assert!(!status.speed.capable.contains(&key));
+    assert!(
+        a.agent
+            .start_speed_test(net, Some(peer), true)
+            .await
+            .is_err()
+    );
+    assert!(
+        a.agent
+            .network_status(net)
+            .await
+            .unwrap()
+            .speed
+            .peers
+            .is_empty()
+    );
+
+    let relay = WgAgent::spawn(&discovery, "relay").await;
+    relay.agent.join_network(&name, &secret).await.unwrap();
+    for (node, target) in [(&a, peer), (&b, a.endpoint_id())] {
+        wait_until("end-to-end data RTT without a direct link", || async {
+            let status = node.agent.network_status(net).await.ok()?;
+            let p = status.peers.iter().find(|p| p.endpoint_id == target)?;
+            (matches!(p.data_path, DataPath::Relayed { hops: 2, via } if via == relay.endpoint_id())
+                && p.data_rtt.is_some()
+                && status.speed.capable.contains(&target.to_string()))
+            .then_some(())
+        })
+        .await;
+    }
+    a.agent
+        .start_speed_test(net, Some(peer), true)
+        .await
+        .unwrap();
+    let report = wait_until("both test directions carried over the relay", || async {
+        let s = a.agent.network_status(net).await.ok()?.speed;
+        let p = s.peers.get(&key)?;
+        matches!(p.phase, SpeedPhase::Done | SpeedPhase::Failed(_)).then(|| p.clone())
+    })
+    .await;
+    assert_eq!(report.phase, SpeedPhase::Done, "{report:?}");
+    assert!(report.down.is_some() && report.up.is_some() && report.bytes > 0);
+    assert!(report.path.unwrap().contains("2 hops"));
+    relay.shutdown().await;
+    wait_until(
+        "losing only the relay clears data RTT and speed admission",
+        || async {
+            let status = a.agent.network_status(net).await.ok()?;
+            let p = status.peers.iter().find(|p| p.endpoint_id == peer)?;
+            (matches!(p.data_path, DataPath::None)
+                && p.data_rtt.is_none()
+                && !status.speed.capable.contains(&key))
+            .then_some(())
+        },
+    )
+    .await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_speed_measures_both_wireguard_directions_and_can_be_repeated() {
     use tsunagi::ipc::SpeedPhase;
     let discovery = SharedMemoryDiscovery::new();
@@ -2155,6 +2250,20 @@ async fn peer_speed_measures_both_wireguard_directions_and_can_be_repeated() {
             .is_err()
     );
     b.agent.set_speed_test_metered(true);
+    wait_until(
+        "the initiator has confirmed the peer's data path",
+        || async {
+            a.agent
+                .network_status(net)
+                .await
+                .ok()?
+                .speed
+                .capable
+                .contains(&key)
+                .then_some(())
+        },
+    )
+    .await;
     a.agent
         .start_speed_test(net, Some(remote), false)
         .await

@@ -24,9 +24,9 @@ use tsunagi::identity::{DeviceIdentity, NetworkId};
 use crate::cert::{generate_self_signed_cert, make_client_config, make_server_config};
 
 /// Default TCP port to bind and listen on.
-pub const DEFAULT_PORT: u16 = 443;
+pub const DEFAULT_PORT: u16 = 9442;
 
-/// Fallback port if 443 is unprivileged on Linux and denied.
+/// Second unprivileged port when the preferred listener cannot bind.
 pub const FALLBACK_PORT: u16 = 8443;
 
 /// Maximum payload length for a single framed datagram over TLS.
@@ -269,7 +269,7 @@ pub struct TcpTlsTransport {
     sni: String,
     peer_addresses: Candidates,
     server_config: Arc<rustls::ServerConfig>,
-    listener: Option<Arc<TcpListener>>,
+    listener: TcpListener,
 }
 
 impl std::fmt::Debug for TcpTlsTransport {
@@ -363,72 +363,21 @@ impl TcpTlsTransport {
         };
 
         let listener = match bind_result {
-            Ok(l) => {
-                tracing::info!(port = target_port, "TCP TLS listening");
-                Some(Arc::new(l))
-            }
+            Ok(listener) => listener,
             Err(err) if requested_port.is_none() => {
-                let exe = std::env::current_exe()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "tsunagi".into());
-
-                if err.kind() == std::io::ErrorKind::PermissionDenied {
-                    tracing::warn!(
-                        port = target_port,
-                        %err,
-                        "Cannot bind to default port {target_port} without privileges. \
-                         To allow port 443 and TUN on Linux, grant capabilities once with:\n  \
-                         sudo setcap cap_net_admin,cap_net_bind_service+p {exe}\n\
-                         Falling back to port {FALLBACK_PORT}."
-                    );
-                } else {
-                    tracing::warn!(
-                        port = target_port,
-                        %err,
-                        "Cannot bind to default port {target_port}: {err}. \
-                         Falling back to port {FALLBACK_PORT}."
-                    );
-                }
-
-                match crate::candidates::listen(FALLBACK_PORT) {
-                    Ok(l) => {
-                        tracing::info!(port = FALLBACK_PORT, "TCP TLS listening on fallback port");
-                        Some(Arc::new(l))
-                    }
-                    Err(fallback_err) => {
-                        tracing::warn!(
-                            port = FALLBACK_PORT,
-                            err = %fallback_err,
-                            "Cannot bind to fallback port {FALLBACK_PORT}: {fallback_err}. \
-                             Falling back to ephemeral port."
-                        );
-                        let l = crate::candidates::listen(0)?;
-                        let bound = l.local_addr()?.port();
-                        tracing::info!(port = bound, "TCP TLS listening on ephemeral port");
-                        Some(Arc::new(l))
-                    }
-                }
+                tracing::warn!(port = target_port, %err, "TCP TLS default port unavailable");
+                crate::candidates::listen(FALLBACK_PORT).or_else(|err| {
+                    tracing::warn!(port = FALLBACK_PORT, %err, "TCP TLS fallback port unavailable");
+                    crate::candidates::listen(0)
+                })?
             }
             Err(err) => {
-                let exe = std::env::current_exe()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "tsunagi".into());
-                tracing::warn!(
-                    port = target_port,
-                    %err,
-                    "Cannot bind to requested port {target_port}: {err}. \
-                     To allow port {target_port} and TUN on Linux, grant capabilities once with:\n  \
-                     sudo setcap cap_net_admin,cap_net_bind_service+p {exe}"
-                );
+                tracing::warn!(port = target_port, %err, "Cannot bind requested TCP TLS port");
                 return Err(Box::new(err));
             }
         };
-
-        let bound_port = listener
-            .as_ref()
-            .and_then(|l| l.local_addr().ok())
-            .map(|a| a.port())
-            .unwrap_or(target_port);
+        let bound_port = listener.local_addr()?.port();
+        tracing::info!(port = bound_port, "TCP TLS listening");
 
         Ok(Self {
             identity: identity.clone(),
@@ -477,10 +426,6 @@ impl TcpTlsTransport {
     where
         F: Fn(InboundLink) + Send + Sync + Clone + 'static,
     {
-        let Some(listener) = self.listener.as_ref().cloned() else {
-            return;
-        };
-
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&self.server_config));
         let local_id = self.local_id;
 
@@ -488,7 +433,7 @@ impl TcpTlsTransport {
         loop {
             let accepted = tokio::select! {
                 _ = handshakes.join_next(), if !handshakes.is_empty() => continue,
-                result = listener.accept(), if handshakes.len() < 64 => result,
+                result = self.listener.accept(), if handshakes.len() < 64 => result,
             };
             let Ok((socket, remote_addr)) = accepted else {
                 break;

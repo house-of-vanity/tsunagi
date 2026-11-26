@@ -303,6 +303,22 @@ async fn an_unrelated_busy_reply_does_not_cancel_the_active_request() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_half_second_control_round_trip_can_return_both_data_measurements() {
+    let (a, b, _, _) = shaped(
+        12_000_000,
+        25_000_000,
+        NORMAL_BYTES,
+        Duration::from_millis(260),
+        0,
+        None,
+    )
+    .await;
+    assert_eq!(a.state, State::Complete, "{a:?}");
+    assert_eq!(b.state, State::Complete, "{b:?}");
+    assert!(a.down.bps.is_some() && a.up.bps.is_some(), "{a:?}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn slower_control_feedback_leaves_time_for_both_directions() {
     let (a, b, _, _) = shaped(
         12_000_000,

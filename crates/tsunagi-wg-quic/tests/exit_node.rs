@@ -441,8 +441,8 @@ async fn shared_networks<'a>(client: &Node, peer: &'a Node) -> [ExitNetwork<'a>;
 }
 
 #[tokio::test]
-#[ignore = "observes a full 180-second WireGuard key lifetime on real clocks"]
-async fn only_the_selected_exit_stays_keyed_through_idle_expiry() {
+#[ignore = "observes WireGuard's 120-second rekey timer on real clocks"]
+async fn confirmed_idle_paths_remain_usable_through_wireguard_rekeying() {
     let (client, peer) = shared_nodes().await;
     let [chosen, other] = shared_networks(&client, &peer).await;
     client
@@ -463,39 +463,30 @@ async fn only_the_selected_exit_stays_keyed_through_idle_expiry() {
             .unwrap()
     };
     let epoch = tunnel(chosen.id).stats.counter_epoch;
-    let mut old_key_seen = false;
+    let mut old_keys_seen = false;
     tokio::time::timeout(Duration::from_secs(210), async {
         let mut poll = tokio::time::interval(Duration::from_millis(500));
         loop {
             poll.tick().await;
             let warm = tunnel(chosen.id);
-            let cold = tunnel(other.id);
+            let ordinary = tunnel(other.id);
             assert_eq!(warm.stats.counter_epoch, epoch);
             let warm_age = warm
                 .health
                 .since_handshake
                 .expect("usable exit key throughout idle");
             assert_eq!((warm.stats.tx_bytes, warm.stats.rx_bytes), (0, 0));
-            assert_eq!((cold.stats.tx_bytes, cold.stats.rx_bytes), (0, 0));
-            if cold
-                .health
-                .since_handshake
-                .is_some_and(|age| age >= Duration::from_secs(150))
-            {
-                old_key_seen = true;
-            }
-            if old_key_seen && !cold.health.is_up() {
-                assert!(
-                    warm_age < Duration::from_secs(90),
-                    "exit key renewed before expiry"
-                );
-                assert!(warm.health.idle && cold.health.idle);
+            assert_eq!((ordinary.stats.tx_bytes, ordinary.stats.rx_bytes), (0, 0));
+            let ordinary_age = ordinary.health.since_handshake.expect("usable peer key");
+            old_keys_seen |= warm_age.min(ordinary_age) >= Duration::from_secs(90);
+            if old_keys_seen && warm_age.max(ordinary_age) < Duration::from_secs(60) {
+                assert!(warm.health.idle && ordinary.health.idle);
                 break;
             }
         }
     })
     .await
-    .expect("unselected peer's unused session expired");
+    .expect("both confirmed data paths renewed their keys without application traffic");
 
     let packet = ipv4_packet(chosen.client_addr, INTERNET, b"first IP packet after idle");
     client.tun().await.push_from_os(packet.clone());

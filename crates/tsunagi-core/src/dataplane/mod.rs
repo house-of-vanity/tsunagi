@@ -11,6 +11,8 @@
 //! the encrypted inner bytes without entering an IP plugin or the TUN.
 //! Data-plane failure never stops control sessions or discovery.
 
+pub use crate::vip::router::is_path_probe;
+
 pub mod relay;
 pub mod routing;
 pub mod transport;

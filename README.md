@@ -136,8 +136,11 @@ The **Shoes** family adds two embedded TCP carriers. `vless-xhttp` uses VLESS
 over XHTTP stream-one with HTTP/2 and pinned TLS 1.3 (preferred port 9443).
 `ss2022` uses Shadowsocks 2022 with AES-128-GCM or AES-256-GCM (9444).
 Peers agree fresh credentials over their authenticated control connection on
-every attempt. The agent runs both listeners itself. Override their ports with
-`tsng up -o vless-xhttp:port=10443 -o ss2022:port=10444`.
+every attempt. The native `tcp-tls` listener prefers TCP 9442. To use all three
+on a public server, allow inbound TCP 9442–9444. For a second agent on the
+same host, set its listeners explicitly, for example
+`tsng up -o tcp-tls:port=10442 -o vless-xhttp:port=10443 -o ss2022:port=10444`,
+and allow TCP 10442–10444 for that instance.
 
 With two updated peers, `tcp-tls` and both Shoes carriers try the opposite dial
 direction if the first fails. One reachable TCP listener suffices. If neither
@@ -163,7 +166,10 @@ buttons change it. Hover or tap the information icon for protocol details. **Sho
 Tsunagi versions. On Android, tap a device to see its version and traffic.
 
 Select a peer’s speedometer in **Devices** to measure download and upload
-through its current encrypted mesh path. The cell shows live rates in Mbit/s.
+through its current encrypted mesh path. A test becomes available after a
+round trip to the peer succeeds over that path, directly or through relay
+members. The control connection coordinates the test and returns its results.
+Only packets received over the data path count towards the rate in Mbit/s.
 Select the result to test again, or use **Test exits** to check the network’s
 online, compatible exit nodes one at a time. The test ends at the peer, so its
 Internet uplink beyond that peer is outside the measurement. Hover or long-press
@@ -182,9 +188,12 @@ initiator. These ceilings count probe IP packets before tunnel overhead.
 Adjacent peers need a common external transport at the same wire version.
 Peers that both support link comparison probe another mutually enabled transport
 while traffic continues on the current one. They can switch to a faster healthy link.
-`tsng status` and the tray show the direct data link's measured RTT separately
-from the control connection's RTT. A mesh relay's first-hop RTT cannot measure
-the round trip to the destination.
+`tsng status` and Devices show the round trip of an encrypted probe to the
+destination, including any mesh relay hops. The previous measurement stays
+visible while the next probe is in flight. Losing the route or missing two
+consecutive probes clears the measurement. Devices shows **Ready** or **Idle**
+only while the data path is confirmed and the tunnel has a usable session key.
+Control RTT is shown separately.
 Selection applies to this device's incoming and outgoing data links; control and
 discovery are independent. A relay's next hop may use a different transport.
 Every pair uses one internal WireGuard cipher, hidden from these controls.

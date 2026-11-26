@@ -144,30 +144,30 @@ impl VipRouter {
     ) {
         let mut s = self.lock();
         s.limits = limits.clone();
+        let source_changed = s
+            .networks
+            .get(&network)
+            .is_none_or(|n| n.address != address);
         let mut present = HashSet::new();
         for (peer, address, available) in peers {
             present.insert(peer);
             let p = s.paths.entry((network, peer)).or_default();
-            if p.address != Some(address) {
-                p.rtt = None;
-                p.heard = None;
-                p.pending = None;
+            if source_changed || p.address != Some(address) || p.available != available {
+                *p = Path::default();
             }
             p.address = Some(address);
             p.available = available;
         }
-        for ((n, peer), p) in &mut s.paths {
-            if *n == network && !present.contains(peer) {
-                p.available = false;
-            }
-        }
         if let Some(address) = address {
+            present.insert(local);
             let p = s.paths.entry((network, local)).or_default();
             p.address = Some(address);
             p.available = true;
             p.rtt = Some(0);
             p.heard = Some(Instant::now());
         }
+        s.paths
+            .retain(|(n, peer), _| *n != network || present.contains(peer));
         s.networks.insert(
             network,
             Network {
@@ -177,6 +177,16 @@ impl VipRouter {
             },
         );
     }
+    /// Last confirmed round trip through both endpoints' encrypted packet channels.
+    pub fn peer_rtt(&self, network: NetworkId, peer: EndpointId) -> Option<Duration> {
+        let s = self.lock();
+        s.paths
+            .get(&(network, peer))
+            .filter(|p| p.available)?
+            .rtt
+            .map(Duration::from_micros)
+    }
+
     pub fn remove_network(&self, network: NetworkId) {
         let mut s = self.lock();
         s.networks.remove(&network);
@@ -342,6 +352,47 @@ impl VipRouter {
         let live: HashSet<_> = s.flows.keys().copied().collect();
         s.reverse.retain(|_, t| live.contains(t));
         let mut probes = Vec::new();
+        let State {
+            paths,
+            networks,
+            sequence,
+            ..
+        } = &mut *s;
+        for (&(network, peer), path) in paths {
+            let Some(net) = networks.get(&network) else {
+                continue;
+            };
+            let (Some(source), Some(address)) = (net.address, path.address) else {
+                continue;
+            };
+            if !path.available || peer == net.local {
+                continue;
+            }
+            if path
+                .pending
+                .is_some_and(|(_, at)| now.duration_since(at) >= Duration::from_secs(3))
+            {
+                path.pending = None;
+                path.misses = path.misses.saturating_add(1);
+                if path.misses >= 2 {
+                    path.rtt = None;
+                    path.heard = None;
+                }
+            }
+            if path.pending.is_none()
+                && path
+                    .last_probe
+                    .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1))
+            {
+                *sequence = sequence.wrapping_add(1);
+                path.pending = Some((*sequence, now));
+                path.last_probe = Some(now);
+                probes.push((
+                    Route { network, peer },
+                    probe(source, address, 1, *sequence),
+                ));
+            }
+        }
         let mut jobs = Vec::new();
         let mut targets = BTreeMap::new();
         for (n, net) in &s.networks {
@@ -366,37 +417,10 @@ impl VipRouter {
             let Some(net) = s.networks.get(&network) else {
                 continue;
             };
-            let (local, source) = (net.local, net.address);
-            let sequence = s.sequence.wrapping_add(1);
-            s.sequence = sequence;
-            let Some(path) = s.paths.get_mut(&(network, peer)) else {
+            let source = net.address;
+            let Some(address) = s.paths.get(&(network, peer)).and_then(|p| p.address) else {
                 continue;
             };
-            let Some(address) = path.address else {
-                continue;
-            };
-            if peer == local {
-                path.rtt = Some(0);
-                path.heard = Some(now);
-            } else if path.available {
-                if path
-                    .pending
-                    .is_some_and(|(_, at)| now.duration_since(at) >= Duration::from_secs(3))
-                {
-                    path.pending = None;
-                    path.misses = path.misses.saturating_add(1);
-                }
-                if path.pending.is_none()
-                    && path
-                        .last_probe
-                        .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1))
-                    && let Some(source) = source
-                {
-                    path.pending = Some((sequence, now));
-                    path.last_probe = Some(now);
-                    probes.push((Route { network, peer }, probe(source, address, 1, sequence)));
-                }
-            }
             for (l, b) in listeners {
                 let key = (network, peer, address, l.protocol, b.port);
                 wanted_checks.insert(key);
@@ -759,28 +783,32 @@ impl VipRouter {
             let Some(source) = net.address else {
                 return Decision::Drop;
             };
+            let Some(path) = s.paths.get_mut(&(network, peer)) else {
+                return Decision::Drop;
+            };
+            let Some(remote) = path.address else {
+                return Decision::Drop;
+            };
+            if packet::addresses(&packet) != Some((remote, source)) {
+                return Decision::Drop;
+            }
             if kind == 1 {
-                let Some((_, destination)) = packet::addresses(&packet).map(|(a, b)| (b, a)) else {
-                    return Decision::Drop;
-                };
-                return Decision::Send(
-                    Route { network, peer },
-                    probe(source, destination, 2, sequence),
-                );
+                return Decision::Send(Route { network, peer }, probe(source, remote, 2, sequence));
             }
             if kind == 2
-                && let Some(p) = s.paths.get_mut(&(network, peer))
-                && let Some((expected, at)) = p.pending
+                && path.available
+                && let Some((expected, at)) = path.pending
                 && expected == sequence
+                && at.elapsed() < Duration::from_secs(3)
             {
                 let rtt = at.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                p.rtt = Some(
-                    p.rtt
+                path.rtt = Some(
+                    path.rtt
                         .map_or(rtt, |old| old.saturating_mul(7).saturating_add(rtt) / 8),
                 );
-                p.heard = Some(Instant::now());
-                p.pending = None;
-                p.misses = 0;
+                path.heard = Some(Instant::now());
+                path.pending = None;
+                path.misses = 0;
                 return Decision::ProbeReceived;
             }
             return Decision::Drop;
@@ -981,15 +1009,18 @@ fn probe(src: Ipv4Addr, dst: Ipv4Addr, kind: u8, sequence: u64) -> Bytes {
     p[10..12].copy_from_slice(&c.to_be_bytes());
     Bytes::from(p)
 }
+/// Recognizes the reserved encrypted overlay echo used to measure peer RTT.
+pub fn is_path_probe(p: &[u8]) -> bool {
+    p.len() == 45 && p[9] == 253 && &p[20..36] == PROBE && packet::header(p) == Some(20)
+}
+
 fn parse_probe(p: &[u8]) -> Option<(u8, u64)> {
-    (packet::header(p) == Some(20) && p.len() == 45 && p[9] == 253 && &p[20..36] == PROBE).then(
-        || {
-            (
-                p[36],
-                u64::from_be_bytes([p[37], p[38], p[39], p[40], p[41], p[42], p[43], p[44]]),
-            )
-        },
-    )
+    is_path_probe(p).then(|| {
+        (
+            p[36],
+            u64::from_be_bytes([p[37], p[38], p[39], p[40], p[41], p[42], p[43], p[44]]),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1258,6 +1289,66 @@ mod tests {
         }
         assert!(r.statuses(n)[0].listeners[0].selected.is_some());
     }
+    #[test]
+    fn peer_rtt_survives_one_miss_and_expires_on_loss_or_new_membership() {
+        let (router, network, local, peer, other, t) = fixture(Protocol::Udp);
+        let remote = Ipv4Addr::new(10, 0, 0, 2);
+        let configure = |available| {
+            router.configure(
+                network,
+                local,
+                Some(t.src),
+                vec![],
+                vec![(peer, remote, available)],
+                &Limits::default(),
+            )
+        };
+        configure(false);
+        configure(true);
+        assert!(router.peer_rtt(network, peer).is_none());
+        let (probes, _) = router.tick(0);
+        let (_, request) = probes.iter().find(|(route, _)| route.peer == peer).unwrap();
+        let (_, seq) = parse_probe(request).unwrap();
+        let reply = probe(remote, t.src, 2, seq);
+        assert!(matches!(
+            router.incoming(network, other, reply.clone()),
+            Decision::Drop
+        ));
+        assert!(router.peer_rtt(network, peer).is_none());
+        assert!(matches!(
+            router.incoming(network, peer, reply.clone()),
+            Decision::ProbeReceived
+        ));
+        let measured = router.peer_rtt(network, peer).unwrap();
+        configure(true);
+        assert_eq!(router.peer_rtt(network, peer), Some(measured));
+        assert!(matches!(
+            router.incoming(network, peer, reply.clone()),
+            Decision::Drop
+        ));
+        for missed in 1..=2 {
+            {
+                let mut state = router.lock();
+                let p = state.paths.get_mut(&(network, peer)).unwrap();
+                let sent = Instant::now() - Duration::from_secs(4);
+                p.last_probe = Some(sent);
+                p.pending = Some((seq + missed, sent));
+            }
+            router.tick(0);
+            assert_eq!(
+                router.peer_rtt(network, peer),
+                (missed == 1).then_some(measured)
+            );
+        }
+        configure(false);
+        configure(true);
+        assert!(matches!(
+            router.incoming(network, peer, reply),
+            Decision::Drop
+        ));
+        assert!(router.peer_rtt(network, peer).is_none());
+    }
+
     #[test]
     fn unknown_rtt_is_not_selected_and_reflected_probes_do_not_forge_measurements() {
         let (r, n, _, a, _, _) = fixture(Protocol::Udp);

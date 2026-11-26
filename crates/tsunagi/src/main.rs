@@ -3965,7 +3965,6 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     }
 
     use tsunagi::ipc::DataPathReport;
-    let tunnel_up = row.tunnel.is_some_and(|tunnel| tunnel.is_up());
     let has_overlay = row.tunnel.is_some();
     // Online is online: a member reached through others is as much here as
     // one reached directly, and is said to be reached that way.
@@ -3982,8 +3981,9 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
         ),
         Some(DataPathReport::None) | None => ("connected · no data path yet".to_string(), false),
     };
-    let idle = data_path_good && row.data_error.is_none() && row.tunnel.is_some_and(|t| t.idle);
-    let show_counters = tunnel_up || idle;
+    let confirmed = data_path_good && row.data_error.is_none() && row.data_rtt_ms.is_some();
+    let show_counters = confirmed && row.tunnel.is_some_and(|t| t.is_up());
+    let idle = show_counters && row.tunnel.is_some_and(|t| t.idle);
 
     let mut detail = String::new();
     if let Some(v4) = row.overlay_address_v4 {
@@ -4009,7 +4009,7 @@ fn member_row(row: &MemberRow<'_>) -> report::Row {
     }
     detail.extend(taken);
 
-    let health = if !data_path_good || row.data_error.is_some() || (has_overlay && !show_counters) {
+    let health = if !confirmed || (has_overlay && !show_counters) {
         Health::Degraded
     } else {
         Health::Good
@@ -5316,7 +5316,7 @@ mod status_tests {
                 hostname: Some("music".into()),
                 transport: "direct".into(),
                 rtt_ms: Some(24),
-                data_rtt_ms: None,
+                data_rtt_ms: Some(16),
                 data_transport_detail: None,
                 exit_node: false,
                 path: tsunagi::ipc::DataPathReport::Direct {
@@ -5775,8 +5775,8 @@ mod status_tests {
 
     #[test]
     fn a_member_reached_through_another_is_online_and_says_through_whom() {
-        // No direct link, a path through somebody else: online all the same,
-        // and said to be, rather than being shown as away or as a fault.
+        // The member is online via the mesh. Reachability alone hasn't
+        // confirmed an encrypted round trip to it.
         let mut network = network_after_a_peer_returned();
         network.members.push(MemberReport {
             record_version: 1,
@@ -5804,7 +5804,7 @@ mod status_tests {
             "names the member it goes through: {text}"
         );
         assert!(!text.contains("offline"), "{text}");
-        assert_eq!(out.worst(), Health::Good, "{text}");
+        assert_eq!(out.worst(), Health::Degraded, "{text}");
     }
 
     #[test]
@@ -5880,7 +5880,7 @@ mod status_tests {
     #[test]
     fn an_idle_peer_keeps_its_counters_and_a_missing_route_is_still_degraded() {
         let mut network = network_after_a_peer_returned();
-        let mut quiet = tunnel(ONLINE, None);
+        let mut quiet = tunnel(ONLINE, Some(29));
         quiet.idle = true;
         network.overlay = Some(overlay(vec![quiet]));
         for (path, health) in [
@@ -5905,6 +5905,25 @@ mod status_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_key_and_a_control_rtt_cannot_make_an_unverified_data_path_idle() {
+        let mut network = network_after_a_peer_returned();
+        network.peers[0].data_rtt_ms = None;
+        let mut quiet = tunnel(ONLINE, Some(29));
+        quiet.idle = true;
+        network.overlay = Some(overlay(vec![quiet]));
+        let mut out = report::Report::new();
+        out.push(network_section(&network, OWN, false));
+        let text = out.render(false);
+        assert_eq!(out.worst(), Health::Degraded, "{text}");
+        assert!(text.contains("control RTT 24ms"), "{text}");
+        assert!(
+            text.contains("encrypted data channel is not ready yet"),
+            "{text}"
+        );
+        assert!(!text.contains("·  idle"), "{text}");
     }
 
     #[test]

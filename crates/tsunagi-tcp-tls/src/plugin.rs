@@ -199,7 +199,7 @@ impl TcpTlsConfig {
             key: "port",
             value: "PORT",
             help: "TCP port to listen on for TLS 1.3 connections",
-            default: Some("443"),
+            default: Some("9442"),
         },
         ProtocolOption {
             key: "sni",

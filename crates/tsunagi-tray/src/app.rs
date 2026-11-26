@@ -34,6 +34,17 @@ pub(crate) struct App {
     sampled: u64,
 }
 
+const MIN_DEVICES_SIZE: egui::Vec2 = egui::vec2(560., 260.);
+
+fn initial_devices_size(rows: usize, monitor: Option<egui::Vec2>, row_pitch: f32) -> egui::Vec2 {
+    // The collapsed header, the roster header and the totals row are visible on open.
+    let height = (110. + (rows as f32 + 2.) * row_pitch).clamp(MIN_DEVICES_SIZE.y, 780.);
+    let preferred = egui::vec2(1240., height);
+    monitor.map_or(preferred, |screen| {
+        preferred.min((screen - egui::vec2(48., 80.)).max(MIN_DEVICES_SIZE))
+    })
+}
+
 impl App {
     /// Builds the app: resolves the socket and starts the worker.
     pub(crate) fn new(
@@ -195,18 +206,27 @@ impl App {
                 continue;
             };
             let viewport = egui::ViewportId::from_hash_of(("devices", id));
-            let preferred = egui::vec2(1240., 740.);
-            let size = ctx
-                .input(|i| i.viewport().monitor_size)
-                .map_or(preferred, |monitor| {
-                    preferred.min((monitor - egui::vec2(48., 80.)).max(egui::vec2(560., 400.)))
-                });
-            let builder = egui::ViewportBuilder::default()
+            let mut builder = egui::ViewportBuilder::default()
                 .with_title(devices::title(&report.networks[index]))
                 .with_app_id(crate::icon::APP_ID)
                 .with_icon(crate::icon::window())
-                .with_inner_size(size)
-                .with_min_inner_size([560., 400.]);
+                .with_min_inner_size(MIN_DEVICES_SIZE);
+            // Apply the roster estimate only when creating a native window.
+            // Subsequent frames leave the user's own height and width in place.
+            let (opened, monitor) = ctx.input(|i| {
+                (
+                    i.raw.viewports.contains_key(&viewport),
+                    i.viewport().monitor_size,
+                )
+            });
+            if !opened {
+                let rows = devices::known_count(&report.networks[index], &report.endpoint_id);
+                builder = builder.with_inner_size(initial_devices_size(
+                    rows,
+                    monitor,
+                    devices::row_pitch(ctx),
+                ));
+            }
             let views = self.views.clone();
             let agent = self.agent.clone();
             let report = report.clone();
@@ -246,6 +266,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn devices_window_opens_to_fit_the_roster_within_the_screen() {
+        let size = |rows| initial_devices_size(rows, None, 34.);
+        assert_eq!(size(0).y, size(1).y);
+        assert!(size(6).y < size(16).y);
+        assert!(size(16).y < size(80).y);
+        assert_eq!(size(80), size(2000));
+        let on_small_screen = initial_devices_size(80, Some(egui::vec2(950., 670.)), 34.);
+        assert!(on_small_screen.x < 950. && on_small_screen.y < 670.);
+    }
+
+    #[test]
     fn device_frames_are_scheduled_independently_of_the_main_window() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -277,6 +308,28 @@ mod tests {
             app.show_devices_windows(ctx, &report, &["test-id".to_string()], true);
         });
         assert!(out.viewport_output[&id].class == egui::ViewportClass::Deferred);
+        assert_eq!(
+            out.viewport_output[&id].builder.inner_size.unwrap().y,
+            MIN_DEVICES_SIZE.y
+        );
+
+        let mut resized = egui::RawInput::default();
+        resized.viewports.entry(id).or_default().inner_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1300., 900.),
+        ));
+        let mut larger = Arc::clone(&report);
+        Arc::make_mut(&mut larger).networks[0].members = (0..60)
+            .map(|i| tsunagi::ipc::MemberReport {
+                endpoint_id: i.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let out = ctx.run(resized, |ctx| {
+            app.show_devices_windows(ctx, &larger, &["test-id".to_string()], true);
+        });
+        let builder = &out.viewport_output[&id].builder;
+        assert!(builder.inner_size.is_none() && builder.max_inner_size.is_none());
         let draw = out.viewport_output[&id].viewport_ui_cb.as_ref().unwrap();
         let mut input = egui::RawInput {
             viewport_id: id,

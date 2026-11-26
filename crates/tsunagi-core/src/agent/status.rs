@@ -179,7 +179,8 @@ pub struct PeerStatus {
     pub transport: TransportKind,
     /// RTT of the selected path, when iroh reported one.
     pub rtt: Option<Duration>,
-    /// Recent RTT of the selected direct data link, measured by authenticated probes.
+    /// Round trip to this peer over encrypted overlay data, including relay hops.
+    /// Carrier-only agents report their selected physical link's round trip.
     pub data_rtt: Option<Duration>,
     /// The selected direct data carrier's own description of its underlying path.
     pub data_transport_detail: Option<String>,
@@ -195,6 +196,15 @@ pub struct PeerStatus {
     pub control_bytes_received: u64,
     /// How packets reach this peer right now.
     pub data_path: DataPath,
+}
+
+impl PeerStatus {
+    /// A usable route with a successful data round trip to this peer.
+    pub fn has_confirmed_data_path(&self) -> bool {
+        !matches!(self.data_path, DataPath::None)
+            && self.data_rtt.is_some()
+            && self.data_error.is_none()
+    }
 }
 
 /// Counters scoped to one logical network.

@@ -232,6 +232,7 @@ fn rotating_the_devices_view_keeps_the_peer_and_fits_traffic_and_states_on_scree
                     hops: 2,
                     via: "another".into(),
                 },
+                data_rtt_ms: matches!(state, "ready" | "idle").then_some(37),
                 data_error: match state {
                     "waiting" => Some(tsunagi::agent::DATA_CONNECTING.into()),
                     "error" => Some("Carrier unavailable".into()),
@@ -256,6 +257,7 @@ fn rotating_the_devices_view_keeps_the_peer_and_fits_traffic_and_states_on_scree
         OverlayPeerReport {
             endpoint_id: id.into(),
             idle: true,
+            handshake_secs_ago: Some(8),
             ..Default::default()
         }
     }));

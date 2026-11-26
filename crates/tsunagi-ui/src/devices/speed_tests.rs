@@ -27,8 +27,20 @@ fn network() -> NetworkReport {
             endpoint_id: id.into(),
             hostname: Some(id.into()),
             exit_node: offers_exit,
+            path: DataPathReport::Direct {
+                transport: "wg".into(),
+            },
+            data_rtt_ms: Some(12),
             ..Default::default()
         });
+        n.overlay
+            .get_or_insert_with(Default::default)
+            .peers
+            .push(OverlayPeerReport {
+                endpoint_id: id.into(),
+                handshake_secs_ago: Some(1),
+                ..Default::default()
+            });
     }
     n.speed.capable = vec!["alice".into(), "ben".into()];
     n
@@ -326,6 +338,26 @@ fn long_press_explains_a_partial_result_without_requesting_another_test() {
         ],
     );
     assert!(s.log.0.borrow().is_empty());
+}
+
+#[test]
+fn a_control_only_peer_cannot_look_idle_or_start_a_speed_test() {
+    let mut n = network();
+    n.peers[0].data_rtt_ms = None;
+    n.peers[0].rtt_ms = Some(12);
+    n.overlay.as_mut().unwrap().peers[0].idle = true;
+    let row = devices(&n, "self");
+    assert!(matches!(
+        row.iter().find(|p| p.id == "alice").unwrap().channel(),
+        status::Channel::Waiting
+    ));
+    let screen = Screen::new(360., true);
+    screen.frame(&n, vec![]);
+    let output = screen.frame(&n, vec![]);
+    assert_eq!(positions(&output, |s| s == icon::GAUGE).len(), 1);
+    let start = positions(&output, |s| s.contains("Test exits"))[0];
+    screen.click(&n, start);
+    assert!(screen.log.0.borrow().is_empty());
 }
 
 #[test]

@@ -243,10 +243,12 @@ The client renews the selected exit peer's session key at 120 seconds, even
 when no IP traffic is flowing. The current key can carry packets during the
 exchange. Changing the exit moves this behavior to the new network and peer.
 
-The device list shows **Idle** after an established tunnel has had 30 seconds
-without IP traffic. Handshakes and keepalives do not restart this interval.
-Pending IP packets, a missing path, or a selected exit waiting for a usable
-key still show **Waiting**. A reported transport failure shows **Error**.
+The device list shows **Idle** after 30 seconds without application traffic
+on a confirmed path with a usable key and an empty packet queue. Encrypted
+round-trip probes keep measuring an idle path all the way to the destination.
+Probes, handshakes and keepalives leave the idle timer and application counters
+unchanged. A missing key or an unconfirmed path shows **Waiting**. A reported
+transport failure shows **Error**.
 
 User traffic counters count original IP bytes once when the encrypted frame is
 accepted by the logical transport, and once when decrypted on receipt. They do

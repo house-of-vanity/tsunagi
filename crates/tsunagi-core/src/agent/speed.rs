@@ -126,7 +126,7 @@ impl SpeedTests {
                 .collect(),
             capable: peers
                 .iter()
-                .filter(|p| enabled && supported(&p.capabilities))
+                .filter(|p| enabled && p.has_confirmed_data_path() && supported(&p.capabilities))
                 .map(|p| p.endpoint_id.to_string())
                 .collect(),
         }
@@ -221,7 +221,7 @@ fn config(
     key: Key,
     id: u64,
     bytes: u32,
-    rtt: Option<Duration>,
+    rtt: Duration,
 ) -> Option<(wire::Config, DiagnosticPeer)> {
     let addresses = inner.routes.diagnostic_peer(key.0, key.1)?;
     let ceiling = if inner.speed.metered.load(Ordering::Relaxed) {
@@ -235,7 +235,7 @@ fn config(
         remote: addresses.remote,
         mtu: u16::try_from(inner.config.interface_mtu).unwrap_or(u16::MAX),
         byte_limit: bytes.min(ceiling),
-        rtt: rtt.unwrap_or(Duration::from_millis(100)),
+        rtt,
     };
     Some((cfg, addresses))
 }
@@ -257,7 +257,11 @@ pub(super) fn receive_control(
         {
             return envelope(&wire::Control::Busy { id });
         }
-        let (cfg, addresses) = config(inner, key, id, request.byte_limit, rtt())?;
+        let Some((cfg, addresses)) =
+            rtt().and_then(|rtt| config(inner, key, id, request.byte_limit, rtt))
+        else {
+            return envelope(&wire::Control::Cancel { id });
+        };
         let limit = cfg.byte_limit;
         let (handle, session) = wire::respond(cfg, request);
         inner.speed.active.store(Some(Arc::new(Channel {
@@ -430,10 +434,18 @@ impl Agent {
             .collect();
         if targets.is_empty() {
             return Err(Error::SpeedTest(
-                if peer.is_some() {
-                    "Peer is offline or does not support this speed-test version"
+                if let Some(target) = peer {
+                    if status
+                        .peers
+                        .iter()
+                        .any(|p| p.endpoint_id == target && supported(&p.capabilities))
+                    {
+                        "No confirmed data path to this peer"
+                    } else {
+                        "Peer is offline or does not support this speed-test version"
+                    }
                 } else {
-                    "No online exit nodes support speed tests in this network"
+                    "No compatible exit nodes with a confirmed data path in this network"
                 }
                 .into(),
             ));
@@ -522,7 +534,7 @@ impl Agent {
                         Some((_, update, started)) => update_report(report, update, started),
                         None => {
                             report.phase = SpeedPhase::Failed(
-                                "Peer is no longer eligible or its overlay address is unavailable"
+                                "Peer no longer has a confirmed data path or is no longer eligible"
                                     .into(),
                             )
                         }
@@ -577,10 +589,12 @@ async fn run_outgoing(
     };
     let status = agent.network_status(key.0).await.ok()?;
     let peer = status.peers.iter().find(|p| {
-        p.endpoint_id == key.1 && (!exits_only || p.exit_node) && supported(&p.capabilities)
+        p.endpoint_id == key.1
+            && (!exits_only || p.exit_node)
+            && status.speed.capable.contains(&p.endpoint_id.to_string())
     })?;
     let id = rand::random();
-    let (cfg, addresses) = config(inner, key, id, limit, peer.data_rtt.or(peer.rtt))?;
+    let (cfg, addresses) = config(inner, key, id, limit, peer.data_rtt?)?;
     let limit = cfg.byte_limit;
     let (handle, session) = wire::initiate(cfg);
     let io = TestIo::new(inner, key, Some(generation));

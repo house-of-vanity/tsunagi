@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 
 use tsunagi::dataplane::routing::{FlowId, flow::ip_flow};
 use tsunagi::dataplane::transport::{SharedLink, TransportError};
-use tsunagi::dataplane::{PacketSink, PluginContext, PluginError};
+use tsunagi::dataplane::{PacketSink, PluginContext, PluginError, is_path_probe};
 use tsunagi::identity::NetworkId;
 
 use crate::keys::{WgPublicKey, WgSecretKey};
@@ -65,8 +65,8 @@ const SCRATCH: usize = 4096;
 struct FlowTunnel {
     tunn: Tunn,
     queued: VecDeque<(FlowId, usize)>,
-    /// First usable session or most recent IP payload. Keepalives and later
-    /// handshakes leave this alone, including when the current key expires.
+    /// First usable session or most recent application payload. RTT probes,
+    /// keepalives and later handshakes leave this alone.
     last_activity: Option<Instant>,
 }
 
@@ -81,17 +81,26 @@ impl FlowTunnel {
         scratch: &'a mut [u8],
         flow: FlowId,
     ) -> (TunnResult<'a>, FlowId) {
+        let probe = is_path_probe(packet);
+        // A stale health check must never wait in the pending application FIFO.
+        // Ask for a key and let the next scheduled probe use it.
+        if probe && self.tunn.time_since_last_handshake().is_none() {
+            return (self.tunn.format_handshake_initiation(scratch, false), flow);
+        }
         let result = self.tunn.encapsulate(packet, scratch);
         if packet.is_empty() {
             return (result, 0);
         }
         if matches!(&result, TunnResult::WriteToNetwork(out) if carries_ip(out)) {
-            self.last_activity = Some(Instant::now());
+            if !probe {
+                self.last_activity = Some(Instant::now());
+            }
             return (result, flow);
         }
         // MAX_QUEUE_DEPTH in boringtun 0.7: the newest packet is dropped at 256.
         if self.queued.len() < 256 {
-            self.queued.push_back((flow, packet.len()));
+            self.queued
+                .push_back((flow, if probe { 0 } else { packet.len() }));
         }
         (result, 0)
     }
@@ -113,7 +122,7 @@ impl FlowTunnel {
                 TunnResult::WriteToNetwork(out) if carries_ip(out) => {
                     if let Some((tag, len)) = self.queued.pop_front() {
                         flow = tag;
-                        plaintext_len = Some(len);
+                        plaintext_len = (len > 0).then_some(len);
                     }
                 }
                 // An internal keepalive may occupy a slot in the bounded
@@ -122,10 +131,13 @@ impl FlowTunnel {
                 _ => {}
             }
         }
-        if matches!(
-            result,
-            TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..)
-        ) || plaintext_len.is_some()
+        let application_data = match &result {
+            TunnResult::WriteToTunnelV4(out, _) => !is_path_probe(out),
+            TunnResult::WriteToTunnelV6(..) => true,
+            _ => false,
+        };
+        if application_data
+            || plaintext_len.is_some()
             || (self.last_activity.is_none() && self.tunn.time_since_last_handshake().is_some())
         {
             self.last_activity = Some(Instant::now());
@@ -133,10 +145,10 @@ impl FlowTunnel {
         (result, flow, plaintext_len)
     }
 
-    fn health(&self, now: Instant, keep_warm: bool) -> PeerHealth {
+    fn health(&self, now: Instant) -> PeerHealth {
         let since_handshake = self.tunn.time_since_last_handshake();
         let idle = self.queued.is_empty()
-            && (!keep_warm || since_handshake.is_some())
+            && since_handshake.is_some()
             && self
                 .last_activity
                 .is_some_and(|at| now.duration_since(at) >= IDLE_AFTER);
@@ -229,7 +241,7 @@ pub struct PeerStats {
 pub struct PeerHealth {
     /// Age of the last handshake while a usable WireGuard session exists.
     pub since_handshake: Option<Duration>,
-    /// A previously established tunnel with no recent or queued IP traffic.
+    /// A currently usable session with no recent or queued application traffic.
     pub idle: bool,
 }
 
@@ -290,12 +302,12 @@ impl Peer {
         }
     }
 
-    fn health(&self, keep_warm: bool) -> PeerHealth {
+    fn health(&self) -> PeerHealth {
         let guard = match self.tunn.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.health(Instant::now(), keep_warm)
+        guard.health(Instant::now())
     }
 }
 
@@ -416,14 +428,16 @@ impl WireguardDevice {
             }
         };
         let Some((len, selected_flow, data)) = result else {
-            peer.counters
-                .dropped_no_session
-                .fetch_add(1, Ordering::Relaxed);
+            if !is_path_probe(packet) {
+                peer.counters
+                    .dropped_no_session
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return false;
         };
 
         let sent = send_to_peer_flow(&peer, &scratch[..len], selected_flow);
-        if sent && data {
+        if sent && data && !is_path_probe(packet) {
             count_sent(&peer, packet.len());
         }
         sent
@@ -523,7 +537,6 @@ impl WireguardDevice {
 
     /// A snapshot of every peer.
     pub fn peers(&self) -> Vec<PeerSummary> {
-        let warm_peer = self.inner.context.warm_peer(self.inner.network);
         let mut peers: Vec<PeerSummary> = read_lock(&self.inner.peers)
             .values()
             .map(|peer| {
@@ -535,7 +548,7 @@ impl WireguardDevice {
                     endpoint_id: peer.endpoint_id,
                     public_key: peer.public_key,
                     overlay_address_v4: overlay_v4,
-                    health: peer.health(warm_peer == Some(peer.endpoint_id)),
+                    health: peer.health(),
                     stats: peer.stats(),
                     path: peer.link.path_description(),
                     max_datagram: peer.link.max_datagram_size(),
@@ -675,10 +688,12 @@ async fn read_from_link(inner: Arc<Inner>, peer: Arc<Peer>) {
                         .sink
                         .deliver(inner.network, peer.endpoint_id, payload)
                         .await;
-                    peer.counters.rx_packets.fetch_add(1, Ordering::Relaxed);
-                    peer.counters
-                        .rx_bytes
-                        .fetch_add(len as u64, Ordering::Relaxed);
+                    if !is_path_probe(&scratch[..len]) {
+                        peer.counters.rx_packets.fetch_add(1, Ordering::Relaxed);
+                        peer.counters
+                            .rx_bytes
+                            .fetch_add(len as u64, Ordering::Relaxed);
+                    }
                 }
                 Outcome::Failed => {
                     peer.counters
@@ -809,24 +824,24 @@ mod flow_tests {
         let bk = WgSecretKey::from_bytes(&[2; 32]);
         let (mut a, mut b) = (tunnel(&ak, &bk), tunnel(&bk, &ak));
         let mut scratch = [0u8; SCRATCH];
-        assert!(!a.health(Instant::now() + IDLE_AFTER, false).idle);
+        assert!(!a.health(Instant::now() + IDLE_AFTER).idle);
         establish(&mut a, &mut b, &mut scratch);
-        assert!(!a.health(Instant::now(), false).idle);
+        assert!(!a.health(Instant::now()).idle);
         let activity = (a.last_activity, b.last_activity);
         let idle_at = Instant::now() + IDLE_AFTER;
-        assert!(a.health(idle_at, true).idle);
+        assert!(a.health(idle_at).idle);
         establish(&mut a, &mut b, &mut scratch);
         assert_eq!((a.last_activity, b.last_activity), activity);
-        assert!(a.health(idle_at, true).idle);
-        assert!(b.health(idle_at, false).idle);
+        assert!(a.health(idle_at).idle);
+        assert!(b.health(idle_at).idle);
 
         let mut ip = [0u8; 20];
         ip[0] = 0x45;
         ip[2..4].copy_from_slice(&20u16.to_be_bytes());
         let ciphertext = wire(a.encapsulate(&ip, &mut scratch, 7).0);
         let _ = b.decapsulate(&ciphertext, &mut scratch);
-        assert!(!a.health(Instant::now(), false).idle);
-        assert!(!b.health(Instant::now(), false).idle);
+        assert!(!a.health(Instant::now()).idle);
+        assert!(!b.health(Instant::now()).idle);
         assert!(a.last_activity > activity.0 && b.last_activity > activity.1);
 
         // Discard BoringTun's session keys to exercise an idle tunnel with no
@@ -834,10 +849,9 @@ mod flow_tests {
         a.tunn
             .set_static_private(ak.to_static_secret(), ak.public().into_x25519(), None);
         let idle_at = Instant::now() + IDLE_AFTER;
-        assert!(a.health(idle_at, false).idle);
-        assert!(!a.health(idle_at, true).idle);
+        assert!(!a.health(idle_at).idle);
         let _ = a.encapsulate(&ip, &mut scratch, 7);
-        assert!(!a.health(idle_at, false).idle);
+        assert!(!a.health(idle_at).idle);
     }
 
     #[test]
@@ -871,7 +885,7 @@ mod flow_tests {
             a.decapsulate(&[], &mut scratch).0,
             TunnResult::Done
         ));
-        assert!(a.health(Instant::now() + IDLE_AFTER, false).idle);
+        assert!(a.health(Instant::now() + IDLE_AFTER).idle);
     }
 
     #[test]

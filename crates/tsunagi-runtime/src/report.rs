@@ -25,6 +25,12 @@ pub fn networks(
                 let mut peers: Vec<OverlayPeerReport> = Vec::new();
 
                 if let Some(view) = &wg_view {
+                    let confirmed: std::collections::HashSet<_> = network
+                        .peers
+                        .iter()
+                        .filter(|p| p.has_confirmed_data_path())
+                        .map(|p| p.endpoint_id)
+                        .collect();
                     for peer in &view.peers {
                         let tunnel = peer.tunnel.as_ref();
                         peers.push(OverlayPeerReport {
@@ -35,7 +41,8 @@ pub fn networks(
                             address: peer.overlay_address_v4.map(|a| a.to_string()),
                             handshake_secs_ago: tunnel
                                 .and_then(|t| t.health.since_handshake.map(|s| s.as_secs())),
-                            idle: tunnel.is_some_and(|t| t.health.idle),
+                            idle: tunnel.is_some_and(|t| t.health.idle)
+                                && confirmed.contains(&peer.endpoint_id),
                             tx_packets: tunnel.map_or(0, |t| t.stats.tx_packets),
                             rx_packets: tunnel.map_or(0, |t| t.stats.rx_packets),
                             tx_bytes: tunnel.map_or(0, |t| t.stats.tx_bytes),

@@ -890,7 +890,7 @@ pub struct PeerReport {
     pub transport: String,
     /// Round-trip time of the control connection in milliseconds.
     pub rtt_ms: Option<u64>,
-    /// Fresh median RTT of the selected direct data link, in milliseconds.
+    /// Measured round trip to the peer over its data path, in milliseconds.
     pub data_rtt_ms: Option<u64>,
     /// Underlying path reported by the selected direct data carrier.
     pub data_transport_detail: Option<String>,
@@ -989,8 +989,7 @@ pub struct OverlayPeerReport {
     pub address: Option<String>,
     /// Seconds since the last WireGuard handshake while its session key is usable.
     pub handshake_secs_ago: Option<u64>,
-    /// An established tunnel has no recent or pending IP traffic. An expired
-    /// key on a tunnel required to stay warm is reported as waiting instead.
+    /// An established tunnel has no recent or pending application traffic.
     #[serde(default)]
     pub idle: bool,
     /// Packets encrypted and sent to this peer.

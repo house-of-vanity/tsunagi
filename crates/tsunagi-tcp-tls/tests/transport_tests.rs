@@ -12,6 +12,38 @@ use tsunagi::identity::{DeviceIdentity, NetworkId};
 use tsunagi_tcp_tls::TcpTlsTransport;
 
 #[tokio::test]
+async fn default_listeners_use_high_ports_and_report_the_actual_bound_port() {
+    use tsunagi::dataplane::transport::DataCarrier;
+    use tsunagi_tcp_tls::{TcpTlsCarrier, TcpTlsConfig, transport::DEFAULT_PORT};
+
+    assert_eq!(DEFAULT_PORT, 9442);
+    let option = TcpTlsConfig::OPTIONS
+        .iter()
+        .find(|o| o.key == "port")
+        .unwrap();
+    assert_eq!(
+        option.default.unwrap().parse::<u16>().unwrap(),
+        DEFAULT_PORT
+    );
+    let identity = DeviceIdentity::generate();
+    let first = TcpTlsTransport::bind(&identity, None, None).await.unwrap();
+    let second = Arc::new(TcpTlsTransport::bind(&identity, None, None).await.unwrap());
+    assert!(first.bound_port() >= 1024 && second.bound_port() >= 1024);
+    assert_ne!(first.bound_port(), second.bound_port());
+    assert!(
+        TcpTlsTransport::bind(&identity, Some(first.bound_port()), None)
+            .await
+            .is_err()
+    );
+    let cap = TcpTlsCarrier::new(second.clone())
+        .local_capability(NetworkId::from_bytes([3; 32]))
+        .unwrap()
+        .unwrap();
+    let (port, _): (u16, Vec<std::net::IpAddr>) = postcard::from_bytes(&cap.data).unwrap();
+    assert_eq!(port, second.bound_port());
+}
+
+#[tokio::test]
 async fn test_tcp_tls_transport_loopback() {
     let identity_a = DeviceIdentity::generate();
     let peer_a = identity_a.endpoint_id();

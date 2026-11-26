@@ -1,4 +1,4 @@
-use super::{DataPathReport, Device, icon};
+use super::{DataPathReport, Device, OverlayPeerReport, icon};
 use tsunagi::agent::{DATA_CONNECTING, DATA_DISABLED};
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -11,6 +11,16 @@ pub(super) enum Channel {
     Disabled,
 }
 
+pub(super) fn confirmed(
+    path: Option<&DataPathReport>,
+    rtt: Option<u64>,
+    tunnel: Option<&OverlayPeerReport>,
+) -> bool {
+    !matches!(path, None | Some(DataPathReport::None))
+        && rtt.is_some()
+        && tunnel.is_some_and(OverlayPeerReport::is_up)
+}
+
 impl Device<'_> {
     pub(super) fn channel(&self) -> Channel {
         if !self.online {
@@ -20,10 +30,9 @@ impl Device<'_> {
             Some(DATA_DISABLED) => Channel::Disabled,
             Some(DATA_CONNECTING) => Channel::Waiting,
             Some(_) => Channel::Error,
-            None if matches!(self.path, None | Some(DataPathReport::None)) => Channel::Waiting,
+            None if !confirmed(self.path, self.data_rtt_ms, self.overlay) => Channel::Waiting,
             None if self.overlay.is_some_and(|p| p.idle) => Channel::Idle,
-            None if self.overlay.is_some_and(|p| p.is_up()) => Channel::Ready,
-            None => Channel::Waiting,
+            None => Channel::Ready,
         }
     }
     pub(super) fn channel_hint(&self) -> &str {

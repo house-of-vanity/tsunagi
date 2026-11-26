@@ -295,8 +295,7 @@ impl Interface {
                         _=interval.tick()=>{
                             let (probes,jobs)=routes.vips.tick(routes.vips.check_capacity().saturating_sub(checks.len()));
                             for (route,packet) in probes {
-                                let obs = routes.traffic.packet(route.network,route.peer,Direction::Tx,&packet,||Role::Vip);
-                                if carrier.carry(route,packet) {obs.record();}
+                                carrier.carry(route,packet);
                             }
                             for job in jobs {
                                 let factory = Arc::clone(&factory);
@@ -1025,22 +1024,8 @@ impl Interface {
         // Source ownership was checked before any VIP reverse translation.
         let packet = match self.routes.vips.incoming(network, peer, packet.clone()) {
             crate::vip::router::Decision::Send(route, reply) => {
-                self.routes
-                    .traffic
-                    .packet(network, peer, Direction::Rx, &packet, || Role::Vip)
-                    .record();
-                let packet = reply;
-                // Probe replies use the ordinary peer carrier, never the TUN.
-                let tx = self.routes.traffic.packet(
-                    route.network,
-                    route.peer,
-                    Direction::Tx,
-                    &packet,
-                    || Role::Vip,
-                );
-                if self.carrier.carry(route, packet) {
-                    tx.record();
-                }
+                // Only an authenticated RTT request generates an immediate peer reply here.
+                self.carrier.carry(route, reply);
                 return Ok(());
             }
             crate::vip::router::Decision::Local(translated) => {
@@ -1064,14 +1049,9 @@ impl Interface {
                 }
                 return Ok(());
             }
-            crate::vip::router::Decision::ProbeReceived => {
-                self.routes
-                    .traffic
-                    .packet(network, peer, Direction::Rx, &packet, || Role::Vip)
-                    .record();
+            crate::vip::router::Decision::ProbeReceived | crate::vip::router::Decision::Drop => {
                 return Ok(());
             }
-            crate::vip::router::Decision::Drop => return Ok(()),
             crate::vip::router::Decision::Pass => packet,
         };
         self.deliver_admitted(network, peer, packet, broadcast, exit.as_ref(), forwarded)

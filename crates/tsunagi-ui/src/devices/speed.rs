@@ -1,5 +1,5 @@
 //! The same speed control occupies one fixed cell throughout a measurement.
-use super::{Client, Command, Device, NetworkReport, format, icon, widgets};
+use super::{Client, Command, Device, NetworkReport, format, icon, status, widgets};
 use crate::client::speed_running;
 use egui::{Align2, Color32, FontId, Rect, Sense, Ui, pos2, vec2};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,18 +44,28 @@ impl<'a> Controls<'a> {
             )
         } else {
             let available = self.network.active
-                && self
-                    .network
-                    .peers
-                    .iter()
-                    .any(|p| p.exit_node && self.capable(&p.endpoint_id));
+                && self.network.peers.iter().any(|p| {
+                    p.exit_node
+                        && self.capable(&p.endpoint_id)
+                        && p.data_error.is_none()
+                        && status::confirmed(
+                            Some(&p.path),
+                            p.data_rtt_ms,
+                            self.network.overlay.as_ref().and_then(|overlay| {
+                                overlay
+                                    .peers
+                                    .iter()
+                                    .find(|t| t.endpoint_id == p.endpoint_id)
+                            }),
+                        )
+                });
             (
                 icon::GAUGE,
                 "Test exits".to_owned(),
                 if available {
                     "Test each compatible online exit node in this network, one at a time."
                 } else {
-                    "No online exit in this network supports peer speed tests."
+                    "No compatible exit has a confirmed data path."
                 },
                 available,
             )
@@ -100,7 +110,12 @@ impl<'a> Controls<'a> {
         }
         let reading = self.network.speed.peers.get(peer.id);
         let supported = self.capable(peer.id);
-        let ready = self.network.active && peer.online && supported;
+        let ready = self.network.active
+            && supported
+            && matches!(
+                peer.channel(),
+                status::Channel::Ready | status::Channel::Idle
+            );
         let can_start = ready && !self.running && !self.client.busy();
         let id = ui.make_persistent_id(("test peer speed", &self.network.network_id, peer.id));
         let r = ui.interact(rect, id, Sense::click());
@@ -185,7 +200,9 @@ fn paint_reading(
             label("Starting", color);
             activity(ui, rect, color);
         }
+        SpeedPhase::Failed(_) if !ready => label("Failed", v.weak_text_color()),
         SpeedPhase::Failed(_) => label(&format!("{} Retry", icon::WARNING), v.error_fg_color),
+        SpeedPhase::Cancelled if !ready => label("Stopped", v.weak_text_color()),
         SpeedPhase::Cancelled => label(&format!("{} Retry", icon::ARROW_CLOCKWISE), color),
         SpeedPhase::Download | SpeedPhase::Upload | SpeedPhase::Done => {
             // Reserve the same two slots for idle, live and completed readings.
@@ -329,6 +346,11 @@ fn tooltip(
     }
     if !peer.online {
         hint.push_str("\nPeer is offline.");
+    } else if !matches!(
+        peer.channel(),
+        status::Channel::Ready | status::Channel::Idle
+    ) {
+        hint.push_str("\nWaiting for a confirmed data path.");
     } else if !supported {
         hint.push_str("\nNo compatible speed-test session with this peer.");
     } else if !running {

@@ -10,7 +10,7 @@ pub struct SpeedReport {
     pub batch: Option<SpeedBatchReport>,
     /// Per-peer progress or the last local result, keyed by endpoint ID.
     pub peers: BTreeMap<String, SpeedPeerReport>,
-    /// Currently connected peers advertising the same diagnostic wire version.
+    /// Compatible peers with a confirmed encrypted data path for a test.
     pub capable: Vec<String>,
 }
 

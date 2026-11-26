@@ -210,6 +210,12 @@ fn short_name_cell(ui: &mut egui::Ui, device: &Device<'_>) {
     ));
 }
 
+/// Height of one desktop roster row, including the gap to its neighbour.
+pub fn row_pitch(ctx: &egui::Context) -> f32 {
+    let style = ctx.style();
+    crate::table::row_height(ctx, &style) + style.spacing.item_spacing.y
+}
+
 /// Draws the window body into its viewport.
 pub fn show(
     ctx: &egui::Context,
@@ -280,11 +286,7 @@ pub fn show(
             columns[0].collapsing("Network details", |ui| summary(ui, network));
             let plot = &mut columns[1];
             plot.label("Network traffic");
-            let width = plot.available_width().min(440.0);
-            plot.scope(|ui| {
-                ui.set_max_width(width);
-                format::sparkline(ui, traffic.network(&network.network_id), unit, 48.0);
-            });
+            format::sparkline(plot, traffic.network(&network.network_id), unit, 48.0);
         });
         ui.add_space(8.0);
         egui::ScrollArea::vertical()
@@ -769,7 +771,7 @@ const MIN_PLOT_WIDTH: f32 = 100.;
 
 fn stretch_columns(mut widths: [f32; 9], available: f32) -> [f32; 9] {
     let gaps = crate::table::GAP * (widths.len() - 1) as f32;
-    widths[8] = (available - gaps - widths[..8].iter().sum::<f32>()).clamp(MIN_PLOT_WIDTH, 180.0);
+    widths[8] = (available - gaps - widths[..8].iter().sum::<f32>()).max(MIN_PLOT_WIDTH);
     widths
 }
 
@@ -997,7 +999,7 @@ fn device_table(
                 2 => tunnel_cell(ui, device),
                 3 => {
                     ui.label(rtt_pair(device)).on_hover_text(
-                        "Median authenticated direct data-link RTT / selected control-connection RTT. A dash means there is no current measurement.",
+                        "Round trip to the device over the encrypted data path, including relay hops / round trip over the control connection.",
                     );
                 }
                 4 => match &device.address {
@@ -1436,10 +1438,10 @@ mod tests {
     }
 
     #[test]
-    fn wider_windows_keep_a_compact_plot_and_narrow_windows_preserve_column_floors() {
+    fn plots_fill_wide_windows_and_narrow_windows_preserve_column_floors() {
         let minimum = [100.0; 9];
         let wide = stretch_columns(minimum, 1440.0);
-        assert!((100.0..=190.0).contains(&wide[8]));
+        assert!((wide.iter().sum::<f32>() + 8. * crate::table::GAP - 1440.).abs() < 0.1);
         assert_eq!(&wide[..8], &minimum[..8]);
         let narrow = stretch_columns(minimum, 800.0);
         assert_eq!(
@@ -1453,6 +1455,20 @@ mod tests {
         );
 
         let ctx = egui::Context::default();
+        let network = NetworkReport {
+            peers: vec![tsunagi::ipc::PeerReport {
+                endpoint_id: "peer".into(),
+                ..Default::default()
+            }],
+            overlay: Some(tsunagi::ipc::OverlayReport {
+                peers: vec![OverlayPeerReport {
+                    endpoint_id: "peer".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         for window_width in [800.0, 1000.0, 1440.0] {
             let frame = ctx.run(
                 egui::RawInput {
@@ -1468,21 +1484,27 @@ mod tests {
                         &ReadOnly,
                         &mut Unit::Bytes,
                         (&mut None, &mut None),
-                        &NetworkReport::default(),
+                        &network,
                         "self",
                         &Traffic::default(),
                     );
                 },
             );
-            let chart = frame
-                .shapes
-                .iter()
-                .find_map(|s| match &s.shape {
-                    egui::Shape::Rect(r) if r.rect.height() == 48.0 => Some(r.rect),
+            let chart = |height| {
+                frame.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.rect.height() == height => Some(r.rect),
                     _ => None,
                 })
-                .expect("network traffic chart");
-            assert!((300.0..=440.0).contains(&chart.width()), "{chart:?}");
+            };
+            let total = chart(48.).expect("network traffic chart");
+            assert!((window_width - total.right()).abs() < 12., "{total:?}");
+            if window_width == 1440. {
+                let peer = chart(24.).expect("desktop peer traffic chart");
+                assert!(
+                    (peer.right() - total.right()).abs() < 2.,
+                    "{peer:?} {total:?}"
+                );
+            }
         }
     }
 
