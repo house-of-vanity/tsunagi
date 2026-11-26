@@ -6357,14 +6357,17 @@ mod service_log_tests {
         );
 
         let big = std::fs::File::options()
-            .append(true)
+            .write(true)
             .open(logs.join("tsng.log"))
             .unwrap();
         big.set_len(SERVICE_LOG_LIMIT + 1).unwrap();
         drop(big);
         let file = open_log_in(&logs).unwrap();
         assert_eq!(file.metadata().unwrap().len(), 0);
-        assert!(logs.join("tsng.log.old").exists());
+        assert_eq!(
+            std::fs::metadata(logs.join("tsng.log.old")).unwrap().len(),
+            SERVICE_LOG_LIMIT + 1
+        );
     }
 
     #[test]

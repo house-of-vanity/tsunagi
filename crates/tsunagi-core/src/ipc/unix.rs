@@ -3,7 +3,7 @@
 //! One of the per-platform adapters; see [`super`]. It provides only what is
 //! particular to a Unix socket — binding a listener, connecting a client, and
 //! the owner-only permissions — and hands every accepted connection to the
-//! shared [`serve_connection`](super::serve_connection). The request framing,
+//! shared connection handler. The request framing,
 //! the dispatch and the client wrappers are the same on every platform and
 //! live in [`super`], re-exported here so `ipc::unix::request_status` and its
 //! siblings keep resolving.

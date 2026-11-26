@@ -1,9 +1,9 @@
 //! A named-pipe adapter for the local control interface.
 //!
-//! The Windows counterpart of [`super::unix`]. It provides only what is
+//! The Windows counterpart of the Unix socket adapter. It provides only what is
 //! particular to a named pipe — creating the server instance, opening a client
 //! and turning the state directory path into a pipe name — and hands every
-//! accepted connection to the shared [`serve_connection`](super::serve_connection).
+//! accepted connection to the shared connection handler.
 //! The framing, the dispatch and the client wrappers are the same on every
 //! platform and live in [`super`], re-exported here so `ipc::windows::request_status`
 //! and its siblings resolve just as their Unix equivalents do.

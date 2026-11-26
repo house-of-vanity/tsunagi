@@ -66,8 +66,8 @@ fn firewall_todo(plan: &BroadcastRulesPlan) -> String {
     )
 }
 
-/// The macOS implementation: `route` for the route, no firewall yet, and
-/// `pf` plus `route` for exit nodes (see [`super::macos_exit`]).
+/// Installs macOS broadcast routes with `route` and manages exit routing with
+/// `pf` and `route`.
 #[derive(Debug, Default)]
 pub struct MacosHostRules {
     /// The PF reference and the physical routes owned by this agent.
