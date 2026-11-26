@@ -24,7 +24,7 @@ android {
         targetSdk 35
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
         versionCode providers.gradleProperty('tsunagiVersionCode').getOrElse('1').toInteger()
-        versionName providers.gradleProperty('tsunagiVersionName').getOrElse('1.0.11')
+        versionName providers.gradleProperty('tsunagiVersionName').getOrElse('1.0.12')
         ndk { abiFilters abi }
     }
 }
